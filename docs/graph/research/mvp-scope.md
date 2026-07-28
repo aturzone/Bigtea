@@ -1,13 +1,14 @@
 ---
-topic: realistic 4-6 week v1 scope for a small OSS team (post-ADR)
+topic: realistic v1 scope for solo dev + Claude Code (post-ADR)
 status: resolved
 links: [../decisions/fork-vs-wrapper.md, hardware-profiling.md, benchmarking-methodology.md, ../backlog/wrapper-core.md, ../backlog/mvp-v1.md]
 ---
 ## Findings
 
-### Assumptions (for Atur to correct)
-- Team = 1-2 self-taught devs, part-time-to-full-time, i.e. roughly 80-240 total hours across the window — **unverified, flag for Atur**; every week-by-week estimate below scales linearly with this.
-- "4-6 weeks" read as calendar weeks with slack, not 4-6 dedicated FTE-weeks; week 6 is treated as buffer, not new scope.
+### Assumptions (corrected by Atur 2026-07-28)
+- Team = **solo (Atur) + Claude Code** — supersedes the earlier 1-2-dev guess. One self-taught dev's part-time hours; no second track of work ever runs in parallel.
+- **Claude Code throughput is budget-capped ($20/mo plan)**: rolling usage windows limit heavy agent runs. Observed costs in this project: ~50-150k subagent tokens per research-grade run, ~50-70k per planner run; implementation tickets with test/debug cycles will cost more, not less. Honest planning number: **~2-3 Claude-driven tickets per calendar week**, less in weeks with real-hardware debugging — not team-week velocity. Weeks in the milestone plan are paced on this cap.
+- The original "4-6 weeks" was a team-velocity estimate; solo + budget-capped, the same v1 cut re-paces to **~8 calendar weeks** (see ../backlog/mvp-v1.md), with a scope re-check at the week-4 midpoint rather than a week-6 buffer.
 - T0 (gap-closure #21) and hardware-profiler T7 (#14, calibration) both require hands-on access to a real MoE-capable rig (multi-channel RAM, a GPU that runs kt-kernel/SGLang, a working ktransformers install) starting week 1 — if Atur doesn't have this yet, it is the actual week-1 blocker, ahead of any code task.
 - Week-1 risk is entirely front-loaded on T0: it's a GATE (blocks gap-closure T1-T7 per gap-closure.md) and its outcome changes what v1 even is (see fail-path below) — nothing else in gap-closure should be scheduled ahead of it.
 - Assumes DeepSeek-class MoE (MLA attention) is the reachable local test model in some quantized form — unverified against Atur's actual hardware budget; a smaller MoE (e.g. Qwen-MoE class) may be the practical dev-loop target even if DeepSeek-class is the eventual README headline (see open questions).
@@ -58,7 +59,7 @@ links: [../decisions/fork-vs-wrapper.md, hardware-profiling.md, benchmarking-met
 - Vendoring or pinning a specific ktransformers/SGLang commit "to stabilize the demo" under schedule pressure — this directly contradicts the ADR's version-tracking amendment and reintroduces the exact ollama-staleness failure mode the ADR was written to avoid.
 
 ## Open questions
-- Real hardware access timeline: does Atur already have a rig that can run T0 and the hardware probes in week 1, or does procuring/renting one push the whole schedule right? Not resolved here.
-- Whether DeepSeek-V3/R1-class is actually runnable on Atur's own hardware for dev-loop iteration, or whether a smaller MoE model should be the working target with DeepSeek-class reserved for the README's headline number — not resolved, depends on the hardware answer above.
+- ~~Real hardware access timeline~~ **resolved 2026-07-28**: Atur rented a temporary, disposable cloud rig (Ubuntu 22.04) for T0 specifically — nothing persists after T0; calibration (hardware-profiler T7) is deferred to v1.1 anyway.
+- ~~Dev-loop model class~~ **resolved 2026-07-28, by Atur**: T0 runs the smallest MoE both stacks support (Mixtral-8x7B or a small Qwen3-MoE), NOT DeepSeek-class; DeepSeek-class stays the README-headline target for the wrapper itself.
 - Whether a T0 "bypassed" result should be read as a hard, permanent cut of the observability epic or just a deferral pending the dynamic-swap-log upstream PR — the ADR frames it as a revisit trigger, not an automatic kill, so this is a judgment call for Atur once/if T0 fails.
-- Actual weekly hours Atur can commit — flagged above as an assumption, not verified; changes every week-by-week estimate proportionally.
+- Actual weekly hours Atur can commit, and whether ~2-3 Claude-driven tickets/week holds once implementation starts — re-check at the week-4 midpoint and re-pace mvp-v1.md if the real rate differs.
