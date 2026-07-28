@@ -1,0 +1,14 @@
+---
+epic: wrapper-core
+status: open
+links: [../research/mvp-scope.md, ../decisions/fork-vs-wrapper.md]
+---
+## Tickets
+- [ ] T1: Build the CLI skeleton (subcommands: probe, recommend, launch, bench) with arg parsing and a config file schema every subcommand reads from — depends: ../research/mvp-scope.md — evidence: ../research/mvp-scope.md (New work — CLI skeleton, no ticket in any epic builds "the wrapper" as a runnable program) — acceptance: `--help` enumerates all four v1 subcommands, and a malformed config file produces a named parse error instead of an unhandled exception.
+- [ ] T2: Implement upstream version detection for ktransformers/kt-kernel/SGLang via stable surfaces (`pip show` / import-and-check) per the ADR's version-tracking amendment, never vendoring or pinning a commit — depends: ../decisions/fork-vs-wrapper.md — evidence: ../research/mvp-scope.md (New work — version detection) — acceptance: on a machine with all three packages installed the detector prints their exact installed version strings, and on a machine missing one it names the missing package instead of failing silently.
+- [ ] T3: Build launch-flag generation/pass-through that turns gap-closure T2 (#2)'s split recommendation plus hardware-profiler T1/T2/T4 (#8/#9/#11) probe outputs into `--kt-expert-placement-strategy` / `--kt-num-gpu-experts` / `--kt-gpu-experts-ratio` flags and invokes `python -m sglang.launch_server`, scoped to DeepSeek-class MoE on Linux+NVIDIA only — depends: ../backlog/gap-closure.md, ../backlog/hardware-profiler.md — evidence: ../research/mvp-scope.md (New work — launch-flag assembly; T2's acceptance stops at "returns a recommendation," not "launches anything") — acceptance: given a fixed split recommendation and probe output, the generated flag string is byte-identical across three consecutive runs and successfully starts `sglang.launch_server` on a Linux+NVIDIA target.
+- [ ] T4: Wire the CLI (T1), version detection (T2), gap-closure T2 (#2), hardware-profiler T1/T2/T4 (#8/#9/#11), launch-flag assembly (T3), and benchmark-harness T1/T2 (#15/#16) into one end-to-end orchestration command: probe -> recommend -> flags -> launch -> report tok/s — depends: ../backlog/benchmark-harness.md — evidence: ../research/mvp-scope.md (New work — end-to-end one-command UX) — acceptance: running the single orchestration command on the target model/platform prints one real tok/s figure with no manual step between stages.
+- [ ] T5: Package the CLI as an installable pip entry point and write the README quickstart that walks a user from `pip install` to a printed tok/s number — depends: ../research/mvp-scope.md — evidence: ../research/mvp-scope.md ("Launch" = README quickstart definition) — acceptance: from a clean virtualenv, `pip install` followed only by the README's documented commands prints a tok/s number with no undocumented setup step required.
+
+## Issues
+T1 #22 · T2 #23 · T3 #24 · T4 #25 · T5 #26
