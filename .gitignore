@@ -1,0 +1,29 @@
+# Model weights / large artifacts — never tracked
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+models/
+weights/
+*.tar
+*.zip
+
+# Secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Junk
+*.log
+.DS_Store
