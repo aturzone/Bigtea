@@ -1,6 +1,7 @@
 ---
 epic: benchmark-harness
-status: blocked
+status: open
+note: cache-hit-rate reporting (T6) ships static-placement-only until the dynamic swap-event upstream patch lands (../decisions/fork-vs-wrapper.md)
 links: [../research/benchmarking-methodology.md, ../decisions/fork-vs-wrapper.md]
 ---
 ## Tickets

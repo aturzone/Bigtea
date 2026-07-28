@@ -1,6 +1,7 @@
 ---
 epic: hardware-profiler
-status: blocked
+status: open
+note: config-recommendation output overlaps ktransformers' Q2 2026 roadmap — deconflict with upstream before building a competing recommender (../decisions/fork-vs-wrapper.md)
 links: [../research/hardware-profiling.md, ../decisions/fork-vs-wrapper.md]
 ---
 ## Tickets

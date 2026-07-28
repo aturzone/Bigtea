@@ -1,6 +1,6 @@
 ---
 decision: fork ktransformers vs independent wrapper
-status: proposed        # Atur must sanity-check before this becomes accepted
+status: accepted        # accepted by Atur 2026-07-28, with two amendments (T0 gate; version-tracking rule)
 links: [../research/licensing-fork-vs-wrapper.md, ../research/ktransformers-vs-llamacpp-moe-offload-gaps.md]
 ---
 ## Context
@@ -35,6 +35,8 @@ links: [../research/licensing-fork-vs-wrapper.md, ../research/ktransformers-vs-l
 Strongest counterargument: the ollama staleness ceiling — wrappers eventually fall behind and get squeezed when upstream automates their value-add (llama.cpp `--fit` precedent). It loses because ollama's failure was self-inflicted (vendoring a pinned commit); a wrapper driving a user-installed upstream via documented flags tracks head by construction, and the squeeze risk is already answered by aiming at observability, which upstream has left off two consecutive roadmaps.
 
 ## Consequences
+- **Version tracking (amendment, Atur)**: the wrapper MUST drive the user's installed upstream ktransformers/SGLang dynamically via its stable CLI/API surface — never vendor or pin a commit. This, not the observability focus, is the direct mitigation for the ollama-staleness failure mode.
+- **T0 gate (amendment, Atur)**: gap-closure T0 (#21) runtime-verifies the ExpertDistributionRecorder assumption this ADR's observability bet rests on; no other gap-closure ticket starts until T0 is confirmed either way.
 - **backlog/gap-closure.md**: proceeds as wrapper-side tooling plus 2 small upstream PRs (swap-event log, install fixes). **Re-scope T6**: it was written against balance_serve, which is now archived — serving-reliability work must target the SGLang integration path instead (../research/licensing-fork-vs-wrapper.md).
 - **backlog/hardware-profiler.md**: proceeds standalone (preflight probe + tok/s prediction don't need ktransformers source), but its config-recommendation output overlaps a Q2 roadmap item — deconflict with upstream before building a competing recommender.
 - **backlog/benchmark-harness.md**: proceeds unchanged; the cache-hit-rate reporting ticket ships static-placement-only until the dynamic swap-event upstream patch lands.
