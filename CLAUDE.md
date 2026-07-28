@@ -5,7 +5,9 @@
 - Node types: `research/` (investigated topics), `decisions/` (ADRs), `backlog/` (epics → tickets). Nodes link by relative path; never paste content between files.
 - Subagents (`.claude/agents/`): `researcher` (investigate → write node, return 3 lines), `planner` (graph → ticket), `coder` (one ticket only), `reviewer` (diff vs acceptance criteria). Delegate to them; keep the main session thin.
 - Build / test / lint: **no code yet.** When code lands, record the exact commands here, one line each.
-- Git: commit after each completed ticket — small, described commits. Model/weight files are gitignored; keep it that way.
+- Git: remote = `github.com/aturzone/Bigtea`. Push with the token from `C:\Projects\.env` inline in the push URL, output redacted — never store it in git config, never echo it. Commit after each completed ticket. Model/weight files are gitignored; keep it that way.
+- Every backlog ticket has a GitHub issue (`[epic] Tn: title`; body = summary + acceptance + graph links, never full content). Planner creates the issue when it creates the ticket; the `## Issues` section in each epic maps Tn → issue #.
+- Implementation work (coder) happens on branch `ticket/<epic>-Tn` + PR referencing the issue; reviewer checks the PR before Atur merges. **Never direct-to-main once implementation starts.** Docs/research/decision nodes may still commit to main.
 - Token discipline: this file stays under ~2000 tokens. If it grows past that, tell Atur to prune it — do not let it bloat.
 
 ## Compact Instructions

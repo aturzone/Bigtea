@@ -11,3 +11,6 @@ links: [../research/ktransformers-vs-llamacpp-moe-offload-gaps.md, ../decisions/
 - [ ] T5: Expose a CPU-to-GPU expert-transfer cache-hit-rate metric for the offloaded-expert decode path — depends: ../decisions/fork-vs-wrapper.md — evidence: ../research/ktransformers-vs-llamacpp-moe-offload-gaps.md — acceptance: the metric reports a higher hit-rate percentage on a second identical prompt than on the first cold-cache prompt.
 - [ ] T6: Build a concurrent-serving regression harness that replays a long-prompt-then-short-follow-up pattern across N simulated users and flags any inter-request stall past a set threshold — depends: ../decisions/fork-vs-wrapper.md — evidence: ../research/ktransformers-vs-llamacpp-moe-offload-gaps.md — acceptance: the harness fails the run when a follow-up response takes longer than the configured threshold after a large prior prompt, and passes when it doesn't.
 - [ ] T7: Document and script a NUMA-aware launch wrapper for dual-socket/multi-channel-RAM hosts running CPU-offloaded MoE inference — depends: ../decisions/fork-vs-wrapper.md — evidence: ../research/ktransformers-vs-llamacpp-moe-offload-gaps.md — acceptance: on a NUMA host, tokens/sec measured with the wrapper is higher than the unwrapped baseline on the same model and split.
+
+## Issues
+T1 #1 · T2 #2 · T3 #3 · T4 #4 · T5 #5 · T6 #6 · T7 #7
