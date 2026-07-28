@@ -1,0 +1,18 @@
+# bigtea example config (TOML).
+# Copy to bigtea.toml in the directory you run `bigtea` from,
+# or pass an explicit path with `--config path/to/file.toml`.
+
+[model]
+# Model name, used in reports and recommendations.
+name = "deepseek-v3"
+# Path to the GGUF weights. Leave commented while no model is downloaded.
+# gguf = "/models/deepseek-v3-q4_k_m.gguf"
+
+[hardware]
+# Optional overrides for probed values. Empty is fine — probes fill these in.
+# ram_gb = 192
+# vram_gb = 24
+
+[launch]
+# Extra flags appended to the generated launch command. Empty is fine.
+# extra_flags = ["--host", "127.0.0.1"]
