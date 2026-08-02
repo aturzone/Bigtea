@@ -21,4 +21,12 @@ early ticket is a cheap test that can invalidate the whole plan before expensive
 - [ ] T9: Run the full K3-on-16GB attempt end-to-end and publish the honest result — depends: T7, T8 — evidence: ../research/k3-on-16gb-feasibility.md (Has anyone done it; Verdict) — acceptance: published writeup states measured tok/s, measured RAM, measured disk usage, and full method, with the RAM-vs-throughput tradeoff disclosed and no hidden caveats.
 
 ## Issues
-(filled after GitHub issue creation)
+- T1 #34 · disk-space GATE go/no-go
+- T2 #35 · measure real NVMe bandwidth
+- T3 #36 · validate streaming pipeline on Kimi-Linear-48B
+- T4 #37 · resident_trunk_bytes budget-resolver knob
+- T5 #38 · deterministic dense-trunk streaming path
+- T6 #39 · buffer sizing for non-uniform layers
+- T7 #40 · oracle-diff validation of streamed trunk
+- T8 #41 · K3 preflight dry-run
+- T9 #42 · full K3-on-16GB attempt + honest publication
