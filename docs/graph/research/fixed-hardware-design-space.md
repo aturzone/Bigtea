@@ -51,7 +51,32 @@ Why this matters more than anything else — bytes/token at 3.09 GB/s (M):
 **Full trunk residency is worth ~2.6×.** It is the difference between 20 s/token and ~8 s/token.
 Everything below is in service of crossing that 3.75-bit trunk threshold without losing quality.
 
+> **CORRECTION 2026-08-03 — Hypothesis A is DEAD. Later wins; original text kept below.**
+> `sub-2bit-k3-fixed-hardware.md` recovered direct quotes from WASTE's `LEARNED.md`:
+> **"The trunk's bulk has been 4-bit by default since before §13 refuted 3"** and
+> **"4 bits for the bulk and 8 at both ends"** in the production `convert.py`; README states
+> *"the more sensitive shared weights remain at 4 or 8 bits."*
+> **The mixed-precision trunk I hypothesised is already shipped.** My premise ("trunk is int8")
+> was wrong — it came from a stale partial fact in an earlier node. The 27.28 GiB trunk is already
+> near its floor: 4-bit bulk works ("coherent"), 3-bit collapses.
+>
+> **Consequences, and they are severe:**
+> - Trunk residency at ~12.8 GiB usable RAM is **impossible**. 27.3 GiB cannot be compressed to
+>   12.8 without crossing the 3-bit collapse. The "~2.6× from trunk residency" prize does not exist.
+> - Trunk re-streaming of **~14.5 GiB/token is unavoidable on this machine**, which sets a **hard
+>   physical ceiling of 3.09 / 14.5 = 0.213 tok/s (~0.107 realistic)** — independent of *any* expert
+>   compression. This is the wall.
+> - Therefore **expert compression below ~2.5 bits buys little speed** (expert bytes fall below the
+>   trunk floor and stop being the bottleneck). Expert compression is now a **disk-fit** lever only,
+>   not a speed lever. Hypotheses B and C survive, but only in service of *fitting*, not of going
+>   faster.
+> - Hypothesis A's one surviving contribution: the *reason* 3-bit collapses is now better
+>   attributed — WASTE's own note says K3's **"QAT covered the expert weights at MXFP4 and left
+>   every non-expert component in higher precision"**, so the trunk's intolerance is a property of
+>   how the model was trained, not of blob-vs-component quantization.
+
 ## Hypothesis A — the 3-bit trunk collapse was the routers, not the attention
+**(SUPERSEDED — see correction block above. Retained per the append-only convention.)**
 
 WASTE measured a 3-bit trunk destroying the model: logits 36% off, generation degenerating to `+`
 and spaces (P). Their stated cause: K3's QAT covered **experts only**, so the trunk has no trained
