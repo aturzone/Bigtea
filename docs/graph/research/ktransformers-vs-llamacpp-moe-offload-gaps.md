@@ -1,8 +1,34 @@
 ---
 topic: ktransformers vs llama.cpp MoE-offload — gaps for solo/small-team use
-status: resolved
-links: [../backlog/gap-closure.md]
+status: resolved-with-corrections
+links: [../backlog/gap-closure.md, moe-landscape-2026-08.md, waste-engine-verified.md]
 ---
+
+> **CORRECTION BLOCK — 2026-08-02. Later wins; original text below is kept unedited.**
+> A verification pass (see `moe-landscape-2026-08.md`) found this node cited **closed** issues as
+> open evidence. These were wrong **at write time (2026-07-28)**, not merely stale:
+> - ktransformers **#1074** (balance_serve KV loss) — closed 2025-04-09, a year before this node.
+> - ktransformers **#1104**, **#1022** (build/install failures) — closed 2025-04-09 / 2025-04-03.
+>   The "install UX is rough" conclusion still holds, but rests on roadmap issue **#1779** (open),
+>   not on these.
+> - ktransformers **#109** (Windows install.bat) — closed 2025-12-11.
+> - **All five** llama.cpp `--fit` issues (#20308, #22592, #20492, #22442, #18390) — all closed
+>   between 2026-01-08 and 2026-05-02. "Open correctness issues as of mid-2026" was inaccurate.
+>   Caveat: tracker-closed ≠ fixed (#20492 closed "bug-unconfirmed").
+> - llama.cpp **#20757** (persistent GPU expert cache) — **closed** 2026-04-08, not an open feature
+>   request. The underlying gap is real and still unshipped in mainline, but the live artifact to
+>   track is leloch's **Discussion #24528** (open) + PR **#24524** (closed unmerged 2026-06-12).
+>
+> **Still accurate:** #1173 (Windows Vulkan) open; ktransformers has shipped **no** MoE
+> observability (verified again 2026-08-02 — roadmap #1779 has no such line item; adjacent open
+> issues #2093 placement / #2003 io_uring residency are not metrics). The T4/T5 bet stands.
+>
+> **Missing fact:** ktransformers **v0.6.2** (2026-05-03) added native **DeepSeek-V4-Flash**
+> support (kt-kernel MXFP4 MoE operator). This node predates it.
+>
+> **Method lesson:** the researcher cited issue numbers without checking `state`. Every future
+> node citing a tracker item must record its state + date. Adopted as convention.
+
 ## Findings
 
 ### Gaps in ktransformers itself
