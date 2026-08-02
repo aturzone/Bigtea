@@ -31,6 +31,30 @@ inside 16 GB — by the same "it ran" bar the community has already accepted for
 0.5 tok/s result — but at 2–10× worse throughput than WASTE's existing 29 GB regime, dominated
 entirely by NVMe bandwidth. **Nobody has built or published this** (see "Has anyone done it").
 
+## MEASURED on Atur's actual laptop (2026-08-02) — supersedes the assumed values above
+
+First real hardware numbers for this project. No model downloaded; took minutes.
+
+| Quantity | Measured | Method |
+|---|---|---|
+| Drive | SK Hynix HFS001TEJ4X112N, 953 GB, NVMe | `Get-PhysicalDisk` |
+| Free space | **745.9 GB** | `Win32_LogicalDisk` |
+| **Sequential read** | **3.09 GB/s** | 8 GB file (> free RAM, so page cache cannot mask it), 8 MB blocks, single stream |
+| RAM / VRAM | 15.7 GB / 6 GB (RTX 3050) | `Win32_ComputerSystem`, `nvidia-smi` |
+
+**Consequences, using the 31.5 GB/token figure derived above:**
+- Ceiling: 31.5 / 3.09 = **10.2 s/token → 0.098 tok/s**.
+- At the evidence-grounded ~50% efficiency discount: **~0.05 tok/s ≈ 20 s/token**.
+- This lands within 12% of this doc's pre-measurement estimate (~0.056 tok/s at an assumed
+  3.5 GB/s) — the bandwidth model holds up on real hardware.
+- **Disk is confirmed as the binding constraint**: 745.9 GB free vs a 982 GB container = **236 GB
+  short**. No amount of engineering closes this; it is a purchase (2 TB NVMe, ~$100–150) or a
+  smaller representation (REAP-pruned 350 GB, but that is no longer full-quality K3).
+- Caveat: 3.09 GB/s is *single-stream sequential*. Large-block quasi-random expert reads
+  (12.4 MB records) should land near this per the cited convergence result, but that is not yet
+  measured on this drive — and queue-depth parallelism (io_uring/IOCP) could raise the effective
+  figure above single-stream. Both are open, and both would *improve* the projection, not worsen it.
+
 ## Decomposition of the 29.06 GB floor
 
 Primary sources: `docs/K3.md`, `docs/TECHNICAL.md`, `docs/EFFICIENCY.md`, `docs/LEARNED.md`,
