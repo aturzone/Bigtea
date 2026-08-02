@@ -100,6 +100,28 @@ token**, so ~6 GB of it living in VRAM is ~6 GB/token that never touches the dis
 - **Conversion toolchain ready**: Python 3.11 + torch 2.13.0+cpu + safetensors + numpy.
 - **3.04 GB of Kimi-Linear-48B** already downloaded (resumable) — the small-model validation target.
 
+## Build verification (completed 2026-08-03, no model required)
+
+Both engines compile and run standalone on the target machine. Verified by execution, not assumed:
+
+- `C:\Projects\waste\waste.exe` → `WASTE 0.6.3 (container v0, backend AVX2, crc32 slice8, x86_64)`
+  — note it correctly selects the **AVX2** backend (this CPU has no AVX-512).
+- `C:\Projects\llamacpp-unsloth\build\bin\llama-completion.exe` → `version 1 (daef2b3), built with
+  GNU 16.1.0 for Windows AMD64`. **46 binaries** built, including `llama-completion` (text gen),
+  `llama-bench` (throughput), `llama-mtmd-cli` (K3 is multimodal), `llama-perplexity` (quality),
+  `llama-fit-params`, `llama-quantize`.
+- **K3 support confirmed inside the compiled binary**, not merely in source: symbol scan finds
+  `kimi_k3`, `kimi_k3_conv1d`, `kimi_k3_situ`, plus its `build_arch` / `load_arch` / graph-builder
+  symbols.
+- MinGW runtime DLLs (`libgcc_s_seh-1`, `libstdc++-6`, `libwinpthread-1`, `libgomp-1`, `libssl-3-x64`,
+  `libcrypto-3-x64`) copied into `build\bin\` so the binaries run **without** any PATH setup.
+
+**Windows build recipe worth keeping** (both failures cost real time):
+1. `-DCMAKE_CXX_FLAGS=-D_WIN32_WINNT=0x0A00 -DCMAKE_C_FLAGS=-D_WIN32_WINNT=0x0A00` — without it the
+   vendored `cpp-httplib` fails on `CreateFile2` (MinGW gates it behind `_WIN32_WINNT >= 0x0602`).
+2. `-DLLAMA_BUILD_TESTS=OFF`, and expect `tools/ui` to fail (it needs a JS toolchain to generate
+   assets) — harmless, every binary that matters is built by then.
+
 ## The only remaining cost: the download
 
 **553.2 GiB, resumable.** Observed throughput during the aborted Kimi-Linear fetch was roughly
