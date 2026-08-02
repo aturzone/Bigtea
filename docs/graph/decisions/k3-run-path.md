@@ -33,6 +33,29 @@ The `--stages 2` discovery (a real, shipped flag that would put K3 at ~665 GiB) 
 interesting and is *the* fallback if C's quality disappoints — but it is strictly more expensive to
 reach. **Do not start there.**
 
+## The full menu of K3 quants that fit (checked 2026-08-03, HF API, sizes in GiB)
+
+| Repo | Size | Pruned? | ~Download @10 MB/s |
+|---|---|---|---|
+| prometheusAIR/Kimi-K3-REAP55-GGUF (IQ1_M) | **319.0** | 55% of experts removed | ~9 h |
+| hellohazime/Kimi-K3-REAP640-IQ1_S-GGUF | **411.1** | 28.6% removed (896→640) | ~12 h |
+| GrEarl/Kimi-K3-GGUF-IQ1_S | 528.0 | no | ~15 h |
+| **unsloth/Kimi-K3-GGUF UD-IQ1_S** | **553.2** | **no** | **~16 h** |
+| unsloth IQ2_XXS | 662.2 | no | ~19 h |
+
+**Critical correction to an intuition worth stating, because it inverts the obvious conclusion:
+REAP pruning saves disk and download, but NOT speed.** Pruning shrinks the expert *pool*
+(896→640), yet each token still routes to **16** experts — so expert bytes read per token are
+**unchanged**. A pruned model is not a faster model here; it is only a cheaper one to obtain.
+
+**Recommendation stands on UD-IQ1_S (553.2 GiB)** despite being the largest full-model option:
+it is the only one with published quality benchmarks (unsloth's KLD/PPL table), and running the
+*unpruned* model keeps the milestone claim clean — "we ran K3" rather than "we ran a 71%-expert
+derivative of K3." The extra ~4 hours of download buys an unambiguous result.
+**If download time proves to be the real pain**, `REAP640-IQ1_S` (411.1 GiB) is the fallback: its
+28.6% prune sits inside the 25–50% band REAP's paper reports as near-baseline, and it saves
+142 GiB. `REAP55` at 319 GiB is past that band — treat its quality as unknown.
+
 ## The evidence that this configuration works at all
 
 - unsloth's own guide, verbatim: *"Best rule of thumb: RAM+VRAM ≈ the quant size; otherwise **it'll
