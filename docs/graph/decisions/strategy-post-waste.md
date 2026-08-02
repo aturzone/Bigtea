@@ -94,11 +94,62 @@ the other way.
 
 ## The hardware reality this decision must state plainly
 
-Running **Kimi K3 on Atur's own machine is not possible**: K3's floor is **29.06 GB RAM** and the
-laptop has **15.7 GB** — short by ~2×, regardless of GPU or SSD, on any engine. Two honest paths:
-- **Today, unchanged**: **Kimi-Linear-48B** (19 GiB container, **1.28 GB** RAM floor, ~10.7 tok/s,
-  CPU-only — no VRAM needed) runs on this laptop now. That is a real, verifiable "frontier-ish MoE
-  on my own machine" demo.
-- **For K3 specifically**: the gate is a **RAM upgrade, not software** — the i7-13650HX platform
-  takes 2× DDR5 SO-DIMM; a 64 GB kit (~$100–200) clears the 29.06 GB floor with headroom for the
-  cache multiples that decide speed. No amount of Bigtea engineering substitutes for this.
+> **CORRECTED 2026-08-02 (later wins).** An earlier version of this section claimed K3 on a 15.7 GB
+> laptop is "not possible" and needs a RAM upgrade. **That was wrong** — it quoted WASTE's *design*
+> floor as if it were physics. See `../research/k3-on-16gb-feasibility.md`.
+
+**K3's 29.06 GB floor is a policy choice, not a physical law.** It is dominated by WASTE's decision
+to keep the 27.28 GB dense trunk RAM-resident. Three independent proofs from WASTE's own docs:
+1. They already stream one dense component — the 1.11 GB embedding table — with **bit-identical
+   logits and zero throughput cost** (LEARNED.md §13).
+2. They tested streaming the LM head too. It worked **correctly**; they rejected it on *speed*
+   grounds, not correctness.
+3. `WASTE_E_RAM_BUDGET` is an explicit **refusal policy** — the engine chooses to refuse rather
+   than run correct-but-slow.
+
+Nothing in K3's mathematics requires any byte to be resident. **The true correctness-only floor is
+~5–6 GB.** A 16 GB machine clears it with ~13 GB to spare.
+
+**The real cost is throughput, and it is severe.** At 16 GB you must stream ~52% of the trunk
+every token: **~31.5 GB of reads per token** (vs ~17 GB in WASTE's 29 GB build). Every spare byte
+should go to *trunk* residency, never expert cache — expert cache is provably worthless below a
+17.0–17.4 GB working set, while trunk residency pays back linearly and cliff-free at 1 GB/token
+per resident GB. On Atur's PCIe-3-class NVMe (~3.5 GB/s) that lands near **~0.056 tok/s ≈ 18
+seconds per token**. This is a demo, not a usable assistant — and it is a genuine world-first.
+
+**The actual binding constraint is disk, not RAM.** Measured 2026-08-02: Atur's drive is a 953 GB
+NVMe with **745.9 GB free**. WASTE's K3 container is **982 GB**; the native HF checkpoint is
+**1.56 TB** (not the 594 GB previously cited). **He is ~236 GB short.** The gate is therefore a
+**~$100–150 2 TB NVMe**, not a RAM upgrade — cheaper than the RAM, and it unblocks the milestone.
+
+**Runs on the laptop today, unchanged:** **Kimi-Linear-48B** (19 GiB container, 1.28 GB floor,
+~10.7 tok/s, CPU-only). Real proof point available now, zero purchases.
+
+## Option D — Build the K3-on-16GB milestone (added 2026-08-02, Atur's direction)
+
+Atur's stated goal is to be **first to run K3 on a laptop** using mathematical/physical/engineering
+methods. Research confirms this is **unclaimed and feasible**: nobody has published K3 — or any
+1T+ model — below WASTE's 29.06 GB floor; WASTE itself refuses to try.
+
+- **This is not "write an engine from scratch"** (which fork-vs-wrapper rightly rejected). It is a
+  bounded, additive extension to WASTE's Apache-2.0 C11 codebase, which already ships ~80% of the
+  needed machinery: streamed `pread` I/O, a read-ahead thread pattern, an oracle-diff correctness
+  harness, and a budget resolver. What's missing is applying all of it to the *trunk* instead of
+  only to experts, and degrading instead of refusing below the floor.
+- **Trunk streaming is easier than the expert case WASTE already solved** — trunk access order is
+  100% deterministic every token (no routing to predict), and residency policy needs no eviction
+  heuristic because every trunk byte is read every token (benefit is uniform per byte).
+- **It is a legitimate fork rationale**: upstream refuses this mode *by policy*. Apache-2.0 permits
+  it; obligations are light (state changes, keep the license, rename).
+- **Prior art validates the technique, not the target**: AirLLM, FlexGen, DeepSpeed ZeRO-Inference
+  all ship dense layer-wise streaming with double buffering — none applied to a 1T+ MoE trunk, none
+  targeting a 16 GB *total-system* envelope.
+- **Spillover value beyond the stunt**: proper async I/O overlap (io_uring / IOCP) would speed up
+  *both* the new 16 GB regime and WASTE's existing 29 GB regime.
+- **Honest risks**: ~0.02–0.4 tok/s depending on drive; every number above the WASTE-sourced ones
+  is first-principles, not measured; upstream could ship a below-floor mode first and erase the
+  claim; and this competes for the same solo, budget-capped hours as Option B.
+
+**Relationship to Option B**: not mutually exclusive, but they are different games — B is a durable
+tooling product, D is a milestone with a headline. D's measurements feed B's predictor with the
+only real 1T-scale calibration data anyone would have. **Atur's call on sequencing.**

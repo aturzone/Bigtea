@@ -1,0 +1,24 @@
+---
+epic: k3-on-16gb
+status: proposed (pending strategy-post-waste.md Option D acceptance)
+links: [../research/k3-on-16gb-feasibility.md, ../decisions/strategy-post-waste.md, ../research/waste-engine-verified.md]
+---
+
+Flagship goal: be first to run Kimi K3 (2.8T params) on a ~16 GB consumer laptop, by extending
+WASTE (Apache-2.0 C11) with partial-trunk-streaming instead of its current all-or-nothing 27.28 GB
+resident trunk. Sequenced cheapest-kill-shot-first — WASTE's own "Gate" culture adopted: every
+early ticket is a cheap test that can invalidate the whole plan before expensive work starts.
+
+## Tickets
+- [ ] T1 [GATE]: Confirm exact K3 container disk-footprint requirement and produce a go/no-go with a number (2TB NVMe purchase ~$100-150 / external drive + bandwidth penalty / REAP-pruned 350GB variant w/ quality loss) — depends: ../decisions/strategy-post-waste.md, ../research/k3-on-16gb-feasibility.md — evidence: ../research/k3-on-16gb-feasibility.md (Disk-footprint constraint) — acceptance: written go/no-go states the exact GB shortfall vs Atur's 745.9GB free and names one funded remediation path; nothing else in this epic starts until this ticket closes.
+- [ ] T2: Measure Atur's actual NVMe sequential + large-block (~12.4MB) random read bandwidth (SK Hynix HFS001TEJ4X112N) — no model download required, runnable today — depends: T1 — evidence: ../research/k3-on-16gb-feasibility.md (Bytes-per-token physics + tok/s at each SSD speed) — acceptance: a recorded GB/s figure (seq + large-block-random) replaces the assumed 3.5 GB/s in the tok/s projection table, with the resulting tok/s recomputed from the measured number.
+- [ ] T3: Validate trunk-streaming pipeline correctness on Kimi-Linear-48B (19 GiB, runs on laptop today) — correctness/pipeline check ONLY, explicitly not a performance proof for K3 — depends: T2 — evidence: ../research/k3-on-16gb-feasibility.md (Layer-wise streaming: prior art and transferability — "a test on the small model does not test the big one") — acceptance: streamed-trunk decode on Kimi-Linear-48B produces bit-identical (or oracle-diff-tolerance) logits vs the existing resident-trunk baseline; report explicitly labels the result correctness-only, silent on tok/s implications for K3.
+- [ ] T4: Generalize WASTE's budget resolver from binary trunk residency to a `resident_trunk_bytes` knob, replacing the hard `WASTE_E_RAM_BUDGET` refusal below floor with a degraded-but-working mode — depends: T3 — evidence: ../research/k3-on-16gb-feasibility.md (What would have to be built, item 1) — acceptance: passing `resident_trunk_bytes` below the full 27.28GB trunk no longer triggers `WASTE_E_RAM_BUDGET`; engine instead computes and reports expected bytes/token and predicted tok/s.
+- [ ] T5: Build a layer-order deterministic streaming path for the dense trunk, mirroring WASTE's existing expert read-ahead (2-thread, 1.6x measured) — depends: T4 — evidence: ../research/k3-on-16gb-feasibility.md (What would have to be built, items 2 and 4) — acceptance: trunk weights are streamed per-decode-step (not just at load) with read-ahead overlap; validated on Kimi-Linear-48B with no logit regression vs T3's baseline.
+- [ ] T6: Size the double-buffer to the largest adjacent-2-layer window, not the average, accounting for K3's non-uniform layers (69 KDA : 24 MLA, layer 0 fully dense) — depends: T4 — evidence: ../research/k3-on-16gb-feasibility.md (What would have to be built, item 5; Decomposition of the 29.06 GB floor) — acceptance: a documented per-layer trunk-byte table for K3's 93 layers exists, and the allocated buffer size equals the largest actual adjacent-pair byte sum (not `27.28GB / 93 layers * 2`).
+- [ ] T7: Validate the streamed-trunk path against WASTE's existing oracle-diff correctness harness — depends: T5, T6 — evidence: ../research/k3-on-16gb-feasibility.md (What would have to be built, item 6) — acceptance: oracle-diff run shows streamed-trunk logits bit-identical, or within WASTE's own published logit tolerance, vs resident-trunk baseline, on Kimi-Linear-48B.
+- [ ] T8: Dry-run the resident_trunk_bytes + streaming path against the full K3 container as a preflight only (no full decode yet) — depends: T1, T6, T7 — evidence: ../research/k3-on-16gb-feasibility.md (Minimum-RAM budget table for a 16 GB target) — acceptance: a `waste plan`-style preflight against the real K3 container reports resident-trunk fraction (~48% of 27.28GB), predicted bytes/token (~31.5GB), and predicted tok/s using T2's measured bandwidth, with zero refusal errors.
+- [ ] T9: Run the full K3-on-16GB attempt end-to-end and publish the honest result — depends: T7, T8 — evidence: ../research/k3-on-16gb-feasibility.md (Has anyone done it; Verdict) — acceptance: published writeup states measured tok/s, measured RAM, measured disk usage, and full method, with the RAM-vs-throughput tradeoff disclosed and no hidden caveats.
+
+## Issues
+(filled after GitHub issue creation)
