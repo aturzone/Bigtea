@@ -1,0 +1,12 @@
+[package]
+name = "bigtea-probe"
+description = "Measure what this machine can actually do: RAM, storage capacity and real read bandwidth, GPUs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No dependencies. The platform calls needed here are a handful of FFI
+# declarations; a crate for them would be more supply chain than code.
+[dependencies]

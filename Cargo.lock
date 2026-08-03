@@ -5,3 +5,14 @@ version = 3
 [[package]]
 name = "bigtea-gguf"
 version = "0.1.0"
+
+[[package]]
+name = "bigtea-plan"
+version = "0.1.0"
+dependencies = [
+ "bigtea-gguf",
+]
+
+[[package]]
+name = "bigtea-probe"
+version = "0.1.0"
