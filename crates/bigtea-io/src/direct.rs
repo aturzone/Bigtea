@@ -197,16 +197,18 @@ mod tests {
 
     impl Temp {
         fn with(bytes: &[u8]) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            // A timestamp is NOT unique enough: Windows' clock granularity is
+            // coarse (~15 ms), so tests running in parallel collide on the same
+            // name and silently overwrite each other's fixtures. A counter is.
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+
             let mut path = std::env::temp_dir();
-            let unique = format!(
-                "bigtea-io-{}-{:?}.bin",
+            path.push(format!(
+                "bigtea-io-{}-{}.bin",
                 std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            );
-            path.push(unique);
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
             let mut f = File::create(&path).expect("create temp");
             f.write_all(bytes).expect("write temp");
             f.sync_all().expect("sync temp");

@@ -1,0 +1,12 @@
+[package]
+name = "bigtea-model"
+description = "A model on disk: sharded GGUF containers, resolved into readable tensors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bigtea-gguf = { path = "../bigtea-gguf" }
+bigtea-io = { path = "../bigtea-io" }

@@ -11,6 +11,14 @@ name = "bigtea-io"
 version = "0.1.0"
 
 [[package]]
+name = "bigtea-model"
+version = "0.1.0"
+dependencies = [
+ "bigtea-gguf",
+ "bigtea-io",
+]
+
+[[package]]
 name = "bigtea-plan"
 version = "0.1.0"
 dependencies = [
