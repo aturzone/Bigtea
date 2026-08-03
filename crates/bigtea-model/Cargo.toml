@@ -11,3 +11,18 @@ repository.workspace = true
 bigtea-gguf = { path = "../bigtea-gguf" }
 bigtea-io = { path = "../bigtea-io" }
 bigtea-plan = { path = "../bigtea-plan" }
+
+# Binary targets contain no #[test] functions, so the empty harness cargo would
+# build for each is pure overhead -- and on Windows with Smart App Control
+# enforced, running those unsigned harnesses is blocked outright, failing the
+# suite for no reason. The library tests are unaffected.
+
+[[bin]]
+name = "bigtea-model-info"
+path = "src/bin/bigtea-model-info.rs"
+test = false
+
+[[bin]]
+name = "bigtea-loadbench"
+path = "src/bin/bigtea-loadbench.rs"
+test = false

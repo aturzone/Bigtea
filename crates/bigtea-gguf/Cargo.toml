@@ -10,3 +10,13 @@ repository.workspace = true
 # No dependencies, deliberately. The format is simple enough that a crate would
 # cost more in supply chain than it saves in code.
 [dependencies]
+
+# Binary targets contain no #[test] functions, so the empty harness cargo would
+# build for each is pure overhead -- and on Windows with Smart App Control
+# enforced, running those unsigned harnesses is blocked outright, failing the
+# suite for no reason. The library tests are unaffected.
+
+[[bin]]
+name = "gguf-info"
+path = "src/bin/gguf-info.rs"
+test = false

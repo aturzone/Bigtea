@@ -37,8 +37,10 @@ fn main() -> ExitCode {
     // The number every plan hangs off, made explicit.
     let usable = machine.usable_ram_for_weights(OVERHEAD);
     println!(
-        "\nusable for weights   {:.1} GiB   (available RAM minus 3 GiB for OS/KV/scratch)",
-        bigtea_probe::gib(usable)
+        "\nusable for weights   {:.1} GiB   (available RAM minus a {:.0} GiB placeholder; \
+         run bigtea-model-info for the real figure)",
+        bigtea_probe::gib(usable),
+        bigtea_probe::gib(OVERHEAD)
     );
 
     report_reclaimable(usable);
@@ -67,7 +69,14 @@ fn dump_processes() {
     );
 }
 
-const OVERHEAD: u64 = 3 << 30;
+/// Runtime cost that is *not* weights, when the model's shape is unknown.
+///
+/// A rough placeholder only: the real figure depends on attention shape and
+/// context length and is computed per model by `bigtea-plan`. Kept small
+/// because `available` RAM already excludes the OS — charging 3 GiB here, as
+/// this once did, double-counted it and threw away ~2 GiB of budget on a
+/// machine with none to spare.
+const OVERHEAD: u64 = 1 << 30;
 /// Ignore anything smaller than this — closing a 64 MiB helper is disruption
 /// for no benefit.
 const MIN_WORTH_CLOSING: u64 = 128 << 20;

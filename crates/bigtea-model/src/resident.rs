@@ -128,6 +128,82 @@ impl ResidentSet {
         Self::load_with_progress(model, budget_bytes, |_, _| {})
     }
 
+    /// Load using `threads` concurrent readers.
+    ///
+    /// A single synchronous read cannot saturate an NVMe device: the drive
+    /// wants several requests in flight to reach its rated bandwidth, and one
+    /// blocking read at a time leaves most of it idle. Issuing reads from
+    /// several threads is the simplest way to get queue depth without an async
+    /// runtime.
+    ///
+    /// Positioned reads (`seek_read` / `pread`) carry their own offset and do
+    /// not share a file cursor, so concurrent readers on one handle are safe
+    /// and need no locking.
+    pub fn load_parallel(
+        model: &Model,
+        budget_bytes: u64,
+        threads: usize,
+    ) -> Result<(Self, LoadReport)> {
+        let start = std::time::Instant::now();
+        let plan = Plan::build(model, budget_bytes)?;
+        let threads = threads.max(1).min(plan.to_load.len().max(1));
+
+        let mut tensors = HashMap::with_capacity(plan.to_load.len());
+        let mut bytes = 0u64;
+
+        if threads == 1 {
+            for (name, size) in &plan.to_load {
+                let data = read_checked(model, name, *size)?;
+                bytes += *size;
+                tensors.insert(name.clone(), data);
+            }
+        } else {
+            // Round-robin rather than contiguous chunks: tensor sizes vary by
+            // orders of magnitude, so contiguous slices of a size-sorted list
+            // would hand one thread all the large tensors.
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let slice = &plan.to_load;
+                        scope.spawn(move || {
+                            let mut out = Vec::new();
+                            for (name, size) in slice.iter().skip(t).step_by(threads) {
+                                out.push(read_checked(model, name, *size).map(|d| (name.clone(), d)));
+                            }
+                            out
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap_or_default())
+                    .collect::<Vec<_>>()
+            });
+            for result in results {
+                let (name, data) = result?;
+                bytes += data.len() as u64;
+                tensors.insert(name, data);
+            }
+        }
+
+        let report = LoadReport {
+            loaded_tensors: tensors.len(),
+            loaded_bytes: bytes,
+            budget_bytes,
+            skipped_over_budget: plan.over_budget,
+            skipped_not_downloaded: plan.not_downloaded,
+            seconds: start.elapsed().as_secs_f64(),
+        };
+        Ok((
+            ResidentSet {
+                tensors,
+                bytes,
+                skipped: plan.skipped,
+            },
+            report,
+        ))
+    }
+
     /// As [`Self::load`], calling `progress(loaded_bytes, total_planned)` as it
     /// goes — loading several gigabytes takes long enough to warrant feedback.
     pub fn load_with_progress(
@@ -219,6 +295,64 @@ impl ResidentSet {
     pub fn skipped(&self) -> &[Skipped] {
         &self.skipped
     }
+}
+
+/// Which always-read tensors will be loaded, decided before any I/O.
+///
+/// Separating the decision from the work is what makes parallel loading
+/// possible: the budget is a running total, which is inherently sequential,
+/// so it is resolved first and the reads are then independent.
+struct Plan {
+    to_load: Vec<(String, u64)>,
+    skipped: Vec<Skipped>,
+    over_budget: u64,
+    not_downloaded: u64,
+}
+
+impl Plan {
+    fn build(model: &Model, budget_bytes: u64) -> Result<Self> {
+        let mut planned: Vec<(String, u64)> = model
+            .tensor_names()
+            .filter_map(|name| {
+                let loc = model.location(name)?;
+                (!loc.routed_expert).then(|| (name.to_string(), loc.size))
+            })
+            .collect();
+        planned.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+
+        let mut to_load = Vec::with_capacity(planned.len());
+        let mut skipped = Vec::new();
+        let (mut running, mut over_budget, mut not_downloaded) = (0u64, 0u64, 0u64);
+
+        for (name, size) in planned {
+            if running.saturating_add(size) > budget_bytes {
+                over_budget += size;
+                skipped.push(Skipped { name, size, reason: SkipReason::OverBudget });
+                continue;
+            }
+            if !model.is_available(&name)? {
+                not_downloaded += size;
+                skipped.push(Skipped { name, size, reason: SkipReason::NotDownloaded });
+                continue;
+            }
+            running += size;
+            to_load.push((name, size));
+        }
+        Ok(Plan { to_load, skipped, over_budget, not_downloaded })
+    }
+}
+
+/// Read a tensor, refusing anything but its exact declared size.
+fn read_checked(model: &Model, name: &str, size: u64) -> Result<Vec<u8>> {
+    let data = model.read_tensor(name)?;
+    if data.len() as u64 != size {
+        return Err(Error::NotDownloaded {
+            name: name.to_string(),
+            need: size,
+            have: data.len() as u64,
+        });
+    }
+    Ok(data)
 }
 
 impl fmt::Debug for ResidentSet {
