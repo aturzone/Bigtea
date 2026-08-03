@@ -1,0 +1,16 @@
+# Minimal packaging for T1 — polished properly in wrapper-core T5 (#26).
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bigtea"
+version = "0.1.0.dev0"
+description = "Local MoE inference wrapper: probe hardware, recommend offload splits, launch, benchmark."
+requires-python = ">=3.11"
+
+[project.scripts]
+bigtea = "bigtea.cli:main"
+
+[tool.setuptools]
+packages = ["bigtea"]
