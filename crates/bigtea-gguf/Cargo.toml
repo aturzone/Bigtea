@@ -1,0 +1,12 @@
+[package]
+name = "bigtea-gguf"
+description = "GGUF container parsing: metadata and tensor index, without reading weights."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No dependencies, deliberately. The format is simple enough that a crate would
+# cost more in supply chain than it saves in code.
+[dependencies]

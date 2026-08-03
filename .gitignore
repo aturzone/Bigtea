@@ -1,5 +1,10 @@
+# Rust
+/target/
+**/*.rs.bk
+
 # Model weights / large artifacts — never tracked
 *.gguf
+*.waste
 *.safetensors
 *.bin
 *.pt
@@ -15,7 +20,7 @@ weights/
 .env
 .env.*
 
-# Python
+# Python (conversion tooling only)
 __pycache__/
 *.py[cod]
 .venv/
