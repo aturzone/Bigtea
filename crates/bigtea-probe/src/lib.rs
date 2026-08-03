@@ -18,9 +18,11 @@ use std::path::{Path, PathBuf};
 mod bandwidth;
 mod gpu;
 mod platform;
+pub mod processes;
 
 pub use bandwidth::{measure_read_bandwidth, BandwidthError};
 pub use gpu::Gpu;
+pub use processes::Process;
 
 pub const GIB: u64 = 1 << 30;
 

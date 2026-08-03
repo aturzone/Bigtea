@@ -8,7 +8,7 @@
 
 use std::process::ExitCode;
 
-use bigtea_probe::Machine;
+use bigtea_probe::{processes, Machine};
 
 fn main() -> ExitCode {
     let mut path = String::from(".");
@@ -16,8 +16,12 @@ fn main() -> ExitCode {
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--quick" | "-q" => quick = true,
+            "--processes" | "-p" => {
+                dump_processes();
+                return ExitCode::SUCCESS;
+            }
             "-h" | "--help" => {
-                println!("usage: bigtea-probe [path] [--quick]");
+                println!("usage: bigtea-probe [path] [--quick] [--processes]");
                 return ExitCode::SUCCESS;
             }
             other => path = other.to_string(),
@@ -31,10 +35,78 @@ fn main() -> ExitCode {
     println!("{machine}");
 
     // The number every plan hangs off, made explicit.
-    let usable = machine.usable_ram_for_weights(3 << 30);
+    let usable = machine.usable_ram_for_weights(OVERHEAD);
     println!(
         "\nusable for weights   {:.1} GiB   (available RAM minus 3 GiB for OS/KV/scratch)",
         bigtea_probe::gib(usable)
     );
+
+    report_reclaimable(usable);
     ExitCode::SUCCESS
+}
+
+/// Every process we can see, with whether we would touch it.
+fn dump_processes() {
+    let all = processes::list();
+    println!("{} processes visible\n", all.len());
+    println!("{:<34}{:>10}  {}", "name", "rss", "status");
+    for p in all.iter().take(30) {
+        println!(
+            "{:<34}{:>9.0}M  {}",
+            p.name,
+            p.rss_bytes as f64 / (1 << 20) as f64,
+            if p.protected { "protected" } else { "closeable" }
+        );
+    }
+    let total: u64 = all.iter().map(|p| p.rss_bytes).sum();
+    let closeable: u64 = all.iter().filter(|p| !p.protected).map(|p| p.rss_bytes).sum();
+    println!(
+        "\ntotal {:.2} GiB, of which {:.2} GiB is closeable",
+        bigtea_probe::gib(total),
+        bigtea_probe::gib(closeable)
+    );
+}
+
+const OVERHEAD: u64 = 3 << 30;
+/// Ignore anything smaller than this — closing a 64 MiB helper is disruption
+/// for no benefit.
+const MIN_WORTH_CLOSING: u64 = 128 << 20;
+
+/// Show what is holding RAM and what closing it would actually buy.
+///
+/// On a machine this size that number is often the difference between the
+/// dense weights being cached and being re-read every token, so it is worth
+/// putting in front of the user before they start a run.
+fn report_reclaimable(usable_now: u64) {
+    let groups = processes::grouped(MIN_WORTH_CLOSING);
+    if groups.is_empty() {
+        return;
+    }
+    let total: u64 = groups.iter().map(|(_, b, _)| b).sum();
+
+    println!("\nholding RAM (closeable, largest first):");
+    for (name, bytes, count) in groups.iter().take(8) {
+        let instances = if *count > 1 {
+            format!("  ({count} processes)")
+        } else {
+            String::new()
+        };
+        println!(
+            "  {:<28} {:>7.2} GiB{}",
+            name,
+            bigtea_probe::gib(*bytes),
+            instances
+        );
+    }
+    println!(
+        "\n  closing all of these would free up to {:.2} GiB,\n  \
+         raising usable-for-weights from {:.1} to about {:.1} GiB.",
+        bigtea_probe::gib(total),
+        bigtea_probe::gib(usable_now),
+        bigtea_probe::gib(usable_now + total)
+    );
+    println!(
+        "  (upper bound: processes share pages, and the OS may not return\n   \
+         freed memory immediately. Nothing was closed -- this is a report.)"
+    );
 }
