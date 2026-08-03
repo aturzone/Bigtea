@@ -85,6 +85,17 @@ pub struct Location {
     pub routed_expert: bool,
 }
 
+impl Location {
+    /// Number of values in this tensor — the product of its dimensions.
+    ///
+    /// Distinct from [`Self::size`], which is bytes: a quantized tensor packs
+    /// many values into each stored byte, so the two differ by the type's
+    /// compression ratio.
+    pub fn elements(&self) -> u64 {
+        self.dims.iter().product()
+    }
+}
+
 struct Shard {
     file: DirectFile,
     on_disk: u64,

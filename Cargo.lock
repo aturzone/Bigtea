@@ -3,6 +3,14 @@
 version = 3
 
 [[package]]
+name = "bigtea-ggml"
+version = "0.1.0"
+dependencies = [
+ "bigtea-gguf",
+ "bigtea-model",
+]
+
+[[package]]
 name = "bigtea-gguf"
 version = "0.1.0"
 

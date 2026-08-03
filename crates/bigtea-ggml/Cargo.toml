@@ -1,0 +1,15 @@
+[package]
+name = "bigtea-ggml"
+description = "Minimal FFI to ggml: the arithmetic we borrow rather than rewrite."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+bigtea-gguf = { path = "../bigtea-gguf" }
+
+[dev-dependencies]
+bigtea-model = { path = "../bigtea-model" }
