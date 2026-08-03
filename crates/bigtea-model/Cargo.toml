@@ -10,3 +10,4 @@ repository.workspace = true
 [dependencies]
 bigtea-gguf = { path = "../bigtea-gguf" }
 bigtea-io = { path = "../bigtea-io" }
+bigtea-plan = { path = "../bigtea-plan" }

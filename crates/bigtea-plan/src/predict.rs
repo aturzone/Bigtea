@@ -12,10 +12,15 @@ use crate::GIB;
 /// value per engine as soon as real benchmarks exist.
 pub const DEFAULT_EFFICIENCY: f64 = 0.5;
 
-/// RAM unavailable for weights: OS, KV cache, activation scratch, engine
-/// buffers. Conservative deliberately — over-estimating usable RAM produces a
-/// plan that swaps, and swapping is far slower than the streaming it replaced.
-pub const DEFAULT_OVERHEAD_BYTES: u64 = 3 * GIB;
+/// Fallback runtime overhead when the model's attention shape is unknown.
+///
+/// **Prefer [`crate::overhead`], which computes this from the architecture and
+/// context length.** A flat constant is wrong in both directions: it
+/// double-counts the OS (measured *available* RAM already excludes it), and it
+/// cannot know that a KV cache ranges over three orders of magnitude with
+/// context length and attention shape. On a 16 GiB machine a 2 GiB error here
+/// decides whether the dense weights are resident or re-read every token.
+pub const DEFAULT_OVERHEAD_BYTES: u64 = GIB;
 
 #[derive(Debug, Clone)]
 pub struct Prediction {

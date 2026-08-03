@@ -16,6 +16,7 @@ version = "0.1.0"
 dependencies = [
  "bigtea-gguf",
  "bigtea-io",
+ "bigtea-plan",
 ]
 
 [[package]]

@@ -9,8 +9,82 @@
 use std::process::ExitCode;
 
 use bigtea_model::Model;
+use bigtea_plan::{max_context_for_budget, overhead, AttentionShape, KV_BYTES_F16};
 
 const GIB: f64 = (1u64 << 30) as f64;
+
+/// Attention shape from the container's own metadata, for sizing the KV cache.
+fn attention_shape(model: &Model) -> Option<AttentionShape> {
+    let hidden = model.arch_u64("embedding_length")?;
+    let n_layers = model.arch_u64("block_count")?;
+    let n_heads = model.arch_u64("attention.head_count").unwrap_or(1).max(1);
+    let n_kv_heads = model
+        .arch_u64("attention.head_count_kv")
+        .unwrap_or(n_heads)
+        .max(1);
+    // Prefer the declared key length; fall back to hidden/heads.
+    let head_dim = model
+        .arch_u64("attention.key_length")
+        .unwrap_or(hidden / n_heads)
+        .max(1);
+    Some(AttentionShape {
+        n_layers,
+        n_kv_heads,
+        head_dim,
+        hidden_size: hidden,
+        ffn_intermediate: model
+            .arch_u64("expert_feed_forward_length")
+            .or_else(|| model.arch_u64("feed_forward_length"))
+            .unwrap_or(hidden),
+    })
+}
+
+/// What a given amount of RAM actually buys, with the runtime cost computed
+/// from the architecture rather than guessed.
+fn report_budget(model: &Model, ram_gib: f64, dense: u64, per_token: u64) {
+    let ram = (ram_gib * GIB) as u64;
+    let Some(shape) = attention_shape(model) else {
+        eprintln!("(cannot size KV cache: attention metadata missing)");
+        return;
+    };
+
+    println!("\nwith {ram_gib:.1} GiB of available RAM:");
+    for ctx in [4096u64, 32768, 131_072] {
+        let ov = overhead(&shape, ctx, KV_BYTES_F16);
+        let usable = ram.saturating_sub(ov.total());
+        let resident = dense.min(usable);
+        let shortfall = dense - resident;
+        let per_tok = shortfall + per_token;
+        let verdict = if shortfall == 0 {
+            "dense resident".to_string()
+        } else {
+            format!("{:.2} GiB dense re-read/token", shortfall as f64 / GIB)
+        };
+        println!(
+            "  {:>6} ctx  overhead {:>5.2} GiB  usable {:>5.2} GiB  \
+             read/token {:>5.2} GiB  [{}]",
+            ctx,
+            ov.total() as f64 / GIB,
+            usable as f64 / GIB,
+            per_tok as f64 / GIB,
+            verdict
+        );
+    }
+
+    let max_ctx = max_context_for_budget(&shape, ram, dense, KV_BYTES_F16);
+    if max_ctx > 0 {
+        println!(
+            "\n  longest context with all dense weights resident: {max_ctx} tokens"
+        );
+    } else {
+        let ov = overhead(&shape, 4096, KV_BYTES_F16);
+        let need = (dense + ov.total()) as f64 / GIB;
+        println!(
+            "\n  dense weights do not fit: needs about {need:.2} GiB available \
+             RAM to keep them resident at 4K context"
+        );
+    }
+}
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -67,18 +141,7 @@ fn main() -> ExitCode {
             per_token as f64 / GIB
         );
         if budget_gib > 0.0 {
-            let budget = (budget_gib * GIB) as u64;
-            let resident = dense.min(budget);
-            let shortfall = dense - resident;
-            println!("\nwith a {budget_gib:.1} GiB weight budget:");
-            println!("  dense resident  {:>8.2} GiB", resident as f64 / GIB);
-            if shortfall > 0 {
-                println!("  dense streaming {:>8.2} GiB  (re-read every token)", shortfall as f64 / GIB);
-            }
-            println!(
-                "  read per token  {:>8.2} GiB",
-                (shortfall + per_token) as f64 / GIB
-            );
+            report_budget(&model, budget_gib, dense, per_token);
         }
     }
 

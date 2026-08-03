@@ -27,10 +27,15 @@
 //!    number of experts, so bytes-per-token is unchanged. Pruning buys a
 //!    cheaper model to obtain, never a quicker one to run.
 
+mod overhead;
 mod predict;
 mod profile;
 mod residency;
 
+pub use overhead::{
+    kv_cache_bytes, max_context_for_budget, overhead, scratch_bytes, AttentionShape, Overhead,
+    KV_BYTES_F16,
+};
 pub use predict::{Prediction, DEFAULT_EFFICIENCY, DEFAULT_OVERHEAD_BYTES};
 pub use profile::{ModelProfile, ProfileError, ProfileSource};
 pub use residency::{plan_from_gguf, plan_layout, Layout, Placed, Placement};
