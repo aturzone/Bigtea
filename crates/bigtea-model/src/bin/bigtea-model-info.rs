@@ -93,9 +93,12 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let mut budget_gib = 0.0f64;
+    let mut do_load = false;
     while let Some(a) = args.next() {
-        if a == "--budget" {
-            budget_gib = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        match a.as_str() {
+            "--budget" => budget_gib = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            "--load" => do_load = true,
+            _ => {}
         }
     }
 
@@ -142,6 +145,34 @@ fn main() -> ExitCode {
         );
         if budget_gib > 0.0 {
             report_budget(&model, budget_gib, dense, per_token);
+        }
+    }
+
+    if do_load && budget_gib > 0.0 {
+        let budget = (budget_gib * GIB) as u64;
+        println!("\nloading always-read weights into RAM (budget {budget_gib:.1} GiB)...");
+        let mut last_pct = 0u64;
+        match bigtea_model::ResidentSet::load_with_progress(&model, budget, |done, total| {
+            let pct = done * 100 / total.max(1);
+            if pct >= last_pct + 20 {
+                last_pct = pct;
+                eprint!("  {pct}%...");
+            }
+        }) {
+            Ok((set, report)) => {
+                eprintln!();
+                println!("  {report}");
+                println!(
+                    "  resident: {} tensors, {:.2} GiB held in RAM",
+                    set.len(),
+                    set.bytes() as f64 / GIB
+                );
+                if !report.complete() {
+                    let n = set.skipped().len();
+                    println!("  {n} tensor(s) skipped -- see reasons above");
+                }
+            }
+            Err(e) => println!("  load failed: {e}"),
         }
     }
 

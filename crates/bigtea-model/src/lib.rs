@@ -30,8 +30,10 @@ use bigtea_gguf::{GgmlType, Gguf};
 use bigtea_io::{DirectFile, IoMode};
 
 mod discover;
+mod resident;
 
 pub use discover::discover_shards;
+pub use resident::{LoadReport, ResidentSet, SkipReason, Skipped};
 
 #[derive(Debug)]
 pub enum Error {
