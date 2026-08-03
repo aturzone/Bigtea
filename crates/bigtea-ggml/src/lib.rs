@@ -22,6 +22,11 @@ use std::fmt;
 
 use bigtea_gguf::GgmlType;
 
+mod graph;
+
+#[cfg(have_ggml)]
+pub use graph::{arena_for, Context, Tensor};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GgmlError {
     /// The crate was built without linking ggml.
@@ -32,6 +37,12 @@ pub enum GgmlError {
     PartialBlock { elements: usize, block_size: i64 },
     /// The input buffer is the wrong size for the requested element count.
     WrongSize { expected: usize, actual: usize },
+    /// ggml refused to create a context of this size.
+    ContextAlloc { bytes: usize },
+    /// The context's arena ran out while building the graph.
+    ArenaExhausted,
+    /// Graph execution returned a non-zero status.
+    ComputeFailed(i32),
 }
 
 impl fmt::Display for GgmlError {
@@ -50,6 +61,15 @@ impl fmt::Display for GgmlError {
             ),
             GgmlError::WrongSize { expected, actual } => {
                 write!(f, "buffer is {actual} bytes, expected {expected}")
+            }
+            GgmlError::ContextAlloc { bytes } => {
+                write!(f, "ggml refused a context arena of {bytes} bytes")
+            }
+            GgmlError::ArenaExhausted => f.write_str(
+                "the ggml arena ran out while building the graph; give the context more memory",
+            ),
+            GgmlError::ComputeFailed(s) => {
+                write!(f, "ggml graph computation failed with status {s}")
             }
         }
     }

@@ -79,7 +79,13 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=gomp");
     }
 
-    if target_os != "windows" {
+    if target_os == "windows" {
+        // ggml-cpu reads the registry to identify the CPU, which pulls in
+        // advapi32 (Reg* functions). Without it the link fails on three
+        // symbols and nothing else, which is easy to misread as a ggml
+        // problem rather than a missing system library.
+        println!("cargo:rustc-link-lib=dylib=advapi32");
+    } else {
         println!("cargo:rustc-link-lib=dylib=m");
         println!("cargo:rustc-link-lib=dylib=pthread");
     }
