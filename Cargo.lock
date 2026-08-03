@@ -7,6 +7,10 @@ name = "bigtea-gguf"
 version = "0.1.0"
 
 [[package]]
+name = "bigtea-io"
+version = "0.1.0"
+
+[[package]]
 name = "bigtea-plan"
 version = "0.1.0"
 dependencies = [

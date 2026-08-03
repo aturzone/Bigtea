@@ -4,6 +4,7 @@ members = [
     "crates/bigtea-gguf",
     "crates/bigtea-probe",
     "crates/bigtea-plan",
+    "crates/bigtea-io",
 ]
 
 [workspace.package]
