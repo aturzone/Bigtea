@@ -29,8 +29,10 @@
 
 mod predict;
 mod profile;
+mod residency;
 
 pub use predict::{Prediction, DEFAULT_EFFICIENCY, DEFAULT_OVERHEAD_BYTES};
 pub use profile::{ModelProfile, ProfileError, ProfileSource};
+pub use residency::{plan_from_gguf, plan_layout, Layout, Placed, Placement};
 
 pub const GIB: u64 = 1 << 30;

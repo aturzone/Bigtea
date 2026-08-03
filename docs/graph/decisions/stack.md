@@ -65,6 +65,26 @@ built the memory/streaming layer for the **≤16 GiB** tier, where:
 
 That policy layer is what Bigtea owns.
 
+## Scope: personal single-user runner (Atur, 2026-08-03)
+
+Bigtea runs a model **on your own machine, for you** — it is not a serving
+stack. Nobody is behind it issuing concurrent requests. That is a scope
+decision, and it removes real complexity rather than deferring it:
+
+- **No batching.** Independently refuted anyway (measured 1.63x ceiling, and it
+  does not compose with read-ahead), but with one user there is nothing to
+  batch in the first place.
+- **No concurrent serving, no multi-tenancy, no request queue, no scheduler.**
+- **No throughput metric.** The only number that matters is the latency of
+  *your* next token. Aggregate tokens/sec across users does not exist here.
+- **The RAM budget is the user's whole machine**, not a slice of a server —
+  which is why "close your browser" is legitimate, actionable advice from this
+  tool, and why *available* RAM (not total) is the input that matters.
+
+An OpenAI-compatible local endpoint may still be worth having for editor and
+tool integration, but as a convenience over the same single-stream engine —
+never as a reason to build serving machinery.
+
 ## Consequences
 
 - Workspace of small crates, each independently testable:
