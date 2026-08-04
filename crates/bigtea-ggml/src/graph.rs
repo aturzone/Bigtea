@@ -191,8 +191,21 @@ pub fn arena_for(shapes: &[(i64, i64)], slack_tensors: usize) -> usize {
     // Double the data budget so intermediates have room, and add graph
     // structure overhead. Over-allocating costs a little memory; under-
     // allocating costs the process.
-    data * 2 + count * TENSOR_OVERHEAD + (1 << 20)
+    data * 2 + count * TENSOR_OVERHEAD + GRAPH_RESERVE
 }
+
+/// Arena space `compute` needs beyond the tensors themselves.
+///
+/// `ggml_graph_compute_with_ctx` allocates two things out of the same arena as
+/// the tensors: the graph object, and the work buffer that quantized matmuls
+/// use to hold their converted operands. The graph is the larger of the two and
+/// its size is fixed — `ggml_new_graph` builds a default 2048-node graph
+/// whatever the actual node count, which measured 3,060,816 bytes here.
+///
+/// A 1 MiB reserve was not enough, and the failure is an abort, not an error:
+/// `ggml_new_object: not enough space in the context's memory pool (needed
+/// 3060816, available 2087424)` followed by `GGML_ASSERT(obj_new) failed`.
+const GRAPH_RESERVE: usize = 16 << 20;
 
 /// RoPE scaling parameters, grouped because they always travel together.
 ///

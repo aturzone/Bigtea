@@ -20,15 +20,56 @@ fn main() -> ExitCode {
         eprintln!("usage: bigtea-run <model.gguf> \"prompt\" [-n tokens]");
         return ExitCode::from(2);
     };
-    let prompt = args.next().unwrap_or_else(|| "The capital of France is".into());
+    let mut prompt = String::new();
     let mut n_predict = 8usize;
-    while let Some(a) = args.next() {
-        if a == "-n" {
-            n_predict = args.next().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let mut prefill_block = 256usize;
+    let rest: Vec<String> = args.collect();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "-n" => {
+                n_predict = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(8);
+                i += 2;
+            }
+            "-b" => {
+                prefill_block = rest
+                    .get(i + 1)
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&b: &usize| b > 0)
+                    .unwrap_or(256);
+                i += 2;
+            }
+            // A long-context prompt does not fit on a command line; Windows
+            // caps it around 32k characters, well under the token counts that
+            // make streaming interesting.
+            "-f" => {
+                let Some(file) = rest.get(i + 1) else {
+                    eprintln!("bigtea-run: -f needs a file path");
+                    return ExitCode::from(2);
+                };
+                match std::fs::read_to_string(file) {
+                    Ok(text) => prompt = text,
+                    Err(e) => {
+                        eprintln!("bigtea-run: cannot read {file}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                i += 2;
+            }
+            other => {
+                if prompt.is_empty() {
+                    prompt = other.to_string();
+                }
+                i += 1;
+            }
         }
     }
+    if prompt.is_empty() {
+        prompt = "The capital of France is".into();
+    }
+    let prompt = prompt;
 
-    match run(&path, &prompt, n_predict) {
+    match run(&path, &prompt, n_predict, prefill_block) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("bigtea-run: {e}");
@@ -48,6 +89,7 @@ fn run_streaming(
     tokenizer: &Tokenizer,
     mut tokens: Vec<u32>,
     n_predict: usize,
+    prefill_block: usize,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -68,27 +110,43 @@ fn run_streaming(
     );
 
     let _ = arch;
-    println!("\n{}", tokenizer.decode(&tokens));
-    let gen_start = std::time::Instant::now();
     let prompt_len = tokens.len();
 
-    // Prefill the whole prompt once, then feed one token at a time. Without
-    // the cache each step re-ran every previous position, which is where the
-    // 31,032 expert reads for 5 tokens came from.
     let mut cache = KvCache::new(
         config.n_layer as usize,
         config.n_head_kv as usize,
         config.head_dim as usize,
     );
-    let mut pending: Vec<u32> = tokens.clone();
+    let vocab = config.vocab_size as usize;
+
+    // Prefill in blocks. Attention holds n_total * n_new * n_head floats for
+    // scores and again for their softmax, so prefilling a long prompt in one
+    // pass needs an arena quadratic in prompt length. Blocks bound it, and the
+    // KV cache makes them equivalent — position 900 attends over 0..900 either
+    // way.
+    //
+    // Block size is the central prefill trade-off: a block reads nearly every
+    // expert in the model (16.35 GiB here) regardless of how many tokens are in
+    // it, so doubling the block halves the disk cost per token — until the
+    // attention arena, which grows with block * context, stops fitting.
+    let prefill_start = std::time::Instant::now();
+    let mut logits: Vec<f32> = Vec::new();
     let mut pos = 0usize;
-
-    for _ in 0..n_predict {
-        let logits = runner.forward_cached(&weights, &mut cache, &pending, pos)?;
-        pos += pending.len();
+    for block in tokens.chunks(prefill_block) {
+        logits = runner.forward_cached(&weights, &mut cache, block, pos)?;
+        pos += block.len();
         debug_assert!(cache.is_consistent(), "kv cache layers fell out of step");
+    }
+    let prefill_secs = prefill_start.elapsed().as_secs_f64();
+    println!(
+        "prefill    {prompt_len} tokens in {prefill_secs:.1}s ({:.2} tok/s)",
+        prompt_len as f64 / prefill_secs.max(1e-9)
+    );
 
-        let vocab = config.vocab_size as usize;
+    println!("\n{}", tokenizer.decode(&tokens));
+    let gen_start = std::time::Instant::now();
+
+    for step in 0..n_predict {
         if logits.len() < vocab {
             return Err(format!("logits too small: {} < {vocab}", logits.len()).into());
         }
@@ -107,8 +165,13 @@ fn run_streaming(
         use std::io::Write;
         std::io::stdout().flush().ok();
         tokens.push(next);
+
         // Only the new token needs computing; history lives in the cache.
-        pending = vec![next];
+        // Skipped on the last step — nothing would read those logits.
+        if step + 1 < n_predict {
+            logits = runner.forward_cached(&weights, &mut cache, &[next], pos)?;
+            pos += 1;
+        }
     }
 
     let secs = gen_start.elapsed().as_secs_f64();
@@ -128,7 +191,12 @@ fn run_streaming(
     Ok(())
 }
 
-fn run(path: &str, prompt: &str, n_predict: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn run(
+    path: &str,
+    prompt: &str,
+    n_predict: usize,
+    prefill_block: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
 
     // --- container ---------------------------------------------------------
@@ -162,7 +230,9 @@ fn run(path: &str, prompt: &str, n_predict: usize) -> Result<(), Box<dyn std::er
     }
 
     if config.is_moe() {
-        return run_streaming(&model, config, &arch, &tokenizer, tokens, n_predict, t0);
+        return run_streaming(
+            &model, config, &arch, &tokenizer, tokens, n_predict, prefill_block, t0,
+        );
     }
 
     // --- weights -----------------------------------------------------------

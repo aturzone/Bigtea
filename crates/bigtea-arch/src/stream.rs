@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use bigtea_ggml::{Context, RopeParams, Tensor, WeightSet};
+use bigtea_ggml::{arena_for, Context, RopeParams, Tensor, WeightSet};
 use bigtea_model::Model;
 
 use crate::kv::KvCache;
@@ -159,9 +159,108 @@ impl<'m> StreamingRunner<'m> {
         scored
     }
 
+    /// Apply one layer's expert feed-forward to a whole block of tokens.
+    ///
+    /// The per-token version reads an expert's three tensors every time a token
+    /// selects it. Across a 256-token block that is 256 * 8 * 3 = 6,144 reads
+    /// per layer, against 384 distinct slices that actually exist — the same
+    /// bytes fetched from disk sixteen times over. Measured on a 565-token
+    /// prompt: 609,665 reads, 537 GiB streamed, 470s of prefill.
+    ///
+    /// So invert the loop. Group the block's tokens by the expert they routed
+    /// to, read each distinct expert once, and run it against all of its tokens
+    /// as a single matrix. Experts are visited in ascending index order, which
+    /// also makes the reads walk the file forwards instead of seeking.
+    ///
+    /// `normed` holds the block's post-FFN-norm activations, `n_embd` floats
+    /// per token; `probs` holds `n_expert` router probabilities per token.
+    fn expert_ffn_block(
+        &mut self,
+        normed: &[f32],
+        il: u32,
+        probs: &[f32],
+        n_tokens: usize,
+    ) -> Result<Vec<f32>> {
+        use std::collections::BTreeMap;
+
+        let c = self.arch.config.clone();
+        let n_embd = c.n_embd as usize;
+        let n_expert = c.n_expert as usize;
+
+        // expert -> the tokens that chose it, with their routing weights.
+        // BTreeMap keeps the read order ascending by expert index.
+        let mut by_expert: BTreeMap<u32, Vec<(usize, f32)>> = BTreeMap::new();
+        for t in 0..n_tokens {
+            let picks = self.route(&probs[t * n_expert..(t + 1) * n_expert], c.n_expert_used as usize);
+            for (expert, weight) in picks {
+                by_expert.entry(expert).or_default().push((t, weight));
+            }
+        }
+
+        let gate_name = format!("blk.{il}.ffn_gate_exps.weight");
+        let up_name = format!("blk.{il}.ffn_up_exps.weight");
+        let down_name = format!("blk.{il}.ffn_down_exps.weight");
+        let gate_ty = self.tensor_type(&gate_name)?;
+        let up_ty = self.tensor_type(&up_name)?;
+        let down_ty = self.tensor_type(&down_name)?;
+        let n_embd_i = c.n_embd as i64;
+        let n_ff = c.n_ff_expert as i64;
+
+        let mut accum = vec![0f32; n_embd * n_tokens];
+
+        for (expert, members) in by_expert {
+            let gate_bytes = self.expert_slice(&gate_name, expert)?;
+            let up_bytes = self.expert_slice(&up_name, expert)?;
+            let down_bytes = self.expert_slice(&down_name, expert)?;
+
+            let m = members.len() as i64;
+            let ctx = Context::new(arena_for(
+                &[
+                    (n_embd_i, m), // this expert's tokens, gathered
+                    (n_ff, m),     // gate
+                    (n_ff, m),     // up
+                    (n_ff, m),     // silu(gate) * up
+                    (n_embd_i, m), // down projection
+                ],
+                24,
+            ))?;
+            let mut ws = WeightSet::new();
+            ws.bind(&ctx, "gate", gate_ty, &[n_embd_i as u64, n_ff as u64], gate_bytes)?;
+            ws.bind(&ctx, "up", up_ty, &[n_embd_i as u64, n_ff as u64], up_bytes)?;
+            ws.bind(&ctx, "down", down_ty, &[n_ff as u64, n_embd_i as u64], down_bytes)?;
+
+            // Gather this expert's tokens into one contiguous matrix so the
+            // three matmuls run once for the group rather than once per token.
+            let mut gathered = vec![0f32; n_embd * members.len()];
+            for (slot, (t, _)) in members.iter().enumerate() {
+                gathered[slot * n_embd..(slot + 1) * n_embd]
+                    .copy_from_slice(&normed[t * n_embd..(t + 1) * n_embd]);
+            }
+            let xt = ctx.new_f32_2d(n_embd_i, m)?;
+            xt.set_f32(&gathered)?;
+
+            let g = ctx.mul_mat(ws.get("gate").expect("bound"), &xt)?;
+            let u = ctx.mul_mat(ws.get("up").expect("bound"), &xt)?;
+            let act = ctx.mul(&ctx.silu(&g)?, &u)?;
+            let out = ctx.mul_mat(ws.get("down").expect("bound"), &act)?;
+            ctx.compute(&out, 0)?;
+
+            let produced = out.to_vec_f32();
+            for (slot, (t, weight)) in members.iter().enumerate() {
+                let src = &produced[slot * n_embd..(slot + 1) * n_embd];
+                let dst = &mut accum[t * n_embd..(t + 1) * n_embd];
+                for (d, v) in dst.iter_mut().zip(src) {
+                    *d += v * weight;
+                }
+            }
+        }
+        Ok(accum)
+    }
+
     /// Apply one layer's expert feed-forward for a single token.
     ///
     /// `x` is that token's activations after the FFN norm.
+    #[allow(dead_code)]
     fn expert_ffn(&mut self, x: &[f32], il: u32, probs: &[f32]) -> Result<Vec<f32>> {
         let c = self.arch.config.clone();
         let picks = self.route(probs, c.n_expert_used as usize);
@@ -290,7 +389,10 @@ impl<'m> StreamingRunner<'m> {
         let positions: Vec<i32> = (0..n_new).map(|i| (pos_start as i64 + i) as i32).collect();
 
         let mut x: Vec<f32> = {
-            let ctx = Context::new(256 << 20)?;
+            // Sized from the prompt, not a constant: `get_rows` materialises
+            // n_embd * n_new floats, and ggml aborts the process when an arena
+            // runs out rather than returning an error we could catch.
+            let ctx = Context::new(arena_for(&[(n_embd, n_new)], 8))?;
             let tok = ctx.new_i32_1d(n_new)?;
             tok.set_i32(&tokens.iter().map(|&t| t as i32).collect::<Vec<_>>())?;
             let emb = weights
@@ -356,7 +458,25 @@ impl<'m> StreamingRunner<'m> {
             // Phase 2: attend over the whole history, not just the new part.
             let n_total = (cache.len() + tokens.len()) as i64;
             let attn_out = {
-                let ctx = Context::new(512 << 20)?;
+                // The scores and their softmax dominate: n_total * n_new *
+                // n_head floats each. At a 2k prompt that pair alone is over a
+                // gigabyte, so a fixed arena aborts the process somewhere past
+                // 1.5k tokens. Size it from the actual shapes instead.
+                let n_head = c.n_head as i64;
+                let ctx = Context::new(arena_for(
+                    &[
+                        (head_dim * n_head, n_new),      // q, contiguous
+                        (head_dim * n_kv, n_total),      // k, contiguous
+                        (n_total * n_new, n_head),       // scores
+                        (n_total, n_new),                // causal mask
+                        (n_total * n_new, n_head),       // softmax output
+                        (head_dim * n_kv, n_total),      // v, transposed
+                        (head_dim * n_new, n_head),      // attention output
+                        (head_dim * n_new, n_head),      // ...made contiguous
+                        (n_embd, n_new),                 // output projection
+                    ],
+                    24,
+                ))?;
                 let q = ctx.new_f32_3d(head_dim, c.n_head as i64, n_new)?;
                 q.set_f32(&q_v)?;
 
@@ -400,27 +520,26 @@ impl<'m> StreamingRunner<'m> {
                 (normed.to_vec_f32(), probs.to_vec_f32())
             };
 
-            let n_expert = c.n_expert as usize;
             let mut next = ffn_input;
-            for t in 0..tokens.len() {
-                let lo = t * c.n_embd as usize;
-                let hi = lo + c.n_embd as usize;
-                let expert_out = self.expert_ffn(
-                    &normed_v[lo..hi],
-                    il,
-                    &probs_v[t * n_expert..(t + 1) * n_expert],
-                )?;
-                for (dst, v) in next[lo..hi].iter_mut().zip(expert_out) {
-                    *dst += v;
-                }
+            let expert_out = self.expert_ffn_block(&normed_v, il, &probs_v, tokens.len())?;
+            for (dst, v) in next.iter_mut().zip(expert_out) {
+                *dst += v;
             }
             x = next;
         }
         cache.advance_by(tokens.len());
 
-        let ctx = Context::new(512 << 20)?;
-        let xt = ctx.new_f32_2d(n_embd, n_new)?;
-        xt.set_f32(&x)?;
+        // Only the last position's logits are ever sampled, and the vocabulary
+        // projection is the widest matmul in the model (151,936 rows here).
+        // Running it for every prompt token costs the whole prefill that much
+        // again for results nothing reads.
+        let last = x.len() - n_embd as usize;
+        let ctx = Context::new(arena_for(
+            &[(n_embd, 1), (n_embd, 1), (c.vocab_size as i64, 1)],
+            16,
+        ))?;
+        let xt = ctx.new_f32_2d(n_embd, 1)?;
+        xt.set_f32(&x[last..])?;
         let normed = self.arch.norm_scaled(
             &ctx,
             &xt,
