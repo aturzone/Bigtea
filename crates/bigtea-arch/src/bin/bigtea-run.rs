@@ -37,6 +37,78 @@ fn main() -> ExitCode {
     }
 }
 
+/// MoE path: the dense weights stay resident, experts stream per token.
+///
+/// A model far larger than RAM runs here because only the always-read part is
+/// held — for Qwen3-30B-A3B that is 0.93 GiB of a 17.28 GiB container.
+fn run_streaming(
+    model: &Model,
+    config: Qwen3Config,
+    arch: &Qwen3Model,
+    tokenizer: &Tokenizer,
+    mut tokens: Vec<u32>,
+    n_predict: usize,
+    t0: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use bigtea_arch::StreamingRunner;
+
+    // 1 GiB of expert cache: enough to help on repeated routing, bounded so it
+    // cannot grow into the problem streaming exists to avoid.
+    let mut runner = StreamingRunner::new(model, config.clone(), 1 << 30);
+
+    let ctx = Context::new_no_alloc(64 << 20)?;
+    let mut weights = WeightSet::new();
+    let load_start = std::time::Instant::now();
+    let resident = runner.load_resident(&ctx, &mut weights)?;
+    println!(
+        "resident   {} tensors, {:.2} GiB in {:.1}s (experts stream on demand)",
+        weights.len(),
+        resident as f64 / GIB,
+        load_start.elapsed().as_secs_f64()
+    );
+
+    let _ = arch;
+    println!("\n{}", tokenizer.decode(&tokens));
+    let gen_start = std::time::Instant::now();
+    let prompt_len = tokens.len();
+
+    for _ in 0..n_predict {
+        let positions: Vec<i32> = (0..tokens.len() as i32).collect();
+        let logits = runner.forward(&weights, &tokens, &positions)?;
+
+        let vocab = config.vocab_size as usize;
+        if logits.len() < vocab {
+            return Err(format!("logits too small: {} < {vocab}", logits.len()).into());
+        }
+        let last = &logits[logits.len() - vocab..];
+        let (best, _) = last
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .ok_or("empty logits")?;
+
+        let next = best as u32;
+        if Some(next) == tokenizer.eos {
+            break;
+        }
+        print!("{}", tokenizer.decode(&[next]));
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        tokens.push(next);
+    }
+
+    let secs = gen_start.elapsed().as_secs_f64();
+    let produced = tokens.len() - prompt_len;
+    println!("\n");
+    println!(
+        "generated  {produced} tokens in {secs:.1}s ({:.2} tok/s)",
+        produced as f64 / secs.max(1e-9)
+    );
+    println!("streaming  {}", runner.stats);
+    println!("total      {:.1}s", t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
 fn run(path: &str, prompt: &str, n_predict: usize) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
 
@@ -68,6 +140,10 @@ fn run(path: &str, prompt: &str, n_predict: usize) -> Result<(), Box<dyn std::er
     println!("prompt     {prompt:?} -> {} tokens", tokens.len());
     if tokens.is_empty() {
         return Err("prompt encoded to zero tokens".into());
+    }
+
+    if config.is_moe() {
+        return run_streaming(&model, config, &arch, &tokenizer, tokens, n_predict, t0);
     }
 
     // --- weights -----------------------------------------------------------

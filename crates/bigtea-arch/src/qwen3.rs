@@ -258,8 +258,58 @@ impl Qwen3Model {
         Ok(ctx.mul_mat(get(out_name)?, &cur)?)
     }
 
+
+    /// One layer's attention, from the pre-norm through the output projection.
+    ///
+    /// Shared by the single-graph path and the streaming path so the
+    /// architecture is defined once; two copies would drift.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_block<'a>(
+        &self,
+        ctx: &'a Context,
+        weights: &WeightSet<'a>,
+        x: &Tensor<'a>,
+        positions: &Tensor<'a>,
+        n_tokens: i64,
+        il: u32,
+        rope: RopeParams,
+        rope_type: i32,
+    ) -> Result<Tensor<'a>> {
+        let c = &self.config;
+        let get = |name: String| -> Result<&Tensor<'a>> {
+            weights.get(&name).ok_or(ArchError::MissingTensor(name))
+        };
+
+        let normed = self.rms_norm_mul(ctx, x, get(format!("blk.{il}.attn_norm.weight"))?)?;
+
+        let q = ctx.mul_mat(get(format!("blk.{il}.attn_q.weight"))?, &normed)?;
+        let k = ctx.mul_mat(get(format!("blk.{il}.attn_k.weight"))?, &normed)?;
+        let v = ctx.mul_mat(get(format!("blk.{il}.attn_v.weight"))?, &normed)?;
+
+        let q = ctx.reshape_3d(&q, c.head_dim as i64, c.n_head as i64, n_tokens)?;
+        let k = ctx.reshape_3d(&k, c.head_dim as i64, c.n_head_kv as i64, n_tokens)?;
+
+        let q = self.rms_norm_mul(ctx, &q, get(format!("blk.{il}.attn_q_norm.weight"))?)?;
+        let k = self.rms_norm_mul(ctx, &k, get(format!("blk.{il}.attn_k_norm.weight"))?)?;
+
+        let q = ctx.rope_ext(&q, positions, None, c.head_dim as i32, rope_type, 0, rope)?;
+        let k = ctx.rope_ext(&k, positions, None, c.head_dim as i32, rope_type, 0, rope)?;
+
+        let attn = self.attention(ctx, &q, &k, &v, n_tokens)?;
+        Ok(ctx.mul_mat(get(format!("blk.{il}.attn_output.weight"))?, &attn)?)
+    }
+
     /// RMS-normalise then scale by a learned weight — the pattern every norm
     /// in this architecture uses.
+    pub fn norm_scaled<'a>(
+        &self,
+        ctx: &'a Context,
+        x: &Tensor<'a>,
+        weight: &Tensor<'a>,
+    ) -> Result<Tensor<'a>> {
+        self.rms_norm_mul(ctx, x, weight)
+    }
+
     fn rms_norm_mul<'a>(
         &self,
         ctx: &'a Context,

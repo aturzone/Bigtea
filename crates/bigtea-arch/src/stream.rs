@@ -257,6 +257,117 @@ impl<'m> StreamingRunner<'m> {
     pub fn run_expert_ffn(&mut self, x: &[f32], il: u32, router_probs: &[f32]) -> Result<Vec<f32>> {
         self.expert_ffn(x, il, router_probs)
     }
+
+    /// Full forward pass, streaming experts, returning logits for every token.
+    ///
+    /// Runs one layer at a time so the router's choice can drive what is read
+    /// next. Activations cross layer boundaries as plain `Vec<f32>` — small
+    /// (`n_embd * n_tokens`) compared to the weights, and it lets each layer's
+    /// arena be reclaimed immediately.
+    pub fn forward<'a>(
+        &mut self,
+        weights: &WeightSet<'a>,
+        tokens: &[u32],
+        positions: &[i32],
+    ) -> Result<Vec<f32>> {
+        let c = self.arch.config.clone();
+        let n_tokens = tokens.len() as i64;
+        let n_embd = c.n_embd as i64;
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        // Embedding lookup, once.
+        let mut x: Vec<f32> = {
+            let ctx = Context::new(512 << 20)?;
+            let tok = ctx.new_i32_1d(n_tokens)?;
+            tok.set_i32(&tokens.iter().map(|&t| t as i32).collect::<Vec<_>>())?;
+            let emb = weights
+                .get("token_embd.weight")
+                .ok_or_else(|| ArchError::MissingTensor("token_embd.weight".into()))?;
+            let rows = ctx.get_rows(emb, &tok)?;
+            ctx.compute(&rows, threads)?;
+            rows.to_vec_f32()
+        };
+
+        for il in 0..c.n_layer {
+            // Attention and the router run as one graph; computing the router
+            // output also materialises everything upstream, so the residual
+            // and the normed activations can be read from the same pass.
+            let ctx = Context::new(1 << 30)?;
+            let get = |n: &str| -> Result<&Tensor<'a>> {
+                weights.get(n).ok_or_else(|| ArchError::MissingTensor(n.into()))
+            };
+
+            let xt = ctx.new_f32_2d(n_embd, n_tokens)?;
+            xt.set_f32(&x)?;
+            let pos = ctx.new_i32_1d(n_tokens)?;
+            pos.set_i32(positions)?;
+
+            let attn_out = self.arch.attention_block(
+                &ctx,
+                weights,
+                &xt,
+                &pos,
+                n_tokens,
+                il,
+                self.rope(),
+                ROPE_TYPE_NEOX,
+            )?;
+            let ffn_input = ctx.add(&attn_out, &xt)?;
+            let normed = self
+                .arch
+                .norm_scaled(&ctx, &ffn_input, get(&format!("blk.{il}.ffn_norm.weight"))?)?;
+
+            let logits = ctx.mul_mat(get(&format!("blk.{il}.ffn_gate_inp.weight"))?, &normed)?;
+            let probs = ctx.soft_max_ext(&logits, None, 1.0, 0.0)?;
+            ctx.compute(&probs, threads)?;
+
+            let residual = ffn_input.to_vec_f32();
+            let normed_v = normed.to_vec_f32();
+            let probs_v = probs.to_vec_f32();
+            drop(ctx);
+
+            // Experts, per token: the router's choice differs for each.
+            let n_expert = c.n_expert as usize;
+            let mut next = residual;
+            for t in 0..tokens.len() {
+                let lo = t * c.n_embd as usize;
+                let hi = lo + c.n_embd as usize;
+                let token_probs = &probs_v[t * n_expert..(t + 1) * n_expert];
+                let expert_out = self.expert_ffn(&normed_v[lo..hi], il, token_probs)?;
+                for (dst, v) in next[lo..hi].iter_mut().zip(expert_out) {
+                    *dst += v;
+                }
+            }
+            x = next;
+        }
+
+        // Final norm and output projection.
+        let ctx = Context::new(1 << 30)?;
+        let xt = ctx.new_f32_2d(n_embd, n_tokens)?;
+        xt.set_f32(&x)?;
+        let normed = self.arch.norm_scaled(
+            &ctx,
+            &xt,
+            weights
+                .get("output_norm.weight")
+                .ok_or_else(|| ArchError::MissingTensor("output_norm.weight".into()))?,
+        )?;
+        let out_name = if weights.get("output.weight").is_some() {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
+        let out = ctx.mul_mat(
+            weights
+                .get(out_name)
+                .ok_or_else(|| ArchError::MissingTensor(out_name.into()))?,
+            &normed,
+        )?;
+        ctx.compute(&out, threads)?;
+        Ok(out.to_vec_f32())
+    }
 }
 
 #[cfg(test)]
