@@ -25,7 +25,7 @@ use bigtea_gguf::GgmlType;
 mod graph;
 
 #[cfg(have_ggml)]
-pub use graph::{arena_for, Context, Tensor};
+pub use graph::{arena_for, Context, RopeParams, Tensor};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GgmlError {

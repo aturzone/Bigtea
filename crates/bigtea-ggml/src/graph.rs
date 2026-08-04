@@ -68,6 +68,77 @@ extern "C" {
     fn ggml_soft_max(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     fn ggml_silu(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
 
+    fn ggml_new_tensor_3d(
+        ctx: *mut ggml_context,
+        ty: c_int,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+    ) -> *mut ggml_tensor;
+
+    fn ggml_get_rows(ctx: *mut ggml_context, a: *mut ggml_tensor, b: *mut ggml_tensor)
+        -> *mut ggml_tensor;
+    fn ggml_concat(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+        dim: c_int,
+    ) -> *mut ggml_tensor;
+    fn ggml_permute(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        axis0: c_int,
+        axis1: c_int,
+        axis2: c_int,
+        axis3: c_int,
+    ) -> *mut ggml_tensor;
+    fn ggml_transpose(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    fn ggml_cont(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    fn ggml_reshape_2d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: i64,
+        ne1: i64,
+    ) -> *mut ggml_tensor;
+    fn ggml_reshape_3d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+    ) -> *mut ggml_tensor;
+    fn ggml_view_2d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: i64,
+        ne1: i64,
+        nb1: usize,
+        offset: usize,
+    ) -> *mut ggml_tensor;
+    fn ggml_scale(ctx: *mut ggml_context, a: *mut ggml_tensor, s: f32) -> *mut ggml_tensor;
+    fn ggml_sigmoid(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    fn ggml_relu(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    fn ggml_div(ctx: *mut ggml_context, a: *mut ggml_tensor, b: *mut ggml_tensor)
+        -> *mut ggml_tensor;
+    fn ggml_sum_rows(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    fn ggml_top_k(ctx: *mut ggml_context, a: *mut ggml_tensor, k: c_int) -> *mut ggml_tensor;
+    #[allow(clippy::too_many_arguments)]
+    fn ggml_rope_ext(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+        c: *mut ggml_tensor,
+        n_dims: c_int,
+        mode: c_int,
+        n_ctx_orig: c_int,
+        freq_base: f32,
+        freq_scale: f32,
+        ext_factor: f32,
+        attn_factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+    ) -> *mut ggml_tensor;
+
     fn ggml_new_graph(ctx: *mut ggml_context) -> *mut ggml_cgraph;
     fn ggml_build_forward_expand(graph: *mut ggml_cgraph, t: *mut ggml_tensor);
     fn ggml_graph_compute_with_ctx(
@@ -103,6 +174,33 @@ pub fn arena_for(shapes: &[(i64, i64)], slack_tensors: usize) -> usize {
     // structure overhead. Over-allocating costs a little memory; under-
     // allocating costs the process.
     data * 2 + count * TENSOR_OVERHEAD + (1 << 20)
+}
+
+/// RoPE scaling parameters, grouped because they always travel together.
+///
+/// [`RopeParams::default`] is plain RoPE with no context extension — the
+/// values a model uses unless it declares otherwise.
+#[derive(Debug, Clone, Copy)]
+pub struct RopeParams {
+    pub freq_base: f32,
+    pub freq_scale: f32,
+    pub ext_factor: f32,
+    pub attn_factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+}
+
+impl Default for RopeParams {
+    fn default() -> Self {
+        RopeParams {
+            freq_base: 10000.0,
+            freq_scale: 1.0,
+            ext_factor: 0.0,
+            attn_factor: 1.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+        }
+    }
 }
 
 /// An arena that owns every tensor built into it.
@@ -179,6 +277,191 @@ impl Context {
     pub fn silu<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
         // SAFETY: as above.
         self.tensor(unsafe { ggml_silu(self.raw.as_ptr(), a.raw.as_ptr()) })
+    }
+
+    /// An I32 tensor — required for token ids and positions, which ggml
+    /// rejects as f32.
+    pub fn new_i32_1d(&self, n: i64) -> Result<Tensor<'_>, GgmlError> {
+        // SAFETY: valid context; type 26 is GGML_TYPE_I32.
+        self.tensor(unsafe { ggml_new_tensor_1d(self.raw.as_ptr(), 26, n) })
+    }
+
+    pub fn new_f32_3d(&self, ne0: i64, ne1: i64, ne2: i64) -> Result<Tensor<'_>, GgmlError> {
+        // SAFETY: valid context; type 0 is GGML_TYPE_F32.
+        self.tensor(unsafe { ggml_new_tensor_3d(self.raw.as_ptr(), 0, ne0, ne1, ne2) })
+    }
+
+    /// A tensor of the given ggml type — used to hold quantized weights in
+    /// their stored format, with no dequantization step.
+    pub fn new_typed_2d(
+        &self,
+        ty: bigtea_gguf::GgmlType,
+        ne0: i64,
+        ne1: i64,
+    ) -> Result<Tensor<'_>, GgmlError> {
+        // SAFETY: valid context; the type id is passed through to ggml, which
+        // validates it and returns null for anything it does not know.
+        self.tensor(unsafe { ggml_new_tensor_2d(self.raw.as_ptr(), ty.0 as c_int, ne0, ne1) })
+    }
+
+    /// Embedding lookup: gather rows of `a` at the indices in `b`.
+    pub fn get_rows<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        b: &Tensor<'a>,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: both tensors belong to this context.
+        self.tensor(unsafe { ggml_get_rows(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) })
+    }
+
+    pub fn concat<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        b: &Tensor<'a>,
+        dim: i32,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe {
+            ggml_concat(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr(), dim)
+        })
+    }
+
+    pub fn permute<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        axes: [i32; 4],
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe {
+            ggml_permute(self.raw.as_ptr(), a.raw.as_ptr(), axes[0], axes[1], axes[2], axes[3])
+        })
+    }
+
+    pub fn transpose<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_transpose(self.raw.as_ptr(), a.raw.as_ptr()) })
+    }
+
+    /// Materialise a view into contiguous memory.
+    ///
+    /// Views and permutes only change how a tensor is *interpreted*; several
+    /// ops require contiguous input, and this is what makes them legal.
+    pub fn cont<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_cont(self.raw.as_ptr(), a.raw.as_ptr()) })
+    }
+
+    pub fn reshape_2d<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        ne0: i64,
+        ne1: i64,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above; ggml validates that the element count matches.
+        self.tensor(unsafe { ggml_reshape_2d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, ne1) })
+    }
+
+    pub fn reshape_3d<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_reshape_3d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, ne1, ne2) })
+    }
+
+    pub fn view_2d<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        ne0: i64,
+        ne1: i64,
+        row_stride_bytes: usize,
+        offset_bytes: usize,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above. The caller is responsible for the offset and
+        // stride being inside `a` -- ggml does not bounds-check views.
+        self.tensor(unsafe {
+            ggml_view_2d(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                ne0,
+                ne1,
+                row_stride_bytes,
+                offset_bytes,
+            )
+        })
+    }
+
+    pub fn scale<'a>(&'a self, a: &Tensor<'a>, s: f32) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_scale(self.raw.as_ptr(), a.raw.as_ptr(), s) })
+    }
+
+    pub fn sigmoid<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_sigmoid(self.raw.as_ptr(), a.raw.as_ptr()) })
+    }
+
+    pub fn relu<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_relu(self.raw.as_ptr(), a.raw.as_ptr()) })
+    }
+
+    pub fn div<'a>(&'a self, a: &Tensor<'a>, b: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_div(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) })
+    }
+
+    pub fn sum_rows<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_sum_rows(self.raw.as_ptr(), a.raw.as_ptr()) })
+    }
+
+    /// Indices of the `k` largest values per row — MoE expert selection.
+    pub fn top_k<'a>(&'a self, a: &Tensor<'a>, k: i32) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_top_k(self.raw.as_ptr(), a.raw.as_ptr(), k) })
+    }
+
+    /// Rotary position embedding.
+    ///
+    /// `positions` must be an I32 tensor of token positions. `freq_factors`
+    /// is optional and carries per-frequency scaling for extended context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_ext<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        positions: &Tensor<'a>,
+        freq_factors: Option<&Tensor<'a>>,
+        n_dims: i32,
+        mode: i32,
+        n_ctx_orig: i32,
+        rope: RopeParams,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        let c = freq_factors
+            .map(|t| t.raw.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        // SAFETY: all tensors belong to this context; a null `c` is the
+        // documented way to omit frequency factors.
+        self.tensor(unsafe {
+            ggml_rope_ext(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                positions.raw.as_ptr(),
+                c,
+                n_dims,
+                mode,
+                n_ctx_orig,
+                rope.freq_base,
+                rope.freq_scale,
+                rope.ext_factor,
+                rope.attn_factor,
+                rope.beta_fast,
+                rope.beta_slow,
+            )
+        })
     }
 
     /// Build a graph ending at `output` and run it on `threads` threads.
@@ -275,6 +558,34 @@ impl Tensor<'_> {
         Ok(())
     }
 
+    /// Fill an I32 tensor — token ids, positions, expert indices.
+    pub fn set_i32(&self, values: &[i32]) -> Result<(), GgmlError> {
+        let n = self.len() as usize;
+        if values.len() != n {
+            return Err(GgmlError::WrongSize {
+                expected: n,
+                actual: values.len(),
+            });
+        }
+        // SAFETY: the tensor holds `n` i32 slots and `values` has exactly `n`;
+        // distinct allocations.
+        unsafe {
+            let dst = ggml_get_data(self.raw.as_ptr()) as *mut i32;
+            std::ptr::copy_nonoverlapping(values.as_ptr(), dst, n);
+        }
+        Ok(())
+    }
+
+    /// Read an I32 tensor back — `top_k` returns indices, not values.
+    pub fn to_vec_i32(&self) -> Vec<i32> {
+        let n = self.len() as usize;
+        // SAFETY: valid tensor holding `n` contiguous i32 values.
+        unsafe {
+            let src = ggml_get_data(self.raw.as_ptr()) as *const i32;
+            std::slice::from_raw_parts(src, n).to_vec()
+        }
+    }
+
     /// Read the tensor's values back as `f32`.
     pub fn to_vec_f32(&self) -> Vec<f32> {
         let n = self.len() as usize;
@@ -366,6 +677,98 @@ mod tests {
             x.set_f32(&[1.0, 2.0]),
             Err(GgmlError::WrongSize { .. })
         ));
+    }
+
+    #[test]
+    fn get_rows_gathers_embeddings() {
+        // The first op of any forward pass: turn token ids into vectors.
+        let ctx = Context::new(ARENA).expect("context");
+        // 4 rows of width 2: [[0,1],[2,3],[4,5],[6,7]]
+        let table = ctx.new_f32_2d(2, 4).expect("table");
+        table
+            .set_f32(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+            .expect("set");
+
+        // Row indices must be I32, not f32.
+        let ids = ctx.new_i32_1d(2).expect("ids");
+        ids.set_i32(&[2, 0]).expect("set ids");
+
+        let rows = ctx.get_rows(&table, &ids).expect("get_rows");
+        ctx.compute(&rows, 1).expect("compute");
+        assert_eq!(rows.to_vec_f32(), vec![4.0, 5.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn top_k_selects_the_right_experts_but_not_in_score_order() {
+        // MoE routing: pick the k highest-scoring experts.
+        //
+        // IMPORTANT, and the reason this test spells it out: ggml's top_k does
+        // NOT return indices sorted by descending score. Measured here it
+        // returns [3, 1] for scores where index 1 is the highest -- the *set*
+        // is right, the order is not what the name suggests. Routing code must
+        // therefore look each expert's weight up by index rather than assuming
+        // position 0 is the best match. Getting this wrong would silently
+        // weight the wrong experts and produce plausible-looking garbage.
+        let ctx = Context::new(ARENA).expect("context");
+        let scores = ctx.new_f32_1d(6).expect("scores");
+        scores.set_f32(&[0.1, 0.9, 0.3, 0.7, 0.2, 0.5]).expect("set");
+        let top = ctx.top_k(&scores, 2).expect("top_k");
+        ctx.compute(&top, 1).expect("compute");
+
+        let mut idx = top.to_vec_i32();
+        assert_eq!(idx.len(), 2);
+        idx.sort_unstable();
+        // 0.9 is index 1 and 0.7 is index 3 -- those two, in some order.
+        assert_eq!(idx, vec![1, 3], "top_k selected the wrong experts");
+    }
+
+    #[test]
+    fn concat_joins_along_a_dimension() {
+        let ctx = Context::new(ARENA).expect("context");
+        let a = ctx.new_f32_1d(2).expect("a");
+        a.set_f32(&[1.0, 2.0]).expect("set");
+        let b = ctx.new_f32_1d(3).expect("b");
+        b.set_f32(&[3.0, 4.0, 5.0]).expect("set");
+        let c = ctx.concat(&a, &b, 0).expect("concat");
+        ctx.compute(&c, 1).expect("compute");
+        assert_eq!(c.to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn transpose_then_cont_materialises_the_new_layout() {
+        // Views only reinterpret; several ops need real contiguous memory.
+        let ctx = Context::new(ARENA).expect("context");
+        // 3 wide, 2 tall: rows [1,2,3] and [4,5,6].
+        let m = ctx.new_f32_2d(3, 2).expect("m");
+        m.set_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("set");
+
+        let t = ctx.transpose(&m).expect("transpose");
+        let c = ctx.cont(&t).expect("cont");
+        ctx.compute(&c, 1).expect("compute");
+        // Transposed: 2 wide, 3 tall -> [1,4],[2,5],[3,6].
+        assert_eq!(c.to_vec_f32(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn sum_rows_reduces_each_row() {
+        let ctx = Context::new(ARENA).expect("context");
+        let m = ctx.new_f32_2d(3, 2).expect("m");
+        m.set_f32(&[1.0, 2.0, 3.0, 10.0, 20.0, 30.0]).expect("set");
+        let s = ctx.sum_rows(&m).expect("sum_rows");
+        ctx.compute(&s, 1).expect("compute");
+        assert_eq!(s.to_vec_f32(), vec![6.0, 60.0]);
+    }
+
+    #[test]
+    fn scale_and_sigmoid_behave() {
+        let ctx = Context::new(ARENA).expect("context");
+        let x = ctx.new_f32_1d(3).expect("x");
+        x.set_f32(&[-1.0, 0.0, 1.0]).expect("set");
+        let s = ctx.sigmoid(&x).expect("sigmoid");
+        ctx.compute(&s, 1).expect("compute");
+        let out = s.to_vec_f32();
+        assert!((out[1] - 0.5).abs() < 1e-6, "sigmoid(0) = {}", out[1]);
+        assert!(out[0] < out[1] && out[1] < out[2], "must be monotonic");
     }
 
     #[test]
