@@ -26,3 +26,8 @@ test = false
 name = "bigtea-loadbench"
 path = "src/bin/bigtea-loadbench.rs"
 test = false
+
+[[bin]]
+name = "bigtea-meta"
+path = "src/bin/bigtea-meta.rs"
+test = false

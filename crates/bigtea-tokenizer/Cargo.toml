@@ -1,0 +1,18 @@
+[package]
+name = "bigtea-tokenizer"
+description = "Byte-level BPE tokenizer driven by a GGUF container's own vocabulary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No dependencies. A Unicode regex crate would be the obvious way to build the
+# pre-tokenizer, but the patterns this model uses need negative lookahead,
+# which the common crate does not support — so the splitter is hand-written
+# against the exact patterns rather than against a general regex engine.
+[dependencies]
+bigtea-gguf = { path = "../bigtea-gguf" }
+
+[dev-dependencies]
+bigtea-model = { path = "../bigtea-model" }
