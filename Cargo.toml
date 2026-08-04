@@ -8,6 +8,7 @@ members = [
     "crates/bigtea-model",
     "crates/bigtea-ggml",
     "crates/bigtea-tokenizer",
+    "crates/bigtea-arch",
 ]
 
 [workspace.package]

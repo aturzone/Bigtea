@@ -1,0 +1,13 @@
+[package]
+name = "bigtea-arch"
+description = "Model architectures: turning weights and tokens into logits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bigtea-gguf = { path = "../bigtea-gguf" }
+bigtea-ggml = { path = "../bigtea-ggml" }
+bigtea-model = { path = "../bigtea-model" }
