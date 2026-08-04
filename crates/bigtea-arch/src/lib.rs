@@ -33,6 +33,8 @@ pub enum ArchError {
     MissingMetadata(String),
     Model(bigtea_model::Error),
     Ggml(bigtea_ggml::GgmlError),
+    /// The KV cache rejected an append — see [`kv::KvError`].
+    Kv(kv::KvError),
 }
 
 impl fmt::Display for ArchError {
@@ -46,6 +48,7 @@ impl fmt::Display for ArchError {
             ArchError::MissingMetadata(k) => write!(f, "container has no metadata key {k:?}"),
             ArchError::Model(e) => write!(f, "{e}"),
             ArchError::Ggml(e) => write!(f, "{e}"),
+            ArchError::Kv(e) => write!(f, "{e}"),
         }
     }
 }
@@ -55,6 +58,12 @@ impl std::error::Error for ArchError {}
 impl From<bigtea_model::Error> for ArchError {
     fn from(e: bigtea_model::Error) -> Self {
         ArchError::Model(e)
+    }
+}
+
+impl From<kv::KvError> for ArchError {
+    fn from(e: kv::KvError) -> Self {
+        ArchError::Kv(e)
     }
 }
 

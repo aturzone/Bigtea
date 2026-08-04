@@ -299,6 +299,52 @@ impl Qwen3Model {
         Ok(ctx.mul_mat(get(format!("blk.{il}.attn_output.weight"))?, &attn)?)
     }
 
+
+    /// Attention where K and V come from a cache covering the whole history.
+    ///
+    /// `pos_start` is the absolute position of the first query. The mask must
+    /// be offset by it: query `i` may attend to keys up to `pos_start + i`, not
+    /// up to `i`. Getting that wrong lets a token see its own future during
+    /// incremental decoding — the same failure as omitting the mask entirely,
+    /// but only visible after the first generated token.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_cached<'a>(
+        &self,
+        ctx: &'a Context,
+        q: &Tensor<'a>,
+        k_all: &Tensor<'a>,
+        v_all: &Tensor<'a>,
+        n_new: i64,
+        n_total: i64,
+        pos_start: i64,
+    ) -> Result<Tensor<'a>> {
+        let c = &self.config;
+
+        let q = ctx.cont(&ctx.permute(q, [0, 2, 1, 3])?)?;
+        let k = ctx.cont(&ctx.permute(k_all, [0, 2, 1, 3])?)?;
+
+        // [n_total, n_new, n_head]
+        let scores = ctx.mul_mat(&k, &q)?;
+
+        let mask = ctx.new_f32_2d(n_total, n_new)?;
+        let mut m = vec![0f32; (n_total * n_new) as usize];
+        for query in 0..n_new {
+            let absolute = pos_start + query;
+            for key in 0..n_total {
+                if key > absolute {
+                    m[(query * n_total + key) as usize] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        mask.set_f32(&m)?;
+        let probs = ctx.soft_max_ext(&scores, Some(&mask), c.attn_scale(), 0.0)?;
+
+        let v = ctx.cont(&ctx.transpose(&ctx.permute(v_all, [0, 2, 1, 3])?)?)?;
+        let out = ctx.mul_mat(&v, &probs)?;
+        let out = ctx.cont(&ctx.permute(&out, [0, 2, 1, 3])?)?;
+        Ok(ctx.reshape_2d(&out, (c.head_dim * c.n_head) as i64, n_new)?)
+    }
+
     /// RMS-normalise then scale by a learned weight — the pattern every norm
     /// in this architecture uses.
     pub fn norm_scaled<'a>(

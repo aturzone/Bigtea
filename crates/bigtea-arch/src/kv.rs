@@ -83,6 +83,12 @@ impl KvCache {
         self.n_positions += 1;
     }
 
+    /// Advance by several positions at once — prefill appends a whole
+    /// prompt before any token is generated.
+    pub fn advance_by(&mut self, n: usize) {
+        self.n_positions += n;
+    }
+
     pub fn keys(&self, layer: usize) -> &[f32] {
         &self.k[layer]
     }

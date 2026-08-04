@@ -7,7 +7,7 @@
 
 use std::process::ExitCode;
 
-use bigtea_arch::{Qwen3Config, Qwen3Model};
+use bigtea_arch::{KvCache, Qwen3Config, Qwen3Model};
 use bigtea_ggml::{Context, WeightSet};
 use bigtea_model::Model;
 use bigtea_tokenizer::Tokenizer;
@@ -72,9 +72,21 @@ fn run_streaming(
     let gen_start = std::time::Instant::now();
     let prompt_len = tokens.len();
 
+    // Prefill the whole prompt once, then feed one token at a time. Without
+    // the cache each step re-ran every previous position, which is where the
+    // 31,032 expert reads for 5 tokens came from.
+    let mut cache = KvCache::new(
+        config.n_layer as usize,
+        config.n_head_kv as usize,
+        config.head_dim as usize,
+    );
+    let mut pending: Vec<u32> = tokens.clone();
+    let mut pos = 0usize;
+
     for _ in 0..n_predict {
-        let positions: Vec<i32> = (0..tokens.len() as i32).collect();
-        let logits = runner.forward(&weights, &tokens, &positions)?;
+        let logits = runner.forward_cached(&weights, &mut cache, &pending, pos)?;
+        pos += pending.len();
+        debug_assert!(cache.is_consistent(), "kv cache layers fell out of step");
 
         let vocab = config.vocab_size as usize;
         if logits.len() < vocab {
@@ -95,6 +107,8 @@ fn run_streaming(
         use std::io::Write;
         std::io::stdout().flush().ok();
         tokens.push(next);
+        // Only the new token needs computing; history lives in the cache.
+        pending = vec![next];
     }
 
     let secs = gen_start.elapsed().as_secs_f64();
@@ -103,6 +117,11 @@ fn run_streaming(
     println!(
         "generated  {produced} tokens in {secs:.1}s ({:.2} tok/s)",
         produced as f64 / secs.max(1e-9)
+    );
+    println!(
+        "kv cache   {} positions, {:.1} MiB",
+        cache.len(),
+        cache.bytes() as f64 / (1 << 20) as f64
     );
     println!("streaming  {}", runner.stats);
     println!("total      {:.1}s", t0.elapsed().as_secs_f64());
