@@ -14,8 +14,10 @@
 //! people bring — transposes every matrix and produces confident nonsense.
 
 mod qwen3;
+mod stream;
 
 pub use qwen3::{Qwen3Config, Qwen3Model};
+pub use stream::{StreamStats, StreamingRunner};
 
 use std::fmt;
 

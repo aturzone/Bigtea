@@ -272,6 +272,42 @@ impl Model {
         (available, self.tensors.len())
     }
 
+    /// Read part of a tensor — one expert's slice out of a stacked bank.
+    ///
+    /// This is what makes streaming cheap: a routed-expert tensor holds every
+    /// expert for a layer, but a token needs only a few, and each is a
+    /// contiguous run. Reading the run instead of the tensor is the difference
+    /// between 1 GiB and 16 GiB per token.
+    pub fn read_tensor_range(&self, name: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let loc = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::UnknownTensor(name.to_string()))?;
+        if offset + len > loc.size {
+            return Err(Error::NotDownloaded {
+                name: format!("{name} (range {offset}+{len})"),
+                need: offset + len,
+                have: loc.size,
+            });
+        }
+        let shard = &self.shards[loc.shard];
+        let at = loc.file_offset + offset;
+        if at + len > shard.on_disk {
+            return Err(Error::NotDownloaded {
+                name: name.to_string(),
+                need: at + len,
+                have: shard.on_disk,
+            });
+        }
+        shard
+            .file
+            .read_at(at, len as usize)
+            .map_err(|source| Error::Io {
+                path: shard.file.path().to_path_buf(),
+                source,
+            })
+    }
+
     /// Read a tensor's raw bytes, exactly as stored (still quantized).
     pub fn read_tensor(&self, name: &str) -> Result<Vec<u8>> {
         let loc = self
