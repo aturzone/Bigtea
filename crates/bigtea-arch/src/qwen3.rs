@@ -281,26 +281,37 @@ impl Qwen3Model {
     ) -> Result<Tensor<'a>> {
         let c = &self.config;
 
-        // [head_dim, n_head, n_tokens] -> [head_dim, n_tokens, n_head] so the
-        // matmul contracts over head_dim for each head independently.
+        // Shapes are the whole difficulty here, so each step names what it
+        // produces. ggml's ne[0] is the fastest dimension, and mul_mat
+        // contracts over ne[0] of both operands.
+
+        // [head_dim, n_head, n_tok] -> [head_dim, n_tok, n_head]
         let q = ctx.cont(&ctx.permute(q, [0, 2, 1, 3])?)?;
+        // [head_dim, n_kv, n_tok] -> [head_dim, n_tok, n_kv]
         let k = ctx.cont(&ctx.permute(k, [0, 2, 1, 3])?)?;
 
+        // Contracts over head_dim -> [n_tok, n_tok, n_head]. Grouped-query
+        // attention works because ggml broadcasts when n_head is a multiple
+        // of n_kv.
         let scores = ctx.mul_mat(&k, &q)?;
-        // Scale and normalise together; the causal mask is applied by the
-        // caller's mask tensor once KV caching lands, and is unnecessary while
-        // a single position is decoded at a time.
         let probs = ctx.soft_max_ext(&scores, None, c.attn_scale(), 0.0)?;
 
-        let v = ctx.cont(&ctx.transpose(&ctx.reshape_3d(
-            v,
-            c.head_dim as i64,
-            c.n_head_kv as i64,
-            n_tokens,
-        )?)?)?;
+        // V must contract over n_tok, so it needs n_tok in ne[0]:
+        //   [head_dim, n_kv, n_tok] --permute--> [head_dim, n_tok, n_kv]
+        //                           --transpose-> [n_tok, head_dim, n_kv]
+        // Transposing without the permute first leaves [n_kv, head_dim, n_tok],
+        // whose ne[0] is n_kv -- which is exactly the mismatch that aborts
+        // ggml with `ggml_can_mul_mat` failing.
+        let v = ctx.reshape_3d(v, c.head_dim as i64, c.n_head_kv as i64, n_tokens)?;
+        let v = ctx.cont(&ctx.transpose(&ctx.permute(&v, [0, 2, 1, 3])?)?)?;
+
+        // [head_dim, n_tok, n_head]
         let out = ctx.mul_mat(&v, &probs)?;
 
-        // Back to [n_embd, n_tokens] for the output projection.
+        // -> [head_dim, n_head, n_tok] -> flat [n_head*head_dim, n_tok].
+        // Note n_head*head_dim need not equal n_embd: Qwen3-4B has 32*128 =
+        // 4096 against n_embd 2560, and the output projection maps between
+        // them.
         let out = ctx.cont(&ctx.permute(&out, [0, 2, 1, 3])?)?;
         Ok(ctx.reshape_2d(&out, (c.head_dim * c.n_head) as i64, n_tokens)?)
     }

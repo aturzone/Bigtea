@@ -9,6 +9,7 @@ dependencies = [
  "bigtea-ggml",
  "bigtea-gguf",
  "bigtea-model",
+ "bigtea-tokenizer",
 ]
 
 [[package]]
