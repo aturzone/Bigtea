@@ -216,10 +216,27 @@ pub struct Context {
 impl Context {
     /// Create a context with an arena of `mem_size` bytes.
     pub fn new(mem_size: usize) -> Result<Self, GgmlError> {
+        Self::with_alloc(mem_size, false)
+    }
+
+    /// A context that allocates tensor *metadata* but not tensor *data*.
+    ///
+    /// This is how weights are bound without copying: the tensor exists, its
+    /// `data` pointer starts null, and the caller aims it at memory they
+    /// already hold. Without this the model would be stored twice, which for
+    /// a 7.38 GiB dense set on a 15.7 GiB machine simply does not fit.
+    ///
+    /// The arena only needs room for tensor structs — a few hundred bytes
+    /// each — not for the weights themselves.
+    pub fn new_no_alloc(mem_size: usize) -> Result<Self, GgmlError> {
+        Self::with_alloc(mem_size, true)
+    }
+
+    fn with_alloc(mem_size: usize, no_alloc: bool) -> Result<Self, GgmlError> {
         let params = InitParams {
             mem_size,
             mem_buffer: std::ptr::null_mut(),
-            no_alloc: false,
+            no_alloc,
         };
         // SAFETY: `params` is fully initialised; a null mem_buffer asks ggml to
         // allocate the arena itself, which is the documented contract.
@@ -584,6 +601,27 @@ impl Tensor<'_> {
             let src = ggml_get_data(self.raw.as_ptr()) as *const i32;
             std::slice::from_raw_parts(src, n).to_vec()
         }
+    }
+
+    /// This tensor's data pointer, read through the mirrored struct layout.
+    ///
+    /// # Safety
+    /// The tensor must be live. Verified against ggml's own accessor by
+    /// `weights::tests::our_struct_layout_matches_ggmls`.
+    pub(crate) unsafe fn data_ptr(&self) -> *mut std::os::raw::c_void {
+        (*(self.raw.as_ptr() as *const crate::weights::RawTensor)).data
+    }
+
+    /// Aim this tensor at memory the caller owns, without copying.
+    ///
+    /// # Safety
+    /// `ptr` must address at least [`Self::bytes`] readable bytes and must stay
+    /// valid and unmoved for as long as this tensor is used. The tensor does
+    /// not take ownership and will not keep the memory alive — a dangling
+    /// pointer here reads freed memory *successfully*, yielding plausible
+    /// numbers instead of a crash.
+    pub(crate) unsafe fn set_data_ptr(&self, ptr: *mut std::os::raw::c_void) {
+        (*(self.raw.as_ptr() as *mut crate::weights::RawTensor)).data = ptr;
     }
 
     /// Read the tensor's values back as `f32`.

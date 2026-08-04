@@ -23,9 +23,12 @@ use std::fmt;
 use bigtea_gguf::GgmlType;
 
 mod graph;
+mod weights;
 
 #[cfg(have_ggml)]
 pub use graph::{arena_for, Context, RopeParams, Tensor};
+#[cfg(have_ggml)]
+pub use weights::WeightSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GgmlError {

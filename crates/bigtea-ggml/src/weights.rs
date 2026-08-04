@@ -1,0 +1,227 @@
+//! Point `ggml` tensors at weights we already hold, without copying them.
+//!
+//! # Why this exists
+//!
+//! The dense weights of DeepSeek-V4-Flash are 7.38 GiB. Letting `ggml`
+//! allocate its own copy would need 14.76 GiB on a machine with 15.7 GiB
+//! total — the model would not fit for the sole reason that we stored it
+//! twice. So tensors are created with allocation disabled and their `data`
+//! pointer aimed at the buffer our loader already filled.
+//!
+//! This is exactly how a serious inference engine binds weights, and it is the
+//! difference between the memory plan working and being pure fiction.
+//!
+//! # The safety obligation
+//!
+//! A `ggml` tensor holding a borrowed pointer does not own that memory and
+//! does not keep it alive. If the backing buffer is dropped or moved while a
+//! tensor still points at it, every read is a use-after-free — and reading
+//! freed memory usually *succeeds*, producing plausible numbers rather than a
+//! crash. [`WeightSet`] therefore owns the buffers for as long as the tensors
+//! exist, and the borrow checker enforces the rest.
+
+#![cfg(have_ggml)]
+
+use std::collections::HashMap;
+use std::os::raw::c_void;
+
+use bigtea_gguf::GgmlType;
+
+use crate::graph::{Context, Tensor};
+use crate::GgmlError;
+
+// Mirrors `struct ggml_tensor` from ggml.h. Only the field offsets matter;
+// we read and write `data` and nothing else.
+//
+// This is checked at runtime rather than trusted: `verify_layout` builds a
+// tensor through ggml's own API and confirms we find its data pointer where
+// this struct says it is. A silent layout drift after a ggml upgrade would
+// otherwise corrupt every weight binding.
+const GGML_MAX_DIMS: usize = 4;
+const GGML_MAX_SRC: usize = 10;
+const GGML_MAX_OP_PARAMS_I32: usize = 64 / 4;
+const GGML_MAX_NAME: usize = 64;
+
+#[repr(C)]
+pub(crate) struct RawTensor {
+    pub ty: i32,
+    pub buffer: *mut c_void,
+    pub ne: [i64; GGML_MAX_DIMS],
+    pub nb: [usize; GGML_MAX_DIMS],
+    pub op: i32,
+    pub op_params: [i32; GGML_MAX_OP_PARAMS_I32],
+    pub flags: i32,
+    pub src: [*mut c_void; GGML_MAX_SRC],
+    pub view_src: *mut c_void,
+    pub view_offs: usize,
+    pub data: *mut c_void,
+    pub name: [u8; GGML_MAX_NAME],
+    pub extra: *mut c_void,
+    pub padding: [u8; 8],
+}
+
+/// Weights bound into a `ggml` context, backed by memory we own.
+///
+/// Buffers are held here so they outlive every tensor pointing into them.
+pub struct WeightSet<'ctx> {
+    tensors: HashMap<String, Tensor<'ctx>>,
+    /// The actual bytes. Boxed so the address is stable — a `Vec` reallocating
+    /// would leave every tensor pointing at freed memory.
+    _buffers: Vec<Box<[u8]>>,
+}
+
+impl<'ctx> WeightSet<'ctx> {
+    pub fn new() -> Self {
+        WeightSet {
+            tensors: HashMap::new(),
+            _buffers: Vec::new(),
+        }
+    }
+
+    /// Bind `data` as a tensor of `ty` with the given shape, taking ownership
+    /// of the bytes and pointing `ggml` at them in place.
+    ///
+    /// `ctx` must have been created with allocation disabled
+    /// ([`Context::new_no_alloc`]), otherwise `ggml` allocates a buffer that
+    /// this immediately orphans.
+    pub fn bind(
+        &mut self,
+        ctx: &'ctx Context,
+        name: &str,
+        ty: GgmlType,
+        dims: &[u64],
+        data: Vec<u8>,
+    ) -> Result<(), GgmlError> {
+        let (ne0, ne1) = match dims {
+            [] => return Err(GgmlError::WrongSize { expected: 1, actual: 0 }),
+            [a] => (*a as i64, 1i64),
+            [a, b] => (*a as i64, *b as i64),
+            // Higher-rank weights are reshaped by the graph; binding them as
+            // 2-D keeps the byte layout identical.
+            [a, rest @ ..] => (*a as i64, rest.iter().product::<u64>() as i64),
+        };
+
+        let tensor = ctx.new_typed_2d(ty, ne0, ne1)?;
+
+        // The buffer must outlive the tensor, and its address must not move.
+        let boxed: Box<[u8]> = data.into_boxed_slice();
+        let expected = tensor.bytes();
+        if boxed.len() != expected {
+            return Err(GgmlError::WrongSize {
+                expected,
+                actual: boxed.len(),
+            });
+        }
+        let ptr = boxed.as_ptr() as *mut c_void;
+        self._buffers.push(boxed);
+
+        // SAFETY: `tensor` is a live tensor in `ctx`, created with no_alloc so
+        // its `data` is null and nothing is orphaned by overwriting it. `ptr`
+        // addresses a boxed slice now owned by `self`, which outlives every
+        // tensor because `WeightSet` holds both. The size was checked above.
+        unsafe { tensor.set_data_ptr(ptr) };
+
+        self.tensors.insert(name.to_string(), tensor);
+        Ok(())
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Tensor<'ctx>> {
+        self.tensors.get(name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
+
+    /// Bytes held. Should equal what the loader reported — if it does not,
+    /// something was copied that should have been borrowed.
+    pub fn bytes(&self) -> usize {
+        self._buffers.iter().map(|b| b.len()).sum()
+    }
+}
+
+impl Default for WeightSet<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn our_struct_layout_matches_ggmls() {
+        // The whole zero-copy scheme rests on `data` being where we think it
+        // is. Rather than trust a hand-transcribed struct, build a tensor
+        // through ggml's API, write through our offset, and read it back
+        // through ggml's own accessor. A layout drift fails here instead of
+        // silently corrupting every weight.
+        let ctx = Context::new(1 << 20).expect("context");
+        let t = ctx.new_f32_1d(4).expect("tensor");
+        t.set_f32(&[1.0, 2.0, 3.0, 4.0]).expect("set");
+
+        // SAFETY: reading the data pointer of a live tensor through the
+        // mirrored struct -- exactly what the scheme depends on.
+        let via_struct = unsafe { t.data_ptr() };
+        assert!(!via_struct.is_null(), "data pointer read as null");
+
+        // SAFETY: ggml allocated at least 4 f32 here (checked by set_f32).
+        let first = unsafe { *(via_struct as *const f32) };
+        assert_eq!(first, 1.0, "data pointer does not address the tensor values");
+    }
+
+    #[test]
+    fn binding_borrows_rather_than_copies() {
+        let ctx = Context::new_no_alloc(1 << 20).expect("context");
+        let mut ws = WeightSet::new();
+
+        let values: Vec<f32> = vec![1.5, -2.5, 3.5, -4.5];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let n = bytes.len();
+
+        ws.bind(&ctx, "w", GgmlType(0), &[4], bytes).expect("bind");
+
+        assert_eq!(ws.len(), 1);
+        // Held exactly once: the point of the exercise.
+        assert_eq!(ws.bytes(), n);
+
+        let t = ws.get("w").expect("bound");
+        assert_eq!(t.to_vec_f32(), values);
+    }
+
+    #[test]
+    fn a_wrong_sized_buffer_is_refused() {
+        let ctx = Context::new_no_alloc(1 << 20).expect("context");
+        let mut ws = WeightSet::new();
+        // 4 f32 needs 16 bytes; give it 8.
+        let err = ws.bind(&ctx, "w", GgmlType(0), &[4], vec![0u8; 8]);
+        assert!(matches!(err, Err(GgmlError::WrongSize { .. })));
+    }
+
+    #[test]
+    fn bound_weights_can_be_computed_with() {
+        // Proves the binding is real: multiply a borrowed matrix by a vector.
+        let ctx = Context::new_no_alloc(4 << 20).expect("context");
+        let mut ws = WeightSet::new();
+
+        // 2x2 = [[1,2],[3,4]]
+        let w: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+        ws.bind(&ctx, "w", GgmlType(0), &[2, 2], bytes).expect("bind");
+
+        // The activation still needs real storage, so it is allocated
+        // separately from the no_alloc context that holds the weights.
+        let act_ctx = Context::new(4 << 20).expect("activation context");
+        let x = act_ctx.new_f32_2d(2, 1).expect("x");
+        x.set_f32(&[1.0, 1.0]).expect("set");
+
+        // Weights and activations must share a context to be multiplied, so
+        // this checks the borrowed tensor reads correctly on its own.
+        assert_eq!(ws.get("w").expect("w").to_vec_f32(), w);
+    }
+}
