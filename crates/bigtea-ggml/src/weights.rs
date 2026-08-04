@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::os::raw::c_void;
+use std::sync::Arc;
 
 use bigtea_gguf::GgmlType;
 
@@ -65,9 +66,15 @@ pub(crate) struct RawTensor {
 /// Buffers are held here so they outlive every tensor pointing into them.
 pub struct WeightSet<'ctx> {
     tensors: HashMap<String, Tensor<'ctx>>,
-    /// The actual bytes. Boxed so the address is stable — a `Vec` reallocating
-    /// would leave every tensor pointing at freed memory.
-    _buffers: Vec<Box<[u8]>>,
+    /// The actual bytes, shared rather than owned outright.
+    ///
+    /// `Arc` because the streaming path binds the same expert slice over and
+    /// over: it lives in the expert cache and is bound again on every token
+    /// that routes to it. Taking a `Vec` here meant copying the slice out of
+    /// the cache and copying it again into the binder — around a gigabyte of
+    /// memcpy per token, for bytes that never change. An `Arc` clone is a
+    /// refcount bump, and the address is as stable as a `Box`'s.
+    _buffers: Vec<Arc<[u8]>>,
 }
 
 impl<'ctx> WeightSet<'ctx> {
@@ -90,7 +97,7 @@ impl<'ctx> WeightSet<'ctx> {
         name: &str,
         ty: GgmlType,
         dims: &[u64],
-        data: Vec<u8>,
+        data: impl Into<Arc<[u8]>>,
     ) -> Result<(), GgmlError> {
         let (ne0, ne1) = match dims {
             [] => return Err(GgmlError::WrongSize { expected: 1, actual: 0 }),
@@ -104,16 +111,16 @@ impl<'ctx> WeightSet<'ctx> {
         let tensor = ctx.new_typed_2d(ty, ne0, ne1)?;
 
         // The buffer must outlive the tensor, and its address must not move.
-        let boxed: Box<[u8]> = data.into_boxed_slice();
+        let shared: Arc<[u8]> = data.into();
         let expected = tensor.bytes();
-        if boxed.len() != expected {
+        if shared.len() != expected {
             return Err(GgmlError::WrongSize {
                 expected,
-                actual: boxed.len(),
+                actual: shared.len(),
             });
         }
-        let ptr = boxed.as_ptr() as *mut c_void;
-        self._buffers.push(boxed);
+        let ptr = shared.as_ptr() as *mut c_void;
+        self._buffers.push(shared);
 
         // SAFETY: `tensor` is a live tensor in `ctx`, created with no_alloc so
         // its `data` is null and nothing is orphaned by overwriting it. `ptr`

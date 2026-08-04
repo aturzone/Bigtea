@@ -23,12 +23,20 @@ fn main() -> ExitCode {
     let mut prompt = String::new();
     let mut n_predict = 8usize;
     let mut prefill_block = 256usize;
+    let mut cache_budget: Option<u64> = None;
     let rest: Vec<String> = args.collect();
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
             "-n" => {
                 n_predict = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(8);
+                i += 2;
+            }
+            "--cache" => {
+                cache_budget = rest
+                    .get(i + 1)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .map(|g| (g * (1u64 << 30) as f64) as u64);
                 i += 2;
             }
             "-b" => {
@@ -69,7 +77,7 @@ fn main() -> ExitCode {
     }
     let prompt = prompt;
 
-    match run(&path, &prompt, n_predict, prefill_block) {
+    match run(&path, &prompt, n_predict, prefill_block, cache_budget) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("bigtea-run: {e}");
@@ -90,13 +98,31 @@ fn run_streaming(
     mut tokens: Vec<u32>,
     n_predict: usize,
     prefill_block: usize,
+    cache_budget: Option<u64>,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
 
-    // 1 GiB of expert cache: enough to help on repeated routing, bounded so it
-    // cannot grow into the problem streaming exists to avoid.
-    let mut runner = StreamingRunner::new(model, config.clone(), 1 << 30);
+    // Size the expert cache from the RAM that is actually free, not a constant.
+    //
+    // A fixed 1 GiB held under 4% of this model's 18,432 expert slices, so
+    // nearly every token went to disk — while ten gigabytes of memory sat
+    // unused. The whole point of measuring residency is to spend what the
+    // machine has. Headroom covers the OS, the resident weights, the KV cache
+    // and the compute arenas; what remains is worth filling with experts.
+    const HEADROOM: u64 = 4 * (1 << 30);
+    let budget = match cache_budget {
+        Some(bytes) => bytes,
+        None => {
+            let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
+            machine
+                .ram_available_bytes
+                .map(|avail| avail.saturating_sub(HEADROOM).max(1 << 30))
+                .unwrap_or(1 << 30)
+        }
+    };
+    let mut runner = StreamingRunner::new(model, config.clone(), budget as usize);
+    println!("cache      {:.2} GiB for experts", budget as f64 / GIB);
 
     let ctx = Context::new_no_alloc(64 << 20)?;
     let mut weights = WeightSet::new();
@@ -196,6 +222,7 @@ fn run(
     prompt: &str,
     n_predict: usize,
     prefill_block: usize,
+    cache_budget: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
 
@@ -231,7 +258,7 @@ fn run(
 
     if config.is_moe() {
         return run_streaming(
-            &model, config, &arch, &tokenizer, tokens, n_predict, prefill_block, t0,
+            &model, config, &arch, &tokenizer, tokens, n_predict, prefill_block, cache_budget, t0,
         );
     }
 

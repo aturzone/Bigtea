@@ -277,6 +277,35 @@ impl Context {
             .ok_or(GgmlError::ContextAlloc { bytes: mem_size })
     }
 
+    /// A context that builds its graph inside memory the caller already owns.
+    ///
+    /// The streaming forward pass creates on the order of 200 contexts per
+    /// token — one per layer for Q/K/V, attention, the router and the experts.
+    /// Letting ggml allocate each arena means hundreds of multi-megabyte
+    /// `malloc`s and first-touch page faults per token, which measured as the
+    /// single largest unattributed cost in generation. One buffer, reused,
+    /// removes all of it.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must outlive the returned context and must not be aliased by
+    /// another live context — tensors point directly into it, so reusing the
+    /// buffer while an earlier context's tensors are still read would hand back
+    /// overwritten weights rather than fail.
+    pub unsafe fn in_buffer(buf: &mut [u8], no_alloc: bool) -> Result<Self, GgmlError> {
+        let params = InitParams {
+            mem_size: buf.len(),
+            mem_buffer: buf.as_mut_ptr() as *mut c_void,
+            no_alloc,
+        };
+        // SAFETY: the buffer is valid for `buf.len()` bytes and the caller
+        // guarantees it outlives the context.
+        let raw = unsafe { ggml_init(params) };
+        NonNull::new(raw)
+            .map(|raw| Context { raw })
+            .ok_or(GgmlError::ContextAlloc { bytes: buf.len() })
+    }
+
     fn tensor<'a>(&'a self, raw: *mut ggml_tensor) -> Result<Tensor<'a>, GgmlError> {
         NonNull::new(raw)
             .map(|raw| Tensor { raw, _ctx: PhantomData })

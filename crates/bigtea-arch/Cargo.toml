@@ -11,6 +11,7 @@ repository.workspace = true
 bigtea-gguf = { path = "../bigtea-gguf" }
 bigtea-ggml = { path = "../bigtea-ggml" }
 bigtea-model = { path = "../bigtea-model" }
+bigtea-probe = { path = "../bigtea-probe" }
 bigtea-tokenizer = { path = "../bigtea-tokenizer" }
 
 [[bin]]

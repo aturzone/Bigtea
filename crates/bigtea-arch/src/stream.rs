@@ -22,6 +22,7 @@
 //! difference between running and not running.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bigtea_ggml::{arena_for, Context, RopeParams, Tensor, WeightSet};
 use bigtea_model::Model;
@@ -40,31 +41,73 @@ pub struct StreamStats {
     pub expert_bytes: u64,
     pub resident_bytes: u64,
     pub read_seconds: f64,
+    /// Slice requests served from memory. With reads, gives the hit rate —
+    /// the number that says whether the expert cache is earning its RAM.
+    pub cache_hits: u64,
+    pub cache_evictions: u64,
+    /// Wall time inside the expert feed-forward, excluding the disk reads
+    /// already counted in `read_seconds`.
+    pub expert_seconds: f64,
+    /// Wall time in attention, including building the KV tensors.
+    pub attn_seconds: f64,
+    /// Wall time spent handing cached bytes to the binder — a copy per slice
+    /// per use, which is invisible until it is measured.
+    pub copy_seconds: f64,
 }
 
 impl std::fmt::Display for StreamStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "resident {:.2} GiB, streamed {:.2} GiB over {} expert reads in {:.1}s",
+            "resident {:.2} GiB, streamed {:.2} GiB over {} expert reads in {:.1}s, \
+             {} cache hits ({:.0}%), {} evictions",
             self.resident_bytes as f64 / GIB,
             self.expert_bytes as f64 / GIB,
             self.expert_reads,
-            self.read_seconds
+            self.read_seconds,
+            self.cache_hits,
+            100.0 * self.cache_hits as f64 / (self.cache_hits + self.expert_reads).max(1) as f64,
+            self.cache_evictions
+        )?;
+        write!(
+            f,
+            "\n           time: {:.1}s disk, {:.1}s expert compute, {:.1}s attention, {:.1}s slice copies",
+            self.read_seconds, self.expert_seconds, self.attn_seconds, self.copy_seconds
         )
     }
 }
 
 /// A forward pass that streams experts instead of holding them.
+/// A cached expert slice.
+struct CacheEntry {
+    bytes: Arc<[u8]>,
+}
+
 pub struct StreamingRunner<'m> {
     model: &'m Model,
     arch: Qwen3Model,
     /// Cache of expert slices already read this session, keyed by
     /// (tensor name, expert index). Bounded, because an unbounded cache would
     /// silently become the thing we set out to avoid.
-    cache: HashMap<(String, u32), Vec<u8>>,
+    cache: HashMap<(String, u32), CacheEntry>,
     cache_budget: usize,
     cache_bytes: usize,
+    /// How often each slice has been wanted, whether or not it is cached.
+    ///
+    /// Kept outside the cache on purpose: an entry's history must survive its
+    /// eviction, otherwise a slice that keeps being evicted and re-read looks
+    /// permanently new and can never earn its place back.
+    freq: HashMap<(String, u32), u32>,
+    /// Cached keys, for sampling candidates to evict by index. May hold keys
+    /// already gone from `cache`; those are dropped when sampling finds them.
+    keys: Vec<(String, u32)>,
+    rng: u64,
+    /// One arena, reused for every expert graph, instead of a fresh multi-
+    /// megabyte allocation per layer per token.
+    scratch: Vec<u8>,
+    /// Threads for expert matmuls. Held rather than queried per call because
+    /// the expert loop runs it thousands of times per token.
+    threads: usize,
     pub stats: StreamStats,
 }
 
@@ -76,6 +119,13 @@ impl<'m> StreamingRunner<'m> {
             cache: HashMap::new(),
             cache_budget,
             cache_bytes: 0,
+            freq: HashMap::new(),
+            keys: Vec::new(),
+            rng: 0x9E3779B97F4A7C15,
+            scratch: Vec::new(),
+            threads: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
             stats: StreamStats::default(),
         }
     }
@@ -98,40 +148,14 @@ impl<'m> StreamingRunner<'m> {
     /// The stack is `[ne0, ne1, n_expert]`, so expert `idx` is a contiguous
     /// run at `idx * slice_bytes`. Reading only that run is what keeps a
     /// token's cost at 1 GiB instead of 16.
-    fn expert_slice(&mut self, name: &str, idx: u32) -> Result<Vec<u8>> {
+    /// One slice, through the same path as a batch — so cache accounting,
+    /// eviction and statistics have a single implementation rather than two
+    /// that can drift apart.
+    fn expert_slice(&mut self, name: &str, idx: u32) -> Result<Arc<[u8]>> {
         let key = (name.to_string(), idx);
-        if let Some(hit) = self.cache.get(&key) {
-            return Ok(hit.clone());
-        }
-
-        let loc = self
-            .model
-            .location(name)
-            .ok_or_else(|| ArchError::MissingTensor(name.to_string()))?
-            .clone();
-        let n_expert = *loc.dims.last().unwrap_or(&1);
-        if n_expert == 0 || idx as u64 >= n_expert {
-            return Err(ArchError::MissingTensor(format!(
-                "{name}: expert {idx} of {n_expert}"
-            )));
-        }
-        let slice_bytes = loc.size / n_expert;
-
-        let start = std::time::Instant::now();
-        let bytes = self
-            .model
-            .read_tensor_range(name, idx as u64 * slice_bytes, slice_bytes)?;
-        self.stats.read_seconds += start.elapsed().as_secs_f64();
-        self.stats.expert_reads += 1;
-        self.stats.expert_bytes += bytes.len() as u64;
-
-        // Keep it only if the budget allows; a cache that grows without bound
-        // recreates the very problem streaming exists to solve.
-        if self.cache_bytes + bytes.len() <= self.cache_budget {
-            self.cache_bytes += bytes.len();
-            self.cache.insert(key, bytes.clone());
-        }
-        Ok(bytes)
+        let mut got = self.read_slices_parallel(std::slice::from_ref(&key))?;
+        got.remove(&key)
+            .ok_or_else(|| ArchError::MissingTensor(format!("{name}[{idx}]")))
     }
 
     /// Which experts this token routes to, and their weights.
@@ -208,12 +232,49 @@ impl<'m> StreamingRunner<'m> {
 
         let mut accum = vec![0f32; n_embd * n_tokens];
 
-        for (expert, members) in by_expert {
-            let gate_bytes = self.expert_slice(&gate_name, expert)?;
-            let up_bytes = self.expert_slice(&up_name, expert)?;
-            let down_bytes = self.expert_slice(&down_name, expert)?;
+        // Generating a token is one position, so every expert matmul here is a
+        // single column: a few microseconds of arithmetic wrapped in a graph
+        // allocation and a 12-thread barrier. Per token that was 48 layers x 8
+        // experts x (gate, up, down) = 1,152 compute calls, and the overhead of
+        // each dwarfed the work inside it.
+        //
+        // With one position the experts' outputs are all n_embd x 1, so they
+        // can be scaled by their routing weights and summed inside a single
+        // graph — one allocation and one barrier per layer instead of 24.
+        if n_tokens == 1 {
+            return self.expert_ffn_single(normed, &by_expert, &gate_name, &up_name, &down_name);
+        }
 
-            let m = members.len() as i64;
+        // Read ahead in groups. A single synchronous read cannot saturate this
+        // NVMe — measured 1.26 GB/s against 2.79 GB/s across 16 threads — and
+        // the expert loop is almost entirely waiting on disk. Groups bound the
+        // memory this costs: 16 experts is ~43 MiB in flight, against ~340 MiB
+        // for a whole layer's experts.
+        const READ_GROUP: usize = 16;
+        let order: Vec<u32> = by_expert.keys().copied().collect();
+
+        for group in order.chunks(READ_GROUP) {
+            let mut wanted: Vec<(String, u32)> = Vec::with_capacity(group.len() * 3);
+            for &e in group {
+                wanted.push((gate_name.clone(), e));
+                wanted.push((up_name.clone(), e));
+                wanted.push((down_name.clone(), e));
+            }
+            let fetched = self.read_slices_parallel(&wanted)?;
+
+            for &expert in group {
+                let members = &by_expert[&expert];
+                let take = |n: &String| -> Result<Arc<[u8]>> {
+                    fetched
+                        .get(&(n.clone(), expert))
+                        .cloned()
+                        .ok_or_else(|| ArchError::MissingTensor(format!("{n}[{expert}]")))
+                };
+                let gate_bytes = take(&gate_name)?;
+                let up_bytes = take(&up_name)?;
+                let down_bytes = take(&down_name)?;
+
+                let m = members.len() as i64;
             let ctx = Context::new(arena_for(
                 &[
                     (n_embd_i, m), // this expert's tokens, gathered
@@ -243,18 +304,286 @@ impl<'m> StreamingRunner<'m> {
             let u = ctx.mul_mat(ws.get("up").expect("bound"), &xt)?;
             let act = ctx.mul(&ctx.silu(&g)?, &u)?;
             let out = ctx.mul_mat(ws.get("down").expect("bound"), &act)?;
-            ctx.compute(&out, 0)?;
+            // Not 0: `compute` floors the count at 1, so passing 0 ran every
+            // expert matmul on a single thread — the bulk of the model's
+            // arithmetic, on one core of twelve.
+            ctx.compute(&out, self.threads)?;
 
-            let produced = out.to_vec_f32();
-            for (slot, (t, weight)) in members.iter().enumerate() {
-                let src = &produced[slot * n_embd..(slot + 1) * n_embd];
-                let dst = &mut accum[t * n_embd..(t + 1) * n_embd];
-                for (d, v) in dst.iter_mut().zip(src) {
-                    *d += v * weight;
+                let produced = out.to_vec_f32();
+                for (slot, (t, weight)) in members.iter().enumerate() {
+                    let src = &produced[slot * n_embd..(slot + 1) * n_embd];
+                    let dst = &mut accum[t * n_embd..(t + 1) * n_embd];
+                    for (d, v) in dst.iter_mut().zip(src) {
+                        *d += v * weight;
+                    }
                 }
             }
         }
         Ok(accum)
+    }
+
+    /// One layer's experts for a single position, in one graph.
+    ///
+    /// Every expert contributes `n_embd x 1`, so the routing weights can be
+    /// applied with `scale` and the results added together as part of the same
+    /// graph. That leaves one arena and one `compute` per layer instead of one
+    /// per expert matmul.
+    fn expert_ffn_single(
+        &mut self,
+        normed: &[f32],
+        by_expert: &std::collections::BTreeMap<u32, Vec<(usize, f32)>>,
+        gate_name: &str,
+        up_name: &str,
+        down_name: &str,
+    ) -> Result<Vec<f32>> {
+        let c = self.arch.config.clone();
+        let n_embd = c.n_embd as i64;
+        let n_ff = c.n_ff_expert as i64;
+        let gate_ty = self.tensor_type(gate_name)?;
+        let up_ty = self.tensor_type(up_name)?;
+        let down_ty = self.tensor_type(down_name)?;
+
+        // Fetch every expert this position needs in one parallel batch.
+        let mut wanted: Vec<(String, u32)> = Vec::with_capacity(by_expert.len() * 3);
+        for &e in by_expert.keys() {
+            wanted.push((gate_name.to_string(), e));
+            wanted.push((up_name.to_string(), e));
+            wanted.push((down_name.to_string(), e));
+        }
+        let fetched = self.read_slices_parallel(&wanted)?;
+
+        let n_exp = by_expert.len() as i64;
+        // Binding a weight allocates its full size in the arena before the data
+        // pointer is replaced, so every expert's three quantized tensors have to
+        // be paid for here. Eight experts is ~21 MiB, which overran the 16 MiB
+        // graph reserve when only the intermediates were counted — and ggml
+        // aborts rather than reporting it.
+        let weight_bytes: usize = fetched.values().map(|v| v.len()).sum();
+        let need = arena_for(
+            &[
+                (n_embd, 1),
+                (n_ff, n_exp * 3),   // gate, up and their product, per expert
+                (n_embd, n_exp * 3), // down output, scaled, and the sums
+            ],
+            16 * by_expert.len() + 32,
+        ) + weight_bytes;
+
+        // Borrow the scratch arena out of `self` so the context can hold it
+        // mutably while statistics are still being updated.
+        let mut buf = std::mem::take(&mut self.scratch);
+        if buf.len() < need {
+            buf.resize(need, 0);
+        }
+        let threads = self.threads;
+        let result = (|| -> Result<(Vec<f32>, f64)> {
+            // SAFETY: `buf` is a local that outlives `ctx`, and no other
+            // context is live on it — the previous one was dropped and its
+            // results copied out before this call.
+            let ctx = unsafe { Context::in_buffer(&mut buf, false)? };
+            let mut ws = WeightSet::new();
+            let xt = ctx.new_f32_2d(n_embd, 1)?;
+            xt.set_f32(&normed[..n_embd as usize])?;
+
+            let mut total: Option<Tensor> = None;
+            for (&expert, members) in by_expert {
+                let weight = members[0].1;
+                let take = |n: &str| -> Result<Arc<[u8]>> {
+                    fetched
+                        .get(&(n.to_string(), expert))
+                        .cloned()
+                        .ok_or_else(|| ArchError::MissingTensor(format!("{n}[{expert}]")))
+                };
+                // Names must be unique per expert: one WeightSet holds them all.
+                let (gk, uk, dk) = (
+                    format!("g{expert}"),
+                    format!("u{expert}"),
+                    format!("d{expert}"),
+                );
+                ws.bind(&ctx, &gk, gate_ty, &[n_embd as u64, n_ff as u64], take(gate_name)?)?;
+                ws.bind(&ctx, &uk, up_ty, &[n_embd as u64, n_ff as u64], take(up_name)?)?;
+                ws.bind(&ctx, &dk, down_ty, &[n_ff as u64, n_embd as u64], take(down_name)?)?;
+
+                let g = ctx.mul_mat(ws.get(&gk).expect("bound"), &xt)?;
+                let u = ctx.mul_mat(ws.get(&uk).expect("bound"), &xt)?;
+                let act = ctx.mul(&ctx.silu(&g)?, &u)?;
+                let out = ctx.mul_mat(ws.get(&dk).expect("bound"), &act)?;
+                let scaled = ctx.scale(&out, weight)?;
+                total = Some(match total {
+                    None => scaled,
+                    Some(t) => ctx.add(&t, &scaled)?,
+                });
+            }
+
+            let Some(total) = total else {
+                return Ok((vec![0f32; n_embd as usize], 0.0));
+            };
+            let t = std::time::Instant::now();
+            ctx.compute(&total, threads)?;
+            let secs = t.elapsed().as_secs_f64();
+            Ok((total.to_vec_f32(), secs))
+        })();
+
+        self.scratch = buf;
+        let (out, secs) = result?;
+        self.stats.expert_seconds += secs;
+        Ok(out)
+    }
+
+    /// Put a freshly read slice in the cache if it deserves the space.
+    ///
+    /// The access pattern here is a *cyclic scan*: every block walks layers 0
+    /// to 47 and reads most experts in each. When such a cycle is larger than
+    /// the cache — 16.35 GiB of experts against a 6.26 GiB budget — recency is
+    /// precisely the wrong signal. Layer 0's slices are always the oldest thing
+    /// present when layer 47 needs room, so they are evicted just before the
+    /// next block asks for them again. Measured: a 6.26 GiB LRU-ish cache
+    /// returned a **17% hit rate with 20,975 evictions**, worse than the ~38%
+    /// that pinning an arbitrary fixed third would have given for free.
+    ///
+    /// So admission is by frequency and nothing else. A newcomer must be wanted
+    /// strictly more often than the entry it would displace, which stops the
+    /// churn and lets the cache settle on genuinely hot experts. Routing is
+    /// skewed enough for that to beat a fixed subset.
+    fn admit(&mut self, key: (String, u32), bytes: Arc<[u8]>) {
+        const SAMPLE: usize = 8;
+        if bytes.len() > self.cache_budget {
+            return;
+        }
+        let mine = self.freq.get(&key).copied().unwrap_or(1);
+
+        while self.cache_bytes + bytes.len() > self.cache_budget {
+            let Some(victim) = self.weakest(SAMPLE) else {
+                return;
+            };
+            let theirs = self.freq.get(&victim).copied().unwrap_or(1);
+            if mine <= theirs {
+                return; // the incumbent is wanted at least as often; leave it
+            }
+            if let Some(entry) = self.cache.remove(&victim) {
+                self.cache_bytes -= entry.bytes.len();
+                self.stats.cache_evictions += 1;
+            } else {
+                return;
+            }
+        }
+        self.cache_bytes += bytes.len();
+        self.keys.push(key.clone());
+        self.cache.insert(key, CacheEntry { bytes });
+    }
+
+    /// The least valuable of a small random sample: fewest uses, then oldest.
+    ///
+    /// Sampling reads through `keys` by index. Iterating the HashMap with
+    /// `step_by` would have looked equivalent and been O(n) — `step_by` still
+    /// calls `next` for every element it skips — which at one eviction per miss
+    /// is a full scan of the cache thousands of times per token.
+    fn weakest(&mut self, sample: usize) -> Option<(String, u32)> {
+        let mut best: Option<((String, u32), u32)> = None;
+        let mut tries = 0;
+        while tries < sample * 2 && !self.keys.is_empty() {
+            tries += 1;
+            let i = (self.next_rand() as usize) % self.keys.len();
+            let key = self.keys[i].clone();
+            if !self.cache.contains_key(&key) {
+                self.keys.swap_remove(i); // stale: evicted earlier
+                continue;
+            }
+            let uses = self.freq.get(&key).copied().unwrap_or(1);
+            if best.as_ref().is_none_or(|(_, b)| uses < *b) {
+                best = Some((key, uses));
+            }
+        }
+        best.map(|(k, _)| k)
+    }
+
+    /// xorshift64: enough randomness to spread the sample, no dependency.
+    fn next_rand(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
+    }
+
+    /// Read several expert slices at once, returning cache hits and fresh
+    /// reads together.
+    ///
+    /// The expert loop spends most of its time blocked on disk, and one
+    /// synchronous read leaves most of the device idle: 1.26 GB/s measured
+    /// single-threaded against 2.79 GB/s across 16 threads on this NVMe.
+    /// `seek_read` carries its own offset, so concurrent reads through one
+    /// handle are positional and do not race — the same property
+    /// `ResidentSet::load_parallel` already relies on.
+    fn read_slices_parallel(
+        &mut self,
+        wanted: &[(String, u32)],
+    ) -> Result<HashMap<(String, u32), Arc<[u8]>>> {
+        let mut out: HashMap<(String, u32), Arc<[u8]>> = HashMap::with_capacity(wanted.len());
+        let mut misses: Vec<(String, u32, u64, u64)> = Vec::new();
+
+        for key in wanted {
+            if out.contains_key(key) {
+                continue; // the same slice asked for twice in one group
+            }
+            *self.freq.entry(key.clone()).or_insert(0) += 1;
+            if let Some(hit) = self.cache.get(key) {
+                self.stats.cache_hits += 1;
+                let t = std::time::Instant::now();
+                let copy = hit.bytes.clone();
+                self.stats.copy_seconds += t.elapsed().as_secs_f64();
+                out.insert(key.clone(), copy);
+                continue;
+            }
+            let (name, idx) = key;
+            let loc = self
+                .model
+                .location(name)
+                .ok_or_else(|| ArchError::MissingTensor(name.to_string()))?;
+            let n_expert = *loc.dims.last().unwrap_or(&1);
+            if n_expert == 0 || *idx as u64 >= n_expert {
+                return Err(ArchError::MissingTensor(format!(
+                    "{name}: expert {idx} of {n_expert}"
+                )));
+            }
+            let slice_bytes = loc.size / n_expert;
+            misses.push((name.clone(), *idx, *idx as u64 * slice_bytes, slice_bytes));
+        }
+
+        if !misses.is_empty() {
+            let start = std::time::Instant::now();
+            let model = self.model;
+            let threads = self.threads.min(misses.len());
+            let misses_ref = &misses;
+
+            let results: Vec<Result<Vec<((String, u32), Arc<[u8]>)>>> = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(threads);
+                for t in 0..threads {
+                    handles.push(scope.spawn(move || {
+                        let mut mine = Vec::new();
+                        // Round-robin: slices are equal-sized here, but this
+                        // keeps the split even if that stops being true.
+                        for (name, idx, off, len) in misses_ref.iter().skip(t).step_by(threads) {
+                            let bytes = model.read_tensor_range(name, *off, *len)?;
+                            mine.push(((name.clone(), *idx), Arc::from(bytes)));
+                        }
+                        Ok(mine)
+                    }));
+                }
+                handles.into_iter().map(|h| h.join().expect("read thread")).collect()
+            });
+
+            self.stats.read_seconds += start.elapsed().as_secs_f64();
+            for batch in results {
+                for (key, bytes) in batch? {
+                    self.stats.expert_reads += 1;
+                    self.stats.expert_bytes += bytes.len() as u64;
+                    self.admit(key.clone(), bytes.clone());
+                    out.insert(key, bytes);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Apply one layer's expert feed-forward for a single token.
@@ -297,7 +626,7 @@ impl<'m> StreamingRunner<'m> {
             let u = ctx.mul_mat(ws.get("up").expect("bound"), &xt)?;
             let act = ctx.mul(&ctx.silu(&g)?, &u)?;
             let out = ctx.mul_mat(ws.get("down").expect("bound"), &act)?;
-            ctx.compute(&out, 0)?;
+            ctx.compute(&out, self.threads)?;
 
             for (dst, v) in accum.iter_mut().zip(out.to_vec_f32()) {
                 *dst += v * weight;
@@ -492,7 +821,9 @@ impl<'m> StreamingRunner<'m> {
                     &get(weights, format!("blk.{il}.attn_output.weight"))?,
                     &out,
                 )?;
+                let t = std::time::Instant::now();
                 ctx.compute(&out, threads)?;
+                self.stats.attn_seconds += t.elapsed().as_secs_f64();
                 out.to_vec_f32()
             };
 
