@@ -1,7 +1,8 @@
 # Bigtea — a runner for models larger than RAM
 
 - **What it is**: a Rust inference runner whose job is running models that do *not* fit in memory. Keeps the always-read weights resident, streams routed experts from disk per token. Borrows `ggml` for arithmetic; owns memory, residency, streaming, and the token loop.
-- **Proven**: Qwen3-30B-A3B (17.28 GiB container) generates correct text on a 15.7 GiB machine holding **0.93 GiB** resident. llama.cpp refuses the same class of model here (`failed to allocate buffer of size 147169738752`).
+- **Proven**: Qwen3-30B-A3B (17.28 GiB container) generates correct text on a 15.7 GiB machine holding **0.93 GiB** resident.
+- **Not proven — do not claim otherwise.** llama.cpp runs the same model on the same box **3.3x faster** (2.83 vs 0.85 tok/s), and runs the 144 GB V4-Flash too once `--no-repack` is passed. "Larger than RAM" is not a differentiator; mmap already does it. Measurements + retracted claims: `docs/graph/research/head-to-head-llamacpp-2026-08-05.md`.
 - Graph docs live in `/docs/graph/`; read `INDEX.md` first, then only the 2–3 nodes a task links to.
 
 ## Build / test / run
@@ -37,13 +38,15 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 - Git: remote `github.com/aturzone/Bigtea`. Push with the token from `C:\Projects\.env` inline in the URL, output redacted — never in git config, never echoed. Model/weight files stay gitignored.
 - Implementation goes on `ticket/<name>` branches + PR; Atur merges. Docs may go to main.
 - Sync audit at phase boundaries only, not per commit.
+- **A competitive claim is not citable until the competitor's exact command line and its output are in a doc.** "llama.cpp can't do X" survived days on a misattributed error string because nobody ran the opposing command. Run it, paste it, flag it.
 - Keep this file under ~2000 tokens; tell Atur to prune rather than letting it bloat.
 
 ## Next
 
-1. Wire `KvCache` into the streaming forward pass — currently O(n²) (0.19 tok/s on the MoE; 31,032 expert reads for 5 tokens).
-2. Grow the expert cache; 1 GiB holds <4% of 18,432 slices, so hit rate is near zero.
-3. DeepSeek-V4-Flash architecture (1,203-line graph + bespoke KV cache) — the 144 GiB model is on disk.
+1. **Find out whether Bigtea is better at anything.** llama.cpp beats us 3.3x at short context. The untested hypothesis is long context: their page cache should thrash where our bounded residency + KV cache degrade gracefully. Measure at 2k/8k/32k. If we lose there too, the design premise is wrong and we should say so.
+2. Split the 3.3x deficit into kernels vs I/O — run the dense 4B (no streaming) against llama.cpp. Same gap ⇒ our kernels; smaller gap ⇒ our I/O.
+3. Grow the expert cache; 1 GiB holds <4% of 18,432 slices, so hit rate is near zero. 65% of our MoE wall time is disk.
+4. DeepSeek-V4-Flash architecture (1,203-line graph + bespoke KV cache) — the 144 GiB model is on disk. llama.cpp already runs it here at 0.45 tok/s with `--no-repack`; that is the bar.
 
 ## Compact Instructions
 
