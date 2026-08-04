@@ -294,7 +294,23 @@ impl Qwen3Model {
         // attention works because ggml broadcasts when n_head is a multiple
         // of n_kv.
         let scores = ctx.mul_mat(&k, &q)?;
-        let probs = ctx.soft_max_ext(&scores, None, c.attn_scale(), 0.0)?;
+
+        // Causal mask. Without it every position attends to future tokens --
+        // the model sees the answer before predicting it, and collapses into
+        // repeating one token. Added to the scores before softmax, so masked
+        // positions need -inf rather than 0.
+        let mask = ctx.new_f32_2d(n_tokens, n_tokens)?;
+        let mut m = vec![0f32; (n_tokens * n_tokens) as usize];
+        for query in 0..n_tokens {
+            for key in 0..n_tokens {
+                if key > query {
+                    m[(query * n_tokens + key) as usize] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        mask.set_f32(&m)?;
+
+        let probs = ctx.soft_max_ext(&scores, Some(&mask), c.attn_scale(), 0.0)?;
 
         // V must contract over n_tok, so it needs n_tok in ne[0]:
         //   [head_dim, n_kv, n_tok] --permute--> [head_dim, n_tok, n_kv]
