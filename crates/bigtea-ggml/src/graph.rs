@@ -139,6 +139,24 @@ extern "C" {
         beta_slow: f32,
     ) -> *mut ggml_tensor;
 
+    /// Indexed matmul: picks a matrix per row from a stacked 3-D tensor.
+    /// This is what makes MoE tractable — only the selected experts are
+    /// multiplied, rather than all of them followed by a mask.
+    fn ggml_mul_mat_id(
+        ctx: *mut ggml_context,
+        as_: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+        ids: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+
+    fn ggml_soft_max_ext(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        mask: *mut ggml_tensor,
+        scale: f32,
+        max_bias: f32,
+    ) -> *mut ggml_tensor;
+
     fn ggml_new_graph(ctx: *mut ggml_context) -> *mut ggml_cgraph;
     fn ggml_build_forward_expand(graph: *mut ggml_cgraph, t: *mut ggml_tensor);
     fn ggml_graph_compute_with_ctx(
@@ -301,6 +319,12 @@ impl Context {
     pub fn new_i32_1d(&self, n: i64) -> Result<Tensor<'_>, GgmlError> {
         // SAFETY: valid context; type 26 is GGML_TYPE_I32.
         self.tensor(unsafe { ggml_new_tensor_1d(self.raw.as_ptr(), 26, n) })
+    }
+
+    /// A 2-D I32 tensor — `mul_mat_id` requires expert indices in this shape.
+    pub fn new_i32_2d(&self, ne0: i64, ne1: i64) -> Result<Tensor<'_>, GgmlError> {
+        // SAFETY: valid context; type 26 is GGML_TYPE_I32.
+        self.tensor(unsafe { ggml_new_tensor_2d(self.raw.as_ptr(), 26, ne0, ne1) })
     }
 
     pub fn new_f32_3d(&self, ne0: i64, ne1: i64, ne2: i64) -> Result<Tensor<'_>, GgmlError> {
@@ -478,6 +502,48 @@ impl Context {
                 rope.beta_fast,
                 rope.beta_slow,
             )
+        })
+    }
+
+    /// Indexed matmul for mixture-of-experts.
+    ///
+    /// `experts` is a stack of matrices; `ids` selects which one each row
+    /// uses. This is the operation that makes MoE cheap: only the chosen
+    /// experts are multiplied, instead of computing all of them and masking.
+    pub fn mul_mat_id<'a>(
+        &'a self,
+        experts: &Tensor<'a>,
+        b: &Tensor<'a>,
+        ids: &Tensor<'a>,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: all three tensors belong to this context.
+        self.tensor(unsafe {
+            ggml_mul_mat_id(
+                self.raw.as_ptr(),
+                experts.raw.as_ptr(),
+                b.raw.as_ptr(),
+                ids.raw.as_ptr(),
+            )
+        })
+    }
+
+    /// Softmax with an optional additive mask and a scale applied first.
+    ///
+    /// Attention needs all three in one op: scale by 1/sqrt(head_dim), add the
+    /// causal mask, then normalise. Doing them separately is both slower and
+    /// numerically worse.
+    pub fn soft_max_ext<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        mask: Option<&Tensor<'a>>,
+        scale: f32,
+        max_bias: f32,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        let mask_ptr = mask.map(|m| m.raw.as_ptr()).unwrap_or(std::ptr::null_mut());
+        // SAFETY: tensors belong to this context; a null mask is the
+        // documented way to omit it.
+        self.tensor(unsafe {
+            ggml_soft_max_ext(self.raw.as_ptr(), a.raw.as_ptr(), mask_ptr, scale, max_bias)
         })
     }
 
@@ -807,6 +873,58 @@ mod tests {
         let out = s.to_vec_f32();
         assert!((out[1] - 0.5).abs() < 1e-6, "sigmoid(0) = {}", out[1]);
         assert!(out[0] < out[1] && out[1] < out[2], "must be monotonic");
+    }
+
+    #[test]
+    fn soft_max_ext_applies_the_scale_before_normalising() {
+        // Attention needs scale-then-softmax as one op. A larger scale
+        // sharpens the distribution; verifying that catches the case where
+        // the scale is silently ignored.
+        let ctx = Context::new(ARENA).expect("context");
+        let x = ctx.new_f32_1d(3).expect("x");
+        x.set_f32(&[1.0, 2.0, 3.0]).expect("set");
+
+        let soft = ctx.soft_max_ext(&x, None, 1.0, 0.0).expect("softmax");
+        ctx.compute(&soft, 1).expect("compute");
+        let flat = soft.to_vec_f32();
+
+        let ctx2 = Context::new(ARENA).expect("context2");
+        let y = ctx2.new_f32_1d(3).expect("y");
+        y.set_f32(&[1.0, 2.0, 3.0]).expect("set");
+        let sharp = ctx2.soft_max_ext(&y, None, 4.0, 0.0).expect("softmax");
+        ctx2.compute(&sharp, 1).expect("compute");
+        let scaled = sharp.to_vec_f32();
+
+        assert!((flat.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        assert!((scaled.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        assert!(
+            scaled[2] > flat[2],
+            "a larger scale must concentrate mass on the max: {scaled:?} vs {flat:?}"
+        );
+    }
+
+    #[test]
+    fn mul_mat_id_selects_per_row_experts() {
+        // The op MoE depends on: two stacked 2x2 "experts", each row of the
+        // input routed to a different one.
+        let ctx = Context::new(ARENA).expect("context");
+
+        // experts[0] = identity, experts[1] = 2 * identity
+        let experts = ctx.new_f32_3d(2, 2, 2).expect("experts");
+        experts
+            .set_f32(&[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0])
+            .expect("set experts");
+
+        // One input vector, routed to expert 1 (the doubling one).
+        let b = ctx.new_f32_3d(2, 1, 1).expect("b");
+        b.set_f32(&[3.0, 4.0]).expect("set b");
+
+        let ids = ctx.new_i32_2d(1, 1).expect("ids");
+        ids.set_i32(&[1]).expect("set ids");
+
+        let out = ctx.mul_mat_id(&experts, &b, &ids).expect("mul_mat_id");
+        ctx.compute(&out, 1).expect("compute");
+        assert_eq!(out.to_vec_f32(), vec![6.0, 8.0], "wrong expert applied");
     }
 
     #[test]
