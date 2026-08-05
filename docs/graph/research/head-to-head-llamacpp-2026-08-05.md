@@ -1,107 +1,158 @@
 ---
-topic: Bigtea vs llama.cpp head-to-head on the target machine — the claim we were publishing is false
+topic: Bigtea vs llama.cpp head-to-head on the target machine — measured, retracted claims, and where we actually stand
 status: resolved
 links: [moe-landscape-2026-08.md, benchmarking-methodology.md, verify-before-citing]
 ---
 
 Measured 2026-08-05 on the target machine (i7-13650HX, 15.71 GiB RAM, Windows 11).
-llama.cpp build 2026-08-03 (`llamacpp-unsloth`). Bigtea `ticket/rust-core` @ 59875d0.
-Same prompt (`"The capital of France is"`), greedy (`--temp 0`), 12 threads.
+llama.cpp build 2026-08-03 (`llamacpp-unsloth`). Bigtea `ticket/rust-core`.
+Same prompt files for both, greedy (`--temp 0`), 12 threads.
 
 ## CORRECTION BLOCK (2026-08-05)
 
 Three claims in `CLAUDE.md`, `memory/bigtea-runner-state.md`, and every prior session summary
-were **wrong**. All three are retracted here.
+were **wrong**. All three are retracted.
 
 **Claim 1 — "llama.cpp refuses this class of model here."** FALSE.
-llama.cpp runs Qwen3-30B-A3B (17.28 GiB container) on this 15.71 GiB machine without
-special flags, and produces correct text. It mmaps the file and lets the OS page it.
+llama.cpp runs Qwen3-30B-A3B (17.28 GiB) on this 15.71 GiB machine without special flags and
+produces correct text. It mmaps the file and lets the OS page it.
 
 **Claim 2 — the error `failed to allocate buffer of size 147169738752` proves it.** MISATTRIBUTED.
 147,169,738,752 bytes = 137.06 GiB. That is **DeepSeek-V4-Flash**, not Qwen3-30B. The error was
-never produced by the Qwen3 run it was cited against. It was never written into any doc — it
-lived only in session summaries, which is why it went unchecked for days.
+never produced by the run it was cited against. It lived only in session summaries, never in a
+doc, which is why it went unchecked for days.
 
 **Claim 3 — implied: llama.cpp cannot run V4-Flash on this box.** FALSE.
-The V4-Flash failure is caused by **one default flag**. `--repack` (default on) tries to
-allocate a single 137 GiB `CPU_REPACK` buffer outside the mmap. With `--no-repack` llama.cpp
-loads the 144 GB model in 12.3s and generates correct text at 0.45 tok/s.
+The failure is **one default flag**. `--repack` (on by default) allocates a single 137 GiB
+`CPU_REPACK` buffer outside the mmap. With `--no-repack` llama.cpp loads the 144 GB model in
+12.3s and generates correct text at 0.45 tok/s.
 
-This is the second time a Bigtea claim survived because nobody ran the opposing command.
-See [[verify-before-citing]]. Rule going forward: **a competitive claim is not citable until the
-competitor's exact failing command line is in a doc, with its flags.**
+Rule adopted: **a competitive claim is not citable until the competitor's exact command line and
+its output are in a doc.** See [[verify-before-citing]].
 
-## Qwen3-30B-A3B Q4_K_M (17.28 GiB), 16 tokens
+## Qwen3-30B-A3B Q4_K_M (17.28 GiB) — the full ladder
 
-|                  | llama.cpp | Bigtea |
-|------------------|-----------|--------|
-| runs             | yes       | yes    |
-| eval speed       | **2.83 tok/s** | 0.85 tok/s |
-| prompt eval      | 1.44 tok/s | — (not separated) |
-| load time        | 3.5s      | 0.9s   |
-| peak working set | 8.87 GiB  | **0.93 GiB** |
-| peak private     | 17.38 GiB | (streamed, not committed) |
-| output           | identical | identical |
+Bigtea after the optimisation work below; llama.cpp with a fully warm page cache.
 
-Both produced: `Paris. The capital of Italy is Rome. The capital of Spain is Madrid.`
+| prompt tokens | prefill: Bigtea / llama.cpp | eval: Bigtea / llama.cpp |
+|---|---|---|
+| 565  | 19.92 / 23.55 | 1.48 / 3.19 |
+| 2206 | 23.68 / 33.59 | 1.08 / 2.46 |
+| 4395 | 19.79 / 40.25 | 0.88 / 2.16 |
+| 8775 | 14.46 / 35.01 | 0.65 / 1.62 |
 
-**llama.cpp is 3.3x faster. Bigtea holds 9.5x less resident memory.** Those are the only two
-honest deltas. Bigtea streamed 16.97 GiB over 19,185 expert reads in 12.3s of the 18.8s run —
-i.e. **65% of our wall time is disk**, which is exactly what llama.cpp avoids by letting the
-page cache keep hot experts.
+**llama.cpp is faster at every length: ~1.2–2.4x on prefill, ~2.2–2.5x on generation.**
+Both produce identical, correct output. Bigtea's expert cache hit rate climbs with prompt
+length (34% → 60%) because a longer prompt gives the frequency counters more to work with.
 
-Commands:
-```
-llama-completion.exe -m Qwen3-30B-A3B-Q4_K_M.gguf -p "The capital of France is" \
-  -n 16 -no-cnv --temp 0 -t 12 --no-warmup
-bigtea-run.exe Qwen3-30B-A3B-Q4_K_M.gguf "The capital of France is" -n 16
-```
+Memory: Bigtea holds 0.93 GiB resident + a 6.26 GiB expert cache ≈ 7.2 GiB. llama.cpp's peak
+working set was 8.87 GiB, and it additionally benefits from the OS page cache holding most of
+the remaining model — effectively ~11 GiB working for it. **Bigtea also bypasses the page cache
+deliberately** (direct I/O), so on a model that nearly fits, it is competing with one hand tied:
+the kernel can use all free RAM elastically, Bigtea reserves a fixed budget.
 
-## DeepSeek-V4-Flash UD-Q4_K_XL (144 GB, 5 shards), 8 tokens
+### The long-context hypothesis is dead
+
+The prediction was that llama.cpp's page cache would thrash at long context while Bigtea's
+bounded residency degraded gracefully. It does not happen. From 565 to 8775 tokens llama.cpp's
+eval falls 49% (3.19 → 1.62) and Bigtea's falls 56% (1.48 → 0.65). Bigtea degrades *slightly
+faster*, and the ratio between them stays roughly constant at 2.2–2.5x.
+
+An earlier reading of this as "the gap is narrowing" was an artefact: llama.cpp's first run was
+cold, later ones warm.
+
+### The memory-pressure experiment FAILED — do not cite it
+
+To test the design premise (a model far larger than available RAM) without waiting on the
+V4-Flash port, 7 GiB was held resident by a ballast process, leaving 4.28 GiB free against a
+17.28 GiB model. Results looked unremarkable — llama.cpp 25.33 prefill / 2.26 eval, Bigtea 19.58
+/ 1.47, both close to their unpressured numbers.
+
+**That is because the experiment did not work.** The ballast touched its pages once and then
+slept, so Windows paged it straight back out to satisfy llama.cpp's demand. Bigtea, running
+second, then probed 6.66 GiB as "available" — more than the ballast was supposedly holding,
+which is the tell. No pressure was ever applied and these numbers measure nothing. A valid
+version needs `VirtualLock`ed pages, and continuously re-touching them would burn the memory
+bandwidth being measured.
+
+## DeepSeek-V4-Flash UD-Q4_K_XL (144 GB, 5 shards)
 
 | flags | result |
 |---|---|
-| default | **fails**: `ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 147169738752` → `alloc_tensor_range: failed to allocate CPU_REPACK buffer` → `unable to create context` |
-| `--no-repack -c 512` | **runs**: load 12.3s, prompt eval 0.41 tok/s, eval **0.45 tok/s**, correct output |
+| default | **fails**: `failed to allocate buffer of size 147169738752` → `failed to allocate CPU_REPACK buffer` → `unable to create context` |
+| `--no-repack -c 512` | **runs**: load 12.3s, prefill 0.41 tok/s, eval **0.45 tok/s**, correct output |
 
-Output: `The capital of France is Paris.",\n    "The capital of France` (correct, then drifts into
-what looks like JSON training data — expected for a base-ish completion at temp 0 with no
-chat template).
+Bigtea cannot run this model — the architecture is not implemented. **This is the only regime
+where Bigtea's design should win, and it is exactly the one we cannot yet measure.** At 144 GB
+against 15.7 GiB the page cache holds under 8% of the model, so llama.cpp's 4 KiB demand-paged
+faults are competing against Bigtea's ~0.9 MiB sequential direct reads with an explicit
+frequency-based policy. That comparison is the whole thesis and it remains untested.
 
-Bigtea cannot run this model at all — the architecture is not implemented.
+Also worth noting: 0.45 tok/s means a 500-token answer takes 18 minutes. llama.cpp *loads* the
+model; nobody can *work* with it. "Can this machine run it" is answered. "Can this machine run
+it fast enough to code with" is not, by anyone.
 
-## What this means for positioning
+## What was fixed on 2026-08-05, and what each was worth
 
-"Runs models larger than RAM on a small machine" is **not a differentiator**. mmap has done this
-for years; llama.cpp does it for a 144 GB model on a 15.7 GiB laptop today, faster than Bigtea
-does it for a 17 GiB one.
+Every number measured on this machine, before and after.
 
-What remains genuinely different, and is *not yet proven to be better*:
+1. **Expert matmuls ran on one thread.** `compute()` floors its thread count at 1 and the expert
+   path passed 0, so the bulk of the model's arithmetic used one core of twelve.
+   Prefill at 2206 tokens: 11.21 → 18.62 tok/s.
+2. **Expert slices were copied twice per use** — once out of the cache, once into the binder,
+   which took a `Vec` and boxed it. ~1 GiB of memcpy per token for bytes that never change.
+   `WeightSet` now holds `Arc<[u8]>`. Generation: 0.98 → **1.66 tok/s**, and 6s of a 16s run
+   disappeared. This was the single largest win and it was invisible until profiled.
+3. **Experts were re-read per token during prefill.** A 565-token prompt cost 609,665 expert
+   reads and 537 GiB of disk for a model whose experts total 16.35 GiB. Grouping a block's
+   tokens by expert and reading each once: prefill 1.20 → 9.08 tok/s, reads → 42,848,
+   disk → 37.89 GiB.
+4. **The expert cache was hardcoded at 1 GiB** while ~10 GiB of RAM sat unused. Now sized from
+   measured free RAM.
+5. **Cache policy was recency-based, which is the worst possible choice here.** The access
+   pattern is a cyclic scan over 16.35 GiB of experts; when the cycle exceeds the cache, layer 0
+   is always the oldest thing present when layer 47 needs room, so it is evicted just before the
+   next block asks for it. A 6.26 GiB LRU-ish cache returned a **17% hit rate with 20,975
+   evictions** — worse than pinning an arbitrary third would have been for free. Frequency-gated
+   admission (a newcomer must be wanted strictly more often than what it displaces): **70% hits,
+   0 evictions**.
+6. **Single-token generation built 1,152 ggml graphs per token**, one per expert matmul, each a
+   single column wrapped in a 12-thread barrier. With one position all expert outputs are
+   `n_embd x 1`, so they are scaled by routing weights and summed inside one graph — one compute
+   per layer instead of 24.
 
-- **Explicit residency vs. OS page cache.** We pin the always-read weights and stream the rest.
-  llama.cpp lets the kernel decide, so a cold expert read can evict a hot dense weight. Our
-  0.93 GiB vs their 8.87 GiB is real — but a low working set is only a *win* if it buys
-  something the user feels (machine stays responsive, or speed holds at long context).
-- **Untested hypotheses that could become the real claim:**
-  1. Long context — does llama.cpp's advantage survive at 8k/32k, where the page cache thrashes
-     and our KV cache + bounded residency should degrade more gracefully? Not measured.
-  2. Machine responsiveness under load — 8.87 GiB of page cache pressure vs 0.93 GiB. Not measured.
-  3. Concurrent use — can the user keep working while a model runs? Not measured.
+Supporting fixes: arenas computed from actual shapes rather than fixed constants (attention holds
+`n_total * n_new * n_head` floats twice, which blows a 512 MiB arena past ~1.5k tokens and ggml
+*aborts* rather than erroring); `arena_for` reserves 16 MiB not 1 MiB because
+`ggml_graph_compute_with_ctx` allocates the graph object from the same arena and `ggml_new_graph`
+always builds a 2048-node graph (3,060,816 bytes measured); the vocabulary projection runs for
+the last position only (151,936 rows, previously computed for every prompt token to produce
+logits nothing reads).
 
-None of these is established. Until one is, Bigtea is **slower software that solves an
-already-solved problem**, and should be described that way internally.
+Net effect on the same 565-token prompt: prefill **1.20 → 19.92 tok/s (16.6x)**, generation
+**0.88 → 1.48 tok/s**.
+
+## Honest position
+
+- "Runs models larger than RAM" is **not a differentiator**. mmap has done it for years, and
+  llama.cpp does it for a 144 GB model on this laptop today.
+- On a model that nearly fits, llama.cpp is faster and will likely stay faster. The kernel's page
+  cache is elastic and free; our cache is fixed and hand-managed.
+- Bigtea's measured advantage is memory: 7.2 GiB against llama.cpp's 8.87 GiB working set plus
+  page cache. That only matters to a user if it buys responsiveness, which is unmeasured.
+- The one place the design should win — model ≫ RAM, where cache policy dominates and we have
+  direct evidence that frequency beats recency 70% to 17% — cannot be tested until Bigtea runs
+  a model that large.
 
 ## Open questions
 
-- Does the Bigtea/llama.cpp gap invert at long context? This is the single highest-value
-  measurement available and it has not been taken.
-- How much of our 3.3x deficit is the expert cache being useless (<4% of slices) vs. our
-  kernels being slower than llama.cpp's repacked AVX2 paths? Separable: run Bigtea on the
-  dense 4B, where no streaming happens, and compare tok/s there.
-- ~~`--no-repack` costs llama.cpp speed on Qwen3-30B too — if repack is what makes them faster,
-  and repack cannot work above RAM, the honest claim gets sharper.~~ **REFUTED, measured
-  2026-08-05.** llama.cpp with `--no-repack` on Qwen3-30B: eval **3.89 tok/s** (vs 2.83 with
-  repack on). Disabling repack did not hurt them at all. Caveat: this run had the file warm in
-  the page cache from the previous run, which flatters it — but the direction is unambiguous,
-  repack is *not* load-bearing for their advantage. That escape route is closed; our 3.3x
-  deficit is our own kernels and our own I/O, not a flag they get to use and we don't.
+- **The V4-Flash port is now the critical path**, not a nice-to-have. It is the only way to test
+  the thesis. llama.cpp's 0.45 tok/s there is the bar.
+- Does bypassing the page cache still make sense when a model nearly fits? A runner that picked
+  its I/O mode from the model-size-to-RAM ratio would use the kernel's cache when it helps and
+  direct I/O when it would only double-buffer.
+- Our 4 GiB headroom is conservative: Bigtea uses 7.2 GiB where llama.cpp effectively uses ~11.
+  How much of the remaining gap is just that? Untested.
+- Where does generation time go now? At 565 tokens: 3.2s disk, 5.4s expert compute, 1.0s
+  attention, ~3.3s unattributed. The expert compute is single-column matmuls against Q4_K
+  weights — llama.cpp repacks for this and we do not.
