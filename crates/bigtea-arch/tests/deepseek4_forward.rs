@@ -67,6 +67,118 @@ fn rope_layer_0(config: &Deepseek4Config) -> RopeParams {
     rope.params
 }
 
+/// Every checkpoint for one layer, keyed by a layer-agnostic label.
+///
+/// The forward helpers are written once and run for any layer; what changes is
+/// this table and the block index. Keeping the numbers as data rather than as
+/// literals inside the helpers is what makes a second layer nearly free — and
+/// running a second layer is the only way to tell a correct implementation from
+/// one accidentally fitted to layer 0's weights.
+struct LayerSums {
+    il: u32,
+    attn_gates: HcGateSums,
+    ffn_gates: HcGateSums,
+    /// Each routed expert's weighted contribution, checked individually so a
+    /// mis-slotted expert cannot hide inside the total.
+    weighted: [f32; 6],
+    rows: &'static [(&'static str, f32)],
+}
+
+impl LayerSums {
+    /// Panics on an unknown label rather than skipping the check. A typo that
+    /// silently verified nothing would be worse than a failing test.
+    fn get(&self, label: &str) -> f32 {
+        self.rows
+            .iter()
+            .find(|(k, _)| *k == label)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| {
+                panic!("no oracle row labelled {label:?} for layer {}", self.il)
+            })
+    }
+}
+
+/// Assert one checkpoint against the layer's table.
+fn check(s: &LayerSums, label: &str, got: f32) {
+    assert_sum(&format!("{label}-{}", s.il), got, s.get(label));
+}
+
+/// Layer 0, from `v4flash-layer0-oracle-5tok.txt`.
+const LAYER0: LayerSums = LayerSums {
+    il: 0,
+    attn_gates: ATTN_GATE_SUMS,
+    ffn_gates: FFN_GATE_SUMS,
+    weighted: [1.238907, 6.887056, 6.492266, 3.250872, -5.103240, 5.806348],
+    rows: &[("embd", -5.680017), ("hc_init", -22.719982), ("hc_init_norm", -240.102188),
+("hc_mixes_attn", -7549.175781), ("hc_attn_pre", -22.720131), ("norm_attn", -59.969891),
+("attn_norm", -1.357153), ("qr", 0.811234), ("qr_rms", 7.035826), ("qr_norm", -0.110477),
+("q_b", 3.458504), ("q_norm", 157.955597), ("q_nope", -537.884277), ("q_pe_in", 695.835632),
+("q_pe", 4082.126465), ("q", 3544.263184), ("kv_a", 1.867785), ("kv_rms", 19.056290),
+("kv_norm", 10.532839), ("kv_nope", -13.516478), ("kv_pe_in", 24.049295), ("kv_pe", 76.641815),
+("kv", 63.125298), ("cache_k", 63.123978), ("q_perm", 3544.223633), ("flash_attn", 2879.606934),
+("out_nope", -553.160217), ("out_pe_in", 3432.786621), ("rope_back", 28.466785),
+("attn_derope", -524.695190), ("attn_derope_perm", -524.691833), ("attn_wo_a", 134.724960),
+("attn_wo_a_cont", 134.724960), ("attn_out", 255.856689), ("hc_attn_post", -14.514359),
+("post_norm", -77.870285), ("hc_mixes_ffn", -3608.835205), ("hc_ffn_pre", 1.926467),
+("norm_ffn", 61.501854), ("ffn_norm", 11.634495), ("moe_logits", -1176.607300),
+("moe_softplus", 587.096008), ("moe_probs", 792.403992), ("moe_topk", 3688.0),
+("moe_weights", 20.336262), ("moe_weights_sum", 20.336262),
+("moe_weights_sum_clamped", 20.336262), ("moe_weights_norm", 5.000000),
+("moe_weights_scaled", 7.500000), ("shexp_gate", 2518.574707),
+("shexp_gate_clamped", 2518.574707), ("shexp_up", 36.162750), ("shexp_up_clamped", 36.162750),
+("shexp_swiglu", -39.681740), ("shexp", 16.228374), ("moe_gate", -6601.376953),
+("moe_up", -8.613072), ("moe_swiglu", 11.649389), ("moe_down", 89.523140),
+("moe_weighted", 18.572262), ("moe_out", 18.572350), ("ffn_out", 34.800404),
+("l_last", 6.733532), ("next_norm", 1.599161),],
+};
+
+/// Layer 1, from `v4flash-layer1-oracle-5tok.txt`.
+///
+/// No `embd`/`hc_init` rows: layer 1 has no prologue, it consumes layer 0's
+/// `l_last` directly. Asking for one panics, which is the right outcome.
+const LAYER1: LayerSums = LayerSums {
+    il: 1,
+    attn_gates: LAYER1_ATTN_GATE_SUMS,
+    ffn_gates: LAYER1_FFN_GATE_SUMS,
+    weighted: [-3.130055, 3.890552, -1.967723, -5.374112, -17.948400, 6.997021],
+    rows: &[("hc_mixes_attn", -3428.892578), ("hc_attn_pre", -0.132875), ("norm_attn", 7.388832),
+("attn_norm", -0.242196), ("qr", 6.841653), ("qr_rms", 69.162224), ("qr_norm", 2.789355),
+("q_b", -33.388527), ("q_norm", -788.320190), ("q_nope", 2242.772461),
+("q_pe_in", -3031.105957), ("q_pe", -8.882785), ("q", 2233.875488), ("kv_a", -15.869817),
+("kv_rms", -126.332497), ("kv_norm", -106.741287), ("kv_nope", -84.832062),
+("kv_pe_in", -21.909225), ("kv_pe", -28.781113), ("kv", -113.613174),
+("cache_k", -113.621475), ("q_perm", 2233.874023), ("flash_attn", -2656.343018),
+("out_nope", -2504.559814), ("out_pe_in", -151.774292), ("rope_back", -1608.978394),
+("attn_derope", -4113.550781), ("attn_derope_perm", -4113.518555), ("attn_wo_a", 25.395323),
+("attn_wo_a_cont", 25.395643), ("attn_out", 165.457382), ("hc_attn_post", 18.605337),
+("post_norm", 110.003967), ("hc_mixes_ffn", -2718.131592), ("hc_ffn_pre", 9.309790),
+("norm_ffn", 107.963402), ("ffn_norm", 27.486490), ("moe_logits", 23.125708),
+("moe_softplus", 984.889099), ("moe_probs", 1087.419312), ("moe_topk", 3951.0),
+("moe_weights", 25.273024), ("moe_weights_sum", 25.273022),
+("moe_weights_sum_clamped", 25.273022), ("moe_weights_norm", 5.000000),
+("moe_weights_scaled", 7.500000), ("shexp_gate", -1759.062988),
+("shexp_gate_clamped", -1759.062988), ("shexp_up", 12.071652),
+("shexp_up_clamped", 12.071652), ("shexp_swiglu", -57.020535), ("shexp", 36.638653),
+("moe_gate", -3060.197266), ("moe_up", -120.346321), ("moe_swiglu", 11.324850),
+("moe_down", -26.838915), ("moe_weighted", -17.532829), ("moe_out", -17.532742),
+("ffn_out", 19.105911), ("l_last", 23.754854), ("next_norm", 98.961739),],
+};
+
+/// Layer 1's FFN gate block.
+const LAYER1_FFN_GATE_SUMS: HcGateSums = HcGateSums {
+    pre_view: -916.991821,
+    pre_scaled: -80.646713,
+    pre_biased: -116.655891,
+    pre_sigmoid: 4.978212,
+    pre: 4.978231,
+    post_view: -1807.392578,
+    post_scaled: -106.223541,
+    post_biased: -124.776138,
+    post_sigmoid: 1.647393,
+    post: 3.294786,
+    comb: 19.999975,
+};
+
 /// Sums are accumulated over thousands of floats in a different order than
 /// ggml uses, so exact equality is not the right bar. A wrong graph is off by
 /// percent or more, never by 1e-3.
@@ -92,9 +204,10 @@ fn bind_all<'c>(
     model: &Model,
     ctx: &'c Context,
     weights: &mut WeightSet<'c>,
-    names: &[&str],
+    names: &[String],
 ) {
     for name in names {
+        let name = name.as_str();
         let loc = model
             .location(name)
             .unwrap_or_else(|| panic!("{name} present"))
@@ -309,11 +422,11 @@ fn q_projection_matches_llama_cpp() {
         &wctx,
         &mut weights,
         &[
-            "token_embd.weight",
-            "blk.0.attn_norm.weight",
-            "blk.0.attn_q_a.weight",
-            "blk.0.attn_q_a_norm.weight",
-            "blk.0.attn_q_b.weight",
+            "token_embd.weight".to_string(),
+            "blk.0.attn_norm.weight".to_string(),
+            "blk.0.attn_q_a.weight".to_string(),
+            "blk.0.attn_q_a_norm.weight".to_string(),
+            "blk.0.attn_q_b.weight".to_string(),
         ],
     );
 
@@ -381,6 +494,7 @@ fn q_projection_matches_llama_cpp() {
 /// of it; at five tokens the gate differs per token and that shortcut is not
 /// available — which is the better situation, since this runs the actual op.
 fn prologue_5tok<'c>(
+    s: &LayerSums,
     ctx: &'c Context,
     weights: &WeightSet<'c>,
     config: &Deepseek4Config,
@@ -394,7 +508,7 @@ fn prologue_5tok<'c>(
         .get_rows(weights.get("token_embd.weight").expect("bound"), &tok)
         .expect("get_rows");
     ctx.compute(&embd, 12).expect("compute embd");
-    assert_sum("embd", embd.to_vec_f32().iter().sum::<f32>(), -5.680017);
+    check(s, "embd", embd.to_vec_f32().iter().sum::<f32>());
 
     // [n_embd, tokens] -> [n_embd, 1, tokens] -> repeat to [n_embd, hc, tokens].
     let embd_r = ctx
@@ -405,42 +519,64 @@ fn prologue_5tok<'c>(
         .expect("hc_init shape");
     let hc_init = ctx.repeat(&embd_r, &shape).expect("hc_init");
     ctx.compute(&hc_init, 12).expect("compute hc_init");
-    assert_sum("hc_init", hc_init.to_vec_f32().iter().sum::<f32>(), -22.719982);
+    check(s, "hc_init", hc_init.to_vec_f32().iter().sum::<f32>());
 
     let flat = ctx
         .reshape_2d(&hc_init, config.hc_dim() as i64, nt)
         .expect("flatten streams");
     let normed = ctx.rms_norm(&flat, config.rms_eps).expect("rms_norm");
     ctx.compute(&normed, 12).expect("compute norm");
-    assert_sum("node_4 (rms_norm)", normed.to_vec_f32().iter().sum::<f32>(), -240.102188);
+    check(s, "hc_init_norm", normed.to_vec_f32().iter().sum::<f32>());
+
+    layer_entry_5tok(s, ctx, weights, config, &hc_init)
+}
+
+/// A layer's entry: the attention gate block and `attn_norm`, from whatever
+/// residual streams it was handed.
+///
+/// Layer 0 reaches here from the embedding; every other layer reaches it from
+/// the previous layer's `l_last`. That is the *only* structural difference
+/// between the first layer and the rest, which is why it is the seam.
+///
+/// Note the incoming streams are RMS-normed by the caller, because for layers
+/// past the first that norm is the previous layer's last checkpoint
+/// (`next_norm`) and is verified there rather than twice.
+fn layer_entry_5tok<'c>(
+    s: &LayerSums,
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    config: &Deepseek4Config,
+    streams: &Tensor<'c>,
+) -> Prologue5<'c> {
+    let nt = TOKENS_5.len() as i64;
+    let flat = ctx
+        .reshape_2d(streams, config.hc_dim() as i64, nt)
+        .expect("flatten streams");
+    let normed = ctx.rms_norm(&flat, config.rms_eps).expect("rms_norm");
 
     let mixes = ctx
-        .mul_mat(weights.get("blk.0.hc_attn_fn.weight").expect("bound"), &normed)
+        .mul_mat(weights.get(&format!("blk.{}.hc_attn_fn.weight", s.il)).expect("bound"), &normed)
         .expect("hc_mixes");
     ctx.compute(&mixes, 12).expect("compute mixes");
-    assert_sum("hc_mixes", mixes.to_vec_f32().iter().sum::<f32>(), -7549.175781);
+    check(s, "hc_mixes_attn", mixes.to_vec_f32().iter().sum::<f32>());
 
-    let gates = hc_gates(ctx, weights, config, "blk.0.hc_attn", &mixes, ATTN_GATE_SUMS);
+    let gates = hc_gates(ctx, weights, config, &format!("blk.{}.hc_attn", s.il), &mixes, s.attn_gates);
 
-    let collapsed = ctx.dsv4_hc_pre(&hc_init, &gates.pre).expect("dsv4_hc_pre");
+    let collapsed = ctx.dsv4_hc_pre(streams, &gates.pre).expect("dsv4_hc_pre");
     ctx.compute(&collapsed, 12).expect("compute hc_pre op");
-    assert_sum(
-        "hc_attn_pre (fused)",
-        collapsed.to_vec_f32().iter().sum::<f32>(),
-        -22.720131,
-    );
+    check(s, "hc_attn_pre", collapsed.to_vec_f32().iter().sum::<f32>());
 
     let normed = ctx.rms_norm(&collapsed, config.rms_eps).expect("norm");
     ctx.compute(&normed, 12).expect("compute");
-    assert_sum("norm-0", normed.to_vec_f32().iter().sum::<f32>(), -59.969891);
+    check(s, "norm_attn", normed.to_vec_f32().iter().sum::<f32>());
 
     let attn_norm = ctx
-        .mul(&normed, weights.get("blk.0.attn_norm.weight").expect("bound"))
+        .mul(&normed, weights.get(&format!("blk.{}.attn_norm.weight", s.il)).expect("bound"))
         .expect("attn_norm");
     ctx.compute(&attn_norm, 12).expect("compute");
-    assert_sum("attn_norm-0", attn_norm.to_vec_f32().iter().sum::<f32>(), -1.357153);
+    check(s, "attn_norm", attn_norm.to_vec_f32().iter().sum::<f32>());
 
-    Prologue5 { hc_init, attn_norm, gates }
+    Prologue5 { hc_init: *streams, attn_norm, gates }
 }
 
 /// What one `build_hc_pre` call produces.
@@ -466,6 +602,7 @@ struct Prologue5<'c> {
 
 /// The oracle's numbers for one gate block. Two blocks per layer, same
 /// structure, different weights and therefore different sums.
+#[derive(Clone, Copy)]
 struct HcGateSums {
     pre_view: f32,
     pre_scaled: f32,
@@ -638,31 +775,35 @@ fn rope_and_kv_match_llama_cpp_at_five_tokens() {
     let ctx = Context::new(512 << 20).expect("compute context");
     let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
     let mut weights = WeightSet::new();
-    bind_all(&model, &wctx, &mut weights, ATTENTION_WEIGHTS);
+    bind_all(&model, &wctx, &mut weights, &block_weights(0));
 
-    let p = prologue_5tok(&ctx, &weights, &config);
-    let (q_full, kv_full) = q_and_kv_5tok(&ctx, &weights, &config, &p.attn_norm);
-    assert_sum("q-0 (CONCAT)", q_full.to_vec_f32().iter().sum::<f32>(), 3544.263184);
-    assert_sum("kv-0 (CONCAT)", kv_full.to_vec_f32().iter().sum::<f32>(), 63.125298);
+    let s = &LAYER0;
+    let p = prologue_5tok(s, &ctx, &weights, &config);
+    let (q_full, kv_full) = q_and_kv_5tok(s, &ctx, &weights, &config, &p.attn_norm);
+    check(s, "q", q_full.to_vec_f32().iter().sum::<f32>());
+    check(s, "kv", kv_full.to_vec_f32().iter().sum::<f32>());
 }
 
-/// Weights the attention path of layer 0 needs, in one list so the two
-/// multi-token tests cannot drift apart.
-const ATTENTION_WEIGHTS: &[&str] = &[
-    "token_embd.weight",
-    "blk.0.hc_attn_fn.weight",
-    "blk.0.hc_attn_scale.weight",
-    "blk.0.hc_attn_base.weight",
-    "blk.0.attn_norm.weight",
-    "blk.0.attn_q_a.weight",
-    "blk.0.attn_q_a_norm.weight",
-    "blk.0.attn_q_b.weight",
-    "blk.0.attn_kv.weight",
-    "blk.0.attn_kv_a_norm.weight",
-    "blk.0.attn_sinks.weight",
-    "blk.0.attn_output_a.weight",
-    "blk.0.attn_output_b.weight",
-];
+/// Every weight one block needs, for a full layer.
+///
+/// Built per layer rather than listed as `blk.0.*` constants, because running a
+/// second layer is the whole point: the helpers take a block index and this
+/// follows it.
+fn block_weights(il: u32) -> Vec<String> {
+    let mut names = vec!["token_embd.weight".to_string()];
+    for suffix in [
+        "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+        "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
+        "attn_norm", "attn_q_a", "attn_q_a_norm", "attn_q_b",
+        "attn_kv", "attn_kv_a_norm", "attn_sinks",
+        "attn_output_a", "attn_output_b",
+        "ffn_norm", "ffn_gate_inp", "ffn_gate_tid2eid",
+        "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+    ] {
+        names.push(format!("blk.{il}.{suffix}.weight"));
+    }
+    names
+}
 
 /// Q and KV at five tokens, rotation included, checked step by step.
 ///
@@ -670,6 +811,7 @@ const ATTENTION_WEIGHTS: &[&str] = &[
 /// `[head_dim, n_head, tokens]` and `kv` is `[head_dim, 1, tokens]` — one head,
 /// and the same tensor will serve as both K and V.
 fn q_and_kv_5tok<'c>(
+    s: &LayerSums,
     ctx: &'c Context,
     weights: &WeightSet<'c>,
     config: &Deepseek4Config,
@@ -691,33 +833,33 @@ fn q_and_kv_5tok<'c>(
 
     // ---- Q ----
     let qr = ctx
-        .mul_mat(weights.get("blk.0.attn_q_a.weight").expect("bound"), attn_norm)
+        .mul_mat(weights.get(&format!("blk.{}.attn_q_a.weight", s.il)).expect("bound"), attn_norm)
         .expect("qr");
     ctx.compute(&qr, 12).expect("compute");
-    assert_sum("qr-0", qr.to_vec_f32().iter().sum::<f32>(), 0.811234);
+    check(s, "qr", qr.to_vec_f32().iter().sum::<f32>());
 
     let qr_n = ctx.rms_norm(&qr, config.rms_eps).expect("qr rms");
     ctx.compute(&qr_n, 12).expect("compute");
-    assert_sum("norm-0 (qr)", qr_n.to_vec_f32().iter().sum::<f32>(), 7.035826);
+    check(s, "qr_rms", qr_n.to_vec_f32().iter().sum::<f32>());
 
     let qr_norm = ctx
-        .mul(&qr_n, weights.get("blk.0.attn_q_a_norm.weight").expect("bound"))
+        .mul(&qr_n, weights.get(&format!("blk.{}.attn_q_a_norm.weight", s.il)).expect("bound"))
         .expect("qr_norm");
     ctx.compute(&qr_norm, 12).expect("compute");
-    assert_sum("qr_norm-0", qr_norm.to_vec_f32().iter().sum::<f32>(), -0.110477);
+    check(s, "qr_norm", qr_norm.to_vec_f32().iter().sum::<f32>());
 
     let q = ctx
-        .mul_mat(weights.get("blk.0.attn_q_b.weight").expect("bound"), &qr_norm)
+        .mul_mat(weights.get(&format!("blk.{}.attn_q_b.weight", s.il)).expect("bound"), &qr_norm)
         .expect("q");
     ctx.compute(&q, 12).expect("compute");
-    assert_sum("node_19 (q_b)", q.to_vec_f32().iter().sum::<f32>(), 3.458504);
+    check(s, "q_b", q.to_vec_f32().iter().sum::<f32>());
 
     let q3 = ctx
         .reshape_3d(&q, head_dim, config.n_head as i64, nt)
         .expect("reshape q");
     let q_norm = ctx.rms_norm(&q3, config.rms_eps).expect("q_norm");
     ctx.compute(&q_norm, 12).expect("compute");
-    assert_sum("q_norm-0", q_norm.to_vec_f32().iter().sum::<f32>(), 157.955597);
+    check(s, "q_norm", q_norm.to_vec_f32().iter().sum::<f32>());
 
     // The decoupled split. Both views keep the *source's* head stride, so they
     // interleave in memory rather than being two halves of a contiguous buffer;
@@ -734,7 +876,7 @@ fn q_and_kv_5tok<'c>(
         )
         .expect("q_nope");
     ctx.compute(&q_nope, 12).expect("compute q_nope");
-    assert_sum("q_norm-0 (nope view)", q_nope.to_vec_f32().iter().sum::<f32>(), -537.884277);
+    check(s, "q_nope", q_nope.to_vec_f32().iter().sum::<f32>());
 
     let q_pe_in = ctx
         .view_3d(
@@ -749,14 +891,14 @@ fn q_and_kv_5tok<'c>(
         .expect("q_pe view");
     ctx.compute(&q_pe_in, 12).expect("compute q_pe view");
     let unrotated: f32 = q_pe_in.to_vec_f32().iter().sum();
-    assert_sum("q_norm-0 (pe view)", unrotated, 695.835632);
+    check(s, "q_pe_in", unrotated);
 
     let q_pe = ctx
         .rope_ext(&q_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, 0, rope)
         .expect("rope q_pe");
     ctx.compute(&q_pe, 12).expect("compute rope");
     let rotated: f32 = q_pe.to_vec_f32().iter().sum();
-    assert_sum("q_pe-0 (ROPE)", rotated, 4082.126465);
+    check(s, "q_pe", rotated);
 
     // Guard the guard: if a future capture is taken at one token again, the two
     // sums collapse and this assertion is what says so instead of the suite
@@ -773,27 +915,27 @@ fn q_and_kv_5tok<'c>(
     // ---- KV ----
     // One head, and the same tensor serves as K *and* V (deepseek4.cpp:792).
     let kv = ctx
-        .mul_mat(weights.get("blk.0.attn_kv.weight").expect("bound"), attn_norm)
+        .mul_mat(weights.get(&format!("blk.{}.attn_kv.weight", s.il)).expect("bound"), attn_norm)
         .expect("kv");
     ctx.compute(&kv, 12).expect("compute");
-    assert_sum("node_26 (kv_a)", kv.to_vec_f32().iter().sum::<f32>(), 1.867785);
+    check(s, "kv_a", kv.to_vec_f32().iter().sum::<f32>());
 
     let kv_n = ctx.rms_norm(&kv, config.rms_eps).expect("kv rms");
     ctx.compute(&kv_n, 12).expect("compute");
-    assert_sum("norm-0 (kv)", kv_n.to_vec_f32().iter().sum::<f32>(), 19.056290);
+    check(s, "kv_rms", kv_n.to_vec_f32().iter().sum::<f32>());
 
     let kv_norm = ctx
-        .mul(&kv_n, weights.get("blk.0.attn_kv_a_norm.weight").expect("bound"))
+        .mul(&kv_n, weights.get(&format!("blk.{}.attn_kv_a_norm.weight", s.il)).expect("bound"))
         .expect("kv_norm");
     ctx.compute(&kv_norm, 12).expect("compute");
-    assert_sum("node_28 (kv_norm)", kv_norm.to_vec_f32().iter().sum::<f32>(), 10.532839);
+    check(s, "kv_norm", kv_norm.to_vec_f32().iter().sum::<f32>());
 
     let kv3 = ctx.reshape_3d(&kv_norm, head_dim, 1, nt).expect("reshape kv");
     let kv_nope = ctx
         .view_3d(&kv3, n_nope, 1, nt, head_stride, head_stride, 0)
         .expect("kv_nope");
     ctx.compute(&kv_nope, 12).expect("compute kv_nope");
-    assert_sum("kv_norm-0 (nope view)", kv_nope.to_vec_f32().iter().sum::<f32>(), -13.516478);
+    check(s, "kv_nope", kv_nope.to_vec_f32().iter().sum::<f32>());
 
     let kv_pe_in = ctx
         .view_3d(
@@ -807,13 +949,13 @@ fn q_and_kv_5tok<'c>(
         )
         .expect("kv_pe view");
     ctx.compute(&kv_pe_in, 12).expect("compute kv_pe view");
-    assert_sum("kv_norm-0 (pe view)", kv_pe_in.to_vec_f32().iter().sum::<f32>(), 24.049295);
+    check(s, "kv_pe_in", kv_pe_in.to_vec_f32().iter().sum::<f32>());
 
     let kv_pe = ctx
         .rope_ext(&kv_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, 0, rope)
         .expect("rope kv_pe");
     ctx.compute(&kv_pe, 12).expect("compute rope kv");
-    assert_sum("kv_pe-0 (ROPE)", kv_pe.to_vec_f32().iter().sum::<f32>(), 76.641815);
+    check(s, "kv_pe", kv_pe.to_vec_f32().iter().sum::<f32>());
 
     let kv_full = ctx.concat(&kv_nope, &kv_pe, 0).expect("concat kv");
     ctx.compute(&kv_full, 12).expect("compute kv");
@@ -860,11 +1002,11 @@ fn attention_matches_llama_cpp_at_five_tokens() {
     let ctx = Context::new(512 << 20).expect("compute context");
     let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
     let mut weights = WeightSet::new();
-    bind_all(&model, &wctx, &mut weights, ATTENTION_WEIGHTS);
+    bind_all(&model, &wctx, &mut weights, &block_weights(0));
 
-    let p = prologue_5tok(&ctx, &weights, &config);
-    let (q, kv) = q_and_kv_5tok(&ctx, &weights, &config, &p.attn_norm);
-    attention_5tok(&ctx, &weights, &config, &q, &kv);
+    let p = prologue_5tok(&LAYER0, &ctx, &weights, &config);
+    let (q, kv) = q_and_kv_5tok(&LAYER0, &ctx, &weights, &config, &p.attn_norm);
+    attention_5tok(&LAYER0, &ctx, &weights, &config, &q, &kv);
 }
 
 /// **The post hyper-connection**, and the second gate block that feeds the FFN.
@@ -907,33 +1049,14 @@ fn post_hyper_connection_matches_llama_cpp_at_five_tokens() {
     let ctx = Context::new(512 << 20).expect("compute context");
     let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
     let mut weights = WeightSet::new();
-    let mut names: Vec<&str> = ATTENTION_WEIGHTS.to_vec();
-    names.extend_from_slice(FFN_WEIGHTS);
-    bind_all(&model, &wctx, &mut weights, &names);
+    bind_all(&model, &wctx, &mut weights, &block_weights(0));
 
-    let p = prologue_5tok(&ctx, &weights, &config);
-    let (q, kv) = q_and_kv_5tok(&ctx, &weights, &config, &p.attn_norm);
-    let attn_out = attention_5tok(&ctx, &weights, &config, &q, &kv);
+    let p = prologue_5tok(&LAYER0, &ctx, &weights, &config);
+    let (q, kv) = q_and_kv_5tok(&LAYER0, &ctx, &weights, &config, &p.attn_norm);
+    let attn_out = attention_5tok(&LAYER0, &ctx, &weights, &config, &q, &kv);
 
-    let _ = layer_tail_5tok(&ctx, &weights, &config, &p, &attn_out);
+    let _ = layer_tail_5tok(&LAYER0, &ctx, &weights, &config, &p, &attn_out);
 }
-
-/// Weights for the FFN half of the block.
-const FFN_WEIGHTS: &[&str] = &[
-    "blk.0.hc_ffn_fn.weight",
-    "blk.0.hc_ffn_scale.weight",
-    "blk.0.hc_ffn_base.weight",
-    "blk.0.ffn_norm.weight",
-];
-
-/// Router and shared expert. All small — the 256 routed experts are not here.
-const MOE_WEIGHTS: &[&str] = &[
-    "blk.0.ffn_gate_inp.weight",
-    "blk.0.ffn_gate_tid2eid.weight",
-    "blk.0.ffn_gate_shexp.weight",
-    "blk.0.ffn_up_shexp.weight",
-    "blk.0.ffn_down_shexp.weight",
-];
 
 /// `swiglu_clamp_exp[0]` and `swiglu_clamp_shexp[0]`, both 10 in this
 /// container.
@@ -986,18 +1109,15 @@ fn moe_router_and_shared_expert_match_llama_cpp_at_five_tokens() {
     let ctx = Context::new(512 << 20).expect("compute context");
     let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
     let mut weights = WeightSet::new();
-    let mut names: Vec<&str> = ATTENTION_WEIGHTS.to_vec();
-    names.extend_from_slice(FFN_WEIGHTS);
-    names.extend_from_slice(MOE_WEIGHTS);
-    bind_all(&model, &wctx, &mut weights, &names);
+    bind_all(&model, &wctx, &mut weights, &block_weights(0));
 
-    let p = prologue_5tok(&ctx, &weights, &config);
-    let (q, kv) = q_and_kv_5tok(&ctx, &weights, &config, &p.attn_norm);
-    let attn_out = attention_5tok(&ctx, &weights, &config, &q, &kv);
-    let (_streams, ffn_norm, _gates) = layer_tail_5tok(&ctx, &weights, &config, &p, &attn_out);
+    let p = prologue_5tok(&LAYER0, &ctx, &weights, &config);
+    let (q, kv) = q_and_kv_5tok(&LAYER0, &ctx, &weights, &config, &p.attn_norm);
+    let attn_out = attention_5tok(&LAYER0, &ctx, &weights, &config, &q, &kv);
+    let (_streams, ffn_norm, _gates) = layer_tail_5tok(&LAYER0, &ctx, &weights, &config, &p, &attn_out);
 
-    let _ = moe_routing_5tok(&ctx, &weights, &config, &ffn_norm);
-    let _ = shared_expert_5tok(&ctx, &weights, &ffn_norm);
+    let _ = moe_routing_5tok(&LAYER0, &ctx, &weights, &config, &ffn_norm);
+    let _ = shared_expert_5tok(&LAYER0, &ctx, &weights, &ffn_norm);
 }
 
 /// The router: probabilities, the six experts, and their normalised weights.
@@ -1006,6 +1126,7 @@ fn moe_router_and_shared_expert_match_llama_cpp_at_five_tokens() {
 /// ready to multiply the expert outputs, and the expert ids as `mul_mat_id`
 /// wants them.
 fn moe_routing_5tok<'c>(
+    s: &LayerSums,
     ctx: &'c Context,
     weights: &WeightSet<'c>,
     config: &Deepseek4Config,
@@ -1017,22 +1138,18 @@ fn moe_routing_5tok<'c>(
 
     // ---- routing ----
     let logits = ctx
-        .mul_mat(weights.get("blk.0.ffn_gate_inp.weight").expect("bound"), ffn_norm)
+        .mul_mat(weights.get(&format!("blk.{}.ffn_gate_inp.weight", s.il)).expect("bound"), ffn_norm)
         .expect("logits");
     ctx.compute(&logits, 12).expect("compute logits");
-    assert_sum(
-        "ffn_moe_logits-0",
-        logits.to_vec_f32().iter().sum::<f32>(),
-        -1176.607300,
-    );
+    check(s, "moe_logits", logits.to_vec_f32().iter().sum::<f32>());
 
     let sp = ctx.softplus(&logits).expect("softplus");
     ctx.compute(&sp, 12).expect("compute softplus");
-    assert_sum("node_86 (SOFTPLUS)", sp.to_vec_f32().iter().sum::<f32>(), 587.096008);
+    check(s, "moe_softplus", sp.to_vec_f32().iter().sum::<f32>());
 
     let probs = ctx.sqrt(&sp).expect("sqrt");
     ctx.compute(&probs, 12).expect("compute sqrt");
-    assert_sum("ffn_moe_probs-0", probs.to_vec_f32().iter().sum::<f32>(), 792.403992);
+    check(s, "moe_probs", probs.to_vec_f32().iter().sum::<f32>());
 
     // Hash routing: the six experts are a lookup on the token id, and the
     // router never picks anything.
@@ -1040,16 +1157,16 @@ fn moe_routing_5tok<'c>(
     let tok = ctx.new_i32_1d(nt).expect("tok");
     tok.set_i32(&TOKENS_5).expect("set");
     let topk = ctx
-        .get_rows(weights.get("blk.0.ffn_gate_tid2eid.weight").expect("bound"), &tok)
+        .get_rows(weights.get(&format!("blk.{}.ffn_gate_tid2eid.weight", s.il)).expect("bound"), &tok)
         .expect("topk");
     ctx.compute(&topk, 12).expect("compute topk");
     let ids = topk.to_vec_i32();
     assert_eq!(ids.len(), (n_used * nt) as usize, "six experts per token");
-    assert_sum("ffn_moe_topk-0", ids.iter().sum::<i32>() as f32, 3688.0);
+    check(s, "moe_topk", ids.iter().sum::<i32>() as f32);
 
     let w = ctx.get_rows(&probs3, &topk).expect("weights");
     ctx.compute(&w, 12).expect("compute weights");
-    assert_sum("ffn_moe_weights-0", w.to_vec_f32().iter().sum::<f32>(), 20.336262);
+    check(s, "moe_weights", w.to_vec_f32().iter().sum::<f32>());
 
     // Renormalise over the *selected* six, not over all 256. This is the step
     // whose absence is invisible: the weights still sum to something, the model
@@ -1057,24 +1174,16 @@ fn moe_routing_5tok<'c>(
     let w2 = ctx.reshape_2d(&w, n_used, nt).expect("reshape weights");
     let sum = ctx.sum_rows(&w2).expect("sum_rows");
     ctx.compute(&sum, 12).expect("compute sum");
-    assert_sum("ffn_moe_weights_sum-0", sum.to_vec_f32().iter().sum::<f32>(), 20.336262);
+    check(s, "moe_weights_sum", sum.to_vec_f32().iter().sum::<f32>());
 
     // Clamped away from zero at the smallest F16 normal, not at some epsilon.
     let sum_c = ctx.clamp(&sum, 6.103515625e-5, f32::INFINITY).expect("clamp sum");
     ctx.compute(&sum_c, 12).expect("compute clamped sum");
-    assert_sum(
-        "ffn_moe_weights_sum_clamped-0",
-        sum_c.to_vec_f32().iter().sum::<f32>(),
-        20.336262,
-    );
+    check(s, "moe_weights_sum_clamped", sum_c.to_vec_f32().iter().sum::<f32>());
 
     let w_norm = ctx.div(&w2, &sum_c).expect("div");
     ctx.compute(&w_norm, 12).expect("compute norm");
-    assert_sum(
-        "ffn_moe_weights_norm-0",
-        w_norm.to_vec_f32().iter().sum::<f32>(),
-        5.000000,
-    );
+    check(s, "moe_weights_norm", w_norm.to_vec_f32().iter().sum::<f32>());
 
     // Reshaped back to [1, n_used, tokens] *before* the scale, so it can
     // broadcast over each expert's [n_embd] output later.
@@ -1085,11 +1194,7 @@ fn moe_routing_5tok<'c>(
         .scale(&w3, config.expert_weights_scale)
         .expect("scale weights");
     ctx.compute(&w_scaled, 12).expect("compute scaled");
-    assert_sum(
-        "ffn_moe_weights_scaled-0",
-        w_scaled.to_vec_f32().iter().sum::<f32>(),
-        7.500000,
-    );
+    check(s, "moe_weights_scaled", w_scaled.to_vec_f32().iter().sum::<f32>());
 
     (w_scaled, topk)
 }
@@ -1129,29 +1234,57 @@ fn routed_experts_and_layer_output_match_llama_cpp_at_five_tokens() {
     let ctx = Context::new(512 << 20).expect("compute context");
     let wctx = Context::new_no_alloc(16 << 20).expect("weight context");
     let mut weights = WeightSet::new();
-    let mut names: Vec<&str> = ATTENTION_WEIGHTS.to_vec();
-    names.extend_from_slice(FFN_WEIGHTS);
-    names.extend_from_slice(MOE_WEIGHTS);
-    bind_all(&model, &wctx, &mut weights, &names);
+    bind_all(&model, &wctx, &mut weights, &block_weights(0));
 
-    let _ = layer0_5tok(&model, &ctx, &wctx, &mut weights, &config);
+    let _ = layer0_5tok(&LAYER0, &model, &ctx, &wctx, &mut weights, &config);
 }
 
 /// The whole of layer 0, returning `l_last-0` — the four residual streams layer
 /// 1 receives.
 fn layer0_5tok<'c>(
+    s: &LayerSums,
     model: &Model,
     ctx: &'c Context,
     wctx: &'c Context,
     weights: &mut WeightSet<'c>,
     config: &Deepseek4Config,
 ) -> Tensor<'c> {
-    let p = prologue_5tok(ctx, weights, config);
-    let (q, kv) = q_and_kv_5tok(ctx, weights, config, &p.attn_norm);
-    let attn_out = attention_5tok(ctx, weights, config, &q, &kv);
-    let (streams, ffn_norm, gates) = layer_tail_5tok(ctx, weights, config, &p, &attn_out);
-    let (w_scaled, topk) = moe_routing_5tok(ctx, weights, config, &ffn_norm);
-    let shexp = shared_expert_5tok(ctx, weights, &ffn_norm);
+    let p = prologue_5tok(s, ctx, weights, config);
+    layer_body_5tok(s, model, ctx, wctx, weights, config, p)
+}
+
+/// A whole layer that is *not* the first: no embedding, no `hc_init`. It takes
+/// the previous layer's `l_last` as its residual streams and returns its own.
+///
+/// This is what a real forward pass runs 42 times.
+fn layer_5tok<'c>(
+    s: &LayerSums,
+    model: &Model,
+    ctx: &'c Context,
+    wctx: &'c Context,
+    weights: &mut WeightSet<'c>,
+    config: &Deepseek4Config,
+    streams: &Tensor<'c>,
+) -> Tensor<'c> {
+    let p = layer_entry_5tok(s, ctx, weights, config, streams);
+    layer_body_5tok(s, model, ctx, wctx, weights, config, p)
+}
+
+/// Everything after the residual streams exist, shared by every layer.
+fn layer_body_5tok<'c>(
+    s: &LayerSums,
+    model: &Model,
+    ctx: &'c Context,
+    wctx: &'c Context,
+    weights: &mut WeightSet<'c>,
+    config: &Deepseek4Config,
+    p: Prologue5<'c>,
+) -> Tensor<'c> {
+    let (q, kv) = q_and_kv_5tok(s, ctx, weights, config, &p.attn_norm);
+    let attn_out = attention_5tok(s, ctx, weights, config, &q, &kv);
+    let (streams, ffn_norm, gates) = layer_tail_5tok(s, ctx, weights, config, &p, &attn_out);
+    let (w_scaled, topk) = moe_routing_5tok(s, ctx, weights, config, &ffn_norm);
+    let shexp = shared_expert_5tok(s, ctx, weights, &ffn_norm);
 
     let nt = TOKENS_5.len() as i64;
     let n_embd = config.n_embd as i64;
@@ -1176,7 +1309,7 @@ fn layer0_5tok<'c>(
     let mut read_bytes = 0u64;
     let mut dims_of = std::collections::HashMap::new();
     for suffix in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
-        let name = format!("blk.0.{suffix}.weight");
+        let name = format!("blk.{}.{suffix}.weight", s.il);
         let (bytes, dims) = bind_expert_slices(model, wctx, weights, &name, &unique);
         read_bytes += bytes;
         dims_of.insert(suffix, dims);
@@ -1195,7 +1328,9 @@ fn layer0_5tok<'c>(
     let stack = |suffix: &str| {
         let d = &dims_of[suffix];
         ctx.reshape_3d(
-            weights.get(&format!("blk.0.{suffix}.weight")).expect("bound"),
+            weights
+                .get(&format!("blk.{}.{suffix}.weight", s.il))
+                .expect("expert stack bound"),
             d[0] as i64,
             d[1] as i64,
             n_uniq,
@@ -1210,11 +1345,7 @@ fn layer0_5tok<'c>(
         .mul_mat_id(&stack("ffn_gate_exps"), &cur3, &ids_t)
         .expect("moe gate");
     ctx.compute(&gate, 12).expect("compute moe gate");
-    assert_sum(
-        "ffn_moe_gate-0",
-        gate.to_vec_f32().iter().sum::<f32>(),
-        -6601.376953,
-    );
+    check(s, "moe_gate", gate.to_vec_f32().iter().sum::<f32>());
 
     let gate_c = ctx
         .clamp(&gate, f32::NEG_INFINITY, SWIGLU_CLAMP_L0)
@@ -1224,7 +1355,7 @@ fn layer0_5tok<'c>(
         .mul_mat_id(&stack("ffn_up_exps"), &cur3, &ids_t)
         .expect("moe up");
     ctx.compute(&up, 12).expect("compute moe up");
-    assert_sum("ffn_moe_up-0", up.to_vec_f32().iter().sum::<f32>(), -8.613072);
+    check(s, "moe_up", up.to_vec_f32().iter().sum::<f32>());
 
     let up_c = ctx
         .clamp(&up, -SWIGLU_CLAMP_L0, SWIGLU_CLAMP_L0)
@@ -1232,45 +1363,30 @@ fn layer0_5tok<'c>(
 
     let act = ctx.swiglu_split(&gate_c, &up_c).expect("swiglu");
     ctx.compute(&act, 12).expect("compute swiglu");
-    assert_sum(
-        "ffn_moe_swiglu_limited-0",
-        act.to_vec_f32().iter().sum::<f32>(),
-        11.649389,
-    );
+    check(s, "moe_swiglu", act.to_vec_f32().iter().sum::<f32>());
 
     let down = ctx
         .mul_mat_id(&stack("ffn_down_exps"), &act, &ids_t)
         .expect("moe down");
     ctx.compute(&down, 12).expect("compute moe down");
-    assert_sum(
-        "ffn_moe_down-0",
-        down.to_vec_f32().iter().sum::<f32>(),
-        89.523140,
-    );
+    check(s, "moe_down", down.to_vec_f32().iter().sum::<f32>());
 
     // Each expert's output scaled by its router weight, then summed across the
     // six. llama.cpp does this as six strided views and five adds rather than a
     // reduction, so the same shape is used here.
     let weighted = ctx.mul(&down, &w_scaled).expect("weight experts");
     ctx.compute(&weighted, 12).expect("compute weighted");
-    assert_sum(
-        "ffn_moe_weighted-0",
-        weighted.to_vec_f32().iter().sum::<f32>(),
-        18.572262,
-    );
+    check(s, "moe_weighted", weighted.to_vec_f32().iter().sum::<f32>());
 
-    const PER_EXPERT: [f32; 6] = [
-        1.238907, 6.887056, 6.492266, 3.250872, -5.103240, 5.806348,
-    ];
     let row = n_embd as usize * f32_size;
     let mut moe_out: Option<Tensor> = None;
-    for (j, want) in PER_EXPERT.iter().enumerate() {
+    for (j, want) in s.weighted.iter().enumerate() {
         let v = ctx
             .view_2d(&weighted, n_embd, nt, row * n_used as usize, j * row)
             .expect("expert view");
         ctx.compute(&v, 12).expect("compute view");
         assert_sum(
-            &format!("ffn_moe_weighted-0 [{j}]"),
+            &format!("moe_weighted-{}[{j}]", s.il),
             v.to_vec_f32().iter().sum::<f32>(),
             *want,
         );
@@ -1281,20 +1397,12 @@ fn layer0_5tok<'c>(
     }
     let moe_out = moe_out.expect("six experts");
     ctx.compute(&moe_out, 12).expect("compute moe_out");
-    assert_sum(
-        "ffn_moe_out-0",
-        moe_out.to_vec_f32().iter().sum::<f32>(),
-        18.572350,
-    );
+    check(s, "moe_out", moe_out.to_vec_f32().iter().sum::<f32>());
 
     // ---- the shared expert joins, and the layer closes ----
     let ffn_out = ctx.add(&moe_out, &shexp).expect("ffn_out");
     ctx.compute(&ffn_out, 12).expect("compute ffn_out");
-    assert_sum(
-        "ffn_out-0",
-        ffn_out.to_vec_f32().iter().sum::<f32>(),
-        34.800404,
-    );
+    check(s, "ffn_out", ffn_out.to_vec_f32().iter().sum::<f32>());
 
     // The layer's second hyper-connection write-back, using the FFN block's
     // gates — not the attention block's.
@@ -1302,7 +1410,7 @@ fn layer0_5tok<'c>(
         .dsv4_hc_post(&ffn_out, &streams, &gates.post, &gates.comb)
         .expect("dsv4_hc_post");
     ctx.compute(&l_last, 12).expect("compute l_last");
-    assert_sum("l_last-0", l_last.to_vec_f32().iter().sum::<f32>(), 6.733532);
+    check(s, "l_last", l_last.to_vec_f32().iter().sum::<f32>());
 
     // What layer 1 sees. Matching here means the whole of layer 0 is right,
     // since every earlier error would have to cancel exactly to arrive at it.
@@ -1311,11 +1419,7 @@ fn layer0_5tok<'c>(
         .expect("flatten");
     let normed = ctx.rms_norm(&flat, config.rms_eps).expect("rms_norm");
     ctx.compute(&normed, 12).expect("compute node_125");
-    assert_sum(
-        "node_125 (into layer 1)",
-        normed.to_vec_f32().iter().sum::<f32>(),
-        1.599161,
-    );
+    check(s, "next_norm", normed.to_vec_f32().iter().sum::<f32>());
 
     l_last
 }
@@ -1370,89 +1474,33 @@ fn layer_1_chains_from_layer_0_at_five_tokens() {
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
-    let ctx = Context::new(512 << 20).expect("compute context");
+    // Two full layers in one arena. ggml ABORTS the process when its pool is
+    // exhausted -- it does not return an error -- so this is sized up front,
+    // and 512 MiB (enough for one layer) dies partway through layer 1's Q.
+    let ctx = Context::new(1536 << 20).expect("compute context");
     let wctx = Context::new_no_alloc(16 << 20).expect("weight context");
     let mut weights = WeightSet::new();
-    let mut names: Vec<&str> = ATTENTION_WEIGHTS.to_vec();
-    names.extend_from_slice(FFN_WEIGHTS);
-    names.extend_from_slice(MOE_WEIGHTS);
-    names.extend_from_slice(LAYER1_WEIGHTS);
-    bind_all(&model, &wctx, &mut weights, &names);
+    bind_all(&model, &wctx, &mut weights, &block_weights(0));
 
-    let l_last = layer0_5tok(&model, &ctx, &wctx, &mut weights, &config);
+    bind_all(&model, &wctx, &mut weights, &block_weights(1));
+
+    let l_last = layer0_5tok(&LAYER0, &model, &ctx, &wctx, &mut weights, &config);
 
     // Layer 1 is Raw too, so it must take the uncompressed RoPE branch as
-    // well. Asserted rather than assumed: this is the last layer for which
-    // that is true.
+    // well. Asserted rather than assumed: it is the last layer for which that
+    // is true, and every layer after it is compressed.
     assert!(
         !config.uses_compress_rope(1),
         "layer 1 is the second Raw layer and must be uncompressed"
     );
-
-    let nt = TOKENS_5.len() as i64;
-    let flat = ctx
-        .reshape_2d(&l_last, config.hc_dim() as i64, nt)
-        .expect("flatten");
-    let normed = ctx.rms_norm(&flat, config.rms_eps).expect("rms_norm");
-
-    let mixes = ctx
-        .mul_mat(weights.get("blk.1.hc_attn_fn.weight").expect("bound"), &normed)
-        .expect("hc_mixes-1");
-    ctx.compute(&mixes, 12).expect("compute mixes");
-    assert_sum(
-        "hc_mixes-1",
-        mixes.to_vec_f32().iter().sum::<f32>(),
-        -3428.892578,
+    assert_eq!(
+        config.attention_kind_from_ratio(1),
+        Some(bigtea_arch::AttentionKind::Raw)
     );
 
-    let gates = hc_gates(
-        &ctx,
-        &weights,
-        &config,
-        "blk.1.hc_attn",
-        &mixes,
-        LAYER1_ATTN_GATE_SUMS,
-    );
-
-    let collapsed = ctx.dsv4_hc_pre(&l_last, &gates.pre).expect("dsv4_hc_pre");
-    ctx.compute(&collapsed, 12).expect("compute hc_attn_pre-1");
-    assert_sum(
-        "hc_attn_pre-1",
-        collapsed.to_vec_f32().iter().sum::<f32>(),
-        -0.132875,
-    );
-
-    let normed = ctx.rms_norm(&collapsed, config.rms_eps).expect("norm");
-    ctx.compute(&normed, 12).expect("compute");
-    assert_sum("norm-1", normed.to_vec_f32().iter().sum::<f32>(), 7.388832);
-
-    let attn_norm = ctx
-        .mul(&normed, weights.get("blk.1.attn_norm.weight").expect("bound"))
-        .expect("attn_norm-1");
-    ctx.compute(&attn_norm, 12).expect("compute");
-    assert_sum(
-        "attn_norm-1",
-        attn_norm.to_vec_f32().iter().sum::<f32>(),
-        -0.242196,
-    );
-
-    // One matmul into layer 1's own attention, enough to show its weights bind
-    // and resolve correctly across shards.
-    let qr = ctx
-        .mul_mat(weights.get("blk.1.attn_q_a.weight").expect("bound"), &attn_norm)
-        .expect("qr-1");
-    ctx.compute(&qr, 12).expect("compute qr-1");
-    assert_sum("qr-1", qr.to_vec_f32().iter().sum::<f32>(), 6.841653);
+    let s = &LAYER1;
+    let _ = layer_5tok(s, &model, &ctx, &wctx, &mut weights, &config, &l_last);
 }
-
-/// Layer 1's entry weights. The rest of layer 1 is not built yet.
-const LAYER1_WEIGHTS: &[&str] = &[
-    "blk.1.hc_attn_fn.weight",
-    "blk.1.hc_attn_scale.weight",
-    "blk.1.hc_attn_base.weight",
-    "blk.1.attn_norm.weight",
-    "blk.1.attn_q_a.weight",
-];
 
 /// Read just the named experts out of a stacked tensor and bind them as a
 /// compact stack, returning `(bytes read, the compact dims)`.
@@ -1491,52 +1539,45 @@ fn bind_expert_slices<'c>(
 /// Confusing it with the 256 routed ones is the difference between a 7 GiB
 /// resident set and a 144 GiB one.
 fn shared_expert_5tok<'c>(
+    s: &LayerSums,
     ctx: &'c Context,
     weights: &WeightSet<'c>,
     ffn_norm: &Tensor<'c>,
 ) -> Tensor<'c> {
     let gate = ctx
-        .mul_mat(weights.get("blk.0.ffn_gate_shexp.weight").expect("bound"), ffn_norm)
+        .mul_mat(weights.get(&format!("blk.{}.ffn_gate_shexp.weight", s.il)).expect("bound"), ffn_norm)
         .expect("gate");
     ctx.compute(&gate, 12).expect("compute gate");
-    assert_sum("ffn_gate-0", gate.to_vec_f32().iter().sum::<f32>(), 2518.574707);
+    check(s, "shexp_gate", gate.to_vec_f32().iter().sum::<f32>());
 
     // Asymmetric on purpose: upper bound only.
     let gate_c = ctx
         .clamp(&gate, f32::NEG_INFINITY, SWIGLU_CLAMP_L0)
         .expect("clamp gate");
     ctx.compute(&gate_c, 12).expect("compute gate clamped");
-    assert_sum(
-        "ffn_gate_clamped-0",
-        gate_c.to_vec_f32().iter().sum::<f32>(),
-        2518.574707,
-    );
+    check(s, "shexp_gate_clamped", gate_c.to_vec_f32().iter().sum::<f32>());
 
     let up = ctx
-        .mul_mat(weights.get("blk.0.ffn_up_shexp.weight").expect("bound"), ffn_norm)
+        .mul_mat(weights.get(&format!("blk.{}.ffn_up_shexp.weight", s.il)).expect("bound"), ffn_norm)
         .expect("up");
     ctx.compute(&up, 12).expect("compute up");
-    assert_sum("ffn_up-0", up.to_vec_f32().iter().sum::<f32>(), 36.162750);
+    check(s, "shexp_up", up.to_vec_f32().iter().sum::<f32>());
 
     let up_c = ctx
         .clamp(&up, -SWIGLU_CLAMP_L0, SWIGLU_CLAMP_L0)
         .expect("clamp up");
     ctx.compute(&up_c, 12).expect("compute up clamped");
-    assert_sum("ffn_up_clamped-0", up_c.to_vec_f32().iter().sum::<f32>(), 36.162750);
+    check(s, "shexp_up_clamped", up_c.to_vec_f32().iter().sum::<f32>());
 
     let act = ctx.swiglu_split(&gate_c, &up_c).expect("swiglu");
     ctx.compute(&act, 12).expect("compute swiglu");
-    assert_sum(
-        "ffn_swiglu_limited-0",
-        act.to_vec_f32().iter().sum::<f32>(),
-        -39.681740,
-    );
+    check(s, "shexp_swiglu", act.to_vec_f32().iter().sum::<f32>());
 
     let shexp = ctx
-        .mul_mat(weights.get("blk.0.ffn_down_shexp.weight").expect("bound"), &act)
+        .mul_mat(weights.get(&format!("blk.{}.ffn_down_shexp.weight", s.il)).expect("bound"), &act)
         .expect("shexp");
     ctx.compute(&shexp, 12).expect("compute shexp");
-    assert_sum("ffn_shexp-0", shexp.to_vec_f32().iter().sum::<f32>(), 16.228374);
+    check(s, "shexp", shexp.to_vec_f32().iter().sum::<f32>());
 
     shexp
 }
@@ -1547,6 +1588,7 @@ fn shared_expert_5tok<'c>(
 /// layer's second `hc_post` will need, and the normalised input the MoE and the
 /// shared expert both consume.
 fn layer_tail_5tok<'c>(
+    s: &LayerSums,
     ctx: &'c Context,
     weights: &WeightSet<'c>,
     config: &Deepseek4Config,
@@ -1560,11 +1602,7 @@ fn layer_tail_5tok<'c>(
         .dsv4_hc_post(attn_out, &p.hc_init, &p.gates.post, &p.gates.comb)
         .expect("dsv4_hc_post");
     ctx.compute(&streams, 12).expect("compute hc_post");
-    assert_sum(
-        "hc_attn_post-0",
-        streams.to_vec_f32().iter().sum::<f32>(),
-        -14.514359,
-    );
+    check(s, "hc_attn_post", streams.to_vec_f32().iter().sum::<f32>());
 
     // The FFN's gates come from their own matmul over the post-attention
     // stream, against hc_ffn_fn rather than hc_attn_fn.
@@ -1573,33 +1611,29 @@ fn layer_tail_5tok<'c>(
         .expect("flatten streams");
     let normed = ctx.rms_norm(&flat, config.rms_eps).expect("rms_norm");
     ctx.compute(&normed, 12).expect("compute norm");
-    assert_sum("node_65 (rms_norm)", normed.to_vec_f32().iter().sum::<f32>(), -77.870285);
+    check(s, "post_norm", normed.to_vec_f32().iter().sum::<f32>());
 
     let mixes = ctx
-        .mul_mat(weights.get("blk.0.hc_ffn_fn.weight").expect("bound"), &normed)
+        .mul_mat(weights.get(&format!("blk.{}.hc_ffn_fn.weight", s.il)).expect("bound"), &normed)
         .expect("hc_mixes ffn");
     ctx.compute(&mixes, 12).expect("compute mixes");
-    assert_sum("hc_mixes (ffn)", mixes.to_vec_f32().iter().sum::<f32>(), -3608.835205);
+    check(s, "hc_mixes_ffn", mixes.to_vec_f32().iter().sum::<f32>());
 
-    let gates = hc_gates(ctx, weights, config, "blk.0.hc_ffn", &mixes, FFN_GATE_SUMS);
+    let gates = hc_gates(ctx, weights, config, &format!("blk.{}.hc_ffn", s.il), &mixes, s.ffn_gates);
 
     let collapsed = ctx.dsv4_hc_pre(&streams, &gates.pre).expect("dsv4_hc_pre");
     ctx.compute(&collapsed, 12).expect("compute hc_ffn_pre");
-    assert_sum(
-        "hc_ffn_pre-0",
-        collapsed.to_vec_f32().iter().sum::<f32>(),
-        1.926467,
-    );
+    check(s, "hc_ffn_pre", collapsed.to_vec_f32().iter().sum::<f32>());
 
     let normed = ctx.rms_norm(&collapsed, config.rms_eps).expect("norm");
     ctx.compute(&normed, 12).expect("compute");
-    assert_sum("norm-0 (ffn)", normed.to_vec_f32().iter().sum::<f32>(), 61.501854);
+    check(s, "norm_ffn", normed.to_vec_f32().iter().sum::<f32>());
 
     let ffn_norm = ctx
-        .mul(&normed, weights.get("blk.0.ffn_norm.weight").expect("bound"))
+        .mul(&normed, weights.get(&format!("blk.{}.ffn_norm.weight", s.il)).expect("bound"))
         .expect("ffn_norm");
     ctx.compute(&ffn_norm, 12).expect("compute");
-    assert_sum("ffn_norm-0", ffn_norm.to_vec_f32().iter().sum::<f32>(), 11.634495);
+    check(s, "ffn_norm", ffn_norm.to_vec_f32().iter().sum::<f32>());
 
     (streams, ffn_norm, gates)
 }
@@ -1609,6 +1643,7 @@ fn layer_tail_5tok<'c>(
 /// Shared with the layer-tail test, which needs `attn_out` to feed the post
 /// hyper-connection.
 fn attention_5tok<'c>(
+    s: &LayerSums,
     ctx: &'c Context,
     weights: &WeightSet<'c>,
     config: &Deepseek4Config,
@@ -1622,7 +1657,7 @@ fn attention_5tok<'c>(
     // {512, 1, 256} and permuted to {512, 256, 1}.
     const N_KV: i64 = 256;
 
-    let sinks = weights.get("blk.0.attn_sinks.weight").expect("bound");
+    let sinks = weights.get(&format!("blk.{}.attn_sinks.weight", s.il)).expect("bound");
     assert_eq!(sinks.len(), n_head, "one sink per head");
 
     // ---- the K cache, in F16 ----
@@ -1635,11 +1670,7 @@ fn attention_5tok<'c>(
     // its trace reports.
     let mut round_tripped = vec![0f32; cache_f16.len()];
     bigtea_ggml::f16_to_f32(&cache_f16, &mut round_tripped);
-    assert_sum(
-        "cache_k_l0 (F16)",
-        round_tripped.iter().sum::<f32>(),
-        63.123978,
-    );
+    check(s, "cache_k", round_tripped.iter().sum::<f32>());
 
     let k = ctx.new_f16_3d(head_dim, N_KV, 1).expect("k cache");
     let bytes: Vec<u8> = cache_f16.iter().flat_map(|h| h.to_le_bytes()).collect();
@@ -1669,11 +1700,7 @@ fn attention_5tok<'c>(
     // [head_dim, tokens, n_head], so dims 1 and 2 swap.
     let q_perm = ctx.permute(q_full, [0, 2, 1, 3]).expect("permute q");
     ctx.compute(&q_perm, 12).expect("compute q_perm");
-    assert_sum(
-        "q-0 (permuted)",
-        q_perm.to_vec_f32().iter().sum::<f32>(),
-        3544.223633,
-    );
+    check(s, "q_perm", q_perm.to_vec_f32().iter().sum::<f32>());
 
     // scale is 1/sqrt(n_embd_head) over the *full* 512, not the 448 unrotated
     // dims (deepseek4.cpp:1063).
@@ -1682,11 +1709,7 @@ fn attention_5tok<'c>(
         .flash_attn_ext_with_sinks(&q_perm, &k, &k, &mask, sinks, scale)
         .expect("flash_attn_ext");
     ctx.compute(&out, 12).expect("compute attention");
-    assert_sum(
-        "node_41 (FLASH_ATTN_EXT)",
-        out.to_vec_f32().iter().sum::<f32>(),
-        2879.606934,
-    );
+    check(s, "flash_attn", out.to_vec_f32().iter().sum::<f32>());
 
     // Prove the sinks are load-bearing rather than assume it. `add_sinks`
     // mutates a node and returns nothing, so a binding that silently did
@@ -1727,11 +1750,7 @@ fn attention_5tok<'c>(
         .view_3d(&out3, n_nope, n_head, nt, head_stride, head_stride * n_head as usize, 0)
         .expect("out_nope");
     ctx.compute(&out_nope, 12).expect("compute out_nope");
-    assert_sum(
-        "attn_raw-0 (nope view)",
-        out_nope.to_vec_f32().iter().sum::<f32>(),
-        -553.160217,
-    );
+    check(s, "out_nope", out_nope.to_vec_f32().iter().sum::<f32>());
 
     let out_pe_in = ctx
         .view_3d(
@@ -1745,11 +1764,7 @@ fn attention_5tok<'c>(
         )
         .expect("out_pe view");
     ctx.compute(&out_pe_in, 12).expect("compute out_pe view");
-    assert_sum(
-        "attn_raw-0 (pe view)",
-        out_pe_in.to_vec_f32().iter().sum::<f32>(),
-        3432.786621,
-    );
+    check(s, "out_pe_in", out_pe_in.to_vec_f32().iter().sum::<f32>());
 
     // The inverse rotation, with exactly the parameters the forward one used.
     // 3432.8 -> 28.5 is not a small correction, and a forward rope here instead
@@ -1758,19 +1773,11 @@ fn attention_5tok<'c>(
         .rope_ext_back(&out_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, 0, rope)
         .expect("rope_back");
     ctx.compute(&out_pe, 12).expect("compute rope_back");
-    assert_sum(
-        "node_47 (ROPE_BACK)",
-        out_pe.to_vec_f32().iter().sum::<f32>(),
-        28.466785,
-    );
+    check(s, "rope_back", out_pe.to_vec_f32().iter().sum::<f32>());
 
     let derope = ctx.concat(&out_nope, &out_pe, 0).expect("concat derope");
     ctx.compute(&derope, 12).expect("compute derope");
-    assert_sum(
-        "attn_derope-0",
-        derope.to_vec_f32().iter().sum::<f32>(),
-        -524.695190,
-    );
+    check(s, "attn_derope", derope.to_vec_f32().iter().sum::<f32>());
 
     // The output projection is grouped: `attn_output_a` ships 2-D as
     // [4096, 8192] and is *used* as [4096, o_lora_rank, 8] — a batched matmul
@@ -1785,19 +1792,15 @@ fn attention_5tok<'c>(
         .expect("reshape groups");
     let derope_p = ctx.permute(&derope_g, [0, 2, 1, 3]).expect("permute groups");
     ctx.compute(&derope_p, 12).expect("compute permuted");
-    assert_sum(
-        "attn_derope-0 (permuted)",
-        derope_p.to_vec_f32().iter().sum::<f32>(),
-        -524.691833,
-    );
+    check(s, "attn_derope_perm", derope_p.to_vec_f32().iter().sum::<f32>());
 
-    let wo_a = weights.get("blk.0.attn_output_a.weight").expect("bound");
+    let wo_a = weights.get(&format!("blk.{}.attn_output_a.weight", s.il)).expect("bound");
     let wo_a3 = ctx
         .reshape_3d(wo_a, group_dim, o_lora, n_groups)
         .expect("reshape wo_a");
     let oa = ctx.mul_mat(&wo_a3, &derope_p).expect("attn_wo_a");
     ctx.compute(&oa, 12).expect("compute wo_a");
-    assert_sum("attn_wo_a-0", oa.to_vec_f32().iter().sum::<f32>(), 134.724960);
+    check(s, "attn_wo_a", oa.to_vec_f32().iter().sum::<f32>());
 
     let oa_p = ctx.permute(&oa, [0, 2, 1, 3]).expect("permute oa");
     let oa_c = ctx.cont(&oa_p).expect("cont oa");
@@ -1805,21 +1808,13 @@ fn attention_5tok<'c>(
         .reshape_2d(&oa_c, o_lora * n_groups, nt)
         .expect("flatten oa");
     ctx.compute(&oa_2d, 12).expect("compute oa");
-    assert_sum(
-        "attn_wo_a-0 (cont)",
-        oa_2d.to_vec_f32().iter().sum::<f32>(),
-        134.724960,
-    );
+    check(s, "attn_wo_a_cont", oa_2d.to_vec_f32().iter().sum::<f32>());
 
     let attn_out = ctx
-        .mul_mat(weights.get("blk.0.attn_output_b.weight").expect("bound"), &oa_2d)
+        .mul_mat(weights.get(&format!("blk.{}.attn_output_b.weight", s.il)).expect("bound"), &oa_2d)
         .expect("attn_out");
     ctx.compute(&attn_out, 12).expect("compute attn_out");
-    assert_sum(
-        "attn_out-0",
-        attn_out.to_vec_f32().iter().sum::<f32>(),
-        255.856689,
-    );
+    check(s, "attn_out", attn_out.to_vec_f32().iter().sum::<f32>());
 
     attn_out
 }
