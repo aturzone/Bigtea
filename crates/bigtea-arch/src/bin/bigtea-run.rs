@@ -22,7 +22,10 @@ fn main() -> ExitCode {
     };
     let mut prompt = String::new();
     let mut n_predict = 8usize;
-    let mut prefill_block = 256usize;
+    // 512 measured faster than 256 at every prompt length tried: a block reads
+    // nearly the whole expert set whatever its size, so larger blocks amortise
+    // that over more tokens.
+    let mut prefill_block = 512usize;
     let mut cache_budget: Option<u64> = None;
     let rest: Vec<String> = args.collect();
     let mut i = 0;

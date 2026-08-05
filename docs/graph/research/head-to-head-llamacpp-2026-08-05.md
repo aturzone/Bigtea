@@ -132,6 +132,31 @@ logits nothing reads).
 Net effect on the same 565-token prompt: prefill **1.20 → 19.92 tok/s (16.6x)**, generation
 **0.88 → 1.48 tok/s**.
 
+## Expert cache size sweep — more cache is not better
+
+2206-token prompt, 8 generated, `--cache` forced. Same machine, ~11.5 GiB free.
+
+| cache | hit rate | disk read | prefill tok/s | eval tok/s |
+|---|---|---|---|---|
+| 1 GiB  | 8%  | 56.27 GiB | 21.85 | 0.92 |
+| 3 GiB  | 23% | 47.53 GiB | 22.13 | 1.02 |
+| **6 GiB** | 41% | 36.21 GiB | **23.17** | **1.08** |
+| 9 GiB  | 61% | 24.54 GiB | 17.59 | 0.95 |
+| 11 GiB | 71% | 17.84 GiB | 13.95 | 0.76 |
+
+Hit rate rises monotonically and disk traffic falls by 3.2x across the range — and past 6 GiB
+the runner gets *slower*, ending 40% down on prefill at its best-ever hit rate. **The cache wins
+the metric it optimises and loses the one that matters.**
+
+The cause is that beyond ~6 GiB we are bidding against the OS for the same pages. Our cached
+bytes get paged out, so a "hit" returns memory the kernel has to fault back in from disk — a
+disk read with extra bookkeeping, counted as a hit. Hit rate stops being a proxy for speed the
+moment the cache does not fit in physical RAM.
+
+This validates the 4 GiB headroom default, which produces a 6.26 GiB cache on this machine —
+within noise of the measured optimum. It also means **hit rate must never be reported as a
+success metric on its own**; only tok/s at a given footprint says anything.
+
 ## Honest position
 
 - "Runs models larger than RAM" is **not a differentiator**. mmap has done it for years, and
