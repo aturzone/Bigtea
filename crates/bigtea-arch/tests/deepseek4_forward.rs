@@ -420,7 +420,7 @@ fn prologue_5tok<'c>(
     ctx.compute(&mixes, 12).expect("compute mixes");
     assert_sum("hc_mixes", mixes.to_vec_f32().iter().sum::<f32>(), -7549.175781);
 
-    let gates = hc_gates(ctx, weights, config, "hc_attn", &mixes, ATTN_GATE_SUMS);
+    let gates = hc_gates(ctx, weights, config, "blk.0.hc_attn", &mixes, ATTN_GATE_SUMS);
 
     let collapsed = ctx.dsv4_hc_pre(&hc_init, &gates.pre).expect("dsv4_hc_pre");
     ctx.compute(&collapsed, 12).expect("compute hc_pre op");
@@ -523,7 +523,7 @@ fn hc_gates<'c>(
     ctx: &'c Context,
     weights: &WeightSet<'c>,
     config: &Deepseek4Config,
-    block: &str,
+    prefix: &str,
     mixes: &Tensor<'c>,
     want: HcGateSums,
 ) -> HcGates<'c> {
@@ -537,8 +537,8 @@ fn hc_gates<'c>(
     // pinned this.
     let mix_stride = ((2 + hc) * hc) as usize * f32_size;
 
-    let scale_w = weights.get(&format!("blk.0.{block}_scale.weight")).expect("scale bound");
-    let base_w = weights.get(&format!("blk.0.{block}_base.weight")).expect("base bound");
+    let scale_w = weights.get(&format!("{prefix}_scale.weight")).expect("scale bound");
+    let base_w = weights.get(&format!("{prefix}_base.weight")).expect("base bound");
 
     // One gate: view the mixes slice, affine it, sigmoid, then its own tail.
     let gate = |label: &str, mix_off: i64, scale_idx: i64, base_off: i64,
@@ -1134,12 +1134,24 @@ fn routed_experts_and_layer_output_match_llama_cpp_at_five_tokens() {
     names.extend_from_slice(MOE_WEIGHTS);
     bind_all(&model, &wctx, &mut weights, &names);
 
-    let p = prologue_5tok(&ctx, &weights, &config);
-    let (q, kv) = q_and_kv_5tok(&ctx, &weights, &config, &p.attn_norm);
-    let attn_out = attention_5tok(&ctx, &weights, &config, &q, &kv);
-    let (streams, ffn_norm, gates) = layer_tail_5tok(&ctx, &weights, &config, &p, &attn_out);
-    let (w_scaled, topk) = moe_routing_5tok(&ctx, &weights, &config, &ffn_norm);
-    let shexp = shared_expert_5tok(&ctx, &weights, &ffn_norm);
+    let _ = layer0_5tok(&model, &ctx, &wctx, &mut weights, &config);
+}
+
+/// The whole of layer 0, returning `l_last-0` — the four residual streams layer
+/// 1 receives.
+fn layer0_5tok<'c>(
+    model: &Model,
+    ctx: &'c Context,
+    wctx: &'c Context,
+    weights: &mut WeightSet<'c>,
+    config: &Deepseek4Config,
+) -> Tensor<'c> {
+    let p = prologue_5tok(ctx, weights, config);
+    let (q, kv) = q_and_kv_5tok(ctx, weights, config, &p.attn_norm);
+    let attn_out = attention_5tok(ctx, weights, config, &q, &kv);
+    let (streams, ffn_norm, gates) = layer_tail_5tok(ctx, weights, config, &p, &attn_out);
+    let (w_scaled, topk) = moe_routing_5tok(ctx, weights, config, &ffn_norm);
+    let shexp = shared_expert_5tok(ctx, weights, &ffn_norm);
 
     let nt = TOKENS_5.len() as i64;
     let n_embd = config.n_embd as i64;
@@ -1165,7 +1177,7 @@ fn routed_experts_and_layer_output_match_llama_cpp_at_five_tokens() {
     let mut dims_of = std::collections::HashMap::new();
     for suffix in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
         let name = format!("blk.0.{suffix}.weight");
-        let (bytes, dims) = bind_expert_slices(&model, &wctx, &mut weights, &name, &unique);
+        let (bytes, dims) = bind_expert_slices(model, wctx, weights, &name, &unique);
         read_bytes += bytes;
         dims_of.insert(suffix, dims);
     }
@@ -1304,7 +1316,143 @@ fn routed_experts_and_layer_output_match_llama_cpp_at_five_tokens() {
         normed.to_vec_f32().iter().sum::<f32>(),
         1.599161,
     );
+
+    l_last
 }
+
+/// Layer 1's own attention gates, from `v4flash-layer1-oracle-5tok.txt`.
+const LAYER1_ATTN_GATE_SUMS: HcGateSums = HcGateSums {
+    pre_view: -11.962343,
+    pre_scaled: -1.086020,
+    pre_biased: -25.837482,
+    pre_sigmoid: 5.607750,
+    pre: 5.607770,
+    post_view: -3115.966064,
+    post_scaled: -94.570992,
+    post_biased: -370.218567,
+    post_sigmoid: 0.104725,
+    post: 0.209451,
+    comb: 19.999981,
+};
+
+/// **Layer 1 begins, which is the only evidence that layers compose.**
+///
+/// Oracle rows, from `v4flash-layer1-oracle-5tok.txt`:
+/// ```text
+/// hc_mixes-1     MUL_MAT      {24, 5}     -3428.892578
+/// hc_pre-1       SCALE        {4, 5}          5.607770
+/// hc_attn_pre-1  DSV4_HC_PRE  {4096, 5}      -0.132875
+/// norm-1         RMS_NORM     {4096, 5}       7.388832
+/// attn_norm-1    MUL          {4096, 5}      -0.242196
+/// qr-1           MUL_MAT      {1024, 5}       6.841653
+/// ```
+///
+/// Everything before this test verified *layer 0*. That is a weaker claim than
+/// it sounds, for two reasons this test closes:
+///
+/// 1. **Composition.** Layer 1 has no embedding and no `hc_init` — it consumes
+///    layer 0's `l_last-0` directly. Its first matmul is against `node_125`,
+///    the RMS-norm of that. If layer 0's output were wrong anywhere, nothing
+///    here could match, so `hc_mixes-1` is a single number standing in for the
+///    correctness of the entire preceding layer.
+/// 2. **The code is not fitted to layer 0's weights.** Layer 1 is the *second*
+///    `Raw` layer — confirmed two ways, `compress_ratios` having exactly two
+///    zeros and exactly two blocks carrying neither compressor nor indexer — so
+///    it runs the same path with entirely different numbers. An implementation
+///    that happened to suit layer 0 has nowhere to hide.
+///
+/// Layer 1's own `hc_attn_scale` is 0.090787 against layer 0's 2.076026, and
+/// its gates sum to 5.607770 rather than 20.000015, so these really are
+/// different weights and not the same rows under another name.
+#[test]
+#[ignore = "reads weights from a 144 GB container"]
+fn layer_1_chains_from_layer_0_at_five_tokens() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+
+    let ctx = Context::new(512 << 20).expect("compute context");
+    let wctx = Context::new_no_alloc(16 << 20).expect("weight context");
+    let mut weights = WeightSet::new();
+    let mut names: Vec<&str> = ATTENTION_WEIGHTS.to_vec();
+    names.extend_from_slice(FFN_WEIGHTS);
+    names.extend_from_slice(MOE_WEIGHTS);
+    names.extend_from_slice(LAYER1_WEIGHTS);
+    bind_all(&model, &wctx, &mut weights, &names);
+
+    let l_last = layer0_5tok(&model, &ctx, &wctx, &mut weights, &config);
+
+    // Layer 1 is Raw too, so it must take the uncompressed RoPE branch as
+    // well. Asserted rather than assumed: this is the last layer for which
+    // that is true.
+    assert!(
+        !config.uses_compress_rope(1),
+        "layer 1 is the second Raw layer and must be uncompressed"
+    );
+
+    let nt = TOKENS_5.len() as i64;
+    let flat = ctx
+        .reshape_2d(&l_last, config.hc_dim() as i64, nt)
+        .expect("flatten");
+    let normed = ctx.rms_norm(&flat, config.rms_eps).expect("rms_norm");
+
+    let mixes = ctx
+        .mul_mat(weights.get("blk.1.hc_attn_fn.weight").expect("bound"), &normed)
+        .expect("hc_mixes-1");
+    ctx.compute(&mixes, 12).expect("compute mixes");
+    assert_sum(
+        "hc_mixes-1",
+        mixes.to_vec_f32().iter().sum::<f32>(),
+        -3428.892578,
+    );
+
+    let gates = hc_gates(
+        &ctx,
+        &weights,
+        &config,
+        "blk.1.hc_attn",
+        &mixes,
+        LAYER1_ATTN_GATE_SUMS,
+    );
+
+    let collapsed = ctx.dsv4_hc_pre(&l_last, &gates.pre).expect("dsv4_hc_pre");
+    ctx.compute(&collapsed, 12).expect("compute hc_attn_pre-1");
+    assert_sum(
+        "hc_attn_pre-1",
+        collapsed.to_vec_f32().iter().sum::<f32>(),
+        -0.132875,
+    );
+
+    let normed = ctx.rms_norm(&collapsed, config.rms_eps).expect("norm");
+    ctx.compute(&normed, 12).expect("compute");
+    assert_sum("norm-1", normed.to_vec_f32().iter().sum::<f32>(), 7.388832);
+
+    let attn_norm = ctx
+        .mul(&normed, weights.get("blk.1.attn_norm.weight").expect("bound"))
+        .expect("attn_norm-1");
+    ctx.compute(&attn_norm, 12).expect("compute");
+    assert_sum(
+        "attn_norm-1",
+        attn_norm.to_vec_f32().iter().sum::<f32>(),
+        -0.242196,
+    );
+
+    // One matmul into layer 1's own attention, enough to show its weights bind
+    // and resolve correctly across shards.
+    let qr = ctx
+        .mul_mat(weights.get("blk.1.attn_q_a.weight").expect("bound"), &attn_norm)
+        .expect("qr-1");
+    ctx.compute(&qr, 12).expect("compute qr-1");
+    assert_sum("qr-1", qr.to_vec_f32().iter().sum::<f32>(), 6.841653);
+}
+
+/// Layer 1's entry weights. The rest of layer 1 is not built yet.
+const LAYER1_WEIGHTS: &[&str] = &[
+    "blk.1.hc_attn_fn.weight",
+    "blk.1.hc_attn_scale.weight",
+    "blk.1.hc_attn_base.weight",
+    "blk.1.attn_norm.weight",
+    "blk.1.attn_q_a.weight",
+];
 
 /// Read just the named experts out of a stacked tensor and bind them as a
 /// compact stack, returning `(bytes read, the compact dims)`.
@@ -1433,7 +1581,7 @@ fn layer_tail_5tok<'c>(
     ctx.compute(&mixes, 12).expect("compute mixes");
     assert_sum("hc_mixes (ffn)", mixes.to_vec_f32().iter().sum::<f32>(), -3608.835205);
 
-    let gates = hc_gates(ctx, weights, config, "hc_ffn", &mixes, FFN_GATE_SUMS);
+    let gates = hc_gates(ctx, weights, config, "blk.0.hc_ffn", &mixes, FFN_GATE_SUMS);
 
     let collapsed = ctx.dsv4_hc_pre(&streams, &gates.pre).expect("dsv4_hc_pre");
     ctx.compute(&collapsed, 12).expect("compute hc_ffn_pre");

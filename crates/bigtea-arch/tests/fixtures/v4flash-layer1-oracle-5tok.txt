@@ -1,0 +1,144 @@
+# DeepSeek-V4-Flash LAYER 1 reference at five tokens, same capture as
+# v4flash-layer0-oracle-5tok.txt:
+#
+#   llama-eval-callback -m DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf \
+#     -p "The capital of France is" --no-repack -c 512 -t 12
+#
+# Format: name|op|shape|sum
+#
+# WHY LAYER 1 IS WORTH HAVING
+#
+# Layer 1 is the *second* of the two Raw (uncompressed) layers -- confirmed two
+# ways: compress_ratios has exactly two zeros, and exactly two blocks carry
+# neither attn_compressor_* nor indexer.*. So it exercises the same code path as
+# layer 0 with entirely different weights, which is the only way to tell a
+# correct implementation from one accidentally fitted to layer 0's numbers.
+#
+# It also proves composition. Layer 1 has no embedding and no hc_init: it
+# consumes layer 0's l_last-0 directly, and its first row below is a matmul
+# against node_125, the RMS-norm of that. If layer 0's output were wrong in any
+# way, nothing here could match.
+#
+# Layer 1 is also a hash-routing layer (blk.1.ffn_gate_tid2eid exists), like
+# layers 0 and 2.
+hc_mixes-1|MUL_MAT|{24, 5, 1, 1}|-3428.892578
+hc_mixes-1 (view)|VIEW|{4, 5, 1, 1}|-11.962343
+blk.1.hc_attn_scale.weight (view)|VIEW|{1, 1, 1, 1}|0.090787
+node_129|MUL|{4, 5, 1, 1}|-1.086020
+blk.1.hc_attn_base.weight (view)|VIEW|{4, 1, 1, 1}|-4.950293
+node_131|ADD|{4, 5, 1, 1}|-25.837482
+node_132|SIGMOID|{4, 5, 1, 1}|5.607750
+hc_pre-1|SCALE|{4, 5, 1, 1}|5.607770
+hc_attn_pre-1|DSV4_HC_PRE|{4096, 5, 1, 1}|-0.132875
+norm-1|RMS_NORM|{4096, 5, 1, 1}|7.388832
+attn_norm-1|MUL|{4096, 5, 1, 1}|-0.242196
+qr-1|MUL_MAT|{1024, 5, 1, 1}|6.841653
+norm-1|RMS_NORM|{1024, 5, 1, 1}|69.162224
+qr_norm-1|MUL|{1024, 5, 1, 1}|2.789355
+node_140|MUL_MAT|{32768, 5, 1, 1}|-33.388527
+(reshaped)|RESHAPE|{512, 64, 5, 1}|-33.388527
+q_norm-1|RMS_NORM|{512, 64, 5, 1}|-788.320190
+q_norm-1 (view)|VIEW|{448, 64, 5, 1}|2242.772461
+q_norm-1 (view)|VIEW|{64, 64, 5, 1}|-3031.105957
+q_pe-1|ROPE|{64, 64, 5, 1}|-8.882785
+q-1|CONCAT|{512, 64, 5, 1}|2233.875488
+node_147|MUL_MAT|{512, 5, 1, 1}|-15.869817
+norm-1|RMS_NORM|{512, 5, 1, 1}|-126.332497
+node_149|MUL|{512, 5, 1, 1}|-106.741287
+kv_norm-1|RESHAPE|{512, 1, 5, 1}|-106.741287
+kv_norm-1 (view)|VIEW|{448, 1, 5, 1}|-84.832062
+kv_norm-1 (view)|VIEW|{64, 1, 5, 1}|-21.909225
+kv_pe-1|ROPE|{64, 1, 5, 1}|-28.781113
+kv-1|CONCAT|{512, 1, 5, 1}|-113.613174
+kv-1 (view)|VIEW|{512, 5, 1, 1}|-113.613174
+cache_k_l1 (view)|SET_ROWS|{512, 512, 1, 1}|-113.621475
+q-1 (view)|VIEW|{512, 64, 5, 1}|2233.875488
+q-1 (view) (permuted)|PERMUTE|{512, 5, 64, 1}|2233.874023
+cache_k_l1 (view)|VIEW|{512, 1, 256, 1}|-113.621475
+cache_k_l1 (view) (permuted)|PERMUTE|{512, 256, 1, 1}|-113.621475
+cache_k_l1 (view) (permuted)|PERMUTE|{512, 256, 1, 1}|-113.621475
+node_162|FLASH_ATTN_EXT|{512, 64, 5, 1}|-2656.343018
+attn_raw-1|RESHAPE|{32768, 5, 1, 1}|-2656.343018
+attn_raw-1 (reshaped)|RESHAPE|{512, 64, 5, 1}|-2656.343018
+attn_raw-1 (reshaped) (view)|VIEW|{448, 64, 5, 1}|-2504.559814
+attn_raw-1 (reshaped) (view)|VIEW|{64, 64, 5, 1}|-151.774292
+node_168|ROPE_BACK|{64, 64, 5, 1}|-1608.978394
+attn_derope-1|CONCAT|{512, 64, 5, 1}|-4113.550781
+attn_derope-1 (reshaped)|RESHAPE|{4096, 8, 5, 1}|-4113.550781
+attn_derope-1 (reshaped) (permuted)|PERMUTE|{4096, 5, 8, 1}|-4113.518555
+attn_wo_a-1|MUL_MAT|{1024, 5, 8, 1}|25.395323
+attn_wo_a-1 (permuted)|PERMUTE|{1024, 8, 5, 1}|25.395643
+attn_wo_a-1 (permuted) (cont)|CONT|{8192, 5, 1, 1}|25.395643
+attn_out-1|MUL_MAT|{4096, 5, 1, 1}|165.457382
+hc_mixes-1 (view)|VIEW|{4, 5, 1, 1}|-3115.966064
+blk.1.hc_attn_scale.weight (view)|VIEW|{1, 1, 1, 1}|0.030350
+node_178|MUL|{4, 5, 1, 1}|-94.570992
+blk.1.hc_attn_base.weight (view)|VIEW|{4, 1, 1, 1}|-55.129509
+node_180|ADD|{4, 5, 1, 1}|-370.218567
+node_181|SIGMOID|{4, 5, 1, 1}|0.104725
+hc_post-1|SCALE|{4, 5, 1, 1}|0.209451
+hc_comb-1|DSV4_HC_COMB|{4, 4, 5, 1}|19.999981
+hc_attn_post-1|DSV4_HC_POST|{4096, 4, 5, 1}|18.605337
+hc_attn_post-1 (reshaped)|RESHAPE|{16384, 5, 1, 1}|18.605337
+node_186|RMS_NORM|{16384, 5, 1, 1}|110.003967
+hc_mixes-1|MUL_MAT|{24, 5, 1, 1}|-2718.131592
+hc_mixes-1 (view)|VIEW|{4, 5, 1, 1}|-1807.392578
+blk.1.hc_ffn_scale.weight (view)|VIEW|{1, 1, 1, 1}|0.058772
+node_190|MUL|{4, 5, 1, 1}|-106.223541
+blk.1.hc_ffn_base.weight (view)|VIEW|{4, 1, 1, 1}|-3.710519
+node_192|ADD|{4, 5, 1, 1}|-124.776138
+node_193|SIGMOID|{4, 5, 1, 1}|1.647393
+hc_post-1|SCALE|{4, 5, 1, 1}|3.294786
+hc_comb-1|DSV4_HC_COMB|{4, 4, 5, 1}|19.999975
+hc_mixes-1 (view)|VIEW|{4, 5, 1, 1}|-916.991821
+blk.1.hc_ffn_scale.weight (view)|VIEW|{1, 1, 1, 1}|0.087947
+node_198|MUL|{4, 5, 1, 1}|-80.646713
+blk.1.hc_ffn_base.weight (view)|VIEW|{4, 1, 1, 1}|-7.201834
+node_200|ADD|{4, 5, 1, 1}|-116.655891
+node_201|SIGMOID|{4, 5, 1, 1}|4.978212
+hc_pre-1|SCALE|{4, 5, 1, 1}|4.978231
+hc_ffn_pre-1|DSV4_HC_PRE|{4096, 5, 1, 1}|9.309790
+norm-1|RMS_NORM|{4096, 5, 1, 1}|107.963402
+ffn_norm-1|MUL|{4096, 5, 1, 1}|27.486490
+ffn_moe_logits-1|MUL_MAT|{256, 5, 1, 1}|23.125708
+node_207|SOFTPLUS|{256, 5, 1, 1}|984.889099
+ffn_moe_probs-1|SQRT|{256, 5, 1, 1}|1087.419312
+ffn_moe_probs-1 (reshaped)|RESHAPE|{1, 256, 5, 1}|1087.419312
+ffn_moe_topk-1|GET_ROWS|{6, 5, 1, 1}|3951.000000
+ffn_moe_weights-1|GET_ROWS|{1, 6, 5, 1}|25.273024
+ffn_moe_weights-1 (reshaped)|RESHAPE|{6, 5, 1, 1}|25.273024
+ffn_moe_weights_sum-1|SUM_ROWS|{1, 5, 1, 1}|25.273022
+ffn_moe_weights_sum_clamped-1|CLAMP|{1, 5, 1, 1}|25.273022
+ffn_moe_weights_norm-1|DIV|{6, 5, 1, 1}|5.000000
+ffn_moe_weights_norm-1 (reshaped)|RESHAPE|{1, 6, 5, 1}|5.000000
+ffn_moe_weights_scaled-1|SCALE|{1, 6, 5, 1}|7.500000
+ffn_norm-1 (reshaped)|RESHAPE|{4096, 1, 5, 1}|27.486490
+ffn_moe_gate-1|MUL_MAT_ID|{2048, 6, 5, 1}|-3060.197266
+ffn_moe_gate_clamped-1|CLAMP|{2048, 6, 5, 1}|-3060.197266
+ffn_moe_up-1|MUL_MAT_ID|{2048, 6, 5, 1}|-120.346321
+ffn_moe_up_clamped-1|CLAMP|{2048, 6, 5, 1}|-120.346321
+ffn_moe_swiglu_limited-1|SWIGLU|{2048, 6, 5, 1}|11.324850
+ffn_moe_down-1|MUL_MAT_ID|{4096, 6, 5, 1}|-26.838915
+ffn_moe_weighted-1|MUL|{4096, 6, 5, 1}|-17.532829
+ffn_moe_weighted-1 (view)|VIEW|{4096, 5, 1, 1}|-3.130055
+ffn_moe_weighted-1 (view)|VIEW|{4096, 5, 1, 1}|3.890552
+ffn_moe_weighted-1 (view)|VIEW|{4096, 5, 1, 1}|-1.967723
+ffn_moe_weighted-1 (view)|VIEW|{4096, 5, 1, 1}|-5.374112
+ffn_moe_weighted-1 (view)|VIEW|{4096, 5, 1, 1}|-17.948400
+ffn_moe_weighted-1 (view)|VIEW|{4096, 5, 1, 1}|6.997021
+node_232|ADD|{4096, 5, 1, 1}|0.760529
+node_233|ADD|{4096, 5, 1, 1}|-1.207210
+node_234|ADD|{4096, 5, 1, 1}|-6.581291
+node_235|ADD|{4096, 5, 1, 1}|-24.529716
+ffn_moe_out-1|ADD|{4096, 5, 1, 1}|-17.532742
+dsv4_csa_state_kv_l2 (reshaped)|RESHAPE|{1024, 8, 1, 1}|0.000000
+ffn_gate-1|MUL_MAT|{2048, 5, 1, 1}|-1759.062988
+ffn_gate_clamped-1|CLAMP|{2048, 5, 1, 1}|-1759.062988
+ffn_up-1|MUL_MAT|{2048, 5, 1, 1}|12.071652
+ffn_up_clamped-1|CLAMP|{2048, 5, 1, 1}|12.071652
+ffn_swiglu_limited-1|SWIGLU|{2048, 5, 1, 1}|-57.020535
+ffn_shexp-1|MUL_MAT|{4096, 5, 1, 1}|36.638653
+ffn_out-1|ADD|{4096, 5, 1, 1}|19.105911
+l_last-1|DSV4_HC_POST|{4096, 4, 5, 1}|23.754854
+l_last-1 (reshaped)|RESHAPE|{16384, 5, 1, 1}|23.754854
+node_247|RMS_NORM|{16384, 5, 1, 1}|98.961739
