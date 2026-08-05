@@ -53,6 +53,13 @@ pub struct StreamStats {
     /// Wall time spent handing cached bytes to the binder — a copy per slice
     /// per use, which is invisible until it is measured.
     pub copy_seconds: f64,
+    /// Wall time copying the KV history into fresh tensors for attention.
+    /// Grows with context length times layers, so it is a prime suspect for
+    /// why generation slows down as the prompt gets longer.
+    pub kv_build_seconds: f64,
+    /// Everything else computed per token: embeddings, Q/K/V, the router and
+    /// the vocabulary projection.
+    pub other_seconds: f64,
 }
 
 impl std::fmt::Display for StreamStats {
@@ -71,8 +78,14 @@ impl std::fmt::Display for StreamStats {
         )?;
         write!(
             f,
-            "\n           time: {:.1}s disk, {:.1}s expert compute, {:.1}s attention, {:.1}s slice copies",
-            self.read_seconds, self.expert_seconds, self.attn_seconds, self.copy_seconds
+            "\n           time: {:.1}s disk, {:.1}s expert compute, {:.1}s attention, \
+             {:.1}s slice copies, {:.1}s kv build, {:.1}s other compute",
+            self.read_seconds,
+            self.expert_seconds,
+            self.attn_seconds,
+            self.copy_seconds,
+            self.kv_build_seconds,
+            self.other_seconds
         )
     }
 }
@@ -262,6 +275,13 @@ impl<'m> StreamingRunner<'m> {
             }
             let fetched = self.read_slices_parallel(&wanted)?;
 
+            // One arena for the whole group. Prefilling a 4395-token prompt
+            // otherwise allocates and first-touches a fresh multi-megabyte
+            // arena 55,296 times — 128 experts x 48 layers x 9 blocks.
+            let mut buf = std::mem::take(&mut self.scratch);
+            let threads = self.threads;
+            let mut group_secs = 0f64;
+            let group_result = (|| -> Result<()> {
             for &expert in group {
                 let members = &by_expert[&expert];
                 let take = |n: &String| -> Result<Arc<[u8]>> {
@@ -275,7 +295,7 @@ impl<'m> StreamingRunner<'m> {
                 let down_bytes = take(&down_name)?;
 
                 let m = members.len() as i64;
-            let ctx = Context::new(arena_for(
+            let need = arena_for(
                 &[
                     (n_embd_i, m), // this expert's tokens, gathered
                     (n_ff, m),     // gate
@@ -284,7 +304,13 @@ impl<'m> StreamingRunner<'m> {
                     (n_embd_i, m), // down projection
                 ],
                 24,
-            ))?;
+            ) + gate_bytes.len() + up_bytes.len() + down_bytes.len();
+            if buf.len() < need {
+                buf.resize(need, 0);
+            }
+            // SAFETY: `buf` is a local outliving `ctx`; each expert's context
+            // is dropped and its output copied out before the next is built.
+            let ctx = unsafe { Context::in_buffer(&mut buf, false)? };
             let mut ws = WeightSet::new();
             ws.bind(&ctx, "gate", gate_ty, &[n_embd_i as u64, n_ff as u64], gate_bytes)?;
             ws.bind(&ctx, "up", up_ty, &[n_embd_i as u64, n_ff as u64], up_bytes)?;
@@ -307,7 +333,9 @@ impl<'m> StreamingRunner<'m> {
             // Not 0: `compute` floors the count at 1, so passing 0 ran every
             // expert matmul on a single thread — the bulk of the model's
             // arithmetic, on one core of twelve.
-            ctx.compute(&out, self.threads)?;
+            let t_exp = std::time::Instant::now();
+            ctx.compute(&out, threads)?;
+            group_secs += t_exp.elapsed().as_secs_f64();
 
                 let produced = out.to_vec_f32();
                 for (slot, (t, weight)) in members.iter().enumerate() {
@@ -318,6 +346,11 @@ impl<'m> StreamingRunner<'m> {
                     }
                 }
             }
+            Ok(())
+            })();
+            self.scratch = buf;
+            group_result?;
+            self.stats.expert_seconds += group_secs;
         }
         Ok(accum)
     }
@@ -717,6 +750,22 @@ impl<'m> StreamingRunner<'m> {
 
         let positions: Vec<i32> = (0..n_new).map(|i| (pos_start as i64 + i) as i32).collect();
 
+        // The causal mask depends only on positions, so it is the same for all
+        // 48 layers. Build it once. Masked entries must be -inf, not 0 — a zero
+        // there lets a token attend to its own future and the model produces
+        // fluent repetition rather than an error.
+        let n_total_final = (cache.len() + tokens.len()) as i64;
+        let mask: Vec<f32> = {
+            let mut m = vec![0f32; (n_total_final * n_new) as usize];
+            for query in 0..n_new {
+                let absolute = pos_start as i64 + query;
+                for key in (absolute + 1)..n_total_final {
+                    m[(query * n_total_final + key) as usize] = f32::NEG_INFINITY;
+                }
+            }
+            m
+        };
+
         let mut x: Vec<f32> = {
             // Sized from the prompt, not a constant: `get_rows` materialises
             // n_embd * n_new floats, and ggml aborts the process when an arena
@@ -772,9 +821,11 @@ impl<'m> StreamingRunner<'m> {
                 let k = ctx.rope_ext(&k, &pos, None, head_dim as i32, ROPE_TYPE_NEOX, 0, rp)?;
 
                 // One compute materialises all three; they share a graph.
+                let t = std::time::Instant::now();
                 ctx.compute(&q, threads)?;
                 ctx.compute(&k, threads)?;
                 ctx.compute(&v, threads)?;
+                self.stats.other_seconds += t.elapsed().as_secs_f64();
                 (q.to_vec_f32(), k.to_vec_f32(), v.to_vec_f32(), x.clone())
             };
 
@@ -786,46 +837,58 @@ impl<'m> StreamingRunner<'m> {
 
             // Phase 2: attend over the whole history, not just the new part.
             let n_total = (cache.len() + tokens.len()) as i64;
-            let attn_out = {
-                // The scores and their softmax dominate: n_total * n_new *
-                // n_head floats each. At a 2k prompt that pair alone is over a
-                // gigabyte, so a fixed arena aborts the process somewhere past
-                // 1.5k tokens. Size it from the actual shapes instead.
-                let n_head = c.n_head as i64;
-                let ctx = Context::new(arena_for(
-                    &[
-                        (head_dim * n_head, n_new),      // q, contiguous
-                        (head_dim * n_kv, n_total),      // k, contiguous
-                        (n_total * n_new, n_head),       // scores
-                        (n_total, n_new),                // causal mask
-                        (n_total * n_new, n_head),       // softmax output
-                        (head_dim * n_kv, n_total),      // v, transposed
-                        (head_dim * n_new, n_head),      // attention output
-                        (head_dim * n_new, n_head),      // ...made contiguous
-                        (n_embd, n_new),                 // output projection
-                    ],
-                    24,
-                ))?;
-                let q = ctx.new_f32_3d(head_dim, c.n_head as i64, n_new)?;
+            // The scores and their softmax dominate: n_total * n_new * n_head
+            // floats each. At 4395 tokens with a 512-token block that pair is
+            // ~576 MiB, so the arena runs past a gigabyte — and it was being
+            // allocated and first-touched afresh for every layer of every
+            // block, 432 times over a single prompt. Reuse one buffer.
+            let n_head = c.n_head as i64;
+            let need = arena_for(
+                &[
+                    (head_dim * n_head, n_new), // q, contiguous
+                    (head_dim * n_kv, n_total), // k, contiguous
+                    (n_total * n_new, n_head),  // scores
+                    (n_total, n_new),           // causal mask
+                    (n_total * n_new, n_head),  // softmax output
+                    (head_dim * n_kv, n_total), // v, transposed
+                    (head_dim * n_new, n_head), // attention output
+                    (head_dim * n_new, n_head), // ...made contiguous
+                    (n_embd, n_new),            // output projection
+                ],
+                24,
+            );
+            let mut buf = std::mem::take(&mut self.scratch);
+            if buf.len() < need {
+                buf.resize(need, 0);
+            }
+            let arch = &self.arch;
+            let out_w = get(weights, format!("blk.{il}.attn_output.weight"))?;
+            let attn_result = (|| -> Result<(Vec<f32>, f64, f64)> {
+                // SAFETY: `buf` is a local outliving `ctx`, and no other context
+                // is live on it — the Q/K/V context above was dropped and its
+                // results copied out before this point.
+                let ctx = unsafe { Context::in_buffer(&mut buf, false)? };
+                let q = ctx.new_f32_3d(head_dim, n_head, n_new)?;
                 q.set_f32(&q_v)?;
 
+                let tkv = std::time::Instant::now();
                 let k_all = ctx.new_f32_3d(head_dim, n_kv, n_total)?;
                 k_all.set_f32(cache.keys(il as usize))?;
                 let v_all = ctx.new_f32_3d(head_dim, n_kv, n_total)?;
                 v_all.set_f32(cache.values(il as usize))?;
+                let kv_secs = tkv.elapsed().as_secs_f64();
 
-                let out = self.arch.attention_cached(
-                    &ctx, &q, &k_all, &v_all, n_new, n_total, pos_start as i64,
-                )?;
-                let out = ctx.mul_mat(
-                    &get(weights, format!("blk.{il}.attn_output.weight"))?,
-                    &out,
-                )?;
+                let out =
+                    arch.attention_cached(&ctx, &q, &k_all, &v_all, n_new, n_total, &mask)?;
+                let out = ctx.mul_mat(&out_w, &out)?;
                 let t = std::time::Instant::now();
                 ctx.compute(&out, threads)?;
-                self.stats.attn_seconds += t.elapsed().as_secs_f64();
-                out.to_vec_f32()
-            };
+                Ok((out.to_vec_f32(), kv_secs, t.elapsed().as_secs_f64()))
+            })();
+            self.scratch = buf;
+            let (attn_out, kv_secs, attn_secs) = attn_result?;
+            self.stats.kv_build_seconds += kv_secs;
+            self.stats.attn_seconds += attn_secs;
 
             // Residual, then the feed-forward.
             let mut ffn_input = residual;
@@ -847,7 +910,9 @@ impl<'m> StreamingRunner<'m> {
                     &normed,
                 )?;
                 let probs = ctx.soft_max_ext(&logits, None, 1.0, 0.0)?;
+                let t = std::time::Instant::now();
                 ctx.compute(&probs, threads)?;
+                self.stats.other_seconds += t.elapsed().as_secs_f64();
                 (normed.to_vec_f32(), probs.to_vec_f32())
             };
 
@@ -864,6 +929,7 @@ impl<'m> StreamingRunner<'m> {
         // projection is the widest matmul in the model (151,936 rows here).
         // Running it for every prompt token costs the whole prefill that much
         // again for results nothing reads.
+        let t_out = std::time::Instant::now();
         let last = x.len() - n_embd as usize;
         let ctx = Context::new(arena_for(
             &[(n_embd, 1), (n_embd, 1), (c.vocab_size as i64, 1)],
@@ -890,7 +956,9 @@ impl<'m> StreamingRunner<'m> {
             &normed,
         )?;
         ctx.compute(&out, threads)?;
-        Ok(out.to_vec_f32())
+        let logits = out.to_vec_f32();
+        self.stats.other_seconds += t_out.elapsed().as_secs_f64();
+        Ok(logits)
     }
 
     /// Full forward pass, streaming experts, returning logits for every token.

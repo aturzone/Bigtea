@@ -316,7 +316,7 @@ impl Qwen3Model {
         v_all: &Tensor<'a>,
         n_new: i64,
         n_total: i64,
-        pos_start: i64,
+        mask_data: &[f32],
     ) -> Result<Tensor<'a>> {
         let c = &self.config;
 
@@ -326,17 +326,12 @@ impl Qwen3Model {
         // [n_total, n_new, n_head]
         let scores = ctx.mul_mat(&k, &q)?;
 
+        // The mask depends only on positions, so it is identical for every
+        // layer and is built once per call by the caller. Rebuilding it here
+        // cost an n_total * n_new scalar loop and a copy of the same size,
+        // 48 times per block.
         let mask = ctx.new_f32_2d(n_total, n_new)?;
-        let mut m = vec![0f32; (n_total * n_new) as usize];
-        for query in 0..n_new {
-            let absolute = pos_start + query;
-            for key in 0..n_total {
-                if key > absolute {
-                    m[(query * n_total + key) as usize] = f32::NEG_INFINITY;
-                }
-            }
-        }
-        mask.set_f32(&m)?;
+        mask.set_f32(mask_data)?;
         let probs = ctx.soft_max_ext(&scores, Some(&mask), c.attn_scale(), 0.0)?;
 
         let v = ctx.cont(&ctx.transpose(&ctx.permute(v_all, [0, 2, 1, 3])?)?)?;
