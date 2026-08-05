@@ -75,6 +75,62 @@ fn optional_tensors_appear_on_exactly_the_layers_they_should() {
     );
 }
 
+/// Actually load the 7.38 GiB resident set off five shards and bind it.
+///
+/// Step two of the port. No arithmetic yet — this proves the parts that fail
+/// silently or expensively later: that shard resolution works across all five
+/// files, that every resident tensor's declared size matches what ggml expects
+/// for its type (Q8_0, F32, BF16 and I32 all appear here, and a block-size
+/// table missing one of them would surface as a size mismatch), and that
+/// 7.38 GiB really does fit alongside everything else on a 15.7 GiB machine.
+///
+/// Ignored by default because it reads 7.38 GiB. Run it deliberately:
+/// `cargo test --release --test deepseek4_container -- --ignored --nocapture`
+#[test]
+#[ignore = "loads 7.38 GiB of weights"]
+fn resident_set_loads_and_binds() {
+    use bigtea_ggml::{Context, WeightSet};
+
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+    let arch = Deepseek4Model::new(config);
+    let names = arch.resident_tensor_names(&model);
+
+    // Metadata only: the data pointers reference buffers we own, so this arena
+    // holds tensor structs rather than weights.
+    let ctx = Context::new_no_alloc(256 << 20).expect("context");
+    let mut weights = WeightSet::new();
+    let start = std::time::Instant::now();
+    let mut bound = 0u64;
+
+    for name in &names {
+        let loc = model.location(name).expect("verified present").clone();
+        let data = model
+            .read_tensor(name)
+            .unwrap_or_else(|e| panic!("reading {name}: {e}"));
+        bound += data.len() as u64;
+        weights
+            .bind(&ctx, name, loc.ty, &loc.dims, data)
+            .unwrap_or_else(|e| panic!("binding {name} (type {:?}): {e}", loc.ty));
+    }
+
+    let secs = start.elapsed().as_secs_f64();
+    eprintln!(
+        "bound {} tensors, {:.2} GiB in {secs:.1}s ({:.2} GB/s) across {} shards",
+        weights.len(),
+        bound as f64 / GIB,
+        bound as f64 / 1e9 / secs.max(1e-9),
+        model.shard_count()
+    );
+
+    assert_eq!(weights.len(), names.len(), "every resident tensor bound");
+    assert!(
+        bound as f64 / GIB > 7.0,
+        "expected ~7.38 GiB resident, got {:.2}",
+        bound as f64 / GIB
+    );
+}
+
 #[test]
 fn residency_split_is_what_the_design_depends_on() {
     let Some(model) = open() else { return };
