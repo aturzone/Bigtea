@@ -115,19 +115,40 @@ fn run_streaming(
     // unused. The whole point of measuring residency is to spend what the
     // machine has. Headroom covers the OS, the resident weights, the KV cache
     // and the compute arenas; what remains is worth filling with experts.
-    const HEADROOM: u64 = 4 * (1 << 30);
+    // Headroom is computed, not fixed. A flat 4 GiB was set when the attention
+    // arena needed 1.3 GiB; fused attention cut that to ~100 MiB, and the extra
+    // reserve then cost real speed — at 32 tokens, a 6 GiB cache gives 1.44
+    // tok/s and 8 GiB gives 1.56. The two things that genuinely scale are the
+    // KV cache, which grows with context, and the arenas, which grow with the
+    // prefill block. Everything else is the OS.
+    const BASE_HEADROOM: u64 = 2 * (1 << 30);
+    // Two bytes per value: the KV cache is f16.
+    let kv_per_position =
+        (config.n_layer as u64) * (config.n_head_kv as u64) * (config.head_dim as u64) * 2 * 2;
+    let kv_estimate = kv_per_position * (tokens.len() + n_predict) as u64;
+    // Arenas scale with the block: activations, Q/K/V and the router, roughly
+    // a dozen n_embd-by-block matrices, doubled by `arena_for`.
+    let arena_estimate = (config.n_embd as u64) * (prefill_block as u64) * 4 * 24;
+    let headroom = BASE_HEADROOM + kv_estimate + arena_estimate;
+
     let budget = match cache_budget {
         Some(bytes) => bytes,
         None => {
             let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
             machine
                 .ram_available_bytes
-                .map(|avail| avail.saturating_sub(HEADROOM).max(1 << 30))
+                .map(|avail| avail.saturating_sub(headroom).max(1 << 30))
                 .unwrap_or(1 << 30)
         }
     };
     let mut runner = StreamingRunner::new(model, config.clone(), budget as usize);
-    println!("cache      {:.2} GiB for experts", budget as f64 / GIB);
+    println!(
+        "cache      {:.2} GiB for experts (headroom {:.2} GiB: {:.2} kv + {:.2} arenas + 2.00 os)",
+        budget as f64 / GIB,
+        headroom as f64 / GIB,
+        kv_estimate as f64 / GIB,
+        arena_estimate as f64 / GIB
+    );
 
     let ctx = Context::new_no_alloc(64 << 20)?;
     let mut weights = WeightSet::new();

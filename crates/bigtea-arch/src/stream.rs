@@ -1010,11 +1010,13 @@ impl<'m> StreamingRunner<'m> {
                 let q = ctx.new_f32_3d(head_dim, n_head, n_new)?;
                 q.set_f32(&q_v)?;
 
+                // F16, matching how the cache stores them and what the fused
+                // kernel wants — no conversion on this path at all.
                 let tkv = std::time::Instant::now();
-                let k_all = ctx.new_f32_3d(head_dim, n_kv, n_total)?;
-                k_all.set_f32(cache.keys(il as usize))?;
-                let v_all = ctx.new_f32_3d(head_dim, n_kv, n_total)?;
-                v_all.set_f32(cache.values(il as usize))?;
+                let k_all = ctx.new_f16_3d(head_dim, n_kv, n_total)?;
+                k_all.set_bytes(cache.keys(il as usize))?;
+                let v_all = ctx.new_f16_3d(head_dim, n_kv, n_total)?;
+                v_all.set_bytes(cache.values(il as usize))?;
                 let kv_secs = tkv.elapsed().as_secs_f64();
 
                 let out = arch.attention_flash(&ctx, &q, &k_all, &v_all, n_new, n_total, &mask)?;

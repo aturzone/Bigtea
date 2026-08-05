@@ -18,10 +18,17 @@
 //! gigabytes of experts, which is what it replaces.
 
 /// Stored keys and values for every layer.
+///
+/// Held as f16, which is what llama.cpp stores by default and what ggml's
+/// fused attention consumes directly. For this model that is 96 KiB per
+/// position rather than 192, and at an 8775-token context the difference —
+/// 0.8 GiB — comes straight off the expert cache's budget, where it buys hit
+/// rate. Attention also reads half as many bytes.
 pub struct KvCache {
     /// Per layer, laid out `[head_dim * n_kv_heads]` per position, appended.
-    k: Vec<Vec<f32>>,
-    v: Vec<Vec<f32>>,
+    /// Raw f16 bits, so they can be handed to a ggml F16 tensor unchanged.
+    k: Vec<Vec<u16>>,
+    v: Vec<Vec<u16>>,
     n_positions: usize,
     per_position: usize,
 }
@@ -52,7 +59,7 @@ impl KvCache {
 
     /// Total bytes held, for reporting against the RAM budget.
     pub fn bytes(&self) -> usize {
-        let f = std::mem::size_of::<f32>();
+        let f = std::mem::size_of::<u16>();
         self.k.iter().map(|v| v.len() * f).sum::<usize>()
             + self.v.iter().map(|v| v.len() * f).sum::<usize>()
     }
@@ -70,8 +77,11 @@ impl KvCache {
                 got_v: v.len(),
             });
         }
-        self.k[layer].extend_from_slice(k);
-        self.v[layer].extend_from_slice(v);
+        let at = self.k[layer].len();
+        self.k[layer].resize(at + self.per_position, 0);
+        self.v[layer].resize(at + self.per_position, 0);
+        bigtea_ggml::f32_to_f16(k, &mut self.k[layer][at..]);
+        bigtea_ggml::f32_to_f16(v, &mut self.v[layer][at..]);
         Ok(())
     }
 
@@ -89,12 +99,13 @@ impl KvCache {
         self.n_positions += n;
     }
 
-    pub fn keys(&self, layer: usize) -> &[f32] {
-        &self.k[layer]
+    /// Raw f16 bits for a layer's keys, ready to fill an F16 tensor.
+    pub fn keys(&self, layer: usize) -> &[u8] {
+        as_bytes(&self.k[layer])
     }
 
-    pub fn values(&self, layer: usize) -> &[f32] {
-        &self.v[layer]
+    pub fn values(&self, layer: usize) -> &[u8] {
+        as_bytes(&self.v[layer])
     }
 
     /// Drop everything, for starting a new sequence.
@@ -113,6 +124,16 @@ impl KvCache {
         let expected = self.n_positions * self.per_position;
         self.k.iter().all(|v| v.len() == expected) && self.v.iter().all(|v| v.len() == expected)
     }
+}
+
+/// View f16 values as the bytes a ggml F16 tensor expects.
+///
+/// Little-endian on every target this runs on, and ggml reads the same layout,
+/// so no per-element conversion is needed on the way out.
+fn as_bytes(v: &[u16]) -> &[u8] {
+    // SAFETY: u16 has no padding or invalid bit patterns, and the resulting
+    // slice covers exactly the same allocation with a compatible alignment.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 #[derive(Debug)]
@@ -142,8 +163,24 @@ mod tests {
     use super::*;
 
     fn cache() -> KvCache {
-        // 2 layers, 4 kv heads, head_dim 8 -> 32 floats per position.
+        // 2 layers, 4 kv heads, head_dim 8 -> 32 values per position.
         KvCache::new(2, 4, 8)
+    }
+
+    /// Decode one stored f16 back to f32, so tests read values rather than
+    /// bytes. Handles the normals these tests use; f16 subnormals and NaN are
+    /// not exercised here.
+    fn at(bytes: &[u8], index: usize) -> f32 {
+        let bits = u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
+        let sign = ((bits >> 15) & 1) as u32;
+        let exp = ((bits >> 10) & 0x1f) as u32;
+        let frac = (bits & 0x3ff) as u32;
+        let f = if exp == 0 {
+            (sign << 31) | 0 // zero (or subnormal, treated as zero here)
+        } else {
+            (sign << 31) | ((exp + 112) << 23) | (frac << 13)
+        };
+        f32::from_bits(f)
     }
 
     #[test]
@@ -166,10 +203,11 @@ mod tests {
 
         assert_eq!(c.len(), 1);
         assert!(c.is_consistent());
-        assert_eq!(c.keys(0).len(), 32);
-        assert_eq!(c.values(1)[0], 2.0);
-        // 2 layers * 2 tensors * 32 floats * 4 bytes
-        assert_eq!(c.bytes(), 2 * 2 * 32 * 4);
+        // 32 values per position, two bytes each now that storage is f16.
+        assert_eq!(c.keys(0).len(), 32 * 2);
+        assert_eq!(at(c.values(1), 0), 2.0);
+        // 2 layers * 2 tensors * 32 values * 2 bytes
+        assert_eq!(c.bytes(), 2 * 2 * 32 * 2);
     }
 
     #[test]
@@ -183,11 +221,11 @@ mod tests {
         }
         assert_eq!(c.len(), 3);
         let keys = c.keys(0);
-        assert_eq!(keys.len(), 96);
+        assert_eq!(keys.len(), 96 * 2);
         // Positions must stay in order; attention indexes by position.
-        assert_eq!(keys[0], 0.0);
-        assert_eq!(keys[32], 1.0);
-        assert_eq!(keys[64], 2.0);
+        assert_eq!(at(keys, 0), 0.0);
+        assert_eq!(at(keys, 32), 1.0);
+        assert_eq!(at(keys, 64), 2.0);
     }
 
     #[test]
@@ -208,6 +246,26 @@ mod tests {
         c.advance();
         // Layer 1 never received its position.
         assert!(!c.is_consistent(), "a lagging layer must be detected");
+    }
+
+    #[test]
+    fn f16_storage_round_trips_the_values_attention_needs() {
+        // Halving the cache is only worth it if the numbers survive. These are
+        // the magnitudes real keys and values take; f16 holds them exactly or
+        // near enough that attention cannot tell.
+        let mut c = cache();
+        let vals: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.25).collect();
+        c.push(0, &vals, &vals).expect("push");
+        c.push(1, &vals, &vals).expect("push");
+        c.advance();
+
+        for (i, want) in vals.iter().enumerate() {
+            let got = at(c.keys(0), i);
+            assert!(
+                (got - want).abs() < 1e-3,
+                "position {i}: stored {got}, wanted {want}"
+            );
+        }
     }
 
     #[test]

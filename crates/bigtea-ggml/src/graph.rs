@@ -66,6 +66,7 @@ extern "C" {
     fn ggml_rms_norm(ctx: *mut ggml_context, a: *mut ggml_tensor, eps: f32)
         -> *mut ggml_tensor;
     fn ggml_soft_max(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    fn ggml_fp32_to_fp16_row(src: *const f32, dst: *mut u16, n: i64);
     fn ggml_flash_attn_ext(
         ctx: *mut ggml_context,
         q: *mut ggml_tensor,
@@ -202,6 +203,18 @@ pub fn arena_for(shapes: &[(i64, i64)], slack_tensors: usize) -> usize {
     // structure overhead. Over-allocating costs a little memory; under-
     // allocating costs the process.
     data * 2 + count * TENSOR_OVERHEAD + GRAPH_RESERVE
+}
+
+/// Convert f32 to f16, using ggml's own routine so the rounding matches what
+/// its kernels expect.
+///
+/// Used for the KV cache: keeping it in f16 halves its memory (192 KiB per
+/// position for this model becomes 96 KiB) and halves the bytes attention has
+/// to read. It is what llama.cpp stores by default.
+pub fn f32_to_f16(src: &[f32], dst: &mut [u16]) {
+    let n = src.len().min(dst.len());
+    // SAFETY: both slices are valid for `n` elements of their own type.
+    unsafe { ggml_fp32_to_fp16_row(src.as_ptr(), dst.as_mut_ptr(), n as i64) };
 }
 
 /// Arena space `compute` needs beyond the tensors themselves.
@@ -386,6 +399,13 @@ impl Context {
 
     /// A tensor of the given ggml type — used to hold quantized weights in
     /// their stored format, with no dequantization step.
+    /// An F16 3-D tensor — the KV cache's layout, and what fused attention
+    /// consumes without conversion.
+    pub fn new_f16_3d(&self, ne0: i64, ne1: i64, ne2: i64) -> Result<Tensor<'_>, GgmlError> {
+        // SAFETY: valid context; type 1 is GGML_TYPE_F16.
+        self.tensor(unsafe { ggml_new_tensor_3d(self.raw.as_ptr(), 1, ne0, ne1, ne2) })
+    }
+
     pub fn new_typed_2d(
         &self,
         ty: bigtea_gguf::GgmlType,
