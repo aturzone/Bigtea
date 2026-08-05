@@ -32,18 +32,28 @@ its output are in a doc.** See [[verify-before-citing]].
 
 ## Qwen3-30B-A3B Q4_K_M (17.28 GiB) — the full ladder
 
-Bigtea after the optimisation work below; llama.cpp with a fully warm page cache.
+Bigtea with fused attention and a 2048-token prefill block; llama.cpp with a fully warm page
+cache. Both produce identical, correct output at every length.
 
 | prompt tokens | prefill: Bigtea / llama.cpp | eval: Bigtea / llama.cpp |
 |---|---|---|
-| 565  | 19.92 / 23.55 | 1.48 / 3.19 |
-| 2206 | 23.68 / 33.59 | 1.08 / 2.46 |
-| 4395 | 19.79 / 40.25 | 0.88 / 2.16 |
-| 8775 | 14.46 / 35.01 | 0.65 / 1.62 |
+| 565  | **27.64** / 23.55 | 1.40 / 3.19 |
+| 2206 | **36.60** / 33.59 | 1.11 / 2.46 |
+| 4395 | 38.40 / 40.25 | 1.07 / 2.16 |
+| 8775 | 34.88 / 35.01 | 0.78 / 1.62 |
 
-**llama.cpp is faster at every length: ~1.2–2.4x on prefill, ~2.2–2.5x on generation.**
-Both produce identical, correct output. Bigtea's expert cache hit rate climbs with prompt
-length (34% → 60%) because a longer prompt gives the frequency counters more to work with.
+**Prefill now beats llama.cpp at 565 and 2206 tokens and matches it at 4395 (95%) and 8775
+(99.6%).** Raising the block to 4096 at 4395 tokens gives 43.61 tok/s against their 40.25 — so
+the crossover is a memory budget, not a wall.
+
+**Generation is still ~2x behind** and that gap has not moved. Where the time goes at 4395
+tokens with a 4096 block: 41.1s expert compute, 25.8s attention, 12.3s disk, 11.8s other. The
+expert matmuls are genuine arithmetic at roughly 239 GFLOPS; the remaining lever is that
+llama.cpp repacks weights for its Q4_K kernels and we do not.
+
+Earlier in the session this table read 19.92/23.68/19.79/14.46 on prefill, and before the
+session's optimisation work the 565-token figure was **1.20 tok/s**. Prefill is 23x faster than
+where it started.
 
 Memory: Bigtea holds 0.93 GiB resident + a 6.26 GiB expert cache ≈ 7.2 GiB. llama.cpp's peak
 working set was 8.87 GiB, and it additionally benefits from the OS page cache holding most of
@@ -157,12 +167,32 @@ This validates the 4 GiB headroom default, which produces a 6.26 GiB cache on th
 within noise of the measured optimum. It also means **hit rate must never be reported as a
 success metric on its own**; only tok/s at a given footprint says anything.
 
+## Fused attention
+
+Explicit attention materialises an `n_kv * n_batch * n_head` score matrix, reads it back for the
+softmax and again for the value product. At 4395 tokens with a 512-token block that is 288 MiB
+written and read twice, per layer — measured at about **4 GFLOPS**, an order of magnitude under
+what the arithmetic alone costs. It is memory-bound, not compute-bound.
+
+`ggml_flash_attn_ext` keeps the running softmax in registers and never builds the matrix.
+Attention at 4395 tokens: **38.8s → 25.8s**. The larger effect is indirect: the arena falls from
+~1.3 GiB to ~100 MiB, which is what makes a 4096-token prefill block affordable, and the block
+size is worth more than the kernel (30.5 → 43.6 tok/s going from 512 to 4096).
+
+Two traps, both of which produce silent nonsense rather than an error:
+- **V is not transposed** for `flash_attn_ext`, unlike the `mul_mat` path it replaces.
+- **The mask must be F16 and contiguous** (ggml asserts). Since the only values are 0 and -inf,
+  the bit patterns `0x0000` and `0xFC00` are written directly — no conversion, and -inf stays
+  exact.
+
 ## Honest position
 
 - "Runs models larger than RAM" is **not a differentiator**. mmap has done it for years, and
   llama.cpp does it for a 144 GB model on this laptop today.
-- On a model that nearly fits, llama.cpp is faster and will likely stay faster. The kernel's page
-  cache is elastic and free; our cache is fixed and hand-managed.
+- **Prefill is now competitive and sometimes faster.** That is real and reproducible, but it is
+  prompt processing — it does not make generation usable.
+- Generation remains ~2x behind on a model that nearly fits, and the kernel's page cache is
+  elastic and free where ours is fixed and hand-managed. Expect to keep losing that one here.
 - Bigtea's measured advantage is memory: 7.2 GiB against llama.cpp's 8.87 GiB working set plus
   page cache. That only matters to a user if it buys responsiveness, which is unmeasured.
 - The one place the design should win — model ≫ RAM, where cache policy dominates and we have

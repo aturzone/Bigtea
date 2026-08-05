@@ -66,6 +66,16 @@ extern "C" {
     fn ggml_rms_norm(ctx: *mut ggml_context, a: *mut ggml_tensor, eps: f32)
         -> *mut ggml_tensor;
     fn ggml_soft_max(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    fn ggml_flash_attn_ext(
+        ctx: *mut ggml_context,
+        q: *mut ggml_tensor,
+        k: *mut ggml_tensor,
+        v: *mut ggml_tensor,
+        mask: *mut ggml_tensor,
+        scale: f32,
+        max_bias: f32,
+        logit_softcap: f32,
+    ) -> *mut ggml_tensor;
     fn ggml_silu(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
 
     fn ggml_new_tensor_3d(
@@ -473,6 +483,46 @@ impl Context {
                 ne1,
                 row_stride_bytes,
                 offset_bytes,
+            )
+        })
+    }
+
+    /// Fused attention: scores, mask, softmax and the value product in one op,
+    /// without ever materialising the scores.
+    ///
+    /// The explicit version writes an `n_kv * n_batch * n_head` float matrix,
+    /// reads it back for the softmax and again for the value product. At 4395
+    /// tokens with a 512-token block that is 288 MiB written and read twice,
+    /// per layer — which measured at roughly 4 GFLOPS, an order of magnitude
+    /// below what the arithmetic alone should cost. This keeps the running
+    /// softmax in registers instead.
+    ///
+    /// Shapes ggml requires, which are not the ones the explicit path uses:
+    /// - `q`: `[head_dim, n_batch, n_head]`
+    /// - `k`: `[head_dim, n_kv, n_head_kv]`
+    /// - `v`: `[head_dim, n_kv, n_head_kv]` — **not** transposed, unlike `mul_mat`
+    /// - `mask`: `[n_kv, n_batch]`, **F16 and contiguous** (ggml asserts both)
+    /// - result: `[head_dim, n_head, n_batch]`, already permuted for reshaping
+    pub fn flash_attn_ext<'a>(
+        &'a self,
+        q: &Tensor<'a>,
+        k: &Tensor<'a>,
+        v: &Tensor<'a>,
+        mask: &Tensor<'a>,
+        scale: f32,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: all four tensors live in this context; ggml validates the
+        // shape relationships and returns null on a mismatch.
+        self.tensor(unsafe {
+            ggml_flash_attn_ext(
+                self.raw.as_ptr(),
+                q.raw.as_ptr(),
+                k.raw.as_ptr(),
+                v.raw.as_ptr(),
+                mask.raw.as_ptr(),
+                scale,
+                0.0, // max_bias: ALiBi, which this architecture does not use
+                0.0, // logit_softcap: unused
             )
         })
     }

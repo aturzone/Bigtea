@@ -300,13 +300,48 @@ impl Qwen3Model {
     }
 
 
+    /// Attention through ggml's fused kernel.
+    ///
+    /// Same result as [`Self::attention_cached`], without building the scores
+    /// matrix. `mask_f16` holds the causal mask already in F16 — ggml asserts
+    /// that type, and since the only values are 0 and -inf the bit patterns
+    /// (`0x0000`, `0xFC00`) are written directly rather than converted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash<'a>(
+        &self,
+        ctx: &'a Context,
+        q: &Tensor<'a>,
+        k_all: &Tensor<'a>,
+        v_all: &Tensor<'a>,
+        n_new: i64,
+        n_total: i64,
+        mask_f16: &[u8],
+    ) -> Result<Tensor<'a>> {
+        let c = &self.config;
+
+        // ggml wants [head_dim, n_batch, n_head] for q and [head_dim, n_kv,
+        // n_head_kv] for k and v. Ours are head-major, so permute — and v is
+        // NOT transposed here, which is the one place this differs from the
+        // mul_mat path and would silently produce nonsense if copied across.
+        let q = ctx.cont(&ctx.permute(q, [0, 2, 1, 3])?)?;
+        let k = ctx.cont(&ctx.permute(k_all, [0, 2, 1, 3])?)?;
+        let v = ctx.cont(&ctx.permute(v_all, [0, 2, 1, 3])?)?;
+
+        let mask = ctx.new_typed_2d(bigtea_gguf::GgmlType(1), n_total, n_new)?;
+        mask.set_bytes(mask_f16)?;
+
+        // [head_dim, n_head, n_new], already permuted for the reshape.
+        let out = ctx.flash_attn_ext(&q, &k, &v, &mask, c.attn_scale())?;
+        Ok(ctx.reshape_2d(&ctx.cont(&out)?, (c.head_dim * c.n_head) as i64, n_new)?)
+    }
+
     /// Attention where K and V come from a cache covering the whole history.
     ///
-    /// `pos_start` is the absolute position of the first query. The mask must
-    /// be offset by it: query `i` may attend to keys up to `pos_start + i`, not
-    /// up to `i`. Getting that wrong lets a token see its own future during
-    /// incremental decoding — the same failure as omitting the mask entirely,
-    /// but only visible after the first generated token.
+    /// The mask must be offset by the query's absolute position: query `i` may
+    /// attend to keys up to `pos_start + i`, not up to `i`. Getting that wrong
+    /// lets a token see its own future during incremental decoding — the same
+    /// failure as omitting the mask entirely, but only visible after the first
+    /// generated token. The caller builds it; see `forward_cached`.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_cached<'a>(
         &self,

@@ -755,14 +755,22 @@ impl<'m> StreamingRunner<'m> {
         // there lets a token attend to its own future and the model produces
         // fluent repetition rather than an error.
         let n_total_final = (cache.len() + tokens.len()) as i64;
-        let mask: Vec<f32> = {
-            let mut m = vec![0f32; (n_total_final * n_new) as usize];
+        // F16 because ggml's fused attention asserts that type. The only two
+        // values are 0 and -inf, so the bit patterns go in directly — no
+        // conversion, and -inf stays exactly -inf.
+        const F16_ZERO: [u8; 2] = [0x00, 0x00];
+        const F16_NEG_INF: [u8; 2] = [0x00, 0xFC];
+        let mask: Vec<u8> = {
+            let mut m = vec![0u8; (n_total_final * n_new) as usize * 2];
             for query in 0..n_new {
                 let absolute = pos_start as i64 + query;
+                let row = (query * n_total_final) as usize * 2;
                 for key in (absolute + 1)..n_total_final {
-                    m[(query * n_total_final + key) as usize] = f32::NEG_INFINITY;
+                    let at = row + key as usize * 2;
+                    m[at..at + 2].copy_from_slice(&F16_NEG_INF);
                 }
             }
+            let _ = F16_ZERO; // the default fill is already the zero pattern
             m
         };
 
@@ -788,7 +796,24 @@ impl<'m> StreamingRunner<'m> {
 
             // Phase 1: Q, K and V for the new positions only.
             let (q_v, k_v, v_v, residual) = {
-                let ctx = Context::new(256 << 20)?;
+                // Was a fixed 256 MiB, which aborted at a 4096-token block:
+                // ggml asked for 318,787,536 bytes and got told 268,435,456.
+                // Every arena in this function has to scale with the block.
+                let ctx = Context::new(arena_for(
+                    &[
+                        (n_embd, n_new),            // input activations
+                        (n_embd, n_new),            // normalised
+                        (n_embd, n_new),            // rms intermediate
+                        (c.n_head as i64 * head_dim, n_new), // q
+                        (n_kv * head_dim, n_new),   // k
+                        (n_kv * head_dim, n_new),   // v
+                        (c.n_head as i64 * head_dim, n_new), // q normalised
+                        (n_kv * head_dim, n_new),   // k normalised
+                        (c.n_head as i64 * head_dim, n_new), // q roped
+                        (n_kv * head_dim, n_new),   // k roped
+                    ],
+                    32,
+                ))?;
                 let xt = ctx.new_f32_2d(n_embd, n_new)?;
                 xt.set_f32(&x)?;
                 let pos = ctx.new_i32_1d(n_new)?;
@@ -842,15 +867,17 @@ impl<'m> StreamingRunner<'m> {
             // ~576 MiB, so the arena runs past a gigabyte — and it was being
             // allocated and first-touched afresh for every layer of every
             // block, 432 times over a single prompt. Reuse one buffer.
+            // The fused kernel never builds the scores or their softmax, which
+            // were 288 MiB each at 4395 tokens and dominated this arena. What
+            // remains is Q, K, V, the mask and the output — about 100 MiB where
+            // the explicit path needed 1.3 GiB.
             let n_head = c.n_head as i64;
             let need = arena_for(
                 &[
                     (head_dim * n_head, n_new), // q, contiguous
                     (head_dim * n_kv, n_total), // k, contiguous
-                    (n_total * n_new, n_head),  // scores
-                    (n_total, n_new),           // causal mask
-                    (n_total * n_new, n_head),  // softmax output
-                    (head_dim * n_kv, n_total), // v, transposed
+                    (head_dim * n_kv, n_total), // v, contiguous (not transposed)
+                    (n_total, n_new),           // causal mask (F16, so over-counted)
                     (head_dim * n_new, n_head), // attention output
                     (head_dim * n_new, n_head), // ...made contiguous
                     (n_embd, n_new),            // output projection
@@ -878,8 +905,7 @@ impl<'m> StreamingRunner<'m> {
                 v_all.set_f32(cache.values(il as usize))?;
                 let kv_secs = tkv.elapsed().as_secs_f64();
 
-                let out =
-                    arch.attention_cached(&ctx, &q, &k_all, &v_all, n_new, n_total, &mask)?;
+                let out = arch.attention_flash(&ctx, &q, &k_all, &v_all, n_new, n_total, &mask)?;
                 let out = ctx.mul_mat(&out_w, &out)?;
                 let t = std::time::Instant::now();
                 ctx.compute(&out, threads)?;
@@ -897,7 +923,16 @@ impl<'m> StreamingRunner<'m> {
             }
 
             let (normed_v, probs_v) = {
-                let ctx = Context::new(256 << 20)?;
+                let ctx = Context::new(arena_for(
+                    &[
+                        (n_embd, n_new),           // ffn input
+                        (n_embd, n_new),           // normalised
+                        (n_embd, n_new),           // rms intermediate
+                        (c.n_expert as i64, n_new), // router logits
+                        (c.n_expert as i64, n_new), // router probabilities
+                    ],
+                    24,
+                ))?;
                 let xt = ctx.new_f32_2d(n_embd, n_new)?;
                 xt.set_f32(&ffn_input)?;
                 let normed = self.arch.norm_scaled(

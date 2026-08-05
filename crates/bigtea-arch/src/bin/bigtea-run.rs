@@ -22,10 +22,12 @@ fn main() -> ExitCode {
     };
     let mut prompt = String::new();
     let mut n_predict = 8usize;
-    // 512 measured faster than 256 at every prompt length tried: a block reads
-    // nearly the whole expert set whatever its size, so larger blocks amortise
-    // that over more tokens.
-    let mut prefill_block = 512usize;
+    // A block reads nearly the whole expert set whatever its size, so larger
+    // blocks amortise that over more tokens: at 4395 tokens, 512 gives 30.5
+    // tok/s and 4096 gives 43.6. The limit is memory — every arena in the
+    // forward pass scales with the block — so 2048 is the default and -b
+    // raises it when there is RAM to spare.
+    let mut prefill_block = 2048usize;
     let mut cache_budget: Option<u64> = None;
     let rest: Vec<String> = args.collect();
     let mut i = 0;
