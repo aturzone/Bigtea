@@ -992,15 +992,30 @@ fn moe_router_and_shared_expert_match_llama_cpp_at_five_tokens() {
     let p = prologue_5tok(&ctx, &weights, &config);
     let (q, kv) = q_and_kv_5tok(&ctx, &weights, &config, &p.attn_norm);
     let attn_out = attention_5tok(&ctx, &weights, &config, &q, &kv);
-    let (_streams, ffn_norm) = layer_tail_5tok(&ctx, &weights, &config, &p, &attn_out);
+    let (_streams, ffn_norm, _gates) = layer_tail_5tok(&ctx, &weights, &config, &p, &attn_out);
 
+    let _ = moe_routing_5tok(&ctx, &weights, &config, &ffn_norm);
+    let _ = shared_expert_5tok(&ctx, &weights, &ffn_norm);
+}
+
+/// The router: probabilities, the six experts, and their normalised weights.
+///
+/// Returns `(weights, ids)` — the scaled weights shaped `[1, n_used, tokens]`
+/// ready to multiply the expert outputs, and the expert ids as `mul_mat_id`
+/// wants them.
+fn moe_routing_5tok<'c>(
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    config: &Deepseek4Config,
+    ffn_norm: &Tensor<'c>,
+) -> (Tensor<'c>, Tensor<'c>) {
     let nt = TOKENS_5.len() as i64;
     let n_expert = config.n_expert as i64;
     let n_used = config.n_expert_used as i64;
 
     // ---- routing ----
     let logits = ctx
-        .mul_mat(weights.get("blk.0.ffn_gate_inp.weight").expect("bound"), &ffn_norm)
+        .mul_mat(weights.get("blk.0.ffn_gate_inp.weight").expect("bound"), ffn_norm)
         .expect("logits");
     ctx.compute(&logits, 12).expect("compute logits");
     assert_sum(
@@ -1059,8 +1074,13 @@ fn moe_router_and_shared_expert_match_llama_cpp_at_five_tokens() {
         5.000000,
     );
 
+    // Reshaped back to [1, n_used, tokens] *before* the scale, so it can
+    // broadcast over each expert's [n_embd] output later.
+    let w3 = ctx
+        .reshape_3d(&w_norm, 1, n_used, nt)
+        .expect("reshape weights");
     let w_scaled = ctx
-        .scale(&w_norm, config.expert_weights_scale)
+        .scale(&w3, config.expert_weights_scale)
         .expect("scale weights");
     ctx.compute(&w_scaled, 12).expect("compute scaled");
     assert_sum(
@@ -1069,11 +1089,264 @@ fn moe_router_and_shared_expert_match_llama_cpp_at_five_tokens() {
         7.500000,
     );
 
-    // ---- the shared expert ----
-    // Always active, so it is resident weight rather than streamed. Confusing
-    // that with the 256 routed ones is the difference between 7 GiB and 144.
+    (w_scaled, topk)
+}
+
+/// **The routed experts, and the rest of layer 0.**
+///
+/// Oracle rows:
+/// ```text
+/// ffn_moe_gate-0            MUL_MAT_ID  {2048, 6, 5}  -6601.376953
+/// ffn_moe_up-0              MUL_MAT_ID  {2048, 6, 5}     -8.613072
+/// ffn_moe_swiglu_limited-0  SWIGLU      {2048, 6, 5}     11.649389
+/// ffn_moe_down-0            MUL_MAT_ID  {4096, 6, 5}     89.523140
+/// ffn_moe_out-0             ADD         {4096, 5}        18.572350
+/// ffn_out-0                 ADD         {4096, 5}        34.800404
+/// l_last-0                  DSV4_HC_POST {4096, 4, 5}     6.733532
+/// node_125                  RMS_NORM    {16384, 5}        1.599161
+/// ```
+///
+/// **Only the selected expert slices are read.** llama.cpp mmaps all 256 and
+/// lets `mul_mat_id` index into them; binding layer 0's three stacked tensors
+/// that way is ~3.2 GiB, which does not fit on this machine. Instead the unique
+/// experts the five tokens actually route to are read individually with
+/// `read_tensor_range` and packed into a compact stack, with the ids remapped
+/// to match — around a tenth of the bytes, and the same arithmetic.
+///
+/// That is not a shortcut taken for the test's convenience: **it is what the
+/// runner has to do anyway.** This is the first time the port has exercised the
+/// partial-read path against a reference, and the sums say the packing and the
+/// id remapping are both right — a remap that scrambled experts would still
+/// produce a full-rank result of exactly the right shape.
+#[test]
+#[ignore = "reads weights from a 144 GB container"]
+fn routed_experts_and_layer_output_match_llama_cpp_at_five_tokens() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+
+    let ctx = Context::new(512 << 20).expect("compute context");
+    let wctx = Context::new_no_alloc(16 << 20).expect("weight context");
+    let mut weights = WeightSet::new();
+    let mut names: Vec<&str> = ATTENTION_WEIGHTS.to_vec();
+    names.extend_from_slice(FFN_WEIGHTS);
+    names.extend_from_slice(MOE_WEIGHTS);
+    bind_all(&model, &wctx, &mut weights, &names);
+
+    let p = prologue_5tok(&ctx, &weights, &config);
+    let (q, kv) = q_and_kv_5tok(&ctx, &weights, &config, &p.attn_norm);
+    let attn_out = attention_5tok(&ctx, &weights, &config, &q, &kv);
+    let (streams, ffn_norm, gates) = layer_tail_5tok(&ctx, &weights, &config, &p, &attn_out);
+    let (w_scaled, topk) = moe_routing_5tok(&ctx, &weights, &config, &ffn_norm);
+    let shexp = shared_expert_5tok(&ctx, &weights, &ffn_norm);
+
+    let nt = TOKENS_5.len() as i64;
+    let n_embd = config.n_embd as i64;
+    let n_used = config.n_expert_used as i64;
+    let f32_size = std::mem::size_of::<f32>();
+
+    // ---- read only the experts these five tokens route to ----
+    let ids = topk.to_vec_i32();
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    let position = |e: i32| unique.iter().position(|u| *u == e).expect("in set") as i32;
+    let compact: Vec<i32> = ids.iter().map(|e| position(*e)).collect();
+    eprintln!(
+        "  {:<24} {} of {} experts, {} slots",
+        "routed",
+        unique.len(),
+        config.n_expert,
+        ids.len()
+    );
+
+    let mut read_bytes = 0u64;
+    let mut dims_of = std::collections::HashMap::new();
+    for suffix in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
+        let name = format!("blk.0.{suffix}.weight");
+        let (bytes, dims) = bind_expert_slices(&model, &wctx, &mut weights, &name, &unique);
+        read_bytes += bytes;
+        dims_of.insert(suffix, dims);
+    }
+    eprintln!(
+        "  {:<24} {:.2} GiB read (all 256 would be {:.2} GiB)",
+        "expert slices",
+        read_bytes as f64 / (1 << 30) as f64,
+        read_bytes as f64 / unique.len() as f64 * config.n_expert as f64 / (1 << 30) as f64
+    );
+
+    let n_uniq = unique.len() as i64;
+    let ids_t = ctx.new_i32_2d(n_used, nt).expect("ids");
+    ids_t.set_i32(&compact).expect("set ids");
+
+    let stack = |suffix: &str| {
+        let d = &dims_of[suffix];
+        ctx.reshape_3d(
+            weights.get(&format!("blk.0.{suffix}.weight")).expect("bound"),
+            d[0] as i64,
+            d[1] as i64,
+            n_uniq,
+        )
+        .expect("reshape experts")
+    };
+
+    // ---- the expert FFN ----
+    let cur3 = ctx.reshape_3d(&ffn_norm, n_embd, 1, nt).expect("reshape cur");
+
     let gate = ctx
-        .mul_mat(weights.get("blk.0.ffn_gate_shexp.weight").expect("bound"), &ffn_norm)
+        .mul_mat_id(&stack("ffn_gate_exps"), &cur3, &ids_t)
+        .expect("moe gate");
+    ctx.compute(&gate, 12).expect("compute moe gate");
+    assert_sum(
+        "ffn_moe_gate-0",
+        gate.to_vec_f32().iter().sum::<f32>(),
+        -6601.376953,
+    );
+
+    let gate_c = ctx
+        .clamp(&gate, f32::NEG_INFINITY, SWIGLU_CLAMP_L0)
+        .expect("clamp gate");
+
+    let up = ctx
+        .mul_mat_id(&stack("ffn_up_exps"), &cur3, &ids_t)
+        .expect("moe up");
+    ctx.compute(&up, 12).expect("compute moe up");
+    assert_sum("ffn_moe_up-0", up.to_vec_f32().iter().sum::<f32>(), -8.613072);
+
+    let up_c = ctx
+        .clamp(&up, -SWIGLU_CLAMP_L0, SWIGLU_CLAMP_L0)
+        .expect("clamp up");
+
+    let act = ctx.swiglu_split(&gate_c, &up_c).expect("swiglu");
+    ctx.compute(&act, 12).expect("compute swiglu");
+    assert_sum(
+        "ffn_moe_swiglu_limited-0",
+        act.to_vec_f32().iter().sum::<f32>(),
+        11.649389,
+    );
+
+    let down = ctx
+        .mul_mat_id(&stack("ffn_down_exps"), &act, &ids_t)
+        .expect("moe down");
+    ctx.compute(&down, 12).expect("compute moe down");
+    assert_sum(
+        "ffn_moe_down-0",
+        down.to_vec_f32().iter().sum::<f32>(),
+        89.523140,
+    );
+
+    // Each expert's output scaled by its router weight, then summed across the
+    // six. llama.cpp does this as six strided views and five adds rather than a
+    // reduction, so the same shape is used here.
+    let weighted = ctx.mul(&down, &w_scaled).expect("weight experts");
+    ctx.compute(&weighted, 12).expect("compute weighted");
+    assert_sum(
+        "ffn_moe_weighted-0",
+        weighted.to_vec_f32().iter().sum::<f32>(),
+        18.572262,
+    );
+
+    const PER_EXPERT: [f32; 6] = [
+        1.238907, 6.887056, 6.492266, 3.250872, -5.103240, 5.806348,
+    ];
+    let row = n_embd as usize * f32_size;
+    let mut moe_out: Option<Tensor> = None;
+    for (j, want) in PER_EXPERT.iter().enumerate() {
+        let v = ctx
+            .view_2d(&weighted, n_embd, nt, row * n_used as usize, j * row)
+            .expect("expert view");
+        ctx.compute(&v, 12).expect("compute view");
+        assert_sum(
+            &format!("ffn_moe_weighted-0 [{j}]"),
+            v.to_vec_f32().iter().sum::<f32>(),
+            *want,
+        );
+        moe_out = Some(match moe_out {
+            None => v,
+            Some(acc) => ctx.add(&acc, &v).expect("add expert"),
+        });
+    }
+    let moe_out = moe_out.expect("six experts");
+    ctx.compute(&moe_out, 12).expect("compute moe_out");
+    assert_sum(
+        "ffn_moe_out-0",
+        moe_out.to_vec_f32().iter().sum::<f32>(),
+        18.572350,
+    );
+
+    // ---- the shared expert joins, and the layer closes ----
+    let ffn_out = ctx.add(&moe_out, &shexp).expect("ffn_out");
+    ctx.compute(&ffn_out, 12).expect("compute ffn_out");
+    assert_sum(
+        "ffn_out-0",
+        ffn_out.to_vec_f32().iter().sum::<f32>(),
+        34.800404,
+    );
+
+    // The layer's second hyper-connection write-back, using the FFN block's
+    // gates — not the attention block's.
+    let l_last = ctx
+        .dsv4_hc_post(&ffn_out, &streams, &gates.post, &gates.comb)
+        .expect("dsv4_hc_post");
+    ctx.compute(&l_last, 12).expect("compute l_last");
+    assert_sum("l_last-0", l_last.to_vec_f32().iter().sum::<f32>(), 6.733532);
+
+    // What layer 1 sees. Matching here means the whole of layer 0 is right,
+    // since every earlier error would have to cancel exactly to arrive at it.
+    let flat = ctx
+        .reshape_2d(&l_last, config.hc_dim() as i64, nt)
+        .expect("flatten");
+    let normed = ctx.rms_norm(&flat, config.rms_eps).expect("rms_norm");
+    ctx.compute(&normed, 12).expect("compute node_125");
+    assert_sum(
+        "node_125 (into layer 1)",
+        normed.to_vec_f32().iter().sum::<f32>(),
+        1.599161,
+    );
+}
+
+/// Read just the named experts out of a stacked tensor and bind them as a
+/// compact stack, returning `(bytes read, the compact dims)`.
+///
+/// A stacked expert tensor is `[ne0, ne1, n_expert]` with every slice the same
+/// size, so slice `i` starts at `i * size / n_expert` — the same arithmetic
+/// `stream.rs` uses to fetch one expert.
+fn bind_expert_slices<'c>(
+    model: &Model,
+    ctx: &'c Context,
+    weights: &mut WeightSet<'c>,
+    name: &str,
+    unique: &[i32],
+) -> (u64, Vec<u64>) {
+    let loc = model.location(name).unwrap_or_else(|| panic!("{name} present")).clone();
+    let n_expert = *loc.dims.last().expect("stacked tensor");
+    let slice = loc.size / n_expert;
+
+    let mut buf = Vec::with_capacity(unique.len() * slice as usize);
+    for e in unique {
+        let bytes = model
+            .read_tensor_range(name, *e as u64 * slice, slice)
+            .expect("read expert slice");
+        buf.extend_from_slice(&bytes);
+    }
+
+    let mut dims = loc.dims.clone();
+    *dims.last_mut().expect("stacked") = unique.len() as u64;
+    let read = buf.len() as u64;
+    weights.bind(ctx, name, loc.ty, &dims, buf).expect("bind experts");
+    (read, dims)
+}
+
+/// The shared expert: always active, and therefore resident weight.
+///
+/// Confusing it with the 256 routed ones is the difference between a 7 GiB
+/// resident set and a 144 GiB one.
+fn shared_expert_5tok<'c>(
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    ffn_norm: &Tensor<'c>,
+) -> Tensor<'c> {
+    let gate = ctx
+        .mul_mat(weights.get("blk.0.ffn_gate_shexp.weight").expect("bound"), ffn_norm)
         .expect("gate");
     ctx.compute(&gate, 12).expect("compute gate");
     assert_sum("ffn_gate-0", gate.to_vec_f32().iter().sum::<f32>(), 2518.574707);
@@ -1090,7 +1363,7 @@ fn moe_router_and_shared_expert_match_llama_cpp_at_five_tokens() {
     );
 
     let up = ctx
-        .mul_mat(weights.get("blk.0.ffn_up_shexp.weight").expect("bound"), &ffn_norm)
+        .mul_mat(weights.get("blk.0.ffn_up_shexp.weight").expect("bound"), ffn_norm)
         .expect("up");
     ctx.compute(&up, 12).expect("compute up");
     assert_sum("ffn_up-0", up.to_vec_f32().iter().sum::<f32>(), 36.162750);
@@ -1114,6 +1387,8 @@ fn moe_router_and_shared_expert_match_llama_cpp_at_five_tokens() {
         .expect("shexp");
     ctx.compute(&shexp, 12).expect("compute shexp");
     assert_sum("ffn_shexp-0", shexp.to_vec_f32().iter().sum::<f32>(), 16.228374);
+
+    shexp
 }
 
 /// Post hyper-connection, the FFN gate block, and `ffn_norm`.
@@ -1127,7 +1402,7 @@ fn layer_tail_5tok<'c>(
     config: &Deepseek4Config,
     p: &Prologue5<'c>,
     attn_out: &Tensor<'c>,
-) -> (Tensor<'c>, Tensor<'c>) {
+) -> (Tensor<'c>, Tensor<'c>, HcGates<'c>) {
     let nt = TOKENS_5.len() as i64;
 
     // x = attn_out, residual = the streams as they were *before* attention.
@@ -1176,7 +1451,7 @@ fn layer_tail_5tok<'c>(
     ctx.compute(&ffn_norm, 12).expect("compute");
     assert_sum("ffn_norm-0", ffn_norm.to_vec_f32().iter().sum::<f32>(), 11.634495);
 
-    (streams, ffn_norm)
+    (streams, ffn_norm, gates)
 }
 
 /// Attention through to `attn_out`, returning the block's output.
