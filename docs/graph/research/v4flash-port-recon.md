@@ -182,6 +182,51 @@ right count of plausible floats and all of them the wrong ones — making a
 correct graph look broken. Now stride-aware, with two hand-checkable unit tests
 that need no container.
 
+## Layer 0 is verified end to end (2026-08-06), except the routed experts
+
+Everything from the embedding to `ffn_shexp-0` matches llama.cpp at five tokens. What the
+build found on the way, none of which is derivable from tensor shapes:
+
+- **Layers 0-2 do not use top-k routing.** `ffn_moe_topk-0` is
+  `GET_ROWS(blk.0.ffn_gate_tid2eid.weight{6, 129280}, inp_tokens)` — the six experts are a
+  lookup on the *token id*. That is what `hash_layer_count 3` means operationally. The router
+  probabilities are still computed, but only to weight experts already chosen. **For the
+  streaming design this is a genuine opportunity: on those three layers the expert set is
+  knowable from the token id before any compute runs**, so their reads can be issued as early
+  as tokenisation.
+- The gate is `sqrt(softplus(x))`; weights are renormalised over the selected six only, then
+  scaled by 1.5, with the divisor clamped at the smallest F16 normal (6.103515625e-5).
+- The SwiGLU clamp is **asymmetric on the gate**: `(-inf, 10]` for the gate, `[-10, 10]` for
+  up, in an `LLM_ARCH_DEEPSEEK4` branch (`llama-graph.cpp:2050-2057`).
+- The post hyper-connection replaces the residual add entirely:
+  `x[dst] = f(x)*post[dst] + sum_src x[src]*comb[dst, src]`. `pre` ends with
+  `scale_bias(x, 1, hc_eps)` and `post` with `scale(x, 2.0)` — different tails, same shape.
+  The FFN's gates come from a *second* mixes matmul against `hc_ffn_fn`, not the attention
+  block's.
+- Attention: `kv` is K *and* V; the cache is F16 so the reference sum is the rounded one;
+  `n_kv` is padded to 256 and the unused slots need `-inf`; per-head sinks shift the result
+  ~10%.
+
+**Not done: the routed expert matmuls** (`mul_mat_id` over the 256 stacked experts). Two ways
+in, and the second is better:
+
+1. Bind all three stacked tensors for layer 0 — **~3.2 GiB**, which did not fit when checked
+   (5.2 GiB available, 4.2 GiB usable for weights).
+2. Read only the ~30 unique expert slices the five tokens select and remap the ids into a
+   compact stack — roughly **380 MiB**, and much closer to what the runner will actually do.
+
+### Holes recorded rather than papered over
+
+- **The SwiGLU clamp bounds are unverified.** At five tokens neither is reached: the clamped
+  sums equal the unclamped ones. The capture confirms the shape of the computation, not the
+  numbers. Same class as the one-token RoPE hole.
+- **The sliding window is unverified.** Raw layers are SWA layers with window 128
+  (`GGML_ASSERT(hparams.is_swa(il))`), but five tokens never reach back that far, so the test
+  uses a plain causal mask. Needs a capture longer than 128 tokens.
+- **`swiglu_clamp_exp` / `swiglu_clamp_shexp` are per-layer arrays of 43 and
+  `Deepseek4Config` reads neither.** The tests hardcode index 0. That must be fixed before any
+  layer but 0 runs.
+
 ## Open questions
 
 - `compress_ratios` has 44 entries for 43 blocks. Off-by-one, or an extra leading/trailing value?
@@ -192,7 +237,9 @@ that need no container.
   resident, but the byte accounting has not been re-checked.
 - **Still unverified: the other two attention kinds.** Layer 0 is `Raw`. The 20
   heavily-compressed and 21 compressed-sparse layers have no oracle rows yet — the capture stops
-  where layer 1 begins. Matching layer 0 says nothing about them.
+  where layer 1 begins. Matching layer 0 says nothing about them. Note the same 5-token dump in
+  the scratchpad *does* contain layers 1-42; extracting layer 1 (also `Raw`) is nearly free,
+  but a compressed layer needs its rows pulled out too before that path can be built.
 
 ### Resolved and struck from this list
 
