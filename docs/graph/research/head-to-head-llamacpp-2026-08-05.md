@@ -225,6 +225,27 @@ admission, then binding the repacked layout, is the single remaining lever on ge
 it fits this design unusually well, because a cached slice is repacked once and reused across
 every token that routes to it.
 
+### The obstacle, checked 2026-08-05
+
+**ggml does not expose repacking publicly.** There are no `_R4`/`_R8` entries in the `ggml_type`
+enum (`ggml.h`: Q4_K is 12, the enum ends at 43 with no repacked variants), and nothing matching
+`repack` appears anywhere in `ggml/include`. Upstream applies it through *extra buffer types*
+inside `ggml-cpu`, selected during `ggml-backend` buffer allocation — a path Bigtea bypasses
+entirely, because binding a weight means pointing a tensor's `data` at memory we already hold.
+
+So this is not a matter of calling one more function. Two possible routes, neither cheap:
+
+1. Route cached expert slices through `ggml-backend` buffer allocation so the extra buffer type
+   applies. Costs a copy per slice — acceptable here, since a cached slice is copied once and
+   reused for every token that routes to it — but the extra-buffer-type selection API is not
+   public either, so it may mean linking against ggml-cpu internals.
+2. Write the interleaved Q4_K dequant/dot kernel ourselves in AVX2. Full control, no reliance on
+   ggml internals, but it is a real kernel with a real correctness risk — and a wrong one gives
+   fluent nonsense rather than a crash, like every other numerical mistake in this project.
+
+Route 1 first, and only fall back to 2 if the buffer-type API proves unreachable. Either way this
+is a multi-session piece of work, not an afternoon's.
+
 ## Open questions
 
 - **The V4-Flash port is now the critical path**, not a nice-to-have. It is the only way to test
