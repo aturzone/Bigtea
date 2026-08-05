@@ -35,10 +35,12 @@ it instead from which tensors a block ships. `deepseek4_container.rs` now assert
 agree on all 43 layers; a divergence means one reading is wrong and some layer would run
 through the wrong attention.
 
-## HCA — the right first target
+## HCA — the simpler kind, but *not* the first one reachable
 
-133 rows against Raw's 121. Over a Raw layer it adds exactly three ops, all state
-maintenance:
+133 rows against Raw's 121, so it looks like the obvious next step. It is not: layer 3 sits
+behind layer 2, and layers chain. See the corrected order at the bottom of this node.
+
+Over a Raw layer it adds exactly three ops, all state maintenance:
 
 ```
 hca_state_kv-3         MUL_MAT  {512, 5}   attn_compressor_kv   · x
@@ -105,12 +107,32 @@ changes no shape. Note also this is `ARGSORT` plus a view, not a `TOP_K`, and `t
 not return indices in score order` is already a rediscovered-the-hard-way entry in
 `CLAUDE.md`.
 
-## Suggested order
+## Order — CORRECTED
 
-1. **Finish layer 1** — mechanical, but it is the prerequisite: nothing in layer 2 or 3 can
-   be checked until layers 0-1 both run in full. Needs the forward helpers parameterised by
-   layer index and a second set of expected sums.
-2. **Layer 3 (HCA)** — smallest step that reaches new ground, and it closes *both* holes
-   above at once: compressed RoPE and normal MoE routing.
-3. **A capture longer than 128 tokens**, to make HCA's compression observable at all.
-4. **Layer 2 (CSA + indexer)** last, as the recon originally staged it.
+An earlier version of this node said to do layer 3 (HCA) before layer 2 (CSA), on the
+grounds that HCA is much simpler. **That order is impossible.** Layers chain: layer 3's
+input is layer 2's output, and there is no way to seed it — the trace gives element sums,
+not tensors. The alternation puts CSA at every even layer, so **the simpler kind sits behind
+the harder one and CSA must be built first.**
+
+Recorded rather than quietly fixed, because the mistake is instructive: "smallest next step"
+was chosen by looking at the two kinds in isolation and not at what feeds what.
+
+1. ~~Finish layer 1~~ **done** — both `Raw` layers run in full through one generic layer
+   function, and the helpers now take a block index plus a table of that layer's sums.
+2. ~~The seam into layer 2~~ **done** — a layer's *entry* (hyper-connection gates,
+   `attn_norm`) does not depend on which attention follows, so it was checkable with no CSA
+   code at all: `attn_norm-2` = 5.640476 is exactly what CSA attention will consume. When CSA
+   is built, only the attention itself is new.
+3. **Layer 2's CSA attention** — the actual next build, and unavoidably the hard one.
+   Everything before and after it in the block is already verified, so the work is bounded to
+   `attn_norm-2` → `attn_out-2`.
+4. **Layer 3 (HCA)**, which then follows almost for free and closes both holes above.
+5. **A capture longer than 128 tokens**, to make HCA's compression observable at all — at
+   five tokens `hca_state_compress` never runs.
+
+### A shortcut worth considering for step 3
+
+CSA compresses every 4 tokens. **A capture of 3 or fewer tokens would reduce layer 2 to CSA
+without any compression**, leaving only the indexer over raw keys — a strictly smaller first
+target, and positions 1-2 still make RoPE checkable. Untried, but cheap to find out.

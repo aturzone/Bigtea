@@ -164,6 +164,39 @@ const LAYER1: LayerSums = LayerSums {
 ("ffn_out", 19.105911), ("l_last", 23.754854), ("next_norm", 98.961739),],
 };
 
+/// Layer 2's entry only — its attention is Compressed Sparse and is not built.
+///
+/// A layer's *entry* is architecture-independent: the hyper-connection gate
+/// block and `attn_norm` are identical whatever attention follows. So the seam
+/// into the first compressed layer is checkable now, and when CSA is built only
+/// the attention itself will be new.
+const LAYER2_ENTRY: LayerSums = LayerSums {
+    il: 2,
+    attn_gates: LAYER2_ATTN_GATE_SUMS,
+    ffn_gates: LAYER2_ATTN_GATE_SUMS, // unused: the FFN half is not reached
+    weighted: [0.0; 6],
+    rows: &[
+        ("hc_mixes_attn", -3056.212402),
+        ("hc_attn_pre", 15.256248),
+        ("norm_attn", 81.159294),
+        ("attn_norm", 5.640476),
+    ],
+};
+
+const LAYER2_ATTN_GATE_SUMS: HcGateSums = HcGateSums {
+    pre_view: -287.356506,
+    pre_scaled: -12.378065,
+    pre_biased: -45.173386,
+    pre_sigmoid: 5.595741,
+    pre: 5.595761,
+    post_view: -2590.740479,
+    post_scaled: -70.598717,
+    post_biased: -316.790985,
+    post_sigmoid: 0.108592,
+    post: 0.217185,
+    comb: 19.999975,
+};
+
 /// Layer 1's FFN gate block.
 const LAYER1_FFN_GATE_SUMS: HcGateSums = HcGateSums {
     pre_view: -916.991821,
@@ -1470,7 +1503,7 @@ const LAYER1_ATTN_GATE_SUMS: HcGateSums = HcGateSums {
 /// different weights and not the same rows under another name.
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
-fn layer_1_chains_from_layer_0_at_five_tokens() {
+fn layers_compose_through_the_first_compressed_layer() {
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1498,8 +1531,19 @@ fn layer_1_chains_from_layer_0_at_five_tokens() {
         Some(bigtea_arch::AttentionKind::Raw)
     );
 
-    let s = &LAYER1;
-    let _ = layer_5tok(s, &model, &ctx, &wctx, &mut weights, &config, &l_last);
+    let l_last = layer_5tok(&LAYER1, &model, &ctx, &wctx, &mut weights, &config, &l_last);
+
+    // Into the first *compressed* layer. Its attention is Compressed Sparse and
+    // is not built — but a layer's entry does not depend on which attention
+    // follows, so the seam is checkable now. When CSA is built, only the
+    // attention itself will be new ground.
+    assert_eq!(
+        config.attention_kind_from_ratio(2),
+        Some(bigtea_arch::AttentionKind::CompressedSparse),
+        "layer 2 is where the compressed layers begin"
+    );
+    bind_all(&model, &wctx, &mut weights, &block_weights(2));
+    let _ = layer_entry_5tok(&LAYER2_ENTRY, &ctx, &weights, &config, &l_last);
 }
 
 /// Read just the named experts out of a stacked tensor and bind them as a
