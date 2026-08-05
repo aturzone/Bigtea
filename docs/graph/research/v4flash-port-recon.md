@@ -207,13 +207,33 @@ build found on the way, none of which is derivable from tensor shapes:
   `n_kv` is padded to 256 and the unused slots need `-inf`; per-head sinks shift the result
   ~10%.
 
-**Not done: the routed expert matmuls** (`mul_mat_id` over the 256 stacked experts). Two ways
-in, and the second is better:
+**The routed experts are done, via partial reads.** Binding all three stacked tensors for
+layer 0 is 3.19 GiB and did not fit (5.2 GiB available, 4.2 usable). Instead the experts the
+five tokens actually route to are fetched with `read_tensor_range` and packed into a compact
+stack with the ids remapped:
 
-1. Bind all three stacked tensors for layer 0 — **~3.2 GiB**, which did not fit when checked
-   (5.2 GiB available, 4.2 GiB usable for weights).
-2. Read only the ~30 unique expert slices the five tokens select and remap the ids into a
-   compact stack — roughly **380 MiB**, and much closer to what the runner will actually do.
+```
+routed          29 of 256 experts, 30 slots
+expert slices   0.36 GiB read (all 256 would be 3.19 GiB)
+```
+
+**8.9x fewer bytes for identical arithmetic**, and this is the first time the partial-read
+path has been checked against a reference. It is not a test convenience — it is what the
+runner has to do. Per-expert contributions are asserted individually, so a mis-slotted
+expert cannot hide inside the total.
+
+**Layers compose.** Layer 1 has no embedding and no `hc_init`; it consumes `l_last-0`
+directly, so `hc_mixes-1 = -3428.892578` is one number standing in for the correctness of
+all of layer 0. Layer 1 is also the *second* `Raw` layer, so it runs the same code with
+entirely different weights — an implementation accidentally fitted to layer 0 has nowhere
+to hide. Only layer 1's entry and first matmul are checked; running it fully needs the
+remaining helpers parameterised by layer index.
+
+**Per-layer hyper-parameters are read now.** `swiglu_clamp_exp`, `swiglu_clamp_shexp` and
+`compress_ratios` are arrays, and `Deepseek4Config` previously read none of them.
+`rope_for_layer(il)` picks the branch the way `deepseek4.cpp:822-829` does, and the forward
+tests call it rather than a local copy of the rules — so the checkpoints exercise shipped
+code.
 
 ### Holes recorded rather than papered over
 
@@ -223,9 +243,11 @@ in, and the second is better:
 - **The sliding window is unverified.** Raw layers are SWA layers with window 128
   (`GGML_ASSERT(hparams.is_swa(il))`), but five tokens never reach back that far, so the test
   uses a plain causal mask. Needs a capture longer than 128 tokens.
-- **`swiglu_clamp_exp` / `swiglu_clamp_shexp` are per-layer arrays of 43 and
-  `Deepseek4Config` reads neither.** The tests hardcode index 0. That must be fixed before any
-  layer but 0 runs.
+- ~~`swiglu_clamp_exp` / `swiglu_clamp_shexp` are per-layer arrays and `Deepseek4Config` reads
+  neither.~~ **Fixed** — along with `compress_ratios` and `rope_for_layer(il)`.
+- **The compressed RoPE branch is transcribed, not verified.** `rope_for_layer` returns YaRN
+  parameters for the 41 compressed layers, taken from `deepseek4.cpp` — but the oracle stops
+  inside layer 1 and both Raw layers are uncompressed, so no capture has ever exercised it.
 
 ## Open questions
 
