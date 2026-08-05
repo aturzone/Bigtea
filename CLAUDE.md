@@ -2,7 +2,7 @@
 
 - **What it is**: a Rust inference runner whose job is running models that do *not* fit in memory. Keeps the always-read weights resident, streams routed experts from disk per token. Borrows `ggml` for arithmetic; owns memory, residency, streaming, and the token loop.
 - **Proven**: Qwen3-30B-A3B (17.28 GiB container) generates correct text on a 15.7 GiB machine holding 0.93 GiB resident + a 6.26 GiB expert cache.
-- **We are still behind llama.cpp — do not claim otherwise.** On the same box it is ~1.2–2.4x faster at prefill and ~2.2–2.5x at generation, and it runs the 144 GB V4-Flash too once `--no-repack` is passed. "Larger than RAM" is not a differentiator; mmap already does it. Full ladder, retracted claims, and one experiment that failed: `docs/graph/research/head-to-head-llamacpp-2026-08-05.md`.
+- **Prefill beats llama.cpp** at 565 (27.6 vs 23.6) and 2206 tokens (36.6 vs 33.6), and matches it at 4395 and 8775; `-b 4096` gives 43.6 vs 40.3. **Generation is still ~2x behind** (1.07 vs 2.16) — do not claim otherwise. llama.cpp also runs the 144 GB V4-Flash once `--no-repack` is passed, so "larger than RAM" is not a differentiator. Full ladder, retracted claims, and one experiment that failed: `docs/graph/research/head-to-head-llamacpp-2026-08-05.md`.
 - Graph docs live in `/docs/graph/`; read `INDEX.md` first, then only the 2–3 nodes a task links to.
 
 ## Build / test / run
@@ -36,6 +36,8 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 - **Expert access is a cyclic scan, so recency-based caching is the worst policy available.** Layer 0 is always the oldest entry when layer 47 needs room. Frequency-gated admission took hit rate 17% → 70% at the same budget.
 - **Profile before optimising a streaming runner.** The largest cost in generation was memcpy — slices copied twice per use — not disk and not arithmetic. Nothing suggested it until it was timed.
 - **Cache hit rate is not a success metric.** Past ~6 GiB the expert cache reaches 71% hits and is the *slowest* configuration measured: cached bytes get paged out, so a "hit" is a page fault wearing a disguise. Only tok/s at a stated footprint counts.
+- **`flash_attn_ext` does NOT transpose V**, unlike the `mul_mat` attention path, and its mask must be **F16 and contiguous**. Both mistakes give fluent nonsense, not an error. Mask values are only 0 and -inf, so write the bits (`0x0000` / `0xFC00`) rather than converting.
+- **Every arena must scale with the prefill block.** Fixed-size arenas abort once the block grows; ggml asks and dies rather than returning an error.
 
 ## Working rules
 
@@ -49,8 +51,8 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 
 1. **DeepSeek-V4-Flash — the critical path.** Its 7.38 GiB of always-read weights *fit* this machine, with 137.06 GiB of experts streamed (3.21 GiB/token, 6 of 256). That is the regime the design targets and the only place it should beat llama.cpp, whose dense weights get evicted by cold expert traffic. Bar: 0.45 tok/s. Physics ceiling: ~0.87 tok/s cold. Scoping, staged plan and open questions: `docs/graph/research/v4flash-port-recon.md`.
 2. Choose I/O mode from the model-size-to-RAM ratio. Bypassing the page cache is right when the model dwarfs RAM and wrong when it nearly fits — there we double-buffer against a kernel that uses all free RAM elastically.
-3. Close the generation gap (we are ~2.3x behind). At 565 tokens: 3.2s disk, 5.4s expert compute, 1.0s attention, ~3.3s unattributed. Expert compute is single-column Q4_K matmuls; llama.cpp repacks for exactly this and we do not.
-4. Headroom is 4 GiB, so we use 7.2 GiB where llama.cpp effectively gets ~11. Measure how much of the gap that alone explains.
+3. **Close the generation gap — the only place we still lose (~2x).** Prefill is done. At 4395 tokens generation splits 41.1s expert compute / 25.8s attention / 12.3s disk / 11.8s other. The expert matmuls are single-column Q4_K at ~239 GFLOPS; llama.cpp repacks weights for exactly this and we do not.
+4. Auto-tune the prefill block from free RAM. Block size is worth more than any kernel here (512 → 4096 is 30.5 → 43.6 tok/s) and it is currently a fixed 2048 with a `-b` override.
 
 ## Compact Instructions
 
