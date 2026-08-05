@@ -47,7 +47,7 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 
 ## Next
 
-1. **DeepSeek-V4-Flash architecture — now the critical path, not a nice-to-have.** Model ≫ RAM is the only regime where this design should win, and we cannot test the thesis until Bigtea runs a model that large. llama.cpp does it at 0.45 tok/s with `--no-repack`; that is the bar. 1,203-line graph + bespoke KV cache; the 144 GB model is on disk.
+1. **DeepSeek-V4-Flash — the critical path.** Its 7.38 GiB of always-read weights *fit* this machine, with 137.06 GiB of experts streamed (3.21 GiB/token, 6 of 256). That is the regime the design targets and the only place it should beat llama.cpp, whose dense weights get evicted by cold expert traffic. Bar: 0.45 tok/s. Physics ceiling: ~0.87 tok/s cold. Scoping, staged plan and open questions: `docs/graph/research/v4flash-port-recon.md`.
 2. Choose I/O mode from the model-size-to-RAM ratio. Bypassing the page cache is right when the model dwarfs RAM and wrong when it nearly fits — there we double-buffer against a kernel that uses all free RAM elastically.
 3. Close the generation gap (we are ~2.3x behind). At 565 tokens: 3.2s disk, 5.4s expert compute, 1.0s attention, ~3.3s unattributed. Expert compute is single-column Q4_K matmuls; llama.cpp repacks for exactly this and we do not.
 4. Headroom is 4 GiB, so we use 7.2 GiB where llama.cpp effectively gets ~11. Measure how much of the gap that alone explains.
