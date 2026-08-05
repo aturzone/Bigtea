@@ -67,6 +67,41 @@ extern "C" {
         -> *mut ggml_tensor;
     fn ggml_soft_max(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     fn ggml_fp32_to_fp16_row(src: *const f32, dst: *mut u16, n: i64);
+    fn ggml_repeat(ctx: *mut ggml_context, a: *mut ggml_tensor, b: *mut ggml_tensor)
+        -> *mut ggml_tensor;
+    fn ggml_view_1d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: i64,
+        offset: usize,
+    ) -> *mut ggml_tensor;
+    fn ggml_dsv4_hc_pre(
+        ctx: *mut ggml_context,
+        x: *mut ggml_tensor,
+        weights: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    fn ggml_dsv4_hc_post(
+        ctx: *mut ggml_context,
+        x: *mut ggml_tensor,
+        residual: *mut ggml_tensor,
+        post: *mut ggml_tensor,
+        comb: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    fn ggml_dsv4_hc_comb(
+        ctx: *mut ggml_context,
+        mixes: *mut ggml_tensor,
+        scale: *mut ggml_tensor,
+        base: *mut ggml_tensor,
+        eps: f32,
+        n_iter: c_int,
+    ) -> *mut ggml_tensor;
+    fn ggml_lightning_indexer(
+        ctx: *mut ggml_context,
+        q: *mut ggml_tensor,
+        k: *mut ggml_tensor,
+        weights: *mut ggml_tensor,
+        mask: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
     fn ggml_flash_attn_ext(
         ctx: *mut ggml_context,
         q: *mut ggml_tensor,
@@ -543,6 +578,117 @@ impl Context {
                 scale,
                 0.0, // max_bias: ALiBi, which this architecture does not use
                 0.0, // logit_softcap: unused
+            )
+        })
+    }
+
+    /// Broadcast `a` up to the shape of `b`.
+    pub fn repeat<'a>(&'a self, a: &Tensor<'a>, b: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: both tensors live in this context; ggml checks that the
+        // shapes are compatible for repetition.
+        self.tensor(unsafe { ggml_repeat(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) })
+    }
+
+    /// A contiguous 1-D window into `a`, `offset` bytes from its start.
+    pub fn view_1d<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        ne0: i64,
+        offset: usize,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: valid context and tensor; ggml validates the window against
+        // the source's extent.
+        self.tensor(unsafe { ggml_view_1d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, offset) })
+    }
+
+    /// Collapse the hyper-connection streams into one vector.
+    ///
+    /// `x` is `[n_embd, hc, n_tokens]`, `weights` is `[hc, n_tokens]`, and the
+    /// result is `[n_embd, n_tokens]` where
+    /// `result[i, t] = sum_h x[i, h, t] * weights[h, t]`.
+    ///
+    /// DeepSeek-V4 replaces the plain residual (`x = f(x) + x`) with several
+    /// parallel streams; this is the read side of that. See
+    /// <https://arxiv.org/pdf/2512.24880>.
+    pub fn dsv4_hc_pre<'a>(
+        &'a self,
+        x: &Tensor<'a>,
+        weights: &Tensor<'a>,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: both tensors live in this context.
+        self.tensor(unsafe {
+            ggml_dsv4_hc_pre(self.raw.as_ptr(), x.raw.as_ptr(), weights.raw.as_ptr())
+        })
+    }
+
+    /// Write a block's output back across the hyper-connection streams.
+    ///
+    /// `result[i, dst, t] = x[i, t]*post[dst, t] + sum_src residual[i, src, t]*comb[dst, src, t]`
+    pub fn dsv4_hc_post<'a>(
+        &'a self,
+        x: &Tensor<'a>,
+        residual: &Tensor<'a>,
+        post: &Tensor<'a>,
+        comb: &Tensor<'a>,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: all four tensors live in this context.
+        self.tensor(unsafe {
+            ggml_dsv4_hc_post(
+                self.raw.as_ptr(),
+                x.raw.as_ptr(),
+                residual.raw.as_ptr(),
+                post.raw.as_ptr(),
+                comb.raw.as_ptr(),
+            )
+        })
+    }
+
+    /// Build the stream-mixing matrix, Sinkhorn-normalised.
+    ///
+    /// `n_iter` is the Sinkhorn iteration count — 20 for V4-Flash, read from
+    /// `hyper_connection.sinkhorn_iterations`. ggml implements the
+    /// normalisation itself, so this is a binding rather than an algorithm to
+    /// reproduce.
+    pub fn dsv4_hc_comb<'a>(
+        &'a self,
+        mixes: &Tensor<'a>,
+        scale: &Tensor<'a>,
+        base: &Tensor<'a>,
+        eps: f32,
+        n_iter: i32,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: all three tensors live in this context.
+        self.tensor(unsafe {
+            ggml_dsv4_hc_comb(
+                self.raw.as_ptr(),
+                mixes.raw.as_ptr(),
+                scale.raw.as_ptr(),
+                base.raw.as_ptr(),
+                eps,
+                n_iter as c_int,
+            )
+        })
+    }
+
+    /// Sparse-attention indexer: score every key so the top-k can be kept.
+    ///
+    /// `mask` must be F16, as with [`Self::flash_attn_ext`], and `weights` is
+    /// expected already scaled.
+    pub fn lightning_indexer<'a>(
+        &'a self,
+        q: &Tensor<'a>,
+        k: &Tensor<'a>,
+        weights: &Tensor<'a>,
+        mask: &Tensor<'a>,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: all four tensors live in this context.
+        self.tensor(unsafe {
+            ggml_lightning_indexer(
+                self.raw.as_ptr(),
+                q.raw.as_ptr(),
+                k.raw.as_ptr(),
+                weights.raw.as_ptr(),
+                mask.raw.as_ptr(),
             )
         })
     }
