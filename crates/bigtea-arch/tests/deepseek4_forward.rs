@@ -45,6 +45,23 @@ fn open() -> Option<Model> {
     Model::open_split(SHARD).ok()
 }
 
+/// Bind a set of tensors by name into `weights`.
+fn bind_all<'c>(
+    model: &Model,
+    ctx: &'c Context,
+    weights: &mut WeightSet<'c>,
+    names: &[&str],
+) {
+    for name in names {
+        let loc = model
+            .location(name)
+            .unwrap_or_else(|| panic!("{name} present"))
+            .clone();
+        let data = model.read_tensor(name).expect("read tensor");
+        weights.bind(ctx, name, loc.ty, &loc.dims, data).expect("bind");
+    }
+}
+
 /// The prologue: embedding lookup, and the hyper-connection stream it seeds.
 ///
 /// Oracle rows:
@@ -214,4 +231,102 @@ fn hyper_connection_block_matches_llama_cpp() {
         collapsed.to_vec_f32().iter().sum::<f32>(),
         8.391787,
     );
+}
+
+/// The Q path: down to `q_lora_rank`, back up, then the per-head norm.
+///
+/// Oracle rows:
+/// ```text
+/// norm-0     RMS_NORM {4096, 1}     23.019047
+/// attn_norm  MUL      {4096, 1}      0.769727
+/// qr-0       MUL_MAT  {1024, 1}     -1.006525
+/// norm-0     RMS_NORM {1024, 1}    -13.669229
+/// qr_norm-0  MUL      {1024, 1}     -0.573721
+/// node_19    MUL_MAT  {32768, 1}     0.694762
+/// q_norm-0   RMS_NORM {512, 64}     48.321102
+/// ```
+///
+/// The last row is the one worth having: `q_norm` is an RMS norm with **no
+/// weight**, applied per head across 512 dims. Applying `attn_q_a_norm` again
+/// there is the natural-looking mistake and changes the number.
+///
+/// Note this trace cannot validate RoPE. The prompt is one token at position
+/// 0, where the rotation is the identity — the oracle shows `q_pe` with the
+/// same sum as its input. Checking RoPE needs a multi-token capture.
+#[test]
+#[ignore = "reads weights from a 144 GB container"]
+fn q_projection_matches_llama_cpp() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+
+    let ctx = Context::new(512 << 20).expect("compute context");
+    let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
+    let mut weights = WeightSet::new();
+    bind_all(
+        &model,
+        &wctx,
+        &mut weights,
+        &[
+            "token_embd.weight",
+            "blk.0.attn_norm.weight",
+            "blk.0.attn_q_a.weight",
+            "blk.0.attn_q_a_norm.weight",
+            "blk.0.attn_q_b.weight",
+        ],
+    );
+
+    // At layer 0 every hyper-connection stream is a copy of the embedding, so
+    // the collapse is the embedding times the summed gate — 4.000004 — which
+    // the previous test established against llama.cpp.
+    let tok = ctx.new_i32_1d(1).expect("tok");
+    tok.set_i32(&[TOKEN]).expect("set");
+    let embd = ctx
+        .get_rows(weights.get("token_embd.weight").expect("bound"), &tok)
+        .expect("get_rows");
+    ctx.compute(&embd, 12).expect("compute embd");
+    let hc_out: Vec<f32> = embd.to_vec_f32().iter().map(|v| v * 4.000004).collect();
+
+    let x = ctx.new_f32_2d(config.n_embd as i64, 1).expect("x");
+    x.set_f32(&hc_out).expect("set x");
+    assert_sum("hc_attn_pre", hc_out.iter().sum::<f32>(), 8.391787);
+
+    let normed = ctx.rms_norm(&x, config.rms_eps).expect("norm");
+    ctx.compute(&normed, 12).expect("compute");
+    assert_sum("norm-0", normed.to_vec_f32().iter().sum::<f32>(), 23.019047);
+
+    let attn_norm = ctx
+        .mul(&normed, weights.get("blk.0.attn_norm.weight").expect("bound"))
+        .expect("attn_norm");
+    ctx.compute(&attn_norm, 12).expect("compute");
+    assert_sum("attn_norm-0", attn_norm.to_vec_f32().iter().sum::<f32>(), 0.769727);
+
+    let qr = ctx
+        .mul_mat(weights.get("blk.0.attn_q_a.weight").expect("bound"), &attn_norm)
+        .expect("qr");
+    ctx.compute(&qr, 12).expect("compute");
+    assert_sum("qr-0", qr.to_vec_f32().iter().sum::<f32>(), -1.006525);
+
+    let qr_n = ctx.rms_norm(&qr, config.rms_eps).expect("qr rms");
+    ctx.compute(&qr_n, 12).expect("compute");
+    assert_sum("norm-0 (qr)", qr_n.to_vec_f32().iter().sum::<f32>(), -13.669229);
+
+    let qr_norm = ctx
+        .mul(&qr_n, weights.get("blk.0.attn_q_a_norm.weight").expect("bound"))
+        .expect("qr_norm");
+    ctx.compute(&qr_norm, 12).expect("compute");
+    assert_sum("qr_norm-0", qr_norm.to_vec_f32().iter().sum::<f32>(), -0.573721);
+
+    let q = ctx
+        .mul_mat(weights.get("blk.0.attn_q_b.weight").expect("bound"), &qr_norm)
+        .expect("q");
+    ctx.compute(&q, 12).expect("compute");
+    assert_sum("node_19 (q_b)", q.to_vec_f32().iter().sum::<f32>(), 0.694762);
+
+    // Per head, and unweighted: this is the norm that has no learned scale.
+    let q3 = ctx
+        .reshape_3d(&q, config.kv_lora_rank as i64, config.n_head as i64, 1)
+        .expect("reshape q");
+    let q_norm = ctx.rms_norm(&q3, config.rms_eps).expect("q_norm");
+    ctx.compute(&q_norm, 12).expect("compute");
+    assert_sum("q_norm-0", q_norm.to_vec_f32().iter().sum::<f32>(), 48.321102);
 }
