@@ -67,6 +67,7 @@ extern "C" {
         -> *mut ggml_tensor;
     fn ggml_soft_max(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     fn ggml_fp32_to_fp16_row(src: *const f32, dst: *mut u16, n: i64);
+    fn ggml_fp16_to_fp32_row(src: *const u16, dst: *mut f32, n: i64);
     fn ggml_repeat(ctx: *mut ggml_context, a: *mut ggml_tensor, b: *mut ggml_tensor)
         -> *mut ggml_tensor;
     fn ggml_view_1d(
@@ -172,6 +173,9 @@ extern "C" {
         nb2: usize,
         offset: usize,
     ) -> *mut ggml_tensor;
+    /// Attaches per-head sink logits to an existing `flash_attn_ext` node.
+    /// Mutates `a` in place and returns nothing — it is not a graph builder.
+    fn ggml_flash_attn_ext_add_sinks(a: *mut ggml_tensor, sinks: *mut ggml_tensor);
     fn ggml_scale(ctx: *mut ggml_context, a: *mut ggml_tensor, s: f32) -> *mut ggml_tensor;
     fn ggml_sigmoid(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     fn ggml_relu(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
@@ -261,6 +265,18 @@ pub fn f32_to_f16(src: &[f32], dst: &mut [u16]) {
     let n = src.len().min(dst.len());
     // SAFETY: both slices are valid for `n` elements of their own type.
     unsafe { ggml_fp32_to_fp16_row(src.as_ptr(), dst.as_mut_ptr(), n as i64) };
+}
+
+/// Convert f16 back to f32, again through ggml's own routine.
+///
+/// The KV cache is written in f16, so anything compared against a reference
+/// taken *after* the cache write has to be rounded the same way — llama.cpp's
+/// own trace shows the compressed KV summing to 63.125298 before the cache and
+/// 63.123978 after it, and that 1.3e-3 is the rounding, not an error.
+pub fn f16_to_f32(src: &[u16], dst: &mut [f32]) {
+    let n = src.len().min(dst.len());
+    // SAFETY: both slices are valid for `n` elements of their own type.
+    unsafe { ggml_fp16_to_fp32_row(src.as_ptr(), dst.as_mut_ptr(), n as i64) };
 }
 
 /// Arena space `compute` needs beyond the tensors themselves.
@@ -626,6 +642,34 @@ impl Context {
                 0.0, // logit_softcap: unused
             )
         })
+    }
+
+    /// Fused attention with per-head sinks.
+    ///
+    /// A sink is one extra always-attended logit per head, learned, with no
+    /// key and no value: it lets a head attend to "nothing" and so changes the
+    /// softmax denominator for every score. V4-Flash ships one per head in
+    /// `attn_sinks.weight`, and dropping them is not a small error — it
+    /// rescales the whole attention output while producing a tensor of exactly
+    /// the right shape.
+    ///
+    /// ggml attaches sinks by mutating the node rather than by taking them as
+    /// an argument, so the two calls are wrapped together here: an
+    /// `add_sinks` that a caller forgets is silent.
+    pub fn flash_attn_ext_with_sinks<'a>(
+        &'a self,
+        q: &Tensor<'a>,
+        k: &Tensor<'a>,
+        v: &Tensor<'a>,
+        mask: &Tensor<'a>,
+        sinks: &Tensor<'a>,
+        scale: f32,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        let out = self.flash_attn_ext(q, k, v, mask, scale)?;
+        // SAFETY: both nodes live in this context, and `out` is the tensor
+        // ggml just returned from `flash_attn_ext`, which is what this expects.
+        unsafe { ggml_flash_attn_ext_add_sinks(out.raw.as_ptr(), sinks.raw.as_ptr()) };
+        Ok(out)
     }
 
     /// Broadcast `a` up to the shape of `b`.

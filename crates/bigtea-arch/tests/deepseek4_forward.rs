@@ -511,31 +511,46 @@ fn rope_and_kv_match_llama_cpp_at_five_tokens() {
     let ctx = Context::new(512 << 20).expect("compute context");
     let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
     let mut weights = WeightSet::new();
-    bind_all(
-        &model,
-        &wctx,
-        &mut weights,
-        &[
-            "token_embd.weight",
-            "blk.0.hc_attn_fn.weight",
-            "blk.0.hc_attn_scale.weight",
-            "blk.0.hc_attn_base.weight",
-            "blk.0.attn_norm.weight",
-            "blk.0.attn_q_a.weight",
-            "blk.0.attn_q_a_norm.weight",
-            "blk.0.attn_q_b.weight",
-            "blk.0.attn_kv.weight",
-            "blk.0.attn_kv_a_norm.weight",
-        ],
-    );
+    bind_all(&model, &wctx, &mut weights, ATTENTION_WEIGHTS);
 
+    let (q_full, kv_full) = q_and_kv_5tok(&ctx, &weights, &config);
+    assert_sum("q-0 (CONCAT)", q_full.to_vec_f32().iter().sum::<f32>(), 3544.263184);
+    assert_sum("kv-0 (CONCAT)", kv_full.to_vec_f32().iter().sum::<f32>(), 63.125298);
+}
+
+/// Weights the attention path of layer 0 needs, in one list so the two
+/// multi-token tests cannot drift apart.
+const ATTENTION_WEIGHTS: &[&str] = &[
+    "token_embd.weight",
+    "blk.0.hc_attn_fn.weight",
+    "blk.0.hc_attn_scale.weight",
+    "blk.0.hc_attn_base.weight",
+    "blk.0.attn_norm.weight",
+    "blk.0.attn_q_a.weight",
+    "blk.0.attn_q_a_norm.weight",
+    "blk.0.attn_q_b.weight",
+    "blk.0.attn_kv.weight",
+    "blk.0.attn_kv_a_norm.weight",
+    "blk.0.attn_sinks.weight",
+];
+
+/// Q and KV at five tokens, rotation included, checked step by step.
+///
+/// Returns `(q, kv)` shaped as llama.cpp leaves them: `q` is
+/// `[head_dim, n_head, tokens]` and `kv` is `[head_dim, 1, tokens]` — one head,
+/// and the same tensor will serve as both K and V.
+fn q_and_kv_5tok<'c>(
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    config: &Deepseek4Config,
+) -> (Tensor<'c>, Tensor<'c>) {
     let nt = TOKENS_5.len() as i64;
     let head_dim = config.kv_lora_rank as i64;
     let n_rot = config.n_rot as i64;
     let n_nope = config.n_rot_none() as i64;
     let f32_size = std::mem::size_of::<f32>();
     let head_stride = head_dim as usize * f32_size;
-    let rope = rope_params_uncompressed(&config);
+    let rope = rope_params_uncompressed(config);
 
     // Positions 0..4. This tensor is the whole difference from the one-token
     // capture: with a single zero in it, every assertion below still passes on
@@ -543,7 +558,7 @@ fn rope_and_kv_match_llama_cpp_at_five_tokens() {
     let pos = ctx.new_i32_1d(nt).expect("pos");
     pos.set_i32(&[0, 1, 2, 3, 4]).expect("set pos");
 
-    let attn_norm = prologue_5tok(&ctx, &weights, &config);
+    let attn_norm = prologue_5tok(ctx, weights, config);
 
     // ---- Q ----
     let qr = ctx
@@ -625,7 +640,6 @@ fn rope_and_kv_match_llama_cpp_at_five_tokens() {
 
     let q_full = ctx.concat(&q_nope, &q_pe, 0).expect("concat q");
     ctx.compute(&q_full, 12).expect("compute q");
-    assert_sum("q-0 (CONCAT)", q_full.to_vec_f32().iter().sum::<f32>(), 3544.263184);
 
     // ---- KV ----
     // One head, and the same tensor serves as K *and* V (deepseek4.cpp:792).
@@ -674,5 +688,140 @@ fn rope_and_kv_match_llama_cpp_at_five_tokens() {
 
     let kv_full = ctx.concat(&kv_nope, &kv_pe, 0).expect("concat kv");
     ctx.compute(&kv_full, 12).expect("compute kv");
-    assert_sum("kv-0 (CONCAT)", kv_full.to_vec_f32().iter().sum::<f32>(), 63.125298);
+
+    (q_full, kv_full)
+}
+
+/// **Attention.** The fused kernel, the F16 cache, the mask and the sinks.
+///
+/// Oracle rows:
+/// ```text
+/// cache_k_l0 (view)  SET_ROWS        {512, 512}     63.123978
+/// node_41            FLASH_ATTN_EXT  {512, 64, 5}  2879.606934
+/// ```
+///
+/// Four things here are wrong-without-an-error, and the sum catches each:
+///
+/// 1. **`kv` is passed as K *and* V.** There is no separate V projection —
+///    `build_raw_attention` calls `build_attn_mha(q, k, k, ...)`
+///    (`deepseek4.cpp:792`). `head_count_kv` is 1 because of this.
+/// 2. **The cache is F16**, so the reference sum after the cache write is
+///    63.123978 where the tensor going in summed to 63.125298. That 1.3e-3 is
+///    rounding; comparing the pre-cache number here would look like a near-miss
+///    and be a different bug.
+/// 3. **`n_kv` is padded to 256**, not the 5 tokens present. The 251 unused
+///    slots are zero and must be masked to -inf, or they contribute a
+///    `softmax(0)` share to every score.
+/// 4. **Per-head sinks**, from `attn_sinks.weight`. A sink is an extra
+///    always-attended logit with no value attached, so it changes only the
+///    softmax denominator — omit it and every output is scaled slightly wrong,
+///    with the right shape and no complaint.
+///
+/// Not covered, and deliberately not guessed at: raw layers are **sliding-window
+/// layers** (`GGML_ASSERT(hparams.is_swa(il))`, window 128). At five tokens no
+/// query reaches back 128 positions, so this capture cannot distinguish a
+/// windowed mask from a plain causal one and the mask below is plain causal.
+/// Verifying the window needs a capture longer than 128 tokens.
+#[test]
+#[ignore = "reads weights from a 144 GB container"]
+fn attention_matches_llama_cpp_at_five_tokens() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+
+    let ctx = Context::new(512 << 20).expect("compute context");
+    let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
+    let mut weights = WeightSet::new();
+    bind_all(&model, &wctx, &mut weights, ATTENTION_WEIGHTS);
+
+    let nt = TOKENS_5.len() as i64;
+    let head_dim = config.kv_lora_rank as i64;
+    let n_head = config.n_head as i64;
+    // The padded cache window llama.cpp's trace shows: cache_k_l0 is viewed as
+    // {512, 1, 256} and permuted to {512, 256, 1}.
+    const N_KV: i64 = 256;
+
+    let (q_full, kv_full) = q_and_kv_5tok(&ctx, &weights, &config);
+
+    let sinks = weights.get("blk.0.attn_sinks.weight").expect("bound");
+    assert_eq!(sinks.len(), n_head, "one sink per head");
+
+    // ---- the K cache, in F16 ----
+    // Positions 0..4 hold the compressed KV; 5..255 stay zero and are masked.
+    let kv_values = kv_full.to_vec_f32();
+    let mut cache_f16 = vec![0u16; (head_dim * N_KV) as usize];
+    bigtea_ggml::f32_to_f16(&kv_values, &mut cache_f16[..kv_values.len()]);
+
+    // Check the cache against llama.cpp *after* rounding, which is the number
+    // its trace reports.
+    let mut round_tripped = vec![0f32; cache_f16.len()];
+    bigtea_ggml::f16_to_f32(&cache_f16, &mut round_tripped);
+    assert_sum(
+        "cache_k_l0 (F16)",
+        round_tripped.iter().sum::<f32>(),
+        63.123978,
+    );
+
+    let k = ctx.new_f16_3d(head_dim, N_KV, 1).expect("k cache");
+    let bytes: Vec<u8> = cache_f16.iter().flat_map(|h| h.to_le_bytes()).collect();
+    k.set_bytes(&bytes).expect("fill k");
+
+    // ---- the mask ----
+    // [n_kv, n_tokens], F16 and contiguous — ggml asserts both. Only 0 and -inf
+    // occur, so the bit patterns go in directly: -inf must stay exactly -inf.
+    const F16_NEG_INF: [u8; 2] = [0x00, 0xFC];
+    let mut mask_bytes = vec![0u8; (N_KV * nt) as usize * 2];
+    for query in 0..nt {
+        let row = (query * N_KV) as usize * 2;
+        // Everything strictly after this query's own position, which includes
+        // all 251 unused cache slots.
+        for key in (query + 1)..N_KV {
+            let at = row + key as usize * 2;
+            mask_bytes[at..at + 2].copy_from_slice(&F16_NEG_INF);
+        }
+    }
+    let mask = ctx
+        .new_typed_2d(bigtea_gguf::GgmlType(1), N_KV, nt)
+        .expect("mask");
+    mask.set_bytes(&mask_bytes).expect("fill mask");
+
+    // ---- the fused kernel ----
+    // q arrives as [head_dim, n_head, tokens] and the kernel wants
+    // [head_dim, tokens, n_head], so dims 1 and 2 swap.
+    let q_perm = ctx.permute(&q_full, [0, 2, 1, 3]).expect("permute q");
+    ctx.compute(&q_perm, 12).expect("compute q_perm");
+    assert_sum(
+        "q-0 (permuted)",
+        q_perm.to_vec_f32().iter().sum::<f32>(),
+        3544.223633,
+    );
+
+    // scale is 1/sqrt(n_embd_head) over the *full* 512, not the 448 unrotated
+    // dims (deepseek4.cpp:1063).
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let out = ctx
+        .flash_attn_ext_with_sinks(&q_perm, &k, &k, &mask, sinks, scale)
+        .expect("flash_attn_ext");
+    ctx.compute(&out, 12).expect("compute attention");
+    assert_sum(
+        "node_41 (FLASH_ATTN_EXT)",
+        out.to_vec_f32().iter().sum::<f32>(),
+        2879.606934,
+    );
+
+    // Prove the sinks are load-bearing rather than assume it. `add_sinks`
+    // mutates a node and returns nothing, so a binding that silently did
+    // nothing would leave every assertion above still passing — the same shape
+    // of hole the one-token RoPE capture had. Running the kernel without them
+    // must give a different number.
+    let no_sinks = ctx
+        .flash_attn_ext(&q_perm, &k, &k, &mask, scale)
+        .expect("flash_attn_ext without sinks");
+    ctx.compute(&no_sinks, 12).expect("compute attention");
+    let without: f32 = no_sinks.to_vec_f32().iter().sum();
+    assert!(
+        (without - 2879.606934).abs() > 1.0,
+        "attention without sinks gave {without:.6}, which matches the reference \
+         anyway — the sinks are not reaching the kernel"
+    );
+    eprintln!("  {:<24} {:>14.6}  (differs, as it must)", "without sinks", without);
 }
