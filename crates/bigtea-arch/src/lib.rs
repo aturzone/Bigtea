@@ -13,10 +13,12 @@
 //! `[n_out, n_tokens]`. Reading these shapes as row-major — the intuition most
 //! people bring — transposes every matrix and produces confident nonsense.
 
+mod deepseek4;
 mod kv;
 mod qwen3;
 mod stream;
 
+pub use deepseek4::{Deepseek4Config, Deepseek4Model};
 pub use kv::{KvCache, KvError};
 pub use qwen3::{Qwen3Config, Qwen3Model};
 pub use stream::{StreamStats, StreamingRunner};
