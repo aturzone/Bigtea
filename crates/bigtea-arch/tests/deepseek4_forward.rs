@@ -46,23 +46,25 @@ const TOKENS_5: [i32; 5] = [671, 6102, 294, 8760, 344];
 /// not offset by `n_rot/2`. Both conventions run, and one of them is wrong.
 const ROPE_MODE_NORM: i32 = 0;
 
-/// RoPE parameters for a layer whose `dsv4_compress_ratios[il]` is 0.
+/// RoPE for layer 0, from the shipped [`Deepseek4Config::rope_for_layer`].
 ///
-/// `deepseek4.cpp:822-829` picks per layer: with no compression the plain
-/// `freq_base` is used with scaling switched **off** entirely — freq_scale 1,
-/// ext_factor 0, and therefore `dsv4_rope_attn_factor` returns 1, with both
-/// betas and `n_ctx_orig` zeroed. The container's YaRN settings (factor 16,
-/// original context 65536, beta_fast 32, beta_slow 1) apply to the other 41
-/// layers, and applying them here would be wrong in a way nothing reports.
-fn rope_params_uncompressed(config: &Deepseek4Config) -> RopeParams {
-    RopeParams {
-        freq_base: config.rope_freq_base,
-        freq_scale: 1.0,
-        ext_factor: 0.0,
-        attn_factor: 1.0,
-        beta_fast: 0.0,
-        beta_slow: 0.0,
-    }
+/// Deliberately not a local copy of the rules. `rope_for_layer` is what a real
+/// forward pass will call, so it is what these checkpoints have to exercise —
+/// a helper written out again here would verify the test and not the code.
+///
+/// It also asserts layer 0 is the *uncompressed* branch. `deepseek4.cpp:822-829`
+/// picks per layer, and the container's YaRN settings (factor 16, original
+/// context 65536, beta_fast 32, beta_slow 1) belong to the other 41 layers;
+/// applying them here would be wrong in a way nothing reports.
+fn rope_layer_0(config: &Deepseek4Config) -> RopeParams {
+    assert!(
+        !config.uses_compress_rope(0),
+        "layer 0 must be uncompressed; compress_ratios[0] = {:?}",
+        config.compress_ratios.first()
+    );
+    let rope = config.rope_for_layer(0);
+    assert_eq!(rope.n_ctx_orig, 0, "no context extension on an uncompressed layer");
+    rope.params
 }
 
 /// Sums are accumulated over thousands of floats in a different order than
@@ -679,7 +681,7 @@ fn q_and_kv_5tok<'c>(
     let n_nope = config.n_rot_none() as i64;
     let f32_size = std::mem::size_of::<f32>();
     let head_stride = head_dim as usize * f32_size;
-    let rope = rope_params_uncompressed(config);
+    let rope = rope_layer_0(config);
 
     // Positions 0..4. This tensor is the whole difference from the one-token
     // capture: with a single zero in it, every assertion below still passes on
@@ -1566,7 +1568,7 @@ fn attention_5tok<'c>(
     let n_rot = config.n_rot as i64;
     let f32_size = std::mem::size_of::<f32>();
     let head_stride = head_dim as usize * f32_size;
-    let rope = rope_params_uncompressed(config);
+    let rope = rope_layer_0(config);
     let pos = ctx.new_i32_1d(nt).expect("pos");
     pos.set_i32(&[0, 1, 2, 3, 4]).expect("set pos");
 

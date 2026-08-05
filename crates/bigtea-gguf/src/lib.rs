@@ -109,6 +109,27 @@ impl Value {
         }
     }
 
+    /// Best-effort float view.
+    ///
+    /// Integers convert because GGUF writers are inconsistent about it: this
+    /// container stores `swiglu_clamp_exp` as whole numbers, and refusing them
+    /// would mean refusing a value that is plainly there.
+    pub fn as_f32(&self) -> Option<f32> {
+        match *self {
+            Value::F32(v) => Some(v),
+            Value::F64(v) => Some(v as f32),
+            Value::U8(v) => Some(v as f32),
+            Value::U16(v) => Some(v as f32),
+            Value::U32(v) => Some(v as f32),
+            Value::U64(v) => Some(v as f32),
+            Value::I8(v) => Some(v as f32),
+            Value::I16(v) => Some(v as f32),
+            Value::I32(v) => Some(v as f32),
+            Value::I64(v) => Some(v as f32),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(s) => Some(s),

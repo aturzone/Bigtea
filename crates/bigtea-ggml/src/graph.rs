@@ -326,7 +326,7 @@ const GRAPH_RESERVE: usize = 16 << 20;
 ///
 /// [`RopeParams::default`] is plain RoPE with no context extension — the
 /// values a model uses unless it declares otherwise.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RopeParams {
     pub freq_base: f32,
     pub freq_scale: f32,

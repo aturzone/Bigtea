@@ -42,8 +42,52 @@ fn manifest_matches_the_container() {
     assert_eq!(config.q_lora_rank, 1024);
     assert_eq!(config.kv_lora_rank, 512);
 
+    // Per-layer arrays, which are the ones a scalar read would quietly ruin.
+    assert_eq!(
+        config.swiglu_clamp_exp.len(),
+        config.n_layer as usize,
+        "one SwiGLU clamp limit per block"
+    );
+    assert_eq!(config.swiglu_clamp_shexp.len(), config.n_layer as usize);
+    assert_eq!(config.swiglu_limit(0, false), Some(10.0));
+
+    // 44 ratios for 43 blocks, and that is not an off-by-one: only the first
+    // 43 are ever consulted. Layers 0-1 are the two uncompressed ones, which
+    // is also what the attention plan says independently.
+    assert_eq!(config.compress_ratios.len(), 44);
+    assert!(!config.uses_compress_rope(0), "layer 0 is uncompressed");
+    let uncompressed = (0..config.n_layer)
+        .filter(|il| !config.uses_compress_rope(*il))
+        .count();
+    assert_eq!(uncompressed, 2, "exactly two layers skip the compressed RoPE");
+
+    // The RoPE layer 0 actually gets, which is the one the forward tests
+    // verify against llama.cpp's trace.
+    let rope0 = config.rope_for_layer(0);
+    assert_eq!(rope0.params.freq_base, 10_000.0);
+    assert_eq!(rope0.params.freq_scale, 1.0);
+    assert_eq!(rope0.params.ext_factor, 0.0, "no YaRN on an uncompressed layer");
+    assert_eq!(rope0.n_ctx_orig, 0);
+
+    // And a compressed one, which uses a different base entirely. Transcribed
+    // from deepseek4.cpp and NOT verified against a capture — the oracle stops
+    // at the end of layer 0.
+    let compressed = (0..config.n_layer)
+        .find(|il| config.uses_compress_rope(*il))
+        .expect("41 compressed layers");
+    let rope_c = config.rope_for_layer(compressed);
+    assert_eq!(rope_c.params.freq_base, 160_000.0);
+    assert_eq!(rope_c.n_ctx_orig, 65_536);
+    assert!(rope_c.params.attn_factor < 1.0);
+
     let arch = Deepseek4Model::new(config);
     arch.verify(&model).expect("every named tensor is present");
+
+    // The two uncompressed layers should be the two `Raw` attention layers —
+    // two facts read from different places in the container agreeing.
+    let plan = arch.attention_plan(&model);
+    let raw = plan.iter().filter(|k| **k == AttentionKind::Raw).count();
+    assert_eq!(raw, 2, "compress_ratios and the tensor manifest must agree");
 }
 
 /// The layers are not uniform, and pinning the counts is what stops a future

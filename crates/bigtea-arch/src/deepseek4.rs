@@ -207,6 +207,42 @@ pub struct Deepseek4Config {
     pub output_group_count: u32,
     /// Parallel residual streams the hyper-connection block carries.
     pub hc_mult: u32,
+
+    /// SwiGLU clamp limit **per layer**, for the routed experts.
+    ///
+    /// 43 values. Applied asymmetrically: the gate is clamped to
+    /// `(-inf, limit]` and the up projection to `[-limit, limit]`
+    /// (`llama-graph.cpp:2050-2057`, an `LLM_ARCH_DEEPSEEK4` branch). A limit
+    /// of 0 or less means no clamp at all.
+    pub swiglu_clamp_exp: Vec<f32>,
+    /// The same, for the shared expert. Falls back to
+    /// [`Self::swiglu_clamp_exp`] when the container omits it.
+    pub swiglu_clamp_shexp: Vec<f32>,
+    /// Per-layer compression ratio; **0 means the layer is uncompressed**.
+    ///
+    /// The container ships 44 values for 43 blocks and that is not an
+    /// off-by-one — it is indexed as `dsv4_compress_ratios[il]`, so only the
+    /// first 43 are ever consulted. Non-zero selects the compressed RoPE base
+    /// with YaRN scaling; see [`Self::rope_for_layer`].
+    pub compress_ratios: Vec<i64>,
+    /// RoPE base used by compressed layers, in place of [`Self::rope_freq_base`].
+    pub compress_rope_freq_base: f32,
+    /// YaRN, for compressed layers only.
+    pub rope_freq_scale: f32,
+    pub rope_ext_factor: f32,
+    pub rope_beta_fast: f32,
+    pub rope_beta_slow: f32,
+    pub rope_n_ctx_orig: u32,
+}
+
+/// Everything `ggml_rope_ext` needs for one layer.
+///
+/// `mode` is not included: deepseek4 is `LLAMA_ROPE_TYPE_NORM` throughout, so
+/// rotated pairs are adjacent rather than offset by `n_rot/2`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerRope {
+    pub params: bigtea_ggml::RopeParams,
+    pub n_ctx_orig: i32,
 }
 
 impl Deepseek4Config {
@@ -251,7 +287,117 @@ impl Deepseek4Config {
             n_rot: opt("rope.dimension_count", 0) as u32,
             output_group_count: opt("attention.output_group_count", 1) as u32,
             hc_mult: opt("hyper_connection.count", 1) as u32,
+
+            swiglu_clamp_exp: model.arch_f32_array("swiglu_clamp_exp").unwrap_or_default(),
+            // llama.cpp falls back to the routed limits when the shared-expert
+            // key is absent (`deepseek4.cpp:28`), rather than to no clamp.
+            swiglu_clamp_shexp: model
+                .arch_f32_array("swiglu_clamp_shexp")
+                .or_else(|| model.arch_f32_array("swiglu_clamp_exp"))
+                .unwrap_or_default(),
+            compress_ratios: model
+                .arch_i64_array("attention.compress_ratios")
+                .unwrap_or_default(),
+            compress_rope_freq_base: model
+                .arch_f32("attention.compress_rope_freq_base")
+                .unwrap_or(10_000.0),
+            // The container stores the YaRN *factor* (16); ggml wants its
+            // reciprocal as freq_scale.
+            rope_freq_scale: model
+                .arch_f32("rope.scaling.factor")
+                .filter(|f| *f > 0.0)
+                .map(|f| 1.0 / f)
+                .unwrap_or(1.0),
+            // llama.cpp defaults ext_factor to 1.0 when the scaling type is
+            // yarn and 0.0 otherwise.
+            rope_ext_factor: match model
+                .metadata()
+                .get(&format!("{arch}.rope.scaling.type"))
+                .and_then(bigtea_gguf::Value::as_str)
+            {
+                Some("yarn") => 1.0,
+                _ => 0.0,
+            },
+            rope_beta_fast: model.arch_f32("rope.scaling.yarn_beta_fast").unwrap_or(32.0),
+            rope_beta_slow: model.arch_f32("rope.scaling.yarn_beta_slow").unwrap_or(1.0),
+            rope_n_ctx_orig: opt("rope.scaling.original_context_length", 0) as u32,
         })
+    }
+
+    /// Whether `layer` uses the compressed RoPE base and YaRN scaling.
+    ///
+    /// `dsv4_compress_ratios[il] != 0` (`deepseek4.cpp:822`). A layer past the
+    /// end of the array is treated as uncompressed rather than panicking.
+    pub fn uses_compress_rope(&self, layer: u32) -> bool {
+        self.compress_ratios
+            .get(layer as usize)
+            .is_some_and(|r| *r != 0)
+    }
+
+    /// RoPE parameters for `layer`.
+    ///
+    /// **These are per layer and are not the container's top-level keys.**
+    /// Transcribed from `deepseek4.cpp:822-829`: an uncompressed layer uses the
+    /// plain `freq_base` with scaling switched off *entirely* — freq_scale 1,
+    /// ext_factor 0, attn_factor 1, both betas 0, `n_ctx_orig` 0. Applying the
+    /// container's YaRN settings there changes every score and reports nothing.
+    ///
+    /// # Verification status
+    ///
+    /// The **uncompressed** branch is checked against llama.cpp's trace on
+    /// layer 0 (`tests/deepseek4_forward.rs`). The **compressed** branch is
+    /// transcribed from the source but *not* verified against any capture —
+    /// the oracle stops at the end of layer 0, which is uncompressed. Treat it
+    /// as unproven until a compressed layer has rows.
+    pub fn rope_for_layer(&self, layer: u32) -> LayerRope {
+        if !self.uses_compress_rope(layer) {
+            return LayerRope {
+                params: bigtea_ggml::RopeParams {
+                    freq_base: self.rope_freq_base,
+                    freq_scale: 1.0,
+                    ext_factor: 0.0,
+                    attn_factor: 1.0,
+                    beta_fast: 0.0,
+                    beta_slow: 0.0,
+                },
+                n_ctx_orig: 0,
+            };
+        }
+        LayerRope {
+            params: bigtea_ggml::RopeParams {
+                freq_base: self.compress_rope_freq_base,
+                freq_scale: self.rope_freq_scale,
+                ext_factor: self.rope_ext_factor,
+                attn_factor: Self::rope_attn_factor(self.rope_freq_scale, self.rope_ext_factor),
+                beta_fast: self.rope_beta_fast,
+                beta_slow: self.rope_beta_slow,
+            },
+            n_ctx_orig: self.rope_n_ctx_orig as i32,
+        }
+    }
+
+    /// `dsv4_rope_attn_factor` (`deepseek4.cpp:10`).
+    ///
+    /// Not the usual YaRN `mscale`: DeepSeek-V4 uses `1/(1 + 0.1*ln(1/s))`, and
+    /// returns exactly 1 when there is no extension.
+    fn rope_attn_factor(freq_scale: f32, ext_factor: f32) -> f32 {
+        if ext_factor == 0.0 {
+            return 1.0;
+        }
+        1.0 / (1.0 + 0.1 * (1.0 / freq_scale).ln())
+    }
+
+    /// The SwiGLU clamp limit for `layer`, or `None` when the layer has none.
+    ///
+    /// llama.cpp treats any limit at or below 1e-6 as "no clamp"
+    /// (`llama-graph.cpp:2049`).
+    pub fn swiglu_limit(&self, layer: u32, shared: bool) -> Option<f32> {
+        let table = if shared {
+            &self.swiglu_clamp_shexp
+        } else {
+            &self.swiglu_clamp_exp
+        };
+        table.get(layer as usize).copied().filter(|l| *l > 1e-6)
     }
 
     /// Head dimensions carrying no positional encoding.
@@ -554,6 +700,80 @@ mod tests {
             n_rot: 64,
             output_group_count: 8,
             hc_mult: 4,
+            // Layers 0-1 uncompressed, the rest compressed — the container's
+            // own shape, so the per-layer branches are exercised.
+            swiglu_clamp_exp: vec![10.0; 43],
+            swiglu_clamp_shexp: vec![10.0; 43],
+            compress_ratios: {
+                let mut r = vec![4i64; 44];
+                r[0] = 0;
+                r[1] = 0;
+                r
+            },
+            compress_rope_freq_base: 160_000.0,
+            rope_freq_scale: 1.0 / 16.0,
+            rope_ext_factor: 1.0,
+            rope_beta_fast: 32.0,
+            rope_beta_slow: 1.0,
+            rope_n_ctx_orig: 65536,
         }
+    }
+
+    /// Layer 0 is uncompressed, so it must get plain RoPE with **scaling off**
+    /// — not the container's YaRN keys, which belong to the other 41 layers.
+    ///
+    /// This is the config side of the checkpoint the forward test verifies
+    /// against llama.cpp; keeping it here means a change to `rope_for_layer`
+    /// fails without needing the 144 GB container.
+    #[test]
+    fn layer_0_gets_plain_rope_and_a_compressed_layer_gets_yarn() {
+        let c = config_for_test();
+        assert!(!c.uses_compress_rope(0));
+        let plain = c.rope_for_layer(0);
+        assert_eq!(plain.n_ctx_orig, 0);
+        assert_eq!(plain.params.freq_base, 10_000.0);
+        assert_eq!(plain.params.freq_scale, 1.0);
+        assert_eq!(plain.params.ext_factor, 0.0);
+        assert_eq!(plain.params.attn_factor, 1.0);
+        assert_eq!(plain.params.beta_fast, 0.0);
+        assert_eq!(plain.params.beta_slow, 0.0);
+
+        // Layer 2 is compressed: different base, YaRN on, and an attn_factor
+        // that is 1/(1 + 0.1*ln(16)) rather than the usual YaRN mscale.
+        assert!(c.uses_compress_rope(2));
+        let yarn = c.rope_for_layer(2);
+        assert_eq!(yarn.params.freq_base, 160_000.0);
+        assert_eq!(yarn.n_ctx_orig, 65536);
+        assert_eq!(yarn.params.beta_fast, 32.0);
+        let want = 1.0 / (1.0 + 0.1 * 16f32.ln());
+        assert!((yarn.params.attn_factor - want).abs() < 1e-6);
+        assert!(yarn.params.attn_factor < 1.0, "extension must attenuate");
+    }
+
+    /// The clamp table is per layer, and "no clamp" is a real state.
+    #[test]
+    fn swiglu_limits_are_per_layer_and_optional() {
+        let mut c = config_for_test();
+        assert_eq!(c.swiglu_limit(0, false), Some(10.0));
+        assert_eq!(c.swiglu_limit(0, true), Some(10.0));
+        c.swiglu_clamp_exp[7] = 0.0;
+        assert_eq!(c.swiglu_limit(7, false), None, "0 means no clamp, not clamp to 0");
+        // Past the end of the table is not a panic: a shorter array than
+        // block_count is a container problem, not a reason to abort mid-run.
+        assert_eq!(c.swiglu_limit(99, false), None);
+    }
+
+    /// 44 ratios for 43 blocks is not an off-by-one — only the first 43 are
+    /// ever consulted, so the trailing value must not shift anything.
+    #[test]
+    fn the_extra_compress_ratio_is_never_consulted() {
+        let c = config_for_test();
+        assert_eq!(c.compress_ratios.len(), 44);
+        assert_eq!(c.n_layer, 43);
+        let consulted: Vec<bool> =
+            (0..c.n_layer).map(|il| c.uses_compress_rope(il)).collect();
+        assert_eq!(consulted.len(), 43);
+        assert_eq!(consulted[0], false);
+        assert_eq!(consulted[42], true);
     }
 }

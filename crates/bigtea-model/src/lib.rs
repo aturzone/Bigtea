@@ -208,6 +208,37 @@ impl Model {
         self.get_u64(&format!("{}.{}", self.architecture, suffix))
     }
 
+    pub fn arch_f32(&self, suffix: &str) -> Option<f32> {
+        self.metadata
+            .get(&format!("{}.{}", self.architecture, suffix))
+            .and_then(bigtea_gguf::Value::as_f32)
+    }
+
+    /// An architecture-scoped array of floats, e.g. per-layer clamp limits.
+    ///
+    /// Several DeepSeek-V4 hyper-parameters are **per layer** rather than
+    /// per model — `swiglu_clamp_exp`, `swiglu_clamp_shexp`,
+    /// `attention.compress_ratios`. Reading only a scalar from those keys, or
+    /// reading index 0 and applying it everywhere, gives a model that is
+    /// correct on the first layer and quietly wrong on the rest.
+    pub fn arch_f32_array(&self, suffix: &str) -> Option<Vec<f32>> {
+        self.metadata
+            .get(&format!("{}.{}", self.architecture, suffix))
+            .and_then(bigtea_gguf::Value::as_array)
+            .map(|vs| vs.iter().filter_map(bigtea_gguf::Value::as_f32).collect())
+    }
+
+    pub fn arch_i64_array(&self, suffix: &str) -> Option<Vec<i64>> {
+        self.metadata
+            .get(&format!("{}.{}", self.architecture, suffix))
+            .and_then(bigtea_gguf::Value::as_array)
+            .map(|vs| {
+                vs.iter()
+                    .filter_map(|v| v.as_f32().map(|f| f as i64))
+                    .collect()
+            })
+    }
+
     pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
     }
