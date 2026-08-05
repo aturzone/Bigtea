@@ -169,4 +169,49 @@ fn hyper_connection_block_matches_llama_cpp() {
         .expect("hc_mixes");
     ctx.compute(&mixes, 12).expect("compute mixes");
     assert_sum("hc_mixes", mixes.to_vec_f32().iter().sum::<f32>(), -1121.066162);
+
+    // The 24 mixes are three groups of hc: [0..4] pre, [4..8] post, [8..24]
+    // the 4x4 combination matrix. hc_scale is likewise [pre, post, comb] and
+    // hc_base is [4 pre, 4 post, 16 comb]. Slicing these wrong is an easy
+    // mistake with no shape consequence at all — every view is the right size.
+    let hc = config.hc_mult as i64;
+    let f32_size = std::mem::size_of::<f32>();
+    let scale_pre = ctx
+        .view_1d(weights.get("blk.0.hc_attn_scale.weight").expect("bound"), 1, 0)
+        .expect("scale_pre");
+    let base_pre = ctx
+        .view_1d(weights.get("blk.0.hc_attn_base.weight").expect("bound"), hc, 0)
+        .expect("base_pre");
+    let pre = ctx.view_1d(&mixes, hc, 0).expect("mixes pre");
+
+    // affine: mixes*scale + base, with scale a single broadcast value.
+    let scaled = ctx.mul(&pre, &scale_pre).expect("mul scale");
+    ctx.compute(&scaled, 12).expect("compute scaled");
+    assert_sum("node_8 (mul)", scaled.to_vec_f32().iter().sum::<f32>(), 220.453522);
+
+    let biased = ctx.add(&scaled, &base_pre).expect("add base");
+    ctx.compute(&biased, 12).expect("compute biased");
+    assert_sum("node_10 (add)", biased.to_vec_f32().iter().sum::<f32>(), 218.101593);
+
+    let gated = ctx.sigmoid(&biased).expect("sigmoid");
+    ctx.compute(&gated, 12).expect("compute sigmoid");
+    assert_sum("node_11 (sigmoid)", gated.to_vec_f32().iter().sum::<f32>(), 4.000000);
+
+    // scale_bias(pre, 1.0, hc_eps): the epsilon is what turns 4.000000 into
+    // 4.000004, so this one number pins hyper_connection.epsilon at 1e-6.
+    let eps_t = ctx.new_f32_1d(hc).expect("eps");
+    eps_t.set_f32(&vec![1e-6f32; hc as usize]).expect("fill eps");
+    let hc_pre_w = ctx.add(&gated, &eps_t).expect("add eps");
+    ctx.compute(&hc_pre_w, 12).expect("compute hc_pre");
+    assert_sum("hc_pre (scale_bias)", hc_pre_w.to_vec_f32().iter().sum::<f32>(), 4.000004);
+
+    // The fused op itself: collapse [n_embd, hc] against the [hc] weights.
+    let _ = f32_size;
+    let collapsed = ctx.dsv4_hc_pre(&hc_init, &hc_pre_w).expect("dsv4_hc_pre");
+    ctx.compute(&collapsed, 12).expect("compute hc_pre op");
+    assert_sum(
+        "hc_attn_pre (fused)",
+        collapsed.to_vec_f32().iter().sum::<f32>(),
+        8.391787,
+    );
 }
