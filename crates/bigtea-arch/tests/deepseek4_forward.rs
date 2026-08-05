@@ -532,6 +532,8 @@ const ATTENTION_WEIGHTS: &[&str] = &[
     "blk.0.attn_kv.weight",
     "blk.0.attn_kv_a_norm.weight",
     "blk.0.attn_sinks.weight",
+    "blk.0.attn_output_a.weight",
+    "blk.0.attn_output_b.weight",
 ];
 
 /// Q and KV at five tokens, rotation included, checked step by step.
@@ -824,4 +826,120 @@ fn attention_matches_llama_cpp_at_five_tokens() {
          anyway — the sinks are not reaching the kernel"
     );
     eprintln!("  {:<24} {:>14.6}  (differs, as it must)", "without sinks", without);
+
+    // ---- de-rope, then the grouped output projection ----
+    // Oracle rows:
+    //   attn_raw (view)   {64, 64, 5}  3432.786621
+    //   node_47 ROPE_BACK {64, 64, 5}    28.466785
+    //   attn_derope-0     {512, 64, 5} -524.695190
+    //   attn_wo_a-0       {1024, 5, 8}  134.724960
+    //   attn_out-0        {4096, 5}     255.856689
+    let n_nope = config.n_rot_none() as i64;
+    let n_rot = config.n_rot as i64;
+    let f32_size = std::mem::size_of::<f32>();
+    let head_stride = head_dim as usize * f32_size;
+    let rope = rope_params_uncompressed(&config);
+    let pos = ctx.new_i32_1d(nt).expect("pos");
+    pos.set_i32(&[0, 1, 2, 3, 4]).expect("set pos");
+
+    // flash_attn_ext returns [head_dim, n_head, tokens] already, so this
+    // reshape is a no-op on the layout and only re-labels it.
+    let out3 = ctx.reshape_3d(&out, head_dim, n_head, nt).expect("reshape out");
+    let out_nope = ctx
+        .view_3d(&out3, n_nope, n_head, nt, head_stride, head_stride * n_head as usize, 0)
+        .expect("out_nope");
+    ctx.compute(&out_nope, 12).expect("compute out_nope");
+    assert_sum(
+        "attn_raw-0 (nope view)",
+        out_nope.to_vec_f32().iter().sum::<f32>(),
+        -553.160217,
+    );
+
+    let out_pe_in = ctx
+        .view_3d(
+            &out3,
+            n_rot,
+            n_head,
+            nt,
+            head_stride,
+            head_stride * n_head as usize,
+            n_nope as usize * f32_size,
+        )
+        .expect("out_pe view");
+    ctx.compute(&out_pe_in, 12).expect("compute out_pe view");
+    assert_sum(
+        "attn_raw-0 (pe view)",
+        out_pe_in.to_vec_f32().iter().sum::<f32>(),
+        3432.786621,
+    );
+
+    // The inverse rotation, with exactly the parameters the forward one used.
+    // 3432.8 -> 28.5 is not a small correction, and a forward rope here instead
+    // of a backward one would be neither an error nor obviously wrong.
+    let out_pe = ctx
+        .rope_ext_back(&out_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, 0, rope)
+        .expect("rope_back");
+    ctx.compute(&out_pe, 12).expect("compute rope_back");
+    assert_sum(
+        "node_47 (ROPE_BACK)",
+        out_pe.to_vec_f32().iter().sum::<f32>(),
+        28.466785,
+    );
+
+    let derope = ctx.concat(&out_nope, &out_pe, 0).expect("concat derope");
+    ctx.compute(&derope, 12).expect("compute derope");
+    assert_sum(
+        "attn_derope-0",
+        derope.to_vec_f32().iter().sum::<f32>(),
+        -524.695190,
+    );
+
+    // The output projection is grouped: `attn_output_a` ships 2-D as
+    // [4096, 8192] and is *used* as [4096, o_lora_rank, 8] — a batched matmul
+    // over 8 groups of 8 heads. Reading the shapes alone suggests the
+    // dimensions do not connect, which is why this is transcribed from
+    // deepseek4.cpp:1079-1084 rather than derived.
+    let n_groups = config.output_group_count as i64;
+    let o_lora = config.output_lora_rank as i64;
+    let group_dim = (n_head / n_groups) * head_dim;
+    let derope_g = ctx
+        .reshape_3d(&derope, group_dim, n_groups, nt)
+        .expect("reshape groups");
+    let derope_p = ctx.permute(&derope_g, [0, 2, 1, 3]).expect("permute groups");
+    ctx.compute(&derope_p, 12).expect("compute permuted");
+    assert_sum(
+        "attn_derope-0 (permuted)",
+        derope_p.to_vec_f32().iter().sum::<f32>(),
+        -524.691833,
+    );
+
+    let wo_a = weights.get("blk.0.attn_output_a.weight").expect("bound");
+    let wo_a3 = ctx
+        .reshape_3d(wo_a, group_dim, o_lora, n_groups)
+        .expect("reshape wo_a");
+    let oa = ctx.mul_mat(&wo_a3, &derope_p).expect("attn_wo_a");
+    ctx.compute(&oa, 12).expect("compute wo_a");
+    assert_sum("attn_wo_a-0", oa.to_vec_f32().iter().sum::<f32>(), 134.724960);
+
+    let oa_p = ctx.permute(&oa, [0, 2, 1, 3]).expect("permute oa");
+    let oa_c = ctx.cont(&oa_p).expect("cont oa");
+    let oa_2d = ctx
+        .reshape_2d(&oa_c, o_lora * n_groups, nt)
+        .expect("flatten oa");
+    ctx.compute(&oa_2d, 12).expect("compute oa");
+    assert_sum(
+        "attn_wo_a-0 (cont)",
+        oa_2d.to_vec_f32().iter().sum::<f32>(),
+        134.724960,
+    );
+
+    let attn_out = ctx
+        .mul_mat(weights.get("blk.0.attn_output_b.weight").expect("bound"), &oa_2d)
+        .expect("attn_out");
+    ctx.compute(&attn_out, 12).expect("compute attn_out");
+    assert_sum(
+        "attn_out-0",
+        attn_out.to_vec_f32().iter().sum::<f32>(),
+        255.856689,
+    );
 }

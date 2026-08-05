@@ -200,6 +200,23 @@ extern "C" {
         beta_slow: f32,
     ) -> *mut ggml_tensor;
 
+    #[allow(clippy::too_many_arguments)]
+    fn ggml_rope_ext_back(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+        c: *mut ggml_tensor,
+        n_dims: c_int,
+        mode: c_int,
+        n_ctx_orig: c_int,
+        freq_base: f32,
+        freq_scale: f32,
+        ext_factor: f32,
+        attn_factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+    ) -> *mut ggml_tensor;
+
     /// Indexed matmul: picks a matrix per row from a stacked 3-D tensor.
     /// This is what makes MoE tractable — only the selected experts are
     /// multiplied, rather than all of them followed by a mask.
@@ -836,6 +853,49 @@ impl Context {
         // documented way to omit frequency factors.
         self.tensor(unsafe {
             ggml_rope_ext(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                positions.raw.as_ptr(),
+                c,
+                n_dims,
+                mode,
+                n_ctx_orig,
+                rope.freq_base,
+                rope.freq_scale,
+                rope.ext_factor,
+                rope.attn_factor,
+                rope.beta_fast,
+                rope.beta_slow,
+            )
+        })
+    }
+
+    /// The inverse rotation.
+    ///
+    /// Named "back" because ggml uses it for the backward pass, but here it is
+    /// forward arithmetic: V4-Flash **de-ropes its attention output** before the
+    /// output projection, undoing the rotation on the same trailing `n_rot`
+    /// dims (`deepseek4.cpp:1074`). Skip it and the rotation stays baked into
+    /// the residual stream — visible only in a captured trace, never in the
+    /// tensor shapes. Parameters must match the forward `rope_ext` exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_ext_back<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        positions: &Tensor<'a>,
+        freq_factors: Option<&Tensor<'a>>,
+        n_dims: i32,
+        mode: i32,
+        n_ctx_orig: i32,
+        rope: RopeParams,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        let c = freq_factors
+            .map(|t| t.raw.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        // SAFETY: all tensors belong to this context; a null `c` omits the
+        // frequency factors, as in `rope_ext`.
+        self.tensor(unsafe {
+            ggml_rope_ext_back(
                 self.raw.as_ptr(),
                 a.raw.as_ptr(),
                 positions.raw.as_ptr(),
