@@ -924,6 +924,198 @@ const FFN_WEIGHTS: &[&str] = &[
     "blk.0.ffn_norm.weight",
 ];
 
+/// Router and shared expert. All small — the 256 routed experts are not here.
+const MOE_WEIGHTS: &[&str] = &[
+    "blk.0.ffn_gate_inp.weight",
+    "blk.0.ffn_gate_tid2eid.weight",
+    "blk.0.ffn_gate_shexp.weight",
+    "blk.0.ffn_up_shexp.weight",
+    "blk.0.ffn_down_shexp.weight",
+];
+
+/// `swiglu_clamp_exp[0]` and `swiglu_clamp_shexp[0]`, both 10 in this
+/// container.
+///
+/// **These are per-layer arrays of 43 values and [`Deepseek4Config`] reads
+/// neither.** Hardcoding index 0 is correct for this test and wrong for a real
+/// forward pass; the config needs to carry them before any layer but 0 runs.
+const SWIGLU_CLAMP_L0: f32 = 10.0;
+
+/// **The MoE router and the shared expert.**
+///
+/// Oracle rows:
+/// ```text
+/// ffn_moe_logits-0            MUL_MAT   {256, 5}   -1176.607300
+/// node_86                     SOFTPLUS  {256, 5}     587.096008
+/// ffn_moe_probs-0             SQRT      {256, 5}     792.403992
+/// ffn_moe_topk-0              GET_ROWS  {6, 5}      3688.000000
+/// ffn_moe_weights-0           GET_ROWS  {1, 6, 5}     20.336262
+/// ffn_moe_weights_norm-0      DIV       {6, 5}         5.000000
+/// ffn_moe_weights_scaled-0    SCALE     {1, 6, 5}      7.500000
+/// ffn_shexp-0                 MUL_MAT   {4096, 5}     16.228374
+/// ```
+///
+/// The interesting rows are the ones that contradict what a DeepSeek MoE is
+/// normally assumed to do:
+///
+/// 1. **`ffn_moe_topk-0` is a `GET_ROWS`, not a top-k.** Layers 0-2 are the
+///    `hash_layer_count` layers: their six experts come from
+///    `ffn_gate_tid2eid`, a `[6, vocab]` I32 table indexed by *token id*. The
+///    router probabilities are still computed, but only to weight experts that
+///    were already chosen. For a streaming runner this is worth more than a
+///    correctness check — on these layers the expert set is knowable before any
+///    compute happens.
+/// 2. **The gate is `sqrt(softplus(x))`.** `expert_gating_func 4`.
+/// 3. **Weights are renormalised over the selected six only**, then scaled by
+///    1.5. `ffn_moe_weights_norm` summing to exactly 5.0 across 5 tokens is
+///    that renormalisation, and 7.5 is the scale.
+/// 4. **The SwiGLU clamp is asymmetric on the gate**: `(-inf, 10]` for the
+///    gate, `[-10, 10]` for the up projection, in a `LLM_ARCH_DEEPSEEK4` branch
+///    (`llama-graph.cpp:2050-2057`). At five tokens neither bound is actually
+///    reached — the clamped sums equal the unclamped ones — so this capture
+///    confirms the *shape* of the computation but **not** the bounds. Noted
+///    rather than claimed.
+#[test]
+#[ignore = "reads weights from a 144 GB container"]
+fn moe_router_and_shared_expert_match_llama_cpp_at_five_tokens() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+
+    let ctx = Context::new(512 << 20).expect("compute context");
+    let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
+    let mut weights = WeightSet::new();
+    let mut names: Vec<&str> = ATTENTION_WEIGHTS.to_vec();
+    names.extend_from_slice(FFN_WEIGHTS);
+    names.extend_from_slice(MOE_WEIGHTS);
+    bind_all(&model, &wctx, &mut weights, &names);
+
+    let p = prologue_5tok(&ctx, &weights, &config);
+    let (q, kv) = q_and_kv_5tok(&ctx, &weights, &config, &p.attn_norm);
+    let attn_out = attention_5tok(&ctx, &weights, &config, &q, &kv);
+    let (_streams, ffn_norm) = layer_tail_5tok(&ctx, &weights, &config, &p, &attn_out);
+
+    let nt = TOKENS_5.len() as i64;
+    let n_expert = config.n_expert as i64;
+    let n_used = config.n_expert_used as i64;
+
+    // ---- routing ----
+    let logits = ctx
+        .mul_mat(weights.get("blk.0.ffn_gate_inp.weight").expect("bound"), &ffn_norm)
+        .expect("logits");
+    ctx.compute(&logits, 12).expect("compute logits");
+    assert_sum(
+        "ffn_moe_logits-0",
+        logits.to_vec_f32().iter().sum::<f32>(),
+        -1176.607300,
+    );
+
+    let sp = ctx.softplus(&logits).expect("softplus");
+    ctx.compute(&sp, 12).expect("compute softplus");
+    assert_sum("node_86 (SOFTPLUS)", sp.to_vec_f32().iter().sum::<f32>(), 587.096008);
+
+    let probs = ctx.sqrt(&sp).expect("sqrt");
+    ctx.compute(&probs, 12).expect("compute sqrt");
+    assert_sum("ffn_moe_probs-0", probs.to_vec_f32().iter().sum::<f32>(), 792.403992);
+
+    // Hash routing: the six experts are a lookup on the token id, and the
+    // router never picks anything.
+    let probs3 = ctx.reshape_3d(&probs, 1, n_expert, nt).expect("reshape probs");
+    let tok = ctx.new_i32_1d(nt).expect("tok");
+    tok.set_i32(&TOKENS_5).expect("set");
+    let topk = ctx
+        .get_rows(weights.get("blk.0.ffn_gate_tid2eid.weight").expect("bound"), &tok)
+        .expect("topk");
+    ctx.compute(&topk, 12).expect("compute topk");
+    let ids = topk.to_vec_i32();
+    assert_eq!(ids.len(), (n_used * nt) as usize, "six experts per token");
+    assert_sum("ffn_moe_topk-0", ids.iter().sum::<i32>() as f32, 3688.0);
+
+    let w = ctx.get_rows(&probs3, &topk).expect("weights");
+    ctx.compute(&w, 12).expect("compute weights");
+    assert_sum("ffn_moe_weights-0", w.to_vec_f32().iter().sum::<f32>(), 20.336262);
+
+    // Renormalise over the *selected* six, not over all 256. This is the step
+    // whose absence is invisible: the weights still sum to something, the model
+    // still speaks.
+    let w2 = ctx.reshape_2d(&w, n_used, nt).expect("reshape weights");
+    let sum = ctx.sum_rows(&w2).expect("sum_rows");
+    ctx.compute(&sum, 12).expect("compute sum");
+    assert_sum("ffn_moe_weights_sum-0", sum.to_vec_f32().iter().sum::<f32>(), 20.336262);
+
+    // Clamped away from zero at the smallest F16 normal, not at some epsilon.
+    let sum_c = ctx.clamp(&sum, 6.103515625e-5, f32::INFINITY).expect("clamp sum");
+    ctx.compute(&sum_c, 12).expect("compute clamped sum");
+    assert_sum(
+        "ffn_moe_weights_sum_clamped-0",
+        sum_c.to_vec_f32().iter().sum::<f32>(),
+        20.336262,
+    );
+
+    let w_norm = ctx.div(&w2, &sum_c).expect("div");
+    ctx.compute(&w_norm, 12).expect("compute norm");
+    assert_sum(
+        "ffn_moe_weights_norm-0",
+        w_norm.to_vec_f32().iter().sum::<f32>(),
+        5.000000,
+    );
+
+    let w_scaled = ctx
+        .scale(&w_norm, config.expert_weights_scale)
+        .expect("scale weights");
+    ctx.compute(&w_scaled, 12).expect("compute scaled");
+    assert_sum(
+        "ffn_moe_weights_scaled-0",
+        w_scaled.to_vec_f32().iter().sum::<f32>(),
+        7.500000,
+    );
+
+    // ---- the shared expert ----
+    // Always active, so it is resident weight rather than streamed. Confusing
+    // that with the 256 routed ones is the difference between 7 GiB and 144.
+    let gate = ctx
+        .mul_mat(weights.get("blk.0.ffn_gate_shexp.weight").expect("bound"), &ffn_norm)
+        .expect("gate");
+    ctx.compute(&gate, 12).expect("compute gate");
+    assert_sum("ffn_gate-0", gate.to_vec_f32().iter().sum::<f32>(), 2518.574707);
+
+    // Asymmetric on purpose: upper bound only.
+    let gate_c = ctx
+        .clamp(&gate, f32::NEG_INFINITY, SWIGLU_CLAMP_L0)
+        .expect("clamp gate");
+    ctx.compute(&gate_c, 12).expect("compute gate clamped");
+    assert_sum(
+        "ffn_gate_clamped-0",
+        gate_c.to_vec_f32().iter().sum::<f32>(),
+        2518.574707,
+    );
+
+    let up = ctx
+        .mul_mat(weights.get("blk.0.ffn_up_shexp.weight").expect("bound"), &ffn_norm)
+        .expect("up");
+    ctx.compute(&up, 12).expect("compute up");
+    assert_sum("ffn_up-0", up.to_vec_f32().iter().sum::<f32>(), 36.162750);
+
+    let up_c = ctx
+        .clamp(&up, -SWIGLU_CLAMP_L0, SWIGLU_CLAMP_L0)
+        .expect("clamp up");
+    ctx.compute(&up_c, 12).expect("compute up clamped");
+    assert_sum("ffn_up_clamped-0", up_c.to_vec_f32().iter().sum::<f32>(), 36.162750);
+
+    let act = ctx.swiglu_split(&gate_c, &up_c).expect("swiglu");
+    ctx.compute(&act, 12).expect("compute swiglu");
+    assert_sum(
+        "ffn_swiglu_limited-0",
+        act.to_vec_f32().iter().sum::<f32>(),
+        -39.681740,
+    );
+
+    let shexp = ctx
+        .mul_mat(weights.get("blk.0.ffn_down_shexp.weight").expect("bound"), &act)
+        .expect("shexp");
+    ctx.compute(&shexp, 12).expect("compute shexp");
+    assert_sum("ffn_shexp-0", shexp.to_vec_f32().iter().sum::<f32>(), 16.228374);
+}
+
 /// Post hyper-connection, the FFN gate block, and `ffn_norm`.
 ///
 /// Returns `(streams, ffn_norm)`: the updated 4-stream residual, which the

@@ -182,6 +182,19 @@ extern "C" {
     fn ggml_div(ctx: *mut ggml_context, a: *mut ggml_tensor, b: *mut ggml_tensor)
         -> *mut ggml_tensor;
     fn ggml_sum_rows(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    fn ggml_softplus(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    fn ggml_sqrt(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    fn ggml_clamp(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        min: f32,
+        max: f32,
+    ) -> *mut ggml_tensor;
+    fn ggml_swiglu_split(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
     fn ggml_top_k(ctx: *mut ggml_context, a: *mut ggml_tensor, k: c_int) -> *mut ggml_tensor;
     #[allow(clippy::too_many_arguments)]
     fn ggml_rope_ext(
@@ -823,6 +836,55 @@ impl Context {
     pub fn sum_rows<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
         // SAFETY: as above.
         self.tensor(unsafe { ggml_sum_rows(self.raw.as_ptr(), a.raw.as_ptr()) })
+    }
+
+    /// `log(1 + exp(x))`.
+    ///
+    /// V4-Flash's router gate is `sqrt(softplus(logits))` —
+    /// `expert_gating_func 4`, `LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS`.
+    /// Neither softmax nor sigmoid, and substituting either produces a
+    /// perfectly ordinary-looking distribution over experts.
+    pub fn softplus<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: valid context and tensor.
+        self.tensor(unsafe { ggml_softplus(self.raw.as_ptr(), a.raw.as_ptr()) })
+    }
+
+    pub fn sqrt<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: valid context and tensor.
+        self.tensor(unsafe { ggml_sqrt(self.raw.as_ptr(), a.raw.as_ptr()) })
+    }
+
+    /// Clamp elementwise into `[min, max]`.
+    ///
+    /// Bounds are often *not* symmetric here: V4-Flash clamps the SwiGLU gate
+    /// to `(-inf, limit]` and the up projection to `[-limit, limit]`
+    /// (`llama-graph.cpp:2050-2057`, a `LLM_ARCH_DEEPSEEK4` branch). Pass
+    /// `f32::NEG_INFINITY` / `f32::INFINITY` for a one-sided bound.
+    pub fn clamp<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        min: f32,
+        max: f32,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: valid context and tensor.
+        self.tensor(unsafe { ggml_clamp(self.raw.as_ptr(), a.raw.as_ptr(), min, max) })
+    }
+
+    /// `silu(gate) * up`, with gate and up as separate tensors.
+    ///
+    /// The fused form. Doing it as `mul(silu(gate), up)` is arithmetically the
+    /// same but is a different graph, and llama.cpp uses this one for
+    /// DeepSeek4 — worth matching when comparing against its numbers.
+    pub fn swiglu_split<'a>(
+        &'a self,
+        gate: &Tensor<'a>,
+        up: &Tensor<'a>,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: both tensors live in this context; ggml checks their shapes
+        // agree.
+        self.tensor(unsafe {
+            ggml_swiglu_split(self.raw.as_ptr(), gate.raw.as_ptr(), up.raw.as_ptr())
+        })
     }
 
     /// Indices of the `k` largest values per row — MoE expert selection.
