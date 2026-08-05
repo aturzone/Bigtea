@@ -96,6 +96,103 @@ struct CacheEntry {
     bytes: Arc<[u8]>,
 }
 
+/// A `Model` pointer that may cross to worker threads.
+///
+/// # Safety
+///
+/// `read_tensor_range` takes `&self` and mutates nothing, and `seek_read`
+/// carries its own offset, so concurrent reads through one handle are
+/// positional and cannot race — the property `ResidentSet::load_parallel`
+/// already relies on. The pointer stays valid because the pool lives inside
+/// `StreamingRunner`, which borrows the model for `'m` and joins every worker
+/// when it drops.
+#[derive(Clone, Copy)]
+struct ModelPtr(*const Model);
+unsafe impl Send for ModelPtr {}
+unsafe impl Sync for ModelPtr {}
+
+impl ModelPtr {
+    /// Read through the pointer.
+    ///
+    /// A method rather than a field access at the call site on purpose: under
+    /// edition 2021's disjoint closure capture, touching `.0` inside a spawned
+    /// closure captures the bare `*const Model` — which is not `Send` — instead
+    /// of this wrapper, and the spawn will not compile.
+    ///
+    /// # Safety
+    ///
+    /// See [`ModelPtr`]: the model must still be alive, which the pool
+    /// guarantees by joining its workers on drop.
+    unsafe fn read(&self, name: &str, off: u64, len: u64) -> std::result::Result<Vec<u8>, String> {
+        unsafe { (*self.0).read_tensor_range(name, off, len) }.map_err(|e| e.to_string())
+    }
+}
+
+/// One read request: where to read, and where the answer goes.
+type ReadJob = (
+    String,
+    u64,
+    u64,
+    usize,
+    std::sync::mpsc::Sender<(usize, std::result::Result<Vec<u8>, String>)>,
+);
+
+/// Long-lived reader threads.
+///
+/// Expert reads were previously issued with `std::thread::scope`, which
+/// creates and joins threads on every call — 48 layers x 8 experts' worth of
+/// misses meant roughly 432 thread spawns per generated token. Measured
+/// effect: 13.22 GiB read in 14.4s, about 0.92 GB/s, against the 2.79 GB/s
+/// this NVMe delivers in parallel. Per layer that was 9.4ms to fetch ~9 MiB,
+/// which is what ten serialized thread creations cost — the spawning *was*
+/// the disk time.
+struct ReadPool {
+    jobs: Option<std::sync::mpsc::Sender<ReadJob>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ReadPool {
+    fn new(model: ModelPtr, threads: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<ReadJob>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let mut workers = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let rx = Arc::clone(&rx);
+            let model = model;
+            workers.push(std::thread::spawn(move || loop {
+                // Hold the lock only long enough to take a job, never across
+                // the read itself.
+                let job = { rx.lock().expect("read queue").recv() };
+                let Ok((name, off, len, idx, done)) = job else {
+                    return; // sender dropped: the runner is going away
+                };
+                // SAFETY: see `ModelPtr` — the model outlives this pool and
+                // the read is positional and immutable.
+                let got = unsafe { model.read(&name, off, len) };
+                let _ = done.send((idx, got));
+            }));
+        }
+        ReadPool { jobs: Some(tx), workers }
+    }
+
+    fn submit(&self, job: ReadJob) {
+        if let Some(tx) = &self.jobs {
+            let _ = tx.send(job);
+        }
+    }
+}
+
+impl Drop for ReadPool {
+    fn drop(&mut self) {
+        // Dropping the sender is what tells the workers to stop; they must be
+        // joined before the borrowed model can go out of scope.
+        self.jobs = None;
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+    }
+}
+
 pub struct StreamingRunner<'m> {
     model: &'m Model,
     arch: Qwen3Model,
@@ -118,6 +215,8 @@ pub struct StreamingRunner<'m> {
     /// One arena, reused for every expert graph, instead of a fresh multi-
     /// megabyte allocation per layer per token.
     scratch: Vec<u8>,
+    /// Reader threads, created once. Declared after `model` so it drops first.
+    pool: ReadPool,
     /// Threads for expert matmuls. Held rather than queried per call because
     /// the expert loop runs it thousands of times per token.
     threads: usize,
@@ -126,7 +225,11 @@ pub struct StreamingRunner<'m> {
 
 impl<'m> StreamingRunner<'m> {
     pub fn new(model: &'m Model, config: Qwen3Config, cache_budget: usize) -> Self {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         StreamingRunner {
+            pool: ReadPool::new(ModelPtr(model as *const Model), threads),
             model,
             arch: Qwen3Model::new(config),
             cache: HashMap::new(),
@@ -585,35 +688,44 @@ impl<'m> StreamingRunner<'m> {
 
         if !misses.is_empty() {
             let start = std::time::Instant::now();
-            let model = self.model;
-            let threads = self.threads.min(misses.len());
-            let misses_ref = &misses;
 
-            let results: Vec<Result<Vec<((String, u32), Arc<[u8]>)>>> = std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(threads);
-                for t in 0..threads {
-                    handles.push(scope.spawn(move || {
-                        let mut mine = Vec::new();
-                        // Round-robin: slices are equal-sized here, but this
-                        // keeps the split even if that stops being true.
-                        for (name, idx, off, len) in misses_ref.iter().skip(t).step_by(threads) {
-                            let bytes = model.read_tensor_range(name, *off, *len)?;
-                            mine.push(((name.clone(), *idx), Arc::from(bytes)));
-                        }
-                        Ok(mine)
-                    }));
+            // Hand every miss to the standing pool at once, then wait. The
+            // reads overlap without any thread being created here.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            for (i, (name, _idx, off, len)) in misses.iter().enumerate() {
+                self.pool
+                    .submit((name.clone(), *off, *len, i, done_tx.clone()));
+            }
+            drop(done_tx);
+
+            let mut fetched: Vec<Option<Vec<u8>>> = (0..misses.len()).map(|_| None).collect();
+            let mut failure: Option<String> = None;
+            for _ in 0..misses.len() {
+                match done_rx.recv() {
+                    Ok((i, Ok(bytes))) => fetched[i] = Some(bytes),
+                    Ok((_, Err(e))) => failure = Some(e),
+                    Err(_) => {
+                        failure = Some("read pool stopped before finishing".into());
+                        break;
+                    }
                 }
-                handles.into_iter().map(|h| h.join().expect("read thread")).collect()
-            });
-
+            }
             self.stats.read_seconds += start.elapsed().as_secs_f64();
-            for batch in results {
-                for (key, bytes) in batch? {
-                    self.stats.expert_reads += 1;
-                    self.stats.expert_bytes += bytes.len() as u64;
-                    self.admit(key.clone(), bytes.clone());
-                    out.insert(key, bytes);
-                }
+
+            if let Some(e) = failure {
+                return Err(ArchError::MissingTensor(format!("expert read failed: {e}")));
+            }
+            for (i, (name, idx, _, _)) in misses.iter().enumerate() {
+                let bytes: Arc<[u8]> = Arc::from(
+                    fetched[i]
+                        .take()
+                        .ok_or_else(|| ArchError::MissingTensor(format!("{name}[{idx}]")))?,
+                );
+                let key = (name.clone(), *idx);
+                self.stats.expert_reads += 1;
+                self.stats.expert_bytes += bytes.len() as u64;
+                self.admit(key.clone(), bytes.clone());
+                out.insert(key, bytes);
             }
         }
         Ok(out)
