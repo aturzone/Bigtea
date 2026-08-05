@@ -382,7 +382,7 @@ fn prologue_5tok<'c>(
     ctx: &'c Context,
     weights: &WeightSet<'c>,
     config: &Deepseek4Config,
-) -> Tensor<'c> {
+) -> Prologue5<'c> {
     let hc = config.hc_mult as i64;
     let nt = TOKENS_5.len() as i64;
 
@@ -418,49 +418,9 @@ fn prologue_5tok<'c>(
     ctx.compute(&mixes, 12).expect("compute mixes");
     assert_sum("hc_mixes", mixes.to_vec_f32().iter().sum::<f32>(), -7549.175781);
 
-    // [0..4] of each token's 24 mixes is the pre gate. At five tokens this is a
-    // strided 2-D view, not the contiguous prefix it looked like at one token —
-    // a distinction the single-token capture could not have exposed, because
-    // with nt == 1 the stride is never traversed and any value for it passes.
-    //
-    // The stride is the *source's* row, `hc_mix_dim = (2 + hc) * hc` = 24
-    // floats (`deepseek4.cpp:277`, and `dsv4_view_2d` passes `t->nb[1]`), not
-    // the 4 the view is wide.
-    let f32_size = std::mem::size_of::<f32>();
-    let hc_mix_dim = (2 + hc) * hc;
-    let mix_stride = hc_mix_dim as usize * f32_size;
-    let pre = ctx
-        .view_2d(&mixes, hc, nt, mix_stride, 0)
-        .expect("mixes pre");
-    ctx.compute(&pre, 12).expect("compute pre");
-    assert_sum("hc_mixes (pre view)", pre.to_vec_f32().iter().sum::<f32>(), 516.695312);
+    let gates = hc_gates(ctx, weights, config, "hc_attn", &mixes, ATTN_GATE_SUMS);
 
-    let scale_pre = ctx
-        .view_1d(weights.get("blk.0.hc_attn_scale.weight").expect("bound"), 1, 0)
-        .expect("scale_pre");
-    let base_pre = ctx
-        .view_1d(weights.get("blk.0.hc_attn_base.weight").expect("bound"), hc, 0)
-        .expect("base_pre");
-
-    let scaled = ctx.mul(&pre, &scale_pre).expect("mul scale");
-    ctx.compute(&scaled, 12).expect("compute scaled");
-    assert_sum("node_8 (mul)", scaled.to_vec_f32().iter().sum::<f32>(), 1072.673096);
-
-    let biased = ctx.add(&scaled, &base_pre).expect("add base");
-    ctx.compute(&biased, 12).expect("compute biased");
-    assert_sum("node_10 (add)", biased.to_vec_f32().iter().sum::<f32>(), 1060.913452);
-
-    let gated = ctx.sigmoid(&biased).expect("sigmoid");
-    ctx.compute(&gated, 12).expect("compute sigmoid");
-    assert_sum("node_11 (sigmoid)", gated.to_vec_f32().iter().sum::<f32>(), 20.000000);
-
-    let eps_t = ctx.new_f32_1d(hc).expect("eps");
-    eps_t.set_f32(&vec![1e-6f32; hc as usize]).expect("fill eps");
-    let hc_pre_w = ctx.add(&gated, &eps_t).expect("add eps");
-    ctx.compute(&hc_pre_w, 12).expect("compute hc_pre");
-    assert_sum("hc_pre (scale_bias)", hc_pre_w.to_vec_f32().iter().sum::<f32>(), 20.000015);
-
-    let collapsed = ctx.dsv4_hc_pre(&hc_init, &hc_pre_w).expect("dsv4_hc_pre");
+    let collapsed = ctx.dsv4_hc_pre(&hc_init, &gates.pre).expect("dsv4_hc_pre");
     ctx.compute(&collapsed, 12).expect("compute hc_pre op");
     assert_sum(
         "hc_attn_pre (fused)",
@@ -478,7 +438,172 @@ fn prologue_5tok<'c>(
     ctx.compute(&attn_norm, 12).expect("compute");
     assert_sum("attn_norm-0", attn_norm.to_vec_f32().iter().sum::<f32>(), -1.357153);
 
-    attn_norm
+    Prologue5 { hc_init, attn_norm, gates }
+}
+
+/// What one `build_hc_pre` call produces.
+///
+/// All three gates come out of a **single** mixes matmul (`deepseek4.cpp:264`),
+/// which is why they are returned together rather than recomputed: `pre`
+/// collapses the streams on the way in, `post` and `comb` write the block's
+/// output back on the way out.
+struct HcGates<'c> {
+    pre: Tensor<'c>,
+    post: Tensor<'c>,
+    comb: Tensor<'c>,
+}
+
+struct Prologue5<'c> {
+    /// The four residual streams, `[n_embd, hc, tokens]`.
+    hc_init: Tensor<'c>,
+    /// Input to the Q and KV projections.
+    attn_norm: Tensor<'c>,
+    /// The attention block's gates, needed again after attention.
+    gates: HcGates<'c>,
+}
+
+/// The oracle's numbers for one gate block. Two blocks per layer, same
+/// structure, different weights and therefore different sums.
+struct HcGateSums {
+    pre_view: f32,
+    pre_scaled: f32,
+    pre_biased: f32,
+    pre_sigmoid: f32,
+    pre: f32,
+    post_view: f32,
+    post_scaled: f32,
+    post_biased: f32,
+    post_sigmoid: f32,
+    post: f32,
+    comb: f32,
+}
+
+const ATTN_GATE_SUMS: HcGateSums = HcGateSums {
+    pre_view: 516.695312,
+    pre_scaled: 1072.673096,
+    pre_biased: 1060.913452,
+    pre_sigmoid: 20.000000,
+    pre: 20.000015,
+    post_view: -8064.689453,
+    post_scaled: -151.041122,
+    post_biased: -291.603790,
+    post_sigmoid: 0.078218,
+    post: 0.156435,
+    comb: 19.999973,
+};
+
+const FFN_GATE_SUMS: HcGateSums = HcGateSums {
+    pre_view: -22.430878,
+    pre_scaled: -2.542310,
+    pre_biased: -21.574642,
+    pre_sigmoid: 6.341424,
+    pre: 6.341444,
+    post_view: -3306.610107,
+    post_scaled: -118.711212,
+    post_biased: -172.717499,
+    post_sigmoid: 1.477709,
+    post: 2.955418,
+    comb: 19.999979,
+};
+
+/// Slice the 24 mixes into the three gates, exactly as `build_hc_pre` does.
+///
+/// The layout is `[0..hc]` pre, `[hc..2hc]` post, `[2hc..2hc+hc*hc]` the
+/// combination matrix — with `hc_scale` indexed `[pre, post, comb]` and
+/// `hc_base` `[hc pre, hc post, hc*hc comb]`. **Every one of those views is the
+/// right size whichever slice you take**, so getting the offsets wrong has no
+/// shape consequence at all; only these sums catch it.
+///
+/// `pre` and `post` differ in their tail: `pre` gets `scale_bias(x, 1, hc_eps)`
+/// and `post` gets `scale(x, 2.0)` (`deepseek4.cpp:294, 300`). Swapping those is
+/// another silent one.
+fn hc_gates<'c>(
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    config: &Deepseek4Config,
+    block: &str,
+    mixes: &Tensor<'c>,
+    want: HcGateSums,
+) -> HcGates<'c> {
+    let hc = config.hc_mult as i64;
+    let nt = TOKENS_5.len() as i64;
+    let f32_size = std::mem::size_of::<f32>();
+    // The stride is the *source's* row, `hc_mix_dim = (2 + hc) * hc` = 24
+    // floats (`deepseek4.cpp:277`, and `dsv4_view_2d` passes `t->nb[1]`), not
+    // the 4 the view is wide. At one token the stride is never traversed and
+    // any value for it passes, which is why the five-token capture is what
+    // pinned this.
+    let mix_stride = ((2 + hc) * hc) as usize * f32_size;
+
+    let scale_w = weights.get(&format!("blk.0.{block}_scale.weight")).expect("scale bound");
+    let base_w = weights.get(&format!("blk.0.{block}_base.weight")).expect("base bound");
+
+    // One gate: view the mixes slice, affine it, sigmoid, then its own tail.
+    let gate = |label: &str, mix_off: i64, scale_idx: i64, base_off: i64,
+                sums: (f32, f32, f32, f32)| {
+        let view = ctx
+            .view_2d(mixes, hc, nt, mix_stride, mix_off as usize * f32_size)
+            .expect("mixes view");
+        ctx.compute(&view, 12).expect("compute view");
+        assert_sum(&format!("{label} (view)"), view.to_vec_f32().iter().sum::<f32>(), sums.0);
+
+        let s = ctx
+            .view_1d(scale_w, 1, scale_idx as usize * f32_size)
+            .expect("scale view");
+        let b = ctx
+            .view_1d(base_w, hc, base_off as usize * f32_size)
+            .expect("base view");
+
+        let scaled = ctx.mul(&view, &s).expect("mul scale");
+        ctx.compute(&scaled, 12).expect("compute scaled");
+        assert_sum(&format!("{label} (mul)"), scaled.to_vec_f32().iter().sum::<f32>(), sums.1);
+
+        let biased = ctx.add(&scaled, &b).expect("add base");
+        ctx.compute(&biased, 12).expect("compute biased");
+        assert_sum(&format!("{label} (add)"), biased.to_vec_f32().iter().sum::<f32>(), sums.2);
+
+        let gated = ctx.sigmoid(&biased).expect("sigmoid");
+        ctx.compute(&gated, 12).expect("compute sigmoid");
+        assert_sum(&format!("{label} (sigmoid)"), gated.to_vec_f32().iter().sum::<f32>(), sums.3);
+
+        gated
+    };
+
+    let pre_gated = gate(
+        "hc_pre",
+        0,
+        0,
+        0,
+        (want.pre_view, want.pre_scaled, want.pre_biased, want.pre_sigmoid),
+    );
+    // scale_bias(pre, 1.0, hc_eps): the epsilon is what turns 20.000000 into
+    // 20.000015, so this one number pins hyper_connection.epsilon at 1e-6.
+    let eps_t = ctx.new_f32_1d(hc).expect("eps");
+    eps_t.set_f32(&vec![1e-6f32; hc as usize]).expect("fill eps");
+    let pre = ctx.add(&pre_gated, &eps_t).expect("add eps");
+    ctx.compute(&pre, 12).expect("compute pre");
+    assert_sum("hc_pre (scale_bias)", pre.to_vec_f32().iter().sum::<f32>(), want.pre);
+
+    let post_gated = gate(
+        "hc_post",
+        hc,
+        1,
+        hc,
+        (want.post_view, want.post_scaled, want.post_biased, want.post_sigmoid),
+    );
+    let post = ctx.scale(&post_gated, 2.0).expect("scale post");
+    ctx.compute(&post, 12).expect("compute post");
+    assert_sum("hc_post (scale)", post.to_vec_f32().iter().sum::<f32>(), want.post);
+
+    // The combination matrix is fused: ggml slices the mixes, applies the
+    // affine and runs all 20 Sinkhorn iterations itself.
+    let comb = ctx
+        .dsv4_hc_comb(mixes, scale_w, base_w, 1e-6, config.hc_sinkhorn_iterations as i32)
+        .expect("dsv4_hc_comb");
+    ctx.compute(&comb, 12).expect("compute comb");
+    assert_sum("hc_comb (DSV4_HC_COMB)", comb.to_vec_f32().iter().sum::<f32>(), want.comb);
+
+    HcGates { pre, post, comb }
 }
 
 /// **The RoPE checkpoint.** Q and KV at five tokens, rotation included.
@@ -513,7 +638,8 @@ fn rope_and_kv_match_llama_cpp_at_five_tokens() {
     let mut weights = WeightSet::new();
     bind_all(&model, &wctx, &mut weights, ATTENTION_WEIGHTS);
 
-    let (q_full, kv_full) = q_and_kv_5tok(&ctx, &weights, &config);
+    let p = prologue_5tok(&ctx, &weights, &config);
+    let (q_full, kv_full) = q_and_kv_5tok(&ctx, &weights, &config, &p.attn_norm);
     assert_sum("q-0 (CONCAT)", q_full.to_vec_f32().iter().sum::<f32>(), 3544.263184);
     assert_sum("kv-0 (CONCAT)", kv_full.to_vec_f32().iter().sum::<f32>(), 63.125298);
 }
@@ -545,6 +671,7 @@ fn q_and_kv_5tok<'c>(
     ctx: &'c Context,
     weights: &WeightSet<'c>,
     config: &Deepseek4Config,
+    attn_norm: &Tensor<'c>,
 ) -> (Tensor<'c>, Tensor<'c>) {
     let nt = TOKENS_5.len() as i64;
     let head_dim = config.kv_lora_rank as i64;
@@ -560,11 +687,9 @@ fn q_and_kv_5tok<'c>(
     let pos = ctx.new_i32_1d(nt).expect("pos");
     pos.set_i32(&[0, 1, 2, 3, 4]).expect("set pos");
 
-    let attn_norm = prologue_5tok(ctx, weights, config);
-
     // ---- Q ----
     let qr = ctx
-        .mul_mat(weights.get("blk.0.attn_q_a.weight").expect("bound"), &attn_norm)
+        .mul_mat(weights.get("blk.0.attn_q_a.weight").expect("bound"), attn_norm)
         .expect("qr");
     ctx.compute(&qr, 12).expect("compute");
     assert_sum("qr-0", qr.to_vec_f32().iter().sum::<f32>(), 0.811234);
@@ -646,7 +771,7 @@ fn q_and_kv_5tok<'c>(
     // ---- KV ----
     // One head, and the same tensor serves as K *and* V (deepseek4.cpp:792).
     let kv = ctx
-        .mul_mat(weights.get("blk.0.attn_kv.weight").expect("bound"), &attn_norm)
+        .mul_mat(weights.get("blk.0.attn_kv.weight").expect("bound"), attn_norm)
         .expect("kv");
     ctx.compute(&kv, 12).expect("compute");
     assert_sum("node_26 (kv_a)", kv.to_vec_f32().iter().sum::<f32>(), 1.867785);
@@ -735,14 +860,150 @@ fn attention_matches_llama_cpp_at_five_tokens() {
     let mut weights = WeightSet::new();
     bind_all(&model, &wctx, &mut weights, ATTENTION_WEIGHTS);
 
+    let p = prologue_5tok(&ctx, &weights, &config);
+    let (q, kv) = q_and_kv_5tok(&ctx, &weights, &config, &p.attn_norm);
+    attention_5tok(&ctx, &weights, &config, &q, &kv);
+}
+
+/// **The post hyper-connection**, and the second gate block that feeds the FFN.
+///
+/// Oracle rows:
+/// ```text
+/// hc_attn_post-0  DSV4_HC_POST  {4096, 4, 5}   -14.514359
+/// node_65         RMS_NORM      {16384, 5}     -77.870285
+/// hc_mixes-0      MUL_MAT       {24, 5}      -3608.835205
+/// hc_comb-0       DSV4_HC_COMB  {4, 4, 5}       19.999979
+/// hc_ffn_pre-0    DSV4_HC_PRE   {4096, 5}        1.926467
+/// ffn_norm-0      MUL           {4096, 5}       11.634495
+/// ```
+///
+/// This is where the residual stream is written *back*. A plain transformer does
+/// `x = x + f(x)`; V4-Flash does
+/// `x[dst] = f(x)*post[dst] + sum_src x[src]*comb[dst, src]`, with `comb` a
+/// Sinkhorn-normalised 4x4 mixing matrix. Getting it wrong does not change any
+/// shape.
+///
+/// Two things the sums pin that reading the code alone would not:
+///
+/// 1. **`post` and `pre` have different tails.** `pre` gets
+///    `scale_bias(x, 1, hc_eps)` and `post` gets `scale(x, 2.0)`
+///    (`deepseek4.cpp:294, 300`). The 2.0 is why `hc_post` sums to twice its
+///    sigmoid.
+/// 2. **The FFN's gates come from a second, independent mixes matmul** against
+///    `hc_ffn_fn` over the *post-attention* stream — not from the attention
+///    block's mixes. Reusing the first would be free of any error.
+///
+/// `hc_comb` summing to ~20.0 (5 tokens x 4 rows summing to 1) is the Sinkhorn
+/// normalisation showing up: it is doubly stochastic, so this row would catch an
+/// iteration count of 0 as easily as one of 19.
+#[test]
+#[ignore = "reads weights from a 144 GB container"]
+fn post_hyper_connection_matches_llama_cpp_at_five_tokens() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+
+    let ctx = Context::new(512 << 20).expect("compute context");
+    let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
+    let mut weights = WeightSet::new();
+    let mut names: Vec<&str> = ATTENTION_WEIGHTS.to_vec();
+    names.extend_from_slice(FFN_WEIGHTS);
+    bind_all(&model, &wctx, &mut weights, &names);
+
+    let p = prologue_5tok(&ctx, &weights, &config);
+    let (q, kv) = q_and_kv_5tok(&ctx, &weights, &config, &p.attn_norm);
+    let attn_out = attention_5tok(&ctx, &weights, &config, &q, &kv);
+
+    let _ = layer_tail_5tok(&ctx, &weights, &config, &p, &attn_out);
+}
+
+/// Weights for the FFN half of the block.
+const FFN_WEIGHTS: &[&str] = &[
+    "blk.0.hc_ffn_fn.weight",
+    "blk.0.hc_ffn_scale.weight",
+    "blk.0.hc_ffn_base.weight",
+    "blk.0.ffn_norm.weight",
+];
+
+/// Post hyper-connection, the FFN gate block, and `ffn_norm`.
+///
+/// Returns `(streams, ffn_norm)`: the updated 4-stream residual, which the
+/// layer's second `hc_post` will need, and the normalised input the MoE and the
+/// shared expert both consume.
+fn layer_tail_5tok<'c>(
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    config: &Deepseek4Config,
+    p: &Prologue5<'c>,
+    attn_out: &Tensor<'c>,
+) -> (Tensor<'c>, Tensor<'c>) {
+    let nt = TOKENS_5.len() as i64;
+
+    // x = attn_out, residual = the streams as they were *before* attention.
+    let streams = ctx
+        .dsv4_hc_post(attn_out, &p.hc_init, &p.gates.post, &p.gates.comb)
+        .expect("dsv4_hc_post");
+    ctx.compute(&streams, 12).expect("compute hc_post");
+    assert_sum(
+        "hc_attn_post-0",
+        streams.to_vec_f32().iter().sum::<f32>(),
+        -14.514359,
+    );
+
+    // The FFN's gates come from their own matmul over the post-attention
+    // stream, against hc_ffn_fn rather than hc_attn_fn.
+    let flat = ctx
+        .reshape_2d(&streams, config.hc_dim() as i64, nt)
+        .expect("flatten streams");
+    let normed = ctx.rms_norm(&flat, config.rms_eps).expect("rms_norm");
+    ctx.compute(&normed, 12).expect("compute norm");
+    assert_sum("node_65 (rms_norm)", normed.to_vec_f32().iter().sum::<f32>(), -77.870285);
+
+    let mixes = ctx
+        .mul_mat(weights.get("blk.0.hc_ffn_fn.weight").expect("bound"), &normed)
+        .expect("hc_mixes ffn");
+    ctx.compute(&mixes, 12).expect("compute mixes");
+    assert_sum("hc_mixes (ffn)", mixes.to_vec_f32().iter().sum::<f32>(), -3608.835205);
+
+    let gates = hc_gates(ctx, weights, config, "hc_ffn", &mixes, FFN_GATE_SUMS);
+
+    let collapsed = ctx.dsv4_hc_pre(&streams, &gates.pre).expect("dsv4_hc_pre");
+    ctx.compute(&collapsed, 12).expect("compute hc_ffn_pre");
+    assert_sum(
+        "hc_ffn_pre-0",
+        collapsed.to_vec_f32().iter().sum::<f32>(),
+        1.926467,
+    );
+
+    let normed = ctx.rms_norm(&collapsed, config.rms_eps).expect("norm");
+    ctx.compute(&normed, 12).expect("compute");
+    assert_sum("norm-0 (ffn)", normed.to_vec_f32().iter().sum::<f32>(), 61.501854);
+
+    let ffn_norm = ctx
+        .mul(&normed, weights.get("blk.0.ffn_norm.weight").expect("bound"))
+        .expect("ffn_norm");
+    ctx.compute(&ffn_norm, 12).expect("compute");
+    assert_sum("ffn_norm-0", ffn_norm.to_vec_f32().iter().sum::<f32>(), 11.634495);
+
+    (streams, ffn_norm)
+}
+
+/// Attention through to `attn_out`, returning the block's output.
+///
+/// Shared with the layer-tail test, which needs `attn_out` to feed the post
+/// hyper-connection.
+fn attention_5tok<'c>(
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    config: &Deepseek4Config,
+    q_full: &Tensor<'c>,
+    kv_full: &Tensor<'c>,
+) -> Tensor<'c> {
     let nt = TOKENS_5.len() as i64;
     let head_dim = config.kv_lora_rank as i64;
     let n_head = config.n_head as i64;
     // The padded cache window llama.cpp's trace shows: cache_k_l0 is viewed as
     // {512, 1, 256} and permuted to {512, 256, 1}.
     const N_KV: i64 = 256;
-
-    let (q_full, kv_full) = q_and_kv_5tok(&ctx, &weights, &config);
 
     let sinks = weights.get("blk.0.attn_sinks.weight").expect("bound");
     assert_eq!(sinks.len(), n_head, "one sink per head");
@@ -789,7 +1050,7 @@ fn attention_matches_llama_cpp_at_five_tokens() {
     // ---- the fused kernel ----
     // q arrives as [head_dim, n_head, tokens] and the kernel wants
     // [head_dim, tokens, n_head], so dims 1 and 2 swap.
-    let q_perm = ctx.permute(&q_full, [0, 2, 1, 3]).expect("permute q");
+    let q_perm = ctx.permute(q_full, [0, 2, 1, 3]).expect("permute q");
     ctx.compute(&q_perm, 12).expect("compute q_perm");
     assert_sum(
         "q-0 (permuted)",
@@ -838,7 +1099,7 @@ fn attention_matches_llama_cpp_at_five_tokens() {
     let n_rot = config.n_rot as i64;
     let f32_size = std::mem::size_of::<f32>();
     let head_stride = head_dim as usize * f32_size;
-    let rope = rope_params_uncompressed(&config);
+    let rope = rope_params_uncompressed(config);
     let pos = ctx.new_i32_1d(nt).expect("pos");
     pos.set_i32(&[0, 1, 2, 3, 4]).expect("set pos");
 
@@ -942,4 +1203,6 @@ fn attention_matches_llama_cpp_at_five_tokens() {
         attn_out.to_vec_f32().iter().sum::<f32>(),
         255.856689,
     );
+
+    attn_out
 }
