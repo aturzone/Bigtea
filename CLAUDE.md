@@ -51,7 +51,7 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 
 1. **DeepSeek-V4-Flash — the critical path.** Its 7.38 GiB of always-read weights *fit* this machine, with 137.06 GiB of experts streamed (3.21 GiB/token, 6 of 256). That is the regime the design targets and the only place it should beat llama.cpp, whose dense weights get evicted by cold expert traffic. Bar: 0.45 tok/s. Physics ceiling: ~0.87 tok/s cold. Scoping, staged plan and open questions: `docs/graph/research/v4flash-port-recon.md`.
 2. Choose I/O mode from the model-size-to-RAM ratio. Bypassing the page cache is right when the model dwarfs RAM and wrong when it nearly fits — there we double-buffer against a kernel that uses all free RAM elastically.
-3. **Close the generation gap — the only place we still lose (~2x).** Prefill is done. At 4395 tokens generation splits 41.1s expert compute / 25.8s attention / 12.3s disk / 11.8s other. The expert matmuls are single-column Q4_K at ~239 GFLOPS; llama.cpp repacks weights for exactly this and we do not.
+3. **Close the generation gap — the only place we still lose (~2x). Repack Q4_K expert slices on cache admission.** Expert compute is 60% of generation, and it is neither barrier-bound (12→4 threads costs nothing) nor bandwidth-bound (2.4 GB/s against DDR5) — it is dequantisation. llama.cpp interleaves rows so several unpack per SIMD op (`REPACK = 1`); repacking once when a slice enters the cache fits this design well, since it is then reused by every token that routes there.
 4. Auto-tune the prefill block from free RAM. Block size is worth more than any kernel here (512 → 4096 is 30.5 → 43.6 tok/s) and it is currently a fixed 2048 with a `-b` override.
 
 ## Compact Instructions

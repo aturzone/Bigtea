@@ -199,6 +199,32 @@ Two traps, both of which produce silent nonsense rather than an error:
   direct evidence that frequency beats recency 70% to 17% — cannot be tested until Bigtea runs
   a model that large.
 
+## Where generation time goes, and one lever ruled out
+
+At 32 generated tokens: **12.6s expert compute, 5.8s disk, 3.9s other, 1.5s attention.** Expert
+compute is 60% of it.
+
+Those matmuls are single-column against Q4_K weights. Sweeping the thread count they run on
+(`BIGTEA_EXPERT_THREADS`) changes almost nothing:
+
+| threads | eval tok/s | expert compute |
+|---|---|---|
+| 12 | 1.54 | 9.8s |
+| 8  | 1.55 | 9.8s |
+| 6  | 1.57 | 9.6s |
+| 4  | 1.57 | 9.6s |
+
+Dropping from 12 threads to 4 costs nothing, so generation is **not** limited by the thread
+barrier. Nor is it limited by memory bandwidth: 967 MiB of expert weights per token in ~0.4s is
+about 2.4 GB/s, far under what this DDR5 delivers. What is left is **Q4_K dequantisation** —
+the work of unpacking 4-bit weights before the dot product.
+
+That is exactly what llama.cpp's weight repacking addresses (its `REPACK = 1`), interleaving
+rows so several dequantise under one SIMD operation. **Repacking expert slices once on cache
+admission, then binding the repacked layout, is the single remaining lever on generation** — and
+it fits this design unusually well, because a cached slice is repacked once and reused across
+every token that routes to it.
+
 ## Open questions
 
 - **The V4-Flash port is now the critical path**, not a nice-to-have. It is the only way to test

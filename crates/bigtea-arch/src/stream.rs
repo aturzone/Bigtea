@@ -225,11 +225,21 @@ pub struct StreamingRunner<'m> {
 
 impl<'m> StreamingRunner<'m> {
     pub fn new(model: &'m Model, config: Qwen3Config, cache_budget: usize) -> Self {
-        let threads = std::thread::available_parallelism()
+        let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
+        // Generation runs single-column matmuls, where the work per thread can
+        // be smaller than the barrier that synchronises them. Overridable so
+        // the trade-off can be measured rather than assumed.
+        let threads = std::env::var("BIGTEA_EXPERT_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(cores);
         StreamingRunner {
-            pool: ReadPool::new(ModelPtr(model as *const Model), threads),
+            // The reader pool always gets every core: its threads block on
+            // disk rather than compete for CPU.
+            pool: ReadPool::new(ModelPtr(model as *const Model), cores),
             model,
             arch: Qwen3Model::new(config),
             cache: HashMap::new(),
