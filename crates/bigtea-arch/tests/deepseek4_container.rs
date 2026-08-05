@@ -10,7 +10,7 @@
 //! Skips when the model is absent, so the suite still passes on a machine
 //! without 144 GB to spare.
 
-use bigtea_arch::{Deepseek4Config, Deepseek4Model};
+use bigtea_arch::{AttentionKind, Deepseek4Config, Deepseek4Model};
 use bigtea_model::Model;
 
 const SHARD: &str =
@@ -73,6 +73,73 @@ fn optional_tensors_appear_on_exactly_the_layers_they_should() {
         unclaimed.len(),
         &unclaimed[..unclaimed.len().min(8)]
     );
+}
+
+/// The model uses three different attentions, and which one is per layer.
+///
+/// Implementing one and applying it everywhere would give fluent output that
+/// is wrong on half the layers — so the plan is derived from the container and
+/// pinned here.
+#[test]
+fn attention_kind_is_decided_per_layer() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+    let arch = Deepseek4Model::new(config);
+    let plan = arch.attention_plan(&model);
+
+    let count = |k: AttentionKind| plan.iter().filter(|p| **p == k).count();
+    let raw = count(AttentionKind::Raw);
+    let hca = count(AttentionKind::HeavilyCompressed);
+    let csa = count(AttentionKind::CompressedSparse);
+    eprintln!("attention plan: {raw} raw, {hca} heavily-compressed, {csa} compressed-sparse");
+
+    assert_eq!(plan.len(), 43);
+    assert_eq!(raw + hca + csa, 43, "every layer classified");
+    assert_eq!(csa, 21, "21 layers carry the lightning indexer");
+    assert_eq!(hca, 20, "20 carry a compressor but no indexer");
+    assert_eq!(raw, 2, "2 carry neither");
+}
+
+/// Shapes that only make sense once read from llama.cpp's loader, pinned so a
+/// future misreading fails here rather than as plausible-looking output.
+#[test]
+fn derived_shapes_match_the_container() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+
+    // Only 64 of each 512-wide head is rotated; the rest carries no position.
+    assert_eq!(config.n_rot, 64);
+    assert_eq!(config.n_rot_none(), 448);
+
+    // The hyper-connection block runs on 4 parallel streams of n_embd.
+    assert_eq!(config.hc_mult, 4);
+    assert_eq!(config.hc_dim(), 16384);
+    let hc_fn = model
+        .location("blk.0.hc_attn_fn.weight")
+        .expect("hc_attn_fn present");
+    assert_eq!(hc_fn.dims[0], config.hc_dim() as u64, "hc_attn_fn is [hc_dim, mix]");
+
+    // attn_output_a ships 2-D but is used as [n_head*head_dim/groups, rank, groups].
+    assert_eq!(config.output_group_count, 8);
+    let wo_a = model.location("blk.0.attn_output_a.weight").expect("wo_a");
+    let expect_ne0 =
+        (config.n_head as u64 * config.kv_lora_rank as u64) / config.output_group_count as u64;
+    assert_eq!(wo_a.dims[0], expect_ne0, "grouped output projection ne0");
+    assert_eq!(
+        wo_a.dims[1],
+        config.output_lora_rank as u64 * config.output_group_count as u64,
+        "grouped output projection ne1"
+    );
+
+    // Q goes down to q_lora_rank then up to n_head * head_dim.
+    let wq_b = model.location("blk.0.attn_q_b.weight").expect("wq_b");
+    assert_eq!(wq_b.dims[0], config.q_lora_rank as u64);
+    assert_eq!(wq_b.dims[1], config.n_head as u64 * config.kv_lora_rank as u64);
+
+    // K and V are one shared compressed head, not per-head tensors.
+    let wkv = model.location("blk.0.attn_kv.weight").expect("wkv");
+    assert_eq!(wkv.dims[0], config.n_embd as u64);
+    assert_eq!(wkv.dims[1], config.kv_lora_rank as u64);
 }
 
 /// Actually load the 7.38 GiB resident set off five shards and bind it.

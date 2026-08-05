@@ -18,7 +18,7 @@ mod kv;
 mod qwen3;
 mod stream;
 
-pub use deepseek4::{Deepseek4Config, Deepseek4Model};
+pub use deepseek4::{AttentionKind, Deepseek4Config, Deepseek4Model};
 pub use kv::{KvCache, KvError};
 pub use qwen3::{Qwen3Config, Qwen3Model};
 pub use stream::{StreamStats, StreamingRunner};

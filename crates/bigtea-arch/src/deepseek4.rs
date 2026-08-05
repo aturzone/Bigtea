@@ -41,6 +41,33 @@ use bigtea_model::Model;
 
 use crate::{ArchError, Result};
 
+/// Which attention a given layer uses.
+///
+/// V4-Flash does not use one attention throughout. llama.cpp's `deepseek4.cpp`
+/// dispatches to three different builders per layer, and the container says
+/// which by what tensors the layer carries:
+///
+/// | kind | needs | layers |
+/// |---|---|---|
+/// | [`Raw`](AttentionKind::Raw) | neither compressor nor indexer | 2 |
+/// | [`HeavilyCompressed`](AttentionKind::HeavilyCompressed) | `attn_compressor_*` | 20 |
+/// | [`CompressedSparse`](AttentionKind::CompressedSparse) | compressor **and** `indexer.*` | 21 |
+///
+/// Implementing one of these and applying it everywhere would produce fluent
+/// output that is quietly wrong on half the model — the failure mode this
+/// project keeps meeting. So the kind is derived from the container, never
+/// assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionKind {
+    /// Plain attention over the full context.
+    Raw,
+    /// Heavily Compressed Attention: keys and values summarised into blocks.
+    HeavilyCompressed,
+    /// Compressed Sparse Attention with the lightning indexer choosing which
+    /// keys each query keeps (`indexer.top_k` of them).
+    CompressedSparse,
+}
+
 /// Shape and hyper-parameters, read from the container.
 #[derive(Debug, Clone)]
 pub struct Deepseek4Config {
@@ -73,6 +100,21 @@ pub struct Deepseek4Config {
     pub indexer_top_k: u32,
     pub indexer_head_count: u32,
     pub indexer_key_length: u32,
+    /// Dimensions of a head that carry rotary position (`rope.dimension_count`).
+    ///
+    /// Only 64 of each head's 512 dims are rotated; the other 448 carry no
+    /// position at all. This is DeepSeek's decoupled RoPE, and rotating the
+    /// whole head — the obvious reading — changes every score.
+    pub n_rot: u32,
+    /// Groups the attention output projection is split across.
+    ///
+    /// `attn_output_a` ships as 2-D `[4096, 8192]` but is used as
+    /// `[n_head * head_dim / groups, output_lora_rank, groups]`: a batched
+    /// matmul, not a single one. llama.cpp reshapes it at
+    /// `deepseek4.cpp:1081`.
+    pub output_group_count: u32,
+    /// Parallel residual streams the hyper-connection block carries.
+    pub hc_mult: u32,
 }
 
 impl Deepseek4Config {
@@ -114,7 +156,24 @@ impl Deepseek4Config {
             indexer_top_k: opt("attention.indexer.top_k", 0) as u32,
             indexer_head_count: opt("attention.indexer.head_count", 0) as u32,
             indexer_key_length: opt("attention.indexer.key_length", 0) as u32,
+            n_rot: opt("rope.dimension_count", 0) as u32,
+            output_group_count: opt("attention.output_group_count", 1) as u32,
+            hc_mult: opt("hyper_connection.count", 1) as u32,
         })
+    }
+
+    /// Head dimensions carrying no positional encoding.
+    ///
+    /// `head_dim - n_rot` = 512 - 64 = 448 here.
+    pub fn n_rot_none(&self) -> u32 {
+        self.kv_lora_rank.saturating_sub(self.n_rot)
+    }
+
+    /// Width of the residual stream the hyper-connection block operates on:
+    /// `n_embd * hc_mult`, 16384 here, which is why `hc_attn_fn` is
+    /// `[16384, 24]`.
+    pub fn hc_dim(&self) -> u32 {
+        self.n_embd * self.hc_mult
     }
 
     /// Bytes of routed-expert weight a single token pulls off disk.
@@ -239,6 +298,32 @@ impl Deepseek4Model {
             }
         }
         names
+    }
+
+    /// Which attention `layer` uses, decided by what the container ships.
+    ///
+    /// See [`AttentionKind`]. The indexer implies a compressor, so the check
+    /// is ordered most-specific first.
+    pub fn attention_kind(&self, model: &Model, layer: u32) -> AttentionKind {
+        let has = |suffix: &str| {
+            model
+                .location(&format!("blk.{layer}.{suffix}"))
+                .is_some()
+        };
+        if has("indexer.proj.weight") {
+            AttentionKind::CompressedSparse
+        } else if has("attn_compressor_kv.weight") {
+            AttentionKind::HeavilyCompressed
+        } else {
+            AttentionKind::Raw
+        }
+    }
+
+    /// The attention kind of every layer, in order.
+    pub fn attention_plan(&self, model: &Model) -> Vec<AttentionKind> {
+        (0..self.config.n_layer)
+            .map(|il| self.attention_kind(model, il))
+            .collect()
     }
 
     /// How many blocks carry each optional tensor.
@@ -374,6 +459,9 @@ mod tests {
             indexer_top_k: 512,
             indexer_head_count: 64,
             indexer_key_length: 128,
+            n_rot: 64,
+            output_group_count: 8,
+            hc_mult: 4,
         }
     }
 }
