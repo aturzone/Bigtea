@@ -135,11 +135,67 @@ pass gets built against. It already caught one thing invisible in the shapes:
 the attention output is **de-roped** (`rope_back`) before the grouped output
 projection.
 
+## CORRECTION BLOCK (2026-08-06) — the oracle was blind to RoPE, and now is not
+
+The previous block announced a numerical reference. That reference had a hole,
+found while building against it and recorded here rather than left implicit.
+
+**The one-token capture cannot validate RoPE, at all.** The prompt was `"Hi"` —
+a single token at position 0, where the rotation is the identity. In that trace
+`q_pe` has exactly the same sum as its input, and so does `kv_pe`. Every RoPE
+implementation passes those two rows, *including one that does nothing*. The
+decoupled rotation is one of the five things this architecture makes easy to get
+wrong, and it was the one the oracle silently exempted.
+
+**Closed by a second capture at five tokens** —
+`tests/fixtures/v4flash-layer0-oracle-5tok.txt`, from
+`-p "The capital of France is"` (ids 671, 6102, 294, 8760, 344), same flags.
+Positions 0..4 make the rotation real:
+
+```
+q_norm-0 (view)  {64, 64, 5}    695.835632  ->  q_pe-0     4082.126465
+kv_norm-0 (view) {64,  1, 5}     24.049295  ->  kv_pe-0      76.641815
+attn_raw (view)  {64, 64, 5}   3432.786621  ->  ROPE_BACK    28.466785
+```
+
+Bigtea now matches all three-plus-25 checkpoints through the end of the KV
+projection. The one-token fixture is kept: matching two independent inputs is
+stronger than matching one.
+
+RoPE parameters for layer 0, from `deepseek4.cpp:822-829` rather than from the
+container's top-level keys: `dsv4_compress_ratios[0] == 0`, so it takes the
+*uncompressed* path — plain `freq_base` 10000, `freq_scale` 1.0, and scaling
+switched off entirely (`ext_factor` 0, `attn_factor` 1, both betas 0,
+`n_ctx_orig` 0). **The container's YaRN settings apply to the other 41 layers,
+not this one.** deepseek4 also maps to `LLAMA_ROPE_TYPE_NORM`, not NEOX.
+
+**`expert_gating_func 4` is resolved** — `LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS`
+(`llama-hparams.h:18`), i.e. `sqrt(softplus(logits))`, which the trace confirms
+as `MUL_MAT -> SOFTPLUS -> SQRT`. Neither softmax nor sigmoid, and the five-token
+capture reaches far enough to check it: it covers all of layer 0 through the MoE
+and the shared expert.
+
+**A library bug this found.** `Tensor::to_vec_f32` read `nelements` floats
+straight off the data pointer, ignoring strides. A decoupled-RoPE view is 64 of
+every 512 dims and therefore *not* contiguous, so the readback returned the
+right count of plausible floats and all of them the wrong ones — making a
+correct graph look broken. Now stride-aware, with two hand-checkable unit tests
+that need no container.
+
 ## Open questions
 
-- `expert_gating_func 4` — which function? Read llama.cpp's `deepseek4` implementation rather
-  than guessing; getting this wrong degrades quality silently.
 - `compress_ratios` has 44 entries for 43 blocks. Off-by-one, or an extra leading/trailing value?
-- Does `hash_layer_count 3` mean three layers use a different attention type entirely?
+  (Partly answered above: only the first 43 are consulted.)
 - Is the shared expert always-read (and therefore resident) or routed? If resident, it adds to
   the 7.38 GiB — `bigtea-model-info` already counts it somewhere and that needs confirming.
+  The five-token trace shows `ffn_shexp-0` running unconditionally, which is consistent with
+  resident, but the byte accounting has not been re-checked.
+- **Still unverified: the other two attention kinds.** Layer 0 is `Raw`. The 20
+  heavily-compressed and 21 compressed-sparse layers have no oracle rows yet — the capture stops
+  where layer 1 begins. Matching layer 0 says nothing about them.
+
+### Resolved and struck from this list
+
+- ~~`expert_gating_func 4` — which function?~~ `sqrt(softplus(x))`, see the 2026-08-06 block.
+- ~~Does `hash_layer_count 3` mean three layers use a different attention type entirely?~~ No —
+  it is the three layers carrying `ffn_gate_tid2eid`, see the 2026-08-05 block.

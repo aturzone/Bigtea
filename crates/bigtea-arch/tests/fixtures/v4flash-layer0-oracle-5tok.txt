@@ -1,0 +1,166 @@
+# DeepSeek-V4-Flash layer-0 reference at FIVE tokens, captured from llama.cpp.
+#
+# Produced by, on the 144 GB container:
+#   llama-eval-callback -m DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf \
+#     -p "The capital of France is" --no-repack -c 512 -t 12
+#
+# Tokenizes to 5 ids, no BOS: 671, 6102, 294, 8760, 344.
+#
+# Format: name|op|shape|sum
+#
+# WHY THIS EXISTS ALONGSIDE THE ONE-TOKEN ORACLE
+#
+# v4flash-layer0-oracle.txt was captured at a single token, position 0. RoPE at
+# position 0 is the identity, so in that trace q_pe has exactly the same sum as
+# its input and *every* RoPE implementation passes -- including one that does
+# nothing at all. That made the decoupled rotation unverifiable, and it is one
+# of the five things this architecture makes easy to get wrong.
+#
+# Here positions run 0..4 and the rotation is real:
+#
+#   q_norm-0 (view)   {64, 64, 5}    695.835632   -> q_pe-0    4082.126465
+#   kv_norm-0 (view)  {64, 1, 5}      24.049295   -> kv_pe-0     76.641815
+#   attn_raw (view)   {64, 64, 5}   3432.786621   -> ROPE_BACK   28.466785
+#
+# Layer 0 has dsv4_compress_ratios[0] == 0, so it takes the plain RoPE path:
+# freq_base 10000, freq_scale 1.0, ext_factor 0, attn_factor 1.0, betas 0,
+# n_ctx_orig 0, mode NORM (deepseek4 maps to LLAMA_ROPE_TYPE_NORM, not NEOX).
+# The YaRN parameters in the container apply to the *other* 41 layers.
+#
+# The sum is every element added together: a cheap and unforgiving checksum. A
+# transposed matrix, an unrotated RoPE or a missing norm all change it, and none
+# of them raise an error.
+#
+# Two notes on rows below:
+#   * q_norm-0 is an RMS_NORM with no MUL after it -- that norm carries no
+#     weight, unlike every other norm in the model.
+#   * ffn_moe_probs-0 is SOFTPLUS then SQRT. That is what expert_gating_func 4
+#     means; it is neither softmax nor sigmoid.
+#
+# This capture covers all of layer 0, through the MoE and the shared expert, and
+# ends where layer 1 begins.
+embd|GET_ROWS|{4096, 5, 1, 1}|-5.680017
+embd (reshaped)|RESHAPE|{4096, 1, 5, 1}|-5.680017
+hc_init|REPEAT|{4096, 4, 5, 1}|-22.719982
+hc_init (reshaped)|RESHAPE|{16384, 5, 1, 1}|-22.719982
+node_4|RMS_NORM|{16384, 5, 1, 1}|-240.102188
+hc_mixes-0|MUL_MAT|{24, 5, 1, 1}|-7549.175781
+hc_mixes-0 (view)|VIEW|{4, 5, 1, 1}|516.695312
+blk.0.hc_attn_scale.weight (view)|VIEW|{1, 1, 1, 1}|2.076026
+node_8|MUL|{4, 5, 1, 1}|1072.673096
+blk.0.hc_attn_base.weight (view)|VIEW|{4, 1, 1, 1}|-2.351923
+node_10|ADD|{4, 5, 1, 1}|1060.913452
+node_11|SIGMOID|{4, 5, 1, 1}|20.000000
+hc_pre-0|SCALE|{4, 5, 1, 1}|20.000015
+hc_attn_pre-0|DSV4_HC_PRE|{4096, 5, 1, 1}|-22.720131
+norm-0|RMS_NORM|{4096, 5, 1, 1}|-59.969891
+attn_norm-0|MUL|{4096, 5, 1, 1}|-1.357153
+qr-0|MUL_MAT|{1024, 5, 1, 1}|0.811234
+norm-0|RMS_NORM|{1024, 5, 1, 1}|7.035826
+qr_norm-0|MUL|{1024, 5, 1, 1}|-0.110477
+node_19|MUL_MAT|{32768, 5, 1, 1}|3.458504
+(reshaped)|RESHAPE|{512, 64, 5, 1}|3.458504
+q_norm-0|RMS_NORM|{512, 64, 5, 1}|157.955597
+q_norm-0 (view)|VIEW|{448, 64, 5, 1}|-537.884277
+q_norm-0 (view)|VIEW|{64, 64, 5, 1}|695.835632
+q_pe-0|ROPE|{64, 64, 5, 1}|4082.126465
+q-0|CONCAT|{512, 64, 5, 1}|3544.263184
+node_26|MUL_MAT|{512, 5, 1, 1}|1.867785
+norm-0|RMS_NORM|{512, 5, 1, 1}|19.056290
+node_28|MUL|{512, 5, 1, 1}|10.532839
+kv_norm-0|RESHAPE|{512, 1, 5, 1}|10.532839
+kv_norm-0 (view)|VIEW|{448, 1, 5, 1}|-13.516478
+kv_norm-0 (view)|VIEW|{64, 1, 5, 1}|24.049295
+kv_pe-0|ROPE|{64, 1, 5, 1}|76.641815
+kv-0|CONCAT|{512, 1, 5, 1}|63.125298
+kv-0 (view)|VIEW|{512, 5, 1, 1}|63.125298
+cache_k_l0 (view)|SET_ROWS|{512, 512, 1, 1}|63.123978
+q-0 (view)|VIEW|{512, 64, 5, 1}|3544.263184
+q-0 (view) (permuted)|PERMUTE|{512, 5, 64, 1}|3544.223633
+cache_k_l0 (view)|VIEW|{512, 1, 256, 1}|63.123978
+cache_k_l0 (view) (permuted)|PERMUTE|{512, 256, 1, 1}|63.123978
+cache_k_l0 (view) (permuted)|PERMUTE|{512, 256, 1, 1}|63.123978
+node_41|FLASH_ATTN_EXT|{512, 64, 5, 1}|2879.606934
+attn_raw-0|RESHAPE|{32768, 5, 1, 1}|2879.606934
+attn_raw-0 (reshaped)|RESHAPE|{512, 64, 5, 1}|2879.606934
+attn_raw-0 (reshaped) (view)|VIEW|{448, 64, 5, 1}|-553.160217
+attn_raw-0 (reshaped) (view)|VIEW|{64, 64, 5, 1}|3432.786621
+node_47|ROPE_BACK|{64, 64, 5, 1}|28.466785
+attn_derope-0|CONCAT|{512, 64, 5, 1}|-524.695190
+attn_derope-0 (reshaped)|RESHAPE|{4096, 8, 5, 1}|-524.695190
+attn_derope-0 (reshaped) (permuted)|PERMUTE|{4096, 5, 8, 1}|-524.691833
+attn_wo_a-0|MUL_MAT|{1024, 5, 8, 1}|134.724960
+attn_wo_a-0 (permuted)|PERMUTE|{1024, 8, 5, 1}|134.724960
+attn_wo_a-0 (permuted) (cont)|CONT|{8192, 5, 1, 1}|134.724960
+attn_out-0|MUL_MAT|{4096, 5, 1, 1}|255.856689
+hc_mixes-0 (view)|VIEW|{4, 5, 1, 1}|-8064.689453
+blk.0.hc_attn_scale.weight (view)|VIEW|{1, 1, 1, 1}|0.018729
+node_57|MUL|{4, 5, 1, 1}|-151.041122
+blk.0.hc_attn_base.weight (view)|VIEW|{4, 1, 1, 1}|-28.112528
+node_59|ADD|{4, 5, 1, 1}|-291.603790
+node_60|SIGMOID|{4, 5, 1, 1}|0.078218
+hc_post-0|SCALE|{4, 5, 1, 1}|0.156435
+hc_comb-0|DSV4_HC_COMB|{4, 4, 5, 1}|19.999973
+hc_attn_post-0|DSV4_HC_POST|{4096, 4, 5, 1}|-14.514359
+hc_attn_post-0 (reshaped)|RESHAPE|{16384, 5, 1, 1}|-14.514359
+node_65|RMS_NORM|{16384, 5, 1, 1}|-77.870285
+hc_mixes-0|MUL_MAT|{24, 5, 1, 1}|-3608.835205
+hc_mixes-0 (view)|VIEW|{4, 5, 1, 1}|-3306.610107
+blk.0.hc_ffn_scale.weight (view)|VIEW|{1, 1, 1, 1}|0.035901
+node_69|MUL|{4, 5, 1, 1}|-118.711212
+blk.0.hc_ffn_base.weight (view)|VIEW|{4, 1, 1, 1}|-10.801252
+node_71|ADD|{4, 5, 1, 1}|-172.717499
+node_72|SIGMOID|{4, 5, 1, 1}|1.477709
+hc_post-0|SCALE|{4, 5, 1, 1}|2.955418
+hc_comb-0|DSV4_HC_COMB|{4, 4, 5, 1}|19.999979
+hc_mixes-0 (view)|VIEW|{4, 5, 1, 1}|-22.430878
+blk.0.hc_ffn_scale.weight (view)|VIEW|{1, 1, 1, 1}|0.113340
+node_77|MUL|{4, 5, 1, 1}|-2.542310
+blk.0.hc_ffn_base.weight (view)|VIEW|{4, 1, 1, 1}|-3.806466
+node_79|ADD|{4, 5, 1, 1}|-21.574642
+node_80|SIGMOID|{4, 5, 1, 1}|6.341424
+hc_pre-0|SCALE|{4, 5, 1, 1}|6.341444
+hc_ffn_pre-0|DSV4_HC_PRE|{4096, 5, 1, 1}|1.926467
+norm-0|RMS_NORM|{4096, 5, 1, 1}|61.501854
+ffn_norm-0|MUL|{4096, 5, 1, 1}|11.634495
+ffn_moe_logits-0|MUL_MAT|{256, 5, 1, 1}|-1176.607300
+node_86|SOFTPLUS|{256, 5, 1, 1}|587.096008
+ffn_moe_probs-0|SQRT|{256, 5, 1, 1}|792.403992
+ffn_moe_probs-0 (reshaped)|RESHAPE|{1, 256, 5, 1}|792.403992
+ffn_moe_topk-0|GET_ROWS|{6, 5, 1, 1}|3688.000000
+ffn_moe_weights-0|GET_ROWS|{1, 6, 5, 1}|20.336262
+ffn_moe_weights-0 (reshaped)|RESHAPE|{6, 5, 1, 1}|20.336262
+ffn_moe_weights_sum-0|SUM_ROWS|{1, 5, 1, 1}|20.336262
+ffn_moe_weights_sum_clamped-0|CLAMP|{1, 5, 1, 1}|20.336262
+ffn_moe_weights_norm-0|DIV|{6, 5, 1, 1}|5.000000
+ffn_moe_weights_norm-0 (reshaped)|RESHAPE|{1, 6, 5, 1}|5.000000
+ffn_moe_weights_scaled-0|SCALE|{1, 6, 5, 1}|7.500000
+ffn_norm-0 (reshaped)|RESHAPE|{4096, 1, 5, 1}|11.634495
+ffn_moe_gate-0|MUL_MAT_ID|{2048, 6, 5, 1}|-6601.376953
+ffn_moe_gate_clamped-0|CLAMP|{2048, 6, 5, 1}|-6601.376953
+ffn_moe_up-0|MUL_MAT_ID|{2048, 6, 5, 1}|-8.613072
+ffn_moe_up_clamped-0|CLAMP|{2048, 6, 5, 1}|-8.613072
+ffn_moe_swiglu_limited-0|SWIGLU|{2048, 6, 5, 1}|11.649389
+ffn_moe_down-0|MUL_MAT_ID|{4096, 6, 5, 1}|89.523140
+ffn_moe_weighted-0|MUL|{4096, 6, 5, 1}|18.572262
+ffn_moe_weighted-0 (view)|VIEW|{4096, 5, 1, 1}|1.238907
+ffn_moe_weighted-0 (view)|VIEW|{4096, 5, 1, 1}|6.887056
+ffn_moe_weighted-0 (view)|VIEW|{4096, 5, 1, 1}|6.492266
+ffn_moe_weighted-0 (view)|VIEW|{4096, 5, 1, 1}|3.250872
+ffn_moe_weighted-0 (view)|VIEW|{4096, 5, 1, 1}|-5.103240
+ffn_moe_weighted-0 (view)|VIEW|{4096, 5, 1, 1}|5.806348
+node_111|ADD|{4096, 5, 1, 1}|8.125989
+node_112|ADD|{4096, 5, 1, 1}|14.618224
+node_113|ADD|{4096, 5, 1, 1}|17.869114
+node_114|ADD|{4096, 5, 1, 1}|12.765954
+ffn_moe_out-0|ADD|{4096, 5, 1, 1}|18.572350
+ffn_gate-0|MUL_MAT|{2048, 5, 1, 1}|2518.574707
+ffn_gate_clamped-0|CLAMP|{2048, 5, 1, 1}|2518.574707
+ffn_up-0|MUL_MAT|{2048, 5, 1, 1}|36.162750
+ffn_up_clamped-0|CLAMP|{2048, 5, 1, 1}|36.162750
+ffn_swiglu_limited-0|SWIGLU|{2048, 5, 1, 1}|-39.681740
+ffn_shexp-0|MUL_MAT|{4096, 5, 1, 1}|16.228374
+ffn_out-0|ADD|{4096, 5, 1, 1}|34.800404
+l_last-0|DSV4_HC_POST|{4096, 4, 5, 1}|6.733532
+l_last-0 (reshaped)|RESHAPE|{16384, 5, 1, 1}|6.733532
+node_125|RMS_NORM|{16384, 5, 1, 1}|1.599161

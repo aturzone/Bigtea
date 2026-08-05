@@ -95,12 +95,25 @@
 //!
 //! # The reference these were checked against
 //!
-//! `tests/fixtures/v4flash-layer0-oracle.txt` holds every tensor of the
+//! `tests/fixtures/v4flash-layer0-oracle*.txt` hold every tensor of the
 //! prologue and layer 0 with its shape and the sum of its elements, captured
 //! from `llama-eval-callback` on the real container. A sum is an unforgiving
 //! checksum — a transposed matrix, an unrotated RoPE or a missing norm all
 //! change it — so the forward pass is built against those numbers rather than
 //! against whether the output reads like English.
+//!
+//! There are two captures, at one token and at five, and the second is not
+//! redundant: **at a single token, position 0, RoPE is the identity**, so the
+//! one-token trace shows `q_pe` with the same sum as its input and cannot
+//! distinguish a correct rotation from no rotation at all. Point 3 above is
+//! checked only by the five-token fixture.
+//!
+//! RoPE parameters are per layer and are *not* the container's top-level ones.
+//! Layer 0 has `dsv4_compress_ratios[0] == 0` and so takes the uncompressed
+//! path: plain `freq_base`, `freq_scale` 1, and scaling off entirely —
+//! `ext_factor` 0, `attn_factor` 1, both betas 0, `n_ctx_orig` 0
+//! (`deepseek4.cpp:822-829`). The YaRN settings in the metadata belong to the
+//! other 41 layers. The mode is `NORM`, not `NEOX`.
 //!
 //! # ggml already implements the hard parts
 //!

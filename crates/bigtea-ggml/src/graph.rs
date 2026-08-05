@@ -161,6 +161,17 @@ extern "C" {
         nb1: usize,
         offset: usize,
     ) -> *mut ggml_tensor;
+    #[allow(clippy::too_many_arguments)]
+    fn ggml_view_3d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        nb1: usize,
+        nb2: usize,
+        offset: usize,
+    ) -> *mut ggml_tensor;
     fn ggml_scale(ctx: *mut ggml_context, a: *mut ggml_tensor, s: f32) -> *mut ggml_tensor;
     fn ggml_sigmoid(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     fn ggml_relu(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
@@ -537,6 +548,41 @@ impl Context {
                 ne0,
                 ne1,
                 row_stride_bytes,
+                offset_bytes,
+            )
+        })
+    }
+
+    /// A strided 3-D window into `a`.
+    ///
+    /// This is how DeepSeek's decoupled RoPE is expressed: `q` is
+    /// `[head_dim, n_head, n_tokens]` and only the trailing `n_rot` of each
+    /// head's `head_dim` carries position, so `q_pe` is a view with the full
+    /// head stride but a shorter `ne0` and a non-zero offset. Both strides stay
+    /// those of the *source*, which is what makes the view non-contiguous and
+    /// what a `reshape` cannot express.
+    #[allow(clippy::too_many_arguments)]
+    pub fn view_3d<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        nb1: usize,
+        nb2: usize,
+        offset_bytes: usize,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above. ggml does not bounds-check views, so the offset and
+        // both strides are the caller's responsibility.
+        self.tensor(unsafe {
+            ggml_view_3d(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                ne0,
+                ne1,
+                ne2,
+                nb1,
+                nb2,
                 offset_bytes,
             )
         })
@@ -948,14 +994,65 @@ impl Tensor<'_> {
         (*(self.raw.as_ptr() as *mut crate::weights::RawTensor)).data = ptr;
     }
 
-    /// Read the tensor's values back as `f32`.
+    /// This tensor's extents and byte strides, in ggml's `ne`/`nb` order.
+    pub fn dims_and_strides(&self) -> ([i64; 4], [usize; 4]) {
+        // SAFETY: valid tensor pointer for the context's lifetime; `RawTensor`
+        // mirrors ggml's layout, which the FFI already relies on elsewhere.
+        let raw = unsafe { &*(self.raw.as_ptr() as *const crate::weights::RawTensor) };
+        (raw.ne, raw.nb)
+    }
+
+    /// True when the elements are laid out back to back, so a flat read is
+    /// equivalent to a strided one.
+    pub fn is_contiguous(&self) -> bool {
+        let (ne, nb) = self.dims_and_strides();
+        let mut expect = nb[0];
+        for d in 1..4 {
+            if ne[d] > 1 && nb[d] != expect {
+                return false;
+            }
+            expect *= ne[d].max(1) as usize;
+        }
+        true
+    }
+
+    /// Read the tensor's values back as `f32`, in logical index order.
+    ///
+    /// **Strides are honoured, and that is not a detail.** A view produced by
+    /// [`Context::view_2d`] or [`Context::view_3d`] keeps the *source's*
+    /// strides, so its elements are scattered through the parent's buffer — the
+    /// decoupled-RoPE split (64 rotated dims out of every 512) is exactly this
+    /// shape. Reading such a view as a flat run of `nelements` floats returns
+    /// entirely different numbers, with no error and nothing obviously wrong
+    /// about them: this function used to do that, and it made a correct graph
+    /// look like a wrong one.
     pub fn to_vec_f32(&self) -> Vec<f32> {
         let n = self.len() as usize;
-        // SAFETY: valid tensor holding `n` f32 values, contiguous.
-        unsafe {
-            let src = ggml_get_data_f32(self.raw.as_ptr());
-            std::slice::from_raw_parts(src, n).to_vec()
+        // SAFETY: valid tensor of f32 for the context's lifetime.
+        let src = unsafe { ggml_get_data_f32(self.raw.as_ptr()) } as *const u8;
+        if self.is_contiguous() {
+            // SAFETY: contiguous, so `n` floats follow the data pointer.
+            return unsafe { std::slice::from_raw_parts(src as *const f32, n).to_vec() };
         }
+
+        let (ne, nb) = self.dims_and_strides();
+        let mut out = Vec::with_capacity(n);
+        for i3 in 0..ne[3] {
+            for i2 in 0..ne[2] {
+                for i1 in 0..ne[1] {
+                    for i0 in 0..ne[0] {
+                        let off = i3 as usize * nb[3]
+                            + i2 as usize * nb[2]
+                            + i1 as usize * nb[1]
+                            + i0 as usize * nb[0];
+                        // SAFETY: the offset is built from the tensor's own
+                        // extents and strides, so it lands inside its buffer.
+                        out.push(unsafe { *(src.add(off) as *const f32) });
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -964,6 +1061,60 @@ mod tests {
     use super::*;
 
     const ARENA: usize = 16 << 20;
+
+    /// A strided view must read the elements it describes, not the bytes that
+    /// happen to follow its data pointer.
+    ///
+    /// This is the shape of DeepSeek's decoupled RoPE — the trailing dims of
+    /// each head, so a short window with the *parent's* stride — and reading it
+    /// flat is silent: the right number of plausible floats, all of them the
+    /// wrong ones. It made a correct V4-Flash graph look broken for as long as
+    /// it took to notice the two candidate sums differed by more than any
+    /// arithmetic error could.
+    #[test]
+    fn a_strided_view_reads_its_own_elements_not_the_flat_run() {
+        let ctx = Context::new(ARENA).expect("context");
+
+        // 3 rows of 4: [0 1 2 3][4 5 6 7][8 9 10 11]
+        let t = ctx.new_f32_2d(4, 3).expect("t");
+        t.set_f32(&(0..12).map(|v| v as f32).collect::<Vec<_>>()).expect("set");
+
+        // The last 2 of each row: [2 3][6 7][10 11].
+        let f32_size = std::mem::size_of::<f32>();
+        let tail = ctx
+            .view_2d(&t, 2, 3, 4 * f32_size, 2 * f32_size)
+            .expect("view");
+
+        assert!(!tail.is_contiguous(), "a windowed view is not contiguous");
+        assert_eq!(tail.to_vec_f32(), vec![2.0, 3.0, 6.0, 7.0, 10.0, 11.0]);
+
+        // What the flat read gave instead, spelled out: six consecutive floats
+        // from the offset. Same length, same types, no error.
+        let flat: Vec<f32> = (2..8).map(|v| v as f32).collect();
+        assert_ne!(tail.to_vec_f32(), flat);
+    }
+
+    /// The 3-D case, which is the one the Q projection actually uses: 2 of
+    /// every 4 dims, across 2 heads and 2 tokens.
+    #[test]
+    fn a_strided_3d_view_walks_both_strides() {
+        let ctx = Context::new(ARENA).expect("context");
+
+        // [4 dims, 2 heads, 2 tokens] filled 0..15.
+        let t = ctx.new_f32_3d(4, 2, 2).expect("t");
+        t.set_f32(&(0..16).map(|v| v as f32).collect::<Vec<_>>()).expect("set");
+
+        let f32_size = std::mem::size_of::<f32>();
+        let pe = ctx
+            .view_3d(&t, 2, 2, 2, 4 * f32_size, 8 * f32_size, 2 * f32_size)
+            .expect("view_3d");
+
+        // The trailing pair of each head: rows start at 0,4,8,12.
+        assert_eq!(
+            pe.to_vec_f32(),
+            vec![2.0, 3.0, 6.0, 7.0, 10.0, 11.0, 14.0, 15.0]
+        );
+    }
 
     #[test]
     fn computes_a_matmul_with_a_known_answer() {

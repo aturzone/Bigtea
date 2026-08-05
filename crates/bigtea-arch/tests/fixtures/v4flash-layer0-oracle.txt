@@ -14,6 +14,13 @@
 #
 # Note q_norm-0 is an RMS_NORM with no MUL following it: that norm carries no
 # weight, unlike every other norm in the model.
+#
+# THIS TRACE CANNOT VALIDATE RoPE. The prompt is one token at position 0, where
+# the rotation is the identity -- q_pe-0 below has exactly the same sum as its
+# input, and so does kv_pe-0. Any implementation passes those two rows,
+# including one that does nothing. Use v4flash-layer0-oracle-5tok.txt, captured
+# at 5 tokens, to check the rotation. This file is kept because matching two
+# independent inputs is stronger evidence than matching one.
 embd|GET_ROWS|{4096, 1, 1, 1}|2.097937
 embd (reshaped)|RESHAPE|{4096, 1, 1, 1}|2.097937
 hc_init|REPEAT|{4096, 4, 1, 1}|8.391747
