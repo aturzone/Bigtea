@@ -32,10 +32,89 @@
 //!   question and is deliberately not guessed at here.
 //!
 //! This module currently covers the container: shape, the resident/streamed
-//! split, and verification that every tensor named is actually present. The
-//! forward pass is not implemented — a wrong one produces fluent nonsense
-//! rather than an error, so it is staged separately and checked against
-//! llama.cpp's logits.
+//! split, the per-layer attention plan, and verification that every tensor
+//! named is actually present. The forward pass is not implemented — a wrong
+//! one produces fluent nonsense rather than an error, so it is staged
+//! separately and checked against llama.cpp's logits.
+//!
+//! # Attention, exactly
+//!
+//! Transcribed from `llama.cpp/src/models/deepseek4.cpp` (build 2026-08-03),
+//! `build_attention` at line 801, so the next person does not have to derive
+//! it from tensor shapes — which does not work, because
+//! [`Deepseek4Config::output_group_count`] makes the dimensions appear not to
+//! connect.
+//!
+//! ```text
+//! qr      = wq_a · x                       4096 -> 1024
+//! qr      = rms_norm(qr) * attn_q_a_norm
+//! q       = wq_b · qr                      1024 -> 32768
+//! q       = reshape_3d(q, 512, 64, nt)     [head_dim, n_head, tokens]
+//! q       = rms_norm(q)                    ** no weight — unweighted **
+//! q_nope  = q[.., 0..448]                  view, no position
+//! q_pe    = q[.., 448..512]                view, rotated
+//! q_pe    = rope_ext(q_pe, pos, n_rot=64, ..)
+//! q       = concat(q_nope, q_pe, dim 0)
+//!
+//! kv      = wkv · x                        4096 -> 512
+//! kv      = rms_norm(kv) * attn_kv_a_norm
+//! kv      = reshape_3d(kv, 512, 1, nt)     ** one head, shared **
+//! kv_nope = kv[.., 0..448]
+//! kv_pe   = rope_ext(kv[.., 448..512], pos, 64, ..)
+//! kv      = concat(kv_nope, kv_pe, dim 0)
+//!
+//! out     = attn_mha(q, kv, kv, mask, sinks, scale)   ** kv is K *and* V **
+//!
+//! // the output is de-roped before projection
+//! out     = reshape_3d(out, 512, 64, nt)
+//! out_pe  = rope_back(out[.., 448..512], pos, ..)      ** inverse rotation **
+//! out     = concat(out[.., 0..448], out_pe, dim 0)
+//! out     = permute(reshape(out, 4096, 8, nt))         ** 8 groups **
+//! oa      = mul_mat(reshape_3d(wo_a, 4096, o_lora_rank, 8), out)
+//! oa      = cont(permute(oa))                          -> [8192, nt]
+//! out     = wo_b · oa                                  -> [4096, nt]
+//! ```
+//!
+//! Five things there are easy to get wrong and none of them raise an error:
+//!
+//! 1. **`kv` is passed as both K and V** (`deepseek4.cpp:792`). There is no
+//!    separate V projection and no `wkv_b` — the one compressed 512-wide
+//!    tensor serves as both, which is why `head_count_kv` is 1.
+//! 2. **The per-head `rms_norm` on `q` carries no weight** (line 839), unlike
+//!    every other norm in the model. Applying `attn_q_a_norm` again here would
+//!    look reasonable and be wrong.
+//! 3. **Only `q_pe`/`kv_pe` are rotated**, the trailing 64 of 512 dims. The
+//!    leading 448 are concatenated back unchanged.
+//! 4. **RoPE parameters are per layer.** `dsv4_compress_ratios[il] != 0`
+//!    selects `compress_rope_freq_base` (160000) with YaRN scaling; the other
+//!    layers use the plain base with no scaling at all (lines 822-829).
+//! 5. **The attention output is de-roped** with `rope_back` before projection,
+//!    on the same trailing 64 dims. Skipping it leaves the rotation baked into
+//!    the residual stream. This is visible only in the captured trace, not in
+//!    the tensor shapes.
+//!
+//! # The reference these were checked against
+//!
+//! `tests/fixtures/v4flash-layer0-oracle.txt` holds every tensor of the
+//! prologue and layer 0 with its shape and the sum of its elements, captured
+//! from `llama-eval-callback` on the real container. A sum is an unforgiving
+//! checksum — a transposed matrix, an unrotated RoPE or a missing norm all
+//! change it — so the forward pass is built against those numbers rather than
+//! against whether the output reads like English.
+//!
+//! # ggml already implements the hard parts
+//!
+//! This build's public `ggml.h` exposes the operations that looked like the
+//! expensive half of this port:
+//!
+//! * `ggml_dsv4_hc_pre`, `ggml_dsv4_hc_post`, `ggml_dsv4_hc_comb` —
+//!   hyper-connections, with `hc_comb`'s `n_iter` being the Sinkhorn iteration
+//!   count (20 for this model).
+//! * `ggml_lightning_indexer` — the sparse-attention indexer.
+//! * `ggml_flash_attn_ext_add_sinks` — the per-head attention sinks.
+//!
+//! So hyper-connections and the indexer are FFI bindings here, not
+//! implementations. That removes the two pieces the recon flagged as hardest.
 
 use bigtea_model::Model;
 

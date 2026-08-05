@@ -102,6 +102,39 @@ Do not port all of it at once. In order, each step verifiable on its own:
 5. Indexer and hyper-connections last — the model may produce plausible text without them,
    which makes it dangerously easy to declare victory early.
 
+## CORRECTION BLOCK (2026-08-05, later the same day)
+
+Three of the items scoped above are cheaper than this node claimed, and one is
+harder. All checked against `llama.cpp/src/models/deepseek4.cpp` and the
+container rather than reasoned about.
+
+**Cheaper — ggml already implements them.** This build's *public* `ggml.h`
+exposes `ggml_dsv4_hc_pre`, `ggml_dsv4_hc_post`, `ggml_dsv4_hc_comb` (whose
+`n_iter` argument is the Sinkhorn iteration count) and
+`ggml_lightning_indexer`, plus `ggml_flash_attn_ext_add_sinks` for the
+per-head sinks. **Hyper-connections and the sparse indexer are FFI bindings,
+not implementations** — items 4 and 5 of the scoping list above were the two
+flagged as hardest and both largely evaporate.
+
+**Harder — attention is not one thing.** The model dispatches to *three*
+different attention builders, chosen per layer: 2 raw, 20 heavily-compressed,
+21 compressed-sparse. Implementing one and applying it throughout gives fluent
+output that is wrong on half the model.
+
+**Resolved open questions.** `hash_layer_count 3` means the three layers
+carrying `ffn_gate_tid2eid`. `compress_ratios` having 44 entries for 43 blocks
+is not an off-by-one in the manifest — it is indexed per layer as
+`dsv4_compress_ratios[il]` and selects the RoPE base, so only the first 43 are
+consulted.
+
+**A numerical reference now exists.**
+`crates/bigtea-arch/tests/fixtures/v4flash-layer0-oracle.txt` holds the shape
+and element-sum of every tensor in the prologue and layer 0, captured with
+`llama-eval-callback` on the real container. That is the oracle the forward
+pass gets built against. It already caught one thing invisible in the shapes:
+the attention output is **de-roped** (`rope_back`) before the grouped output
+projection.
+
 ## Open questions
 
 - `expert_gating_func 4` — which function? Read llama.cpp's `deepseek4` implementation rather

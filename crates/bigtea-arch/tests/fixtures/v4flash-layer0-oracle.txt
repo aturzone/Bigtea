@@ -1,0 +1,71 @@
+# DeepSeek-V4-Flash layer-0 reference, captured from llama.cpp.
+#
+# Produced by, on the 144 GB container with prompt "Hi":
+#   llama-eval-callback -m DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf \
+#     -p "Hi" -n 1 --no-repack -c 512 -t 12
+#
+# Format: name|op|shape|sum
+#
+# The sum is every element of the tensor added together. It is a cheap and
+# unforgiving checksum: a transposed matrix, an unrotated RoPE or a missing
+# norm all change it, and none of them raise an error. When the Bigtea
+# forward pass is built, each step is compared against the corresponding row
+# here rather than against whether the output reads like English.
+#
+# Note q_norm-0 is an RMS_NORM with no MUL following it: that norm carries no
+# weight, unlike every other norm in the model.
+embd|GET_ROWS|{4096, 1, 1, 1}|2.097937
+embd (reshaped)|RESHAPE|{4096, 1, 1, 1}|2.097937
+hc_init|REPEAT|{4096, 4, 1, 1}|8.391747
+hc_init (reshaped)|RESHAPE|{16384, 1, 1, 1}|8.391747
+node_4|RMS_NORM|{16384, 1, 1, 1}|92.071121
+hc_mixes-0|MUL_MAT|{24, 1, 1, 1}|-1121.066162
+hc_mixes-0 (view)|VIEW|{4, 1, 1, 1}|106.190155
+blk.0.hc_attn_scale.weight (view)|VIEW|{1, 1, 1, 1}|2.076026
+node_8|MUL|{4, 1, 1, 1}|220.453522
+blk.0.hc_attn_base.weight (view)|VIEW|{4, 1, 1, 1}|-2.351923
+node_10|ADD|{4, 1, 1, 1}|218.101593
+node_11|SIGMOID|{4, 1, 1, 1}|4.000000
+hc_pre-0|SCALE|{4, 1, 1, 1}|4.000004
+hc_attn_pre-0|DSV4_HC_PRE|{4096, 1, 1, 1}|8.391787
+norm-0|RMS_NORM|{4096, 1, 1, 1}|23.019047
+attn_norm-0|MUL|{4096, 1, 1, 1}|0.769727
+qr-0|MUL_MAT|{1024, 1, 1, 1}|-1.006525
+norm-0|RMS_NORM|{1024, 1, 1, 1}|-13.669229
+qr_norm-0|MUL|{1024, 1, 1, 1}|-0.573721
+node_19|MUL_MAT|{32768, 1, 1, 1}|0.694762
+(reshaped)|RESHAPE|{512, 64, 1, 1}|0.694762
+q_norm-0|RMS_NORM|{512, 64, 1, 1}|48.321102
+q_norm-0 (view)|VIEW|{448, 64, 1, 1}|99.254105
+q_norm-0 (view)|VIEW|{64, 64, 1, 1}|-50.933430
+q_pe-0|ROPE|{64, 64, 1, 1}|-50.933430
+q-0|CONCAT|{512, 64, 1, 1}|48.321102
+node_26|MUL_MAT|{512, 1, 1, 1}|-1.157955
+norm-0|RMS_NORM|{512, 1, 1, 1}|-12.004436
+node_28|MUL|{512, 1, 1, 1}|-5.796605
+kv_norm-0|RESHAPE|{512, 1, 1, 1}|-5.796605
+kv_norm-0 (view)|VIEW|{448, 1, 1, 1}|-4.538907
+kv_norm-0 (view)|VIEW|{64, 1, 1, 1}|-1.257697
+kv_pe-0|ROPE|{64, 1, 1, 1}|-1.257697
+kv-0|CONCAT|{512, 1, 1, 1}|-5.796605
+kv-0 (view)|VIEW|{512, 1, 1, 1}|-5.796605
+cache_k_l0 (view)|SET_ROWS|{512, 512, 1, 1}|-5.799220
+q-0 (view)|VIEW|{512, 64, 1, 1}|48.321102
+q-0 (view) (permuted)|PERMUTE|{512, 1, 64, 1}|48.321102
+cache_k_l0 (view)|VIEW|{512, 1, 256, 1}|-5.799220
+cache_k_l0 (view) (permuted)|PERMUTE|{512, 256, 1, 1}|-5.799220
+cache_k_l0 (view) (permuted)|PERMUTE|{512, 256, 1, 1}|-5.799220
+node_41|FLASH_ATTN_EXT|{512, 64, 1, 1}|-245.470413
+attn_raw-0|RESHAPE|{32768, 1, 1, 1}|-245.470413
+attn_raw-0 (reshaped)|RESHAPE|{512, 64, 1, 1}|-245.470413
+attn_raw-0 (reshaped) (view)|VIEW|{448, 64, 1, 1}|-192.094467
+attn_raw-0 (reshaped) (view)|VIEW|{64, 64, 1, 1}|-53.377132
+node_47|ROPE_BACK|{64, 64, 1, 1}|-53.377132
+attn_derope-0|CONCAT|{512, 64, 1, 1}|-245.470413
+attn_derope-0 (reshaped)|RESHAPE|{4096, 8, 1, 1}|-245.470413
+attn_derope-0 (reshaped) (permuted)|PERMUTE|{4096, 1, 8, 1}|-245.470413
+attn_wo_a-0|MUL_MAT|{1024, 1, 8, 1}|-55.117535
+attn_wo_a-0 (permuted)|PERMUTE|{1024, 8, 1, 1}|-55.117535
+attn_wo_a-0 (permuted) (cont)|CONT|{8192, 1, 1, 1}|-55.117535
+attn_out-0|MUL_MAT|{4096, 1, 1, 1}|-15.094330
+hc_mixes-0 (view)|VIEW|{4, 1, 1, 1}|-1227.399170
