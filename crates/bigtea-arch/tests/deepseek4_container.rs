@@ -90,6 +90,59 @@ fn manifest_matches_the_container() {
     assert_eq!(raw, 2, "compress_ratios and the tensor manifest must agree");
 }
 
+/// `compress_ratios` and the tensor manifest must name the same attention on
+/// every layer.
+///
+/// These are genuinely independent readings of the container: one is a metadata
+/// array of 44 integers, the other is which of `attn_compressor_kv` and
+/// `indexer.proj` a block ships. If they disagree, one of them is being read
+/// wrong and the model would run some layer through the wrong builder — which
+/// produces fluent output, not an error.
+///
+/// The pattern they agree on is worth stating, because nothing in the metadata
+/// announces it: **layers 0-1 are Raw, then the kinds alternate** — even layers
+/// Compressed Sparse, odd layers Heavily Compressed, to the end.
+#[test]
+fn the_two_readings_of_attention_kind_agree_on_every_layer() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+    let arch = Deepseek4Model::new(config.clone());
+
+    for il in 0..config.n_layer {
+        let from_ratio = config
+            .attention_kind_from_ratio(il)
+            .unwrap_or_else(|| panic!("layer {il}: unrecognised compress ratio"));
+        let from_tensors = arch.attention_kind(&model, il);
+        assert_eq!(
+            from_ratio, from_tensors,
+            "layer {il}: compress_ratios says {from_ratio:?}, tensors say {from_tensors:?}"
+        );
+    }
+
+    // The alternation, asserted rather than left as a comment.
+    assert_eq!(config.attention_kind_from_ratio(0), Some(AttentionKind::Raw));
+    assert_eq!(config.attention_kind_from_ratio(1), Some(AttentionKind::Raw));
+    for il in 2..config.n_layer {
+        let want = if il % 2 == 0 {
+            AttentionKind::CompressedSparse
+        } else {
+            AttentionKind::HeavilyCompressed
+        };
+        assert_eq!(
+            config.attention_kind_from_ratio(il),
+            Some(want),
+            "layer {il} breaks the even/odd alternation"
+        );
+    }
+
+    // And the block sizes, which are why a five-token capture exercises one
+    // compressor and not the other: CSA compresses every 4 tokens, HCA every
+    // 128, so at five tokens only CSA has ever actually run.
+    assert_eq!(config.compress_block(0), None, "Raw layers have no compressor");
+    assert_eq!(config.compress_block(2), Some(Deepseek4Config::CSA_RATIO));
+    assert_eq!(config.compress_block(3), Some(Deepseek4Config::HCA_RATIO));
+}
+
 /// The layers are not uniform, and pinning the counts is what stops a future
 /// change from silently skipping part of the architecture.
 #[test]

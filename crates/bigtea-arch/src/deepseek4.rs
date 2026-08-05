@@ -324,6 +324,49 @@ impl Deepseek4Config {
         })
     }
 
+    /// Compression ratio marking a Compressed Sparse Attention layer, which
+    /// compresses every 4 tokens (`deepseek4.cpp:187`).
+    pub const CSA_RATIO: i64 = 4;
+    /// Compression ratio marking a Heavily Compressed Attention layer, which
+    /// compresses every 128 (`deepseek4.cpp:188`).
+    pub const HCA_RATIO: i64 = 128;
+
+    /// The attention kind `layer` uses, **from `compress_ratios` alone**.
+    ///
+    /// The ratio is not merely a compressed/uncompressed flag: its *value*
+    /// names the builder llama.cpp dispatches to — 0 raw, 4 sparse, 128 heavy.
+    ///
+    /// [`Deepseek4Model::attention_kind`] answers the same question from which
+    /// tensors a block carries. Two independent sources, and
+    /// `deepseek4_container.rs` asserts they agree on all 43 layers: if they
+    /// ever diverge, one of the two readings of this container is wrong and
+    /// the model would run with the wrong attention on some layer.
+    ///
+    /// `None` for a ratio this build does not recognise, which is a container
+    /// surprise worth surfacing rather than defaulting past.
+    pub fn attention_kind_from_ratio(&self, layer: u32) -> Option<AttentionKind> {
+        match self.compress_ratios.get(layer as usize).copied()? {
+            0 => Some(AttentionKind::Raw),
+            Self::CSA_RATIO => Some(AttentionKind::CompressedSparse),
+            Self::HCA_RATIO => Some(AttentionKind::HeavilyCompressed),
+            _ => None,
+        }
+    }
+
+    /// How many tokens must accumulate before `layer`'s compressor emits a
+    /// block, or `None` when the layer has no compressor.
+    ///
+    /// Worth having explicitly because it is why a short capture proves less
+    /// than it appears to: at five tokens a CSA layer (ratio 4) compresses and
+    /// an HCA layer (ratio 128) never does, so the same prompt exercises one
+    /// path and not the other.
+    pub fn compress_block(&self, layer: u32) -> Option<i64> {
+        self.compress_ratios
+            .get(layer as usize)
+            .copied()
+            .filter(|r| *r != 0)
+    }
+
     /// Whether `layer` uses the compressed RoPE base and YaRN scaling.
     ///
     /// `dsv4_compress_ratios[il] != 0` (`deepseek4.cpp:822`). A layer past the
