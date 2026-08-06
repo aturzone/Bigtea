@@ -792,6 +792,29 @@ fn ffn<'c>(
     let up = ctx.mul_mat_id(&stack("ffn_up_exps")?, &cur3, &ids_t)?;
     let up = ctx.clamp(&up, -limit, limit)?;
     let act = ctx.swiglu_split(&gate, &up)?;
+    if std::env::var("BIGTEA_SPARSITY").is_ok() {
+        // How much of the intermediate actually matters? The router picks 6 of
+        // 256 experts; this asks how much of a CHOSEN expert is dead weight for
+        // this token. Rows whose activation is negligible never reach the
+        // output, so their  rows and  columns need not be read.
+        ctx.compute(&act, 12)?;
+        let v = act.to_vec_f32();
+        let peak = v.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let mut buckets = [0usize; 4]; // >1%, >0.1%, >0.01% of peak, and rest
+        for x in &v {
+            let r = x.abs() / peak.max(f32::MIN_POSITIVE);
+            if r > 1e-2 { buckets[0] += 1 } else if r > 1e-3 { buckets[1] += 1 }
+            else if r > 1e-4 { buckets[2] += 1 } else { buckets[3] += 1 }
+        }
+        let n = v.len() as f64;
+        eprintln!(
+            "  sparsity blk {il:>2}: >1% {:.1}%  >0.1% {:.1}%  >0.01% {:.1}%  negligible {:.1}%",
+            100.0 * buckets[0] as f64 / n,
+            100.0 * buckets[1] as f64 / n,
+            100.0 * buckets[2] as f64 / n,
+            100.0 * buckets[3] as f64 / n,
+        );
+    }
     let down = ctx.mul_mat_id(&stack("ffn_down_exps")?, &act, &ids_t)?;
     let weighted = ctx.mul(&down, w_scaled)?;
     ctx.compute(&weighted, 12)?;

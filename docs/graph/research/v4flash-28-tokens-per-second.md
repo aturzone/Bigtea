@@ -161,3 +161,59 @@ pattern for an SSD.
 
 **That is the big bang, and it is an offline data-layout change plus a prefix read.** No new
 kernel, no new quantiser, no accuracy loss — the same weights in a different order.
+
+## MEASURED, PART 2: V4-Flash's experts are NOT 90% sparse — the plan above is wrong
+
+The layout result stands. The premise it serves does not. Instrumented the real SwiGLU
+activations (`BIGTEA_SPARSITY=1`), all 43 blocks, and binned every one of the 2048
+intermediate neurons by its magnitude relative to that block's peak:
+
+```
+mean over 43 blocks, share of intermediate neurons:
+  >1%    of peak   11.3%      would have to be read
+  >0.1%            46.0%
+  >0.01%           33.5%
+  negligible        9.1%      genuinely skippable
+```
+
+**Only 9.1% is negligible.** Deja Vu and PowerInfer report 80-95% inactive on *dense* FFNs;
+V4-Flash's expert FFNs show a **long tail, not a sharp cutoff**. Keeping only the >1% neurons
+means discarding ~900 per expert that each carry up to 1% of peak — cumulatively that is not
+noise, it is signal, and cutting it is a quality gamble rather than a free win.
+
+### Why, and it should have been predictable
+
+**The router's 6-of-256 IS this architecture's contextual sparsity.** Deja Vu's win comes from
+a dense model computing one big FFN for every token, most of which is irrelevant to that
+token. An MoE has already done that selection: the expert was chosen *because* it is relevant,
+so its neurons are correspondingly dense. Harvesting the same sparsity twice was the mistake —
+V4-Flash spends 3.21 GiB/token precisely because it has already thrown away 250 of 256 experts.
+
+Caveats, stated so this is not over-read: this is one 5-token prompt, magnitude is not the same
+as contribution to the output (the `down` weights matter too), and a real calibration would
+sample a corpus. But the gap between 9.1% and 80% is far too large for any of that to rescue.
+
+### The stack, corrected
+
+```
+3288 MB/token
+  ÷ 1.1   sparsity, safely           ->  2989 MB     0.87 -> 0.96 tok/s
+  ÷ 2.2   speculative decoding       ->  1359 MB     -> 2.1 tok/s
+  ÷ 1.7   2.5-bit experts            ->   799 MB     -> 3.6 tok/s
+  ÷ 2.0   50% cache hits             ->   400 MB     -> 7.2 tok/s
+```
+
+**~7 tok/s, not 28** — and that already assumes VQ quantisation working on an MoE where it has
+never been shown, plus a cache this machine has no RAM for. **The defensible near-term number
+is speculative decoding alone: ~2 tok/s, 4.4x llama.cpp**, needing no new numerics and no
+layout change.
+
+### What survives
+
+- **The 31x layout finding is still true and still useful** — anywhere a partial read is
+  wanted, scattered fragments are catastrophic and a prefix read is cheap. It just no longer
+  has a 7x application here.
+- **Speculative decoding is now the single best lever**, and unlike everything else on this
+  list it is proven, independent, and needs no research.
+- The long-context structural win against llama.cpp (3.3x, from dense-weight eviction) is
+  untouched by any of this and remains the strongest claim available.
