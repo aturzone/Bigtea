@@ -318,7 +318,64 @@ mod imp {
         fn kill(pid: i32, sig: i32) -> i32;
     }
 
+    /// Every process with a resident set, on whichever Unix this is.
+    ///
+    /// `/proc` is a Linux invention. macOS and the BSDs do not have it, so the
+    /// `/proc` walk below silently returned an empty list there — and an empty
+    /// list is not a visible failure, it is the "close these apps to free RAM"
+    /// advice quietly never appearing. `ps` is the portable fallback: slower
+    /// than reading a filesystem, but this runs once at startup and correctness
+    /// beats microseconds.
     pub fn enumerate() -> Vec<Process> {
+        if std::path::Path::new("/proc/self/statm").exists() {
+            return enumerate_proc();
+        }
+        enumerate_ps()
+    }
+
+    /// `ps -axo pid=,rss=,comm=` — POSIX-specified columns, RSS in kilobytes.
+    fn enumerate_ps() -> Vec<Process> {
+        let self_pid = std::process::id();
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-axo", "pid=,rss=,comm="])
+            .output()
+        else {
+            return Vec::new();
+        };
+        let Ok(text) = String::from_utf8(out.stdout) else {
+            return Vec::new();
+        };
+
+        let mut procs = Vec::new();
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(pid), Some(rss_kb)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            let (Ok(pid), Ok(rss_kb)) = (pid.parse::<u32>(), rss_kb.parse::<u64>()) else {
+                continue;
+            };
+            if pid == self_pid {
+                continue;
+            }
+            // `comm` is a full path on macOS; the last component is the name a
+            // user would recognise, and what `is_protected` matches against.
+            let name = fields
+                .next()
+                .map(|c| c.rsplit('/').next().unwrap_or(c).to_string())
+                .unwrap_or_else(|| pid.to_string());
+
+            procs.push(Process {
+                pid,
+                protected: is_protected(&name),
+                name,
+                rss_bytes: rss_kb * 1024,
+            });
+        }
+        procs
+    }
+
+    fn enumerate_proc() -> Vec<Process> {
         let Ok(entries) = std::fs::read_dir("/proc") else {
             return Vec::new();
         };
@@ -428,7 +485,14 @@ mod tests {
     #[test]
     fn enumeration_finds_processes_and_never_includes_us() {
         let procs = list();
-        assert!(!procs.is_empty(), "should see at least one process");
+        // Every platform Bigtea claims to support must be able to answer this,
+        // because "close these apps to free RAM" is useless without it — and an
+        // unimplemented enumerator fails by returning nothing, not by erroring.
+        assert!(
+            !procs.is_empty(),
+            "process enumeration returned nothing on {}; the RAM-reclaim advice              silently does nothing here",
+            std::env::consts::OS
+        );
         let me = std::process::id();
         assert!(procs.iter().all(|p| p.pid != me));
         // Sorted largest-first.
