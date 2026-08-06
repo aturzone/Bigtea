@@ -1613,6 +1613,152 @@ fn every_layer_runs_at_two_tokens() {
     // The last block has no `next_norm`, so its `l_last` is the final check.
     let want = LayerSums::load(SUMS_2TOK, config.n_layer - 1, TOKENS_2).get("l_last");
     assert_sum("l_last (final block)", streams.iter().sum::<f32>(), want);
+
+    // ...and then the head, which makes this a complete forward pass: from a
+    // token id to a logit per vocabulary entry.
+    let head = LayerSums::load(SUMS_2TOK, 43, TOKENS_2);
+    let logits = output_head(&head, &model, &config, &streams);
+
+    // The argmax is the token this model would actually emit. Not in the
+    // trace — llama.cpp prints sums, not picks — so it is reported rather than
+    // asserted, and it is the first end-to-end *output* this port has produced.
+    let best = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, v)| (i, *v))
+        .expect("non-empty logits");
+    // Decoded, because an id is not evidence and a word is. If the whole
+    // 43-layer stack were subtly wrong this would still be *a* token.
+    let tok = bigtea_tokenizer::Tokenizer::from_metadata(model.metadata()).ok();
+    let text = tok
+        .as_ref()
+        .and_then(|t| t.token_text(best.0 as u32))
+        .unwrap_or("<undecodable>")
+        .to_string();
+    eprintln!(
+        "  {:<24} id {} = {:?} at {:.4}   (prompt: {:?})",
+        "argmax", best.0, text, best.1, "Hello there"
+    );
+}
+
+
+/// **The output head**, which turns the last block's streams into logits.
+///
+/// Oracle rows (pseudo-layer 43 in the fixture):
+/// ```text
+/// node_8112       GET_ROWS  {16384, 1}       -1219.583618
+/// hc_head_mixes   MUL_MAT   {4, 1}               1.332416
+/// hc_head         ADD       {4096, 1}         -162.383377
+/// result_norm     MUL       {4096, 1}          -22.952126
+/// result_output   MUL_MAT   {129280, 1}     437389.187500
+/// ```
+///
+/// **Only the last token reaches here.** `inp_out_ids` selects one row before
+/// anything else runs, so the head is single-token whatever the prompt length —
+/// which is why generating a token costs one 129280-wide matmul and not `nt` of
+/// them.
+///
+/// The head has a hyper-connection collapse of its own, with its own
+/// `output_hc_*` weights: the four residual streams are still four here and
+/// something has to fold them into one. llama.cpp writes that out as four
+/// multiplies and three adds rather than calling the fused op; `dsv4_hc_pre`
+/// computes the same thing and is used here.
+fn output_head(
+    s: &LayerSums,
+    model: &Model,
+    config: &Deepseek4Config,
+    streams: &[f32],
+) -> Vec<f32> {
+    let ctx = Context::new(1024 << 20).expect("head context");
+    let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
+    let mut weights = WeightSet::new();
+    bind_all(
+        model,
+        &wctx,
+        &mut weights,
+        &[
+            "output_hc_fn.weight".to_string(),
+            "output_hc_scale.weight".to_string(),
+            "output_hc_base.weight".to_string(),
+            "output_norm.weight".to_string(),
+            "output.weight".to_string(),
+        ],
+    );
+
+    let hc = config.hc_mult as i64;
+    let n_embd = config.n_embd as i64;
+    let hc_dim = config.hc_dim() as i64;
+    let nt = s.tokens.len();
+
+    // inp_out_ids: the last token's streams, and only those.
+    let last = &streams[(nt - 1) * hc_dim as usize..];
+    let x = ctx.new_f32_3d(n_embd, hc, 1).expect("head streams");
+    x.set_f32(last).expect("fill head streams");
+    check(s, "head_select", last.iter().sum::<f32>());
+
+    let flat = ctx.reshape_2d(&x, hc_dim, 1).expect("flatten");
+    let normed = ctx.rms_norm(&flat, config.rms_eps).expect("head rms");
+    ctx.compute(&normed, 12).expect("compute head norm");
+    check(s, "head_norm", normed.to_vec_f32().iter().sum::<f32>());
+
+    let mixes = ctx
+        .mul_mat(weights.get("output_hc_fn.weight").expect("bound"), &normed)
+        .expect("head mixes");
+    ctx.compute(&mixes, 12).expect("compute head mixes");
+    check(s, "head_mixes", mixes.to_vec_f32().iter().sum::<f32>());
+
+    // The head's gate block is the `pre` half only — there is no `post` here,
+    // because nothing writes back into the streams after this.
+    let f32_size = std::mem::size_of::<f32>();
+    let scale = ctx
+        .view_1d(weights.get("output_hc_scale.weight").expect("bound"), 1, 0)
+        .expect("head scale");
+    let base = ctx
+        .view_1d(weights.get("output_hc_base.weight").expect("bound"), hc, 0)
+        .expect("head base");
+    let _ = f32_size;
+
+    let scaled = ctx.mul(&mixes, &scale).expect("head mul");
+    ctx.compute(&scaled, 12).expect("compute");
+    check(s, "head_mul", scaled.to_vec_f32().iter().sum::<f32>());
+
+    let biased = ctx.add(&scaled, &base).expect("head add");
+    ctx.compute(&biased, 12).expect("compute");
+    check(s, "head_add", biased.to_vec_f32().iter().sum::<f32>());
+
+    let gated = ctx.sigmoid(&biased).expect("head sigmoid");
+    ctx.compute(&gated, 12).expect("compute");
+    check(s, "head_sigmoid", gated.to_vec_f32().iter().sum::<f32>());
+
+    let eps_t = ctx.new_f32_1d(hc).expect("eps");
+    eps_t.set_f32(&vec![1e-6f32; hc as usize]).expect("fill eps");
+    let pre = ctx.add(&gated, &eps_t).expect("head pre");
+    ctx.compute(&pre, 12).expect("compute");
+    check(s, "head_pre", pre.to_vec_f32().iter().sum::<f32>());
+
+    let collapsed = ctx.dsv4_hc_pre(&x, &pre).expect("head hc_pre");
+    ctx.compute(&collapsed, 12).expect("compute head hc");
+    check(s, "head_hc", collapsed.to_vec_f32().iter().sum::<f32>());
+
+    let normed = ctx.rms_norm(&collapsed, config.rms_eps).expect("final rms");
+    ctx.compute(&normed, 12).expect("compute");
+    check(s, "head_rms", normed.to_vec_f32().iter().sum::<f32>());
+
+    let result_norm = ctx
+        .mul(&normed, weights.get("output_norm.weight").expect("bound"))
+        .expect("result_norm");
+    ctx.compute(&result_norm, 12).expect("compute");
+    check(s, "result_norm", result_norm.to_vec_f32().iter().sum::<f32>());
+
+    let logits = ctx
+        .mul_mat(weights.get("output.weight").expect("bound"), &result_norm)
+        .expect("result_output");
+    ctx.compute(&logits, 12).expect("compute logits");
+    let out = logits.to_vec_f32();
+    assert_eq!(out.len(), config.vocab_size as usize, "one logit per token id");
+    check(s, "result_output", out.iter().sum::<f32>());
+    out
 }
 
 /// Read just the named experts out of a stacked tensor and bind them as a

@@ -3930,3 +3930,17 @@
 42|ffn_gates.post_sigmoid|1.769086
 42|ffn_gates.post|3.538173
 42|ffn_gates.comb|7.999993
+# The output head, after the last block. Indexed as pseudo-layer 43.
+# Only the LAST token reaches it: inp_out_ids selects one row, so every shape
+# below is single-token regardless of the prompt length.
+43|head_select|-1219.583618
+43|head_norm|-260.222443
+43|head_mixes|1.332416
+43|head_mul|1.052555
+43|head_add|-4.767786
+43|head_sigmoid|1.305129
+43|head_pre|1.305133
+43|head_hc|-162.383377
+43|head_rms|-31.698658
+43|result_norm|-22.952126
+43|result_output|437389.187500
