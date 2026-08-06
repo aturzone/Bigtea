@@ -103,6 +103,7 @@ jobs:
           git clone --depth 1 https://github.com/ggml-org/llama.cpp
           cmake -S llama.cpp -B llama.cpp/build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_SERVER=OFF \
@@ -115,6 +116,13 @@ jobs:
             cp "$f" "ggml-libs/$(basename "$f" | sed 's/^lib//')"
           done
           ls -la ggml-libs
+          # Fail here rather than three steps later inside cargo: an empty
+          # directory means ggml built shared libraries, which is llama.cpp's
+          # default and the reason BUILD_SHARED_LIBS=OFF is set above.
+          for lib in ggml-base ggml-cpu ggml; do
+            test -f "ggml-libs/$lib.a" \
+              || { echo "::error::ggml-libs/$lib.a missing after building ggml"; exit 1; }
+          done
 
       - name: Build, lint and test
         shell: bash

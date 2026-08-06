@@ -111,7 +111,7 @@ this project contributes.
 ```bash
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
 cmake --build build --config Release -j
 # the static libraries land in build/ggml/src/
 ```
@@ -138,7 +138,7 @@ bigtea-arch cannot build: GGML_LIB_DIR is not set.
 
   1. Build ggml once:
        git clone https://github.com/ggml-org/llama.cpp
-       cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release
+       cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
        cmake --build llama.cpp/build --config Release -j
 
   2. Point Bigtea at the result …
