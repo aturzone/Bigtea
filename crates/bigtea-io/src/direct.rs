@@ -1,6 +1,9 @@
 //! A file opened for cache-bypassing positioned reads.
 
-use std::fs::{File, OpenOptions};
+// `OpenOptions` is used only by the Windows and Linux `open_direct` bodies.
+// macOS compiles neither, so importing it at module scope is an unused
+// import there — and `-D warnings` in CI turns that into a build failure.
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -81,6 +84,7 @@ impl DirectFile {
 
     #[cfg(windows)]
     fn open_direct(path: &Path) -> io::Result<File> {
+        use std::fs::OpenOptions;
         use std::os::windows::fs::OpenOptionsExt;
         OpenOptions::new()
             .read(true)
@@ -90,6 +94,7 @@ impl DirectFile {
 
     #[cfg(target_os = "linux")]
     fn open_direct(path: &Path) -> io::Result<File> {
+        use std::fs::OpenOptions;
         use std::os::unix::fs::OpenOptionsExt;
         OpenOptions::new()
             .read(true)
