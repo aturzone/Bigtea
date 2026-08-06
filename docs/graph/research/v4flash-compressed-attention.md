@@ -4,10 +4,11 @@ status: open
 links: [v4flash-port-recon.md]
 ---
 
-Layers 0 and 1 are verified against llama.cpp. They are also the only two `Raw` layers, so
-**41 of 43 blocks run code that does not exist yet**. This node maps what those blocks
-actually compute, read from the captured trace and `deepseek4.cpp` rather than reasoned
-about, so the build has its reference before it starts.
+**Layers 0-3 are verified against llama.cpp** — 0 and 1 at five tokens, and all four at two
+tokens. But only 0 and 1 are `Raw` layers: 2 and 3 pass because at two tokens the compressed
+builders never fire (see below). **The compressed attention itself is still unbuilt, on 41 of
+43 blocks.** This node maps what those blocks compute, read from the captured trace and
+`deepseek4.cpp` rather than reasoned about, so the build has its reference before it starts.
 
 Fixtures already extracted from the existing five-token capture — no new llama.cpp run is
 needed to start:
@@ -137,9 +138,12 @@ was chosen by looking at the two kinds in isolation and not at what feeds what.
 3. **Layer 2's CSA attention** — the actual next build, and unavoidably the hard one.
    Everything before and after it in the block is already verified, so the work is bounded to
    `attn_norm-2` → `attn_out-2`.
-4. **Layer 3 (HCA)**, which then follows almost for free and closes both holes above.
+4. **Layer 3's HCA attention**, which then follows almost for free — its only additions over
+   Raw are two matmuls and an APE add.
 5. **A capture longer than 128 tokens**, to make HCA's compression observable at all — at
-   five tokens `hca_state_compress` never runs.
+   five tokens `hca_state_compress` never runs, and at two neither compressor is read.
+6. **Per-layer contexts**, so depth stops costing arena. See below; it is also the shape the
+   streaming runner needs, so it is not scaffolding.
 
 ### The shortcut, tried and better than expected
 
