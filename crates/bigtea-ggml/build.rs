@@ -76,12 +76,28 @@ fn main() {
         _ => println!("cargo:rustc-link-lib=dylib=stdc++"),
     }
 
-    // ggml's quantization kernels are built with OpenMP, so GOMP_* symbols
-    // must resolve. Missing this fails with a wall of undefined references
-    // from ggml-quants.c and nothing else.
-    if target_env != "msvc" {
+    // ggml's quantization kernels *may* be built with OpenMP, in which case
+    // GOMP_* symbols must resolve or the link fails with a wall of undefined
+    // references from ggml-quants.c and nothing else.
+    //
+    // Whether they are is a property of how ggml was built, not of the target,
+    // and it differs by platform: Apple's clang ships no OpenMP runtime, so
+    // ggml's own cmake reports "OpenMP not found" and builds without it. Asking
+    // for `-lgomp` there fails with `ld: library 'gomp' not found` — which was
+    // exactly how this bug first showed up, on the very first macOS CI run.
+    //
+    // Default per platform, and let anyone with a non-default ggml override it.
+    let openmp = match std::env::var("BIGTEA_GGML_OPENMP").as_deref() {
+        Ok("1") | Ok("true") => true,
+        Ok("0") | Ok("false") => false,
+        // Apple: no OpenMP unless libomp was installed and ggml found it.
+        // MSVC: links its own runtime.
+        _ => !matches!(target_os.as_str(), "macos" | "ios") && target_env != "msvc",
+    };
+    if openmp {
         println!("cargo:rustc-link-lib=dylib=gomp");
     }
+    println!("cargo:rerun-if-env-changed=BIGTEA_GGML_OPENMP");
 
     if target_os == "windows" {
         // ggml-cpu reads the registry to identify the CPU, which pulls in
