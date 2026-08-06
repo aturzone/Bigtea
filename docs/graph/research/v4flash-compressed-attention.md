@@ -116,6 +116,50 @@ changes no shape. Note also this is `ARGSORT` plus a view, not a `TOP_K`, and `t
 not return indices in score order` is already a rediscovered-the-hard-way entry in
 `CLAUDE.md`.
 
+## The CSA compressor, and why its state is tractable after all
+
+`build_overlap_compressed_kv_from_state` (`deepseek4.cpp`) reads a *persistent* state through
+index tensors — `state_read_idxs`, `state_write_idxs`, `comp_pos` — that llama.cpp computes in
+`llama-kv-cache-dsv4.cpp` (1978 lines), not in the graph. That looked like the blocker: port a
+whole cache class before a single number can be checked.
+
+**It is not, for a prefill from an empty cache**, which is the only case that needs to work
+first. Read from `llama-kv-cache-dsv4.cpp:437-535`, the scheme is:
+
+```
+state_pos[i]   = pos % ratio            position within the current block
+n_visible[i]   = (pos + 1) / ratio      compressed entries this token may attend to
+n_kv           = max(n_visible)
+a block completes when (pos + 1) % ratio == 0
+  state_write_idxs <- cache_off + pos/ratio
+  state_write_pos  <- source_start = pos + 1 - ratio
+  overlap reads: prev window [source_start - ratio, source_start)
+                 cur  window [source_start, pos]
+```
+
+and `state_source_idx(pos)` resolves to the appended zero row when `pos < 0`, to
+`state_rows + i` when the position is in the current ubatch, and only otherwise to the
+persistent ring. **On a fresh prefill every position is in the current ubatch**, so the first
+two cases cover everything and the ring never gets read.
+
+At five tokens with `ratio = 4` that gives exactly `n_blocks = 1`, `n_kv = 1`: the state is
+`{1024, 8}` of zeros concatenated with the 5 current rows and a zero row appended, indices
+`8..11` for the current window and `13` (the zero row) four times for the previous one.
+The trace agrees — `node_265 GET_ROWS {1024, 8}` is `2*ratio*n_blocks`.
+
+**The `{1024, …}` width is two entries per row**, not one: `kv_state->ne[0] == 2*n_embd_head`,
+with `kv_prev` reading the first 512 of the first `n_read` rows and `kv_cur` the *second* 512
+of the next `n_read`. That is the "overlap" — each compressed entry summarises `2*ratio` raw
+positions, two windows deep.
+
+The arithmetic itself is ordinary: softmax the scores, multiply, `sum_rows`, RMS-norm with
+`attn_compressor_norm`, then RoPE the trailing 64 dims **at the block position** with the
+compressed base. Every step has a trace row.
+
+So the build is: construct the index tensors directly for the prefill case (a dozen lines,
+no cache class), then follow the fourteen graph steps. The persistent ring only becomes
+necessary for generation, where positions from earlier ubatches are read back.
+
 ## Order — CORRECTED
 
 An earlier version of this node said to do layer 3 (HCA) before layer 2 (CSA), on the
