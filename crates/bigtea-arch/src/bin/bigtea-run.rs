@@ -254,6 +254,16 @@ fn run(
 
     // --- container ---------------------------------------------------------
     let model = Model::open_split(path)?;
+
+    // DeepSeek-V4-Flash shares the residency and streaming machinery but almost
+    // none of the graph, so it gets its own path rather than a config branch.
+    if model.architecture() == "deepseek4" {
+        println!("model      {} ({})", model.architecture(), model.io_mode());
+        let tokenizer = Tokenizer::from_metadata(model.metadata())?;
+        run_deepseek4(&model, &tokenizer, prompt, 1024, t0)?;
+        return Ok(());
+    }
+
     let config = Qwen3Config::from_model(&model)?;
     let arch = Qwen3Model::new(config.clone());
 
@@ -383,5 +393,66 @@ fn run(
     if produced.trim().is_empty() {
         println!("\n! produced no visible text -- check the forward pass");
     }
+    Ok(())
+}
+
+/// Prefill DeepSeek-V4-Flash and time it.
+///
+/// Separate from the Qwen3 path because almost nothing is shared: MLA attention,
+/// hyper-connections instead of a residual add, two compressors, two routing
+/// schemes. What *is* shared is the point of the project — residency, partial
+/// reads, and the arena discipline.
+///
+/// **Prefill only.** Generation needs the persistent compressor ring that a
+/// prefill can skip, a growing KV cache, and the expert cache; see
+/// `deepseek4_forward`'s module docs. Timing this first is deliberate: if
+/// prefill is slow, that changes what generation should look like.
+fn run_deepseek4(
+    model: &Model,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    arena_mib: usize,
+    t0: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = bigtea_arch::Deepseek4Config::from_model(model)?;
+    let fw = bigtea_arch::Deepseek4Forward::new(model, config.clone());
+
+    let tokens: Vec<i32> = tokenizer.encode(prompt).iter().map(|t| *t as i32).collect();
+    if tokens.is_empty() {
+        return Err("empty prompt".into());
+    }
+
+    println!(
+        "shape      {} blocks, {} embd, {} heads, {} experts ({} used, {} shared)",
+        config.n_layer, config.n_embd, config.n_head, config.n_expert,
+        config.n_expert_used, config.n_expert_shared
+    );
+    println!("prompt     {} tokens", tokens.len());
+    if !fw.indexer_is_exact(tokens.len()) {
+        // Below this length skipping the indexer is exact; above it, it is not.
+        println!(
+            "WARNING    the lightning indexer is not implemented, and at {} tokens\n\
+             WARNING    it would no longer be a no-op. These logits are APPROXIMATE.",
+            tokens.len()
+        );
+    }
+    println!("loaded     {:.1}s", t0.elapsed().as_secs_f64());
+
+    let t_prefill = std::time::Instant::now();
+    let logits = bigtea_arch::prefill(&fw, &tokens, arena_mib << 20)?;
+    let secs = t_prefill.elapsed().as_secs_f64();
+
+    let (best, _) = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+        .ok_or("no logits")?;
+
+    println!(
+        "prefill    {} tokens in {secs:.1}s ({:.2} tok/s)",
+        tokens.len(),
+        tokens.len() as f64 / secs
+    );
+    println!("next       {} {:?}", best, tokenizer.decode(&[best as u32]));
     Ok(())
 }
