@@ -748,10 +748,22 @@ fn ffn<'c>(
         .map(|e| unique.iter().position(|u| u == e).expect("in set") as i32)
         .collect();
     let mut dims_of = std::collections::HashMap::new();
+    let t_exp = std::time::Instant::now();
+    let mut exp_bytes = 0u64;
     for suffix in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
         let name = format!("blk.{il}.{suffix}.weight");
-        let (_, dims) = bind_expert_slices(model, wctx, weights, &name, &unique)?;
+        let (read, dims) = bind_expert_slices(model, wctx, weights, &name, &unique)?;
+        exp_bytes += read;
         dims_of.insert(suffix, dims);
+    }
+    if std::env::var("BIGTEA_BLOCK_TIMING").is_ok() {
+        eprintln!(
+            "  block {il:>2}  experts {:.2}s ({:.0} MiB, {} of {} slices)",
+            t_exp.elapsed().as_secs_f64(),
+            exp_bytes as f64 / (1 << 20) as f64,
+            unique.len(),
+            config.n_expert,
+        );
     }
     let n_uniq = unique.len() as i64;
     let ids_t = ctx.new_i32_2d(n_used, nt)?;
