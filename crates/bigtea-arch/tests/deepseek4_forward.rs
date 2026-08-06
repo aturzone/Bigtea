@@ -25,7 +25,7 @@
 //! Ignored by default: these read weights out of a 144 GB container. Run with
 //! `cargo test --release --test deepseek4_forward -- --ignored --nocapture`
 
-use bigtea_arch::{Deepseek4Config, Deepseek4Model};
+use bigtea_arch::{AttentionKind, Deepseek4Config, Deepseek4Model};
 use bigtea_ggml::{Context, RopeParams, Tensor, WeightSet};
 use bigtea_model::Model;
 
@@ -53,6 +53,25 @@ const TOKENS_5: &[i32] = &[671, 6102, 294, 8760, 344];
 /// (layers 3+). Both were open holes.
 const TOKENS_2: &[i32] = &[19923, 1031];
 
+/// The 165-token prompt's ids. Needed in full, not just for the embedding:
+/// layers 0-2 are hash-routed, so their experts are a lookup on the token id.
+const TOKENS_165: &[i32] = &[
+    671, 4787, 13769, 46012, 54994, 1060, 270, 41638, 6397, 305, 1539, 12122,
+    3706, 3543, 16, 455, 4787, 13769, 46012, 54994, 1060, 270, 41638, 6397,
+    305, 1539, 12122, 3706, 3543, 16, 455, 4787, 13769, 46012, 54994, 1060,
+    270, 41638, 6397, 305, 1539, 12122, 3706, 3543, 16, 455, 4787, 13769,
+    46012, 54994, 1060, 270, 41638, 6397, 305, 1539, 12122, 3706, 3543, 16,
+    455, 4787, 13769, 46012, 54994, 1060, 270, 41638, 6397, 305, 1539, 12122,
+    3706, 3543, 16, 455, 4787, 13769, 46012, 54994, 1060, 270, 41638, 6397,
+    305, 1539, 12122, 3706, 3543, 16, 455, 4787, 13769, 46012, 54994, 1060,
+    270, 41638, 6397, 305, 1539, 12122, 3706, 3543, 16, 455, 4787, 13769,
+    46012, 54994, 1060, 270, 41638, 6397, 305, 1539, 12122, 3706, 3543, 16,
+    455, 4787, 13769, 46012, 54994, 1060, 270, 41638, 6397, 305, 1539, 12122,
+    3706, 3543, 16, 455, 4787, 13769, 46012, 54994, 1060, 270, 41638, 6397,
+    305, 1539, 12122, 3706, 3543, 16, 455, 4787, 13769, 46012, 54994, 1060,
+    270, 41638, 6397, 305, 1539, 12122, 3706, 3543, 16,
+];
+
 /// `LLAMA_ROPE_TYPE_NORM`. deepseek4 is in the NORM list in `llama-model.cpp`,
 /// **not** the NEOX one — so rotated pairs are adjacent (`x[2i]`, `x[2i+1]`),
 /// not offset by `n_rot/2`. Both conventions run, and one of them is wrong.
@@ -60,6 +79,15 @@ const ROPE_MODE_NORM: i32 = 0;
 
 const SUMS_2TOK: &str = "tests/fixtures/v4flash-sums-2tok.txt";
 const SUMS_5TOK: &str = "tests/fixtures/v4flash-sums-5tok.txt";
+
+const SUMS_165TOK: &str = "tests/fixtures/v4flash-sums-165tok.txt";
+
+/// The 165-token capture. 165 tokens is the shortest length tried at which
+/// **both** compressed attentions fire: CSA compresses every 4 positions (41
+/// blocks here) and HCA every 128 (one block).
+fn sums_165tok(il: u32) -> LayerSums {
+    LayerSums::load(SUMS_165TOK, il, TOKENS_165)
+}
 
 fn sums_2tok(il: u32) -> LayerSums {
     LayerSums::load(SUMS_2TOK, il, TOKENS_2)
@@ -797,7 +825,21 @@ fn block_weights(il: u32) -> Vec<String> {
 /// mutually exclusive, being the two routing schemes. Binding blindly would
 /// panic on whichever the block lacks.
 fn optional_block_weights(model: &Model, il: u32) -> Vec<String> {
-    ["ffn_gate_tid2eid.weight", "exp_probs_b.bias"]
+    [
+        "ffn_gate_tid2eid.weight",
+        "exp_probs_b.bias",
+        // 41 blocks carry a compressor; 21 of those also carry an indexer.
+        "attn_compressor_kv.weight",
+        "attn_compressor_gate.weight",
+        "attn_compressor_ape.weight",
+        "attn_compressor_norm.weight",
+        "indexer_compressor_kv.weight",
+        "indexer_compressor_gate.weight",
+        "indexer_compressor_ape.weight",
+        "indexer_compressor_norm.weight",
+        "indexer.attn_q_b.weight",
+        "indexer.proj.weight",
+    ]
         .iter()
         .map(|suffix| format!("blk.{il}.{suffix}"))
         .filter(|n| model.location(n).is_some())
@@ -1007,7 +1049,7 @@ fn attention_matches_llama_cpp_at_five_tokens() {
 
     let p = prologue_5tok(&sums_5tok(0), &ctx, &weights, &config);
     let (q, kv) = q_and_kv_5tok(&sums_5tok(0), &ctx, &weights, &config, &p.attn_norm);
-    attention_5tok(&sums_5tok(0), &ctx, &weights, &config, &q, &kv);
+    attention_5tok(&sums_5tok(0), &ctx, &weights, &config, &q, &kv, None);
 }
 
 /// **The post hyper-connection**, and the second gate block that feeds the FFN.
@@ -1055,7 +1097,7 @@ fn post_hyper_connection_matches_llama_cpp_at_five_tokens() {
 
     let p = prologue_5tok(&sums_5tok(0), &ctx, &weights, &config);
     let (q, kv) = q_and_kv_5tok(&sums_5tok(0), &ctx, &weights, &config, &p.attn_norm);
-    let attn_out = attention_5tok(&sums_5tok(0), &ctx, &weights, &config, &q, &kv);
+    let attn_out = attention_5tok(&sums_5tok(0), &ctx, &weights, &config, &q, &kv, None);
 
     let _ = layer_tail_5tok(&sums_5tok(0), &ctx, &weights, &config, &p, &attn_out);
 }
@@ -1116,7 +1158,7 @@ fn moe_router_and_shared_expert_match_llama_cpp_at_five_tokens() {
 
     let p = prologue_5tok(&sums_5tok(0), &ctx, &weights, &config);
     let (q, kv) = q_and_kv_5tok(&sums_5tok(0), &ctx, &weights, &config, &p.attn_norm);
-    let attn_out = attention_5tok(&sums_5tok(0), &ctx, &weights, &config, &q, &kv);
+    let attn_out = attention_5tok(&sums_5tok(0), &ctx, &weights, &config, &q, &kv, None);
     let (_streams, ffn_norm, _gates) = layer_tail_5tok(&sums_5tok(0), &ctx, &weights, &config, &p, &attn_out);
 
     let _ = moe_routing_5tok(&sums_5tok(0), &ctx, &weights, &config, &ffn_norm);
@@ -1310,7 +1352,31 @@ fn layer_body_5tok<'c>(
     p: Prologue5<'c>,
 ) -> Tensor<'c> {
     let (q, kv) = q_and_kv_5tok(s, ctx, weights, config, &p.attn_norm);
-    let attn_out = attention_5tok(s, ctx, weights, config, &q, &kv);
+    // Which attention this block runs is decided by its compression ratio, and
+    // whether a block has completed yet. Below the first boundary a compressed
+    // layer falls back to Raw, exactly as llama.cpp's guards do.
+    let nt_now = s.tokens.len() as i64;
+    let kind = config.attention_kind_from_ratio(s.il).expect("known ratio");
+    let fired = config
+        .compress_block(s.il)
+        .is_some_and(|r| nt_now / r > 0);
+    let comp = match (kind, fired) {
+        (AttentionKind::CompressedSparse, true) => {
+            // The lightning indexer is skipped: below ~2048 tokens
+            // n_top_k = min(n_lid, indexer_top_k) selects every slot, so its
+            // mask is the visibility mask and it cannot change the result.
+            Some((overlap_compressor_5tok(s, ctx, weights, config, &p.attn_norm,
+                    config.kv_lora_rank as i64, "attn_compressor", "csa"), "csa"))
+        }
+        (AttentionKind::HeavilyCompressed, true) => {
+            Some((hca_compressor(s, ctx, weights, config, &p.attn_norm), "hca"))
+        }
+        _ => None,
+    };
+    let attn_out = attention_5tok(
+        s, ctx, weights, config, &q, &kv,
+        comp.as_ref().map(|(t, pfx)| (t, *pfx)),
+    );
     let (streams, ffn_norm, gates) = layer_tail_5tok(s, ctx, weights, config, &p, &attn_out);
     let (w_scaled, topk) = moe_routing_5tok(s, ctx, weights, config, &ffn_norm);
     let shexp = shared_expert_5tok(s, ctx, weights, &ffn_norm);
@@ -1572,6 +1638,43 @@ fn layer_owned(
     out.to_vec_f32()
 }
 
+
+/// **Both compressed attentions, in the layer loop, at 165 tokens.**
+///
+/// Layers 0-3 with each block running the attention its ratio names: 0-1 Raw,
+/// 2 Compressed Sparse, 3 Heavily Compressed. This is the first time a
+/// compressed block runs *inside the chain* rather than as a standalone check,
+/// and the first length at which HCA fires at all.
+///
+/// Two rotations become checkable here that no shorter capture could reach:
+/// CSA completes 41 blocks so its compressed entries rotate at positions
+/// 0,4,...,160 (`csa_comp_normed` -572.6 becomes `csa_comp` -708.4). HCA
+/// completes one, at position 0, so **its** compressor RoPE is still an
+/// identity and still unverified.
+///
+/// **The lightning indexer is deliberately not run.** Below ~2048 tokens
+/// `n_top_k = min(n_lid, indexer_top_k)` selects every compressed slot, so its
+/// mask is exactly the visibility mask and it cannot change any output. Running
+/// it would cost time and verify nothing; skipping it is exact, not an
+/// approximation, and this is the length range 0.0.0 targets.
+#[test]
+#[ignore = "reads weights from a 144 GB container, 165 tokens"]
+fn compressed_attention_runs_in_the_layer_loop_at_165_tokens() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+
+    assert_eq!(config.attention_kind_from_ratio(2), Some(AttentionKind::CompressedSparse));
+    assert_eq!(config.attention_kind_from_ratio(3), Some(AttentionKind::HeavilyCompressed));
+
+    let mut streams = layer_owned(&sums_165tok(0), &model, &config, None);
+    for il in 1..4u32 {
+        streams = layer_owned(&sums_165tok(il), &model, &config, Some(&streams));
+        eprintln!("  ---- layer {il} ({:?}) matches ----",
+            config.attention_kind_from_ratio(il).expect("kind"));
+    }
+    let _ = streams;
+}
+
 /// **The whole model: all 43 blocks, at two tokens.**
 ///
 /// Every block of DeepSeek-V4-Flash, from the embedding to the residual streams
@@ -1821,7 +1924,7 @@ fn overlap_compressor_5tok<'c>(
         )
         .expect("csa_state_kv");
     ctx.compute(&kv, 12).expect("compute");
-    check(s, &format!("{lp}_state_kv"), kv.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_state_kv"), kv.to_vec_f32().iter().sum::<f32>());
 
     let score = ctx
         .mul_mat(
@@ -1832,7 +1935,7 @@ fn overlap_compressor_5tok<'c>(
         )
         .expect("csa_state_score");
     ctx.compute(&score, 12).expect("compute");
-    check(s, &format!("{lp}_state_score"), score.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_state_score"), score.to_vec_f32().iter().sum::<f32>());
 
     // The gate gets an absolute-position embedding indexed by the token's
     // offset *within its block*, not by its absolute position.
@@ -1848,11 +1951,11 @@ fn overlap_compressor_5tok<'c>(
         )
         .expect("ape rows");
     ctx.compute(&ape, 12).expect("compute");
-    check(s, &format!("{lp}_ape_rows"), ape.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_ape_rows"), ape.to_vec_f32().iter().sum::<f32>());
 
     let score = ctx.add(&score, &ape).expect("score + ape");
     ctx.compute(&score, 12).expect("compute");
-    check(s, &format!("{lp}_state_score_ape"), score.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_state_score_ape"), score.to_vec_f32().iter().sum::<f32>());
 
     // Assemble the state as llama.cpp's graph does: [empty ring | this ubatch |
     // one appended row]. The appended row is zero for values and -inf for
@@ -1903,7 +2006,7 @@ fn overlap_compressor_5tok<'c>(
         let rows = ctx.get_rows(src, &idx_t).expect("gather");
         ctx.compute(&rows, 12).expect("compute");
         if is_kv {
-            check(s, &format!("{lp}_gathered"), rows.to_vec_f32().iter().sum::<f32>());
+            check_opt(s, &format!("{lp}_gathered"), rows.to_vec_f32().iter().sum::<f32>());
         }
         // First 512 of the first n_read rows; second 512 of the next n_read.
         let prev = ctx
@@ -1925,9 +2028,9 @@ fn overlap_compressor_5tok<'c>(
         let cur = ctx.reshape_3d(&cur, head, ratio, n_blocks).expect("cur 3d");
         if is_kv {
             ctx.compute(&prev, 12).expect("compute");
-            check(s, &format!("{lp}_kv_prev"), prev.to_vec_f32().iter().sum::<f32>());
+            check_opt(s, &format!("{lp}_kv_prev"), prev.to_vec_f32().iter().sum::<f32>());
             ctx.compute(&cur, 12).expect("compute");
-            check(s, &format!("{lp}_kv_cur"), cur.to_vec_f32().iter().sum::<f32>());
+            check_opt(s, &format!("{lp}_kv_cur"), cur.to_vec_f32().iter().sum::<f32>());
         }
         let joined = ctx.concat(&prev, &cur, 1).expect("concat windows");
         ctx.cont(&ctx.permute(&joined, [1, 0, 2, 3]).expect("permute"))
@@ -1936,30 +2039,30 @@ fn overlap_compressor_5tok<'c>(
 
     let values = split(&kv_state, true);
     ctx.compute(&values, 12).expect("compute values");
-    check(s, &format!("{lp}_values_perm"), values.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_values_perm"), values.to_vec_f32().iter().sum::<f32>());
     let scores = split(&score_state, false);
 
     let w = ctx.soft_max(&scores).expect("softmax scores");
     ctx.compute(&w, 12).expect("compute weights");
-    check(s, &format!("{lp}_comp_weights"), w.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_comp_weights"), w.to_vec_f32().iter().sum::<f32>());
 
     let weighted = ctx.mul(&values, &w).expect("weight values");
     ctx.compute(&weighted, 12).expect("compute weighted");
-    check(s, &format!("{lp}_weighted"), weighted.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_weighted"), weighted.to_vec_f32().iter().sum::<f32>());
 
     let summed = ctx.sum_rows(&weighted).expect("sum_rows");
     ctx.compute(&summed, 12).expect("compute summed");
-    check(s, &format!("{lp}_summed"), summed.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_summed"), summed.to_vec_f32().iter().sum::<f32>());
 
     let comp = ctx
         .cont(&ctx.permute(&summed, [1, 0, 2, 3]).expect("permute back"))
         .expect("cont");
     ctx.compute(&comp, 12).expect("compute comp");
-    check(s, &format!("{lp}_comp_raw"), comp.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_comp_raw"), comp.to_vec_f32().iter().sum::<f32>());
 
     let normed = ctx.rms_norm(&comp, config.rms_eps).expect("comp rms");
     ctx.compute(&normed, 12).expect("compute");
-    check(s, &format!("{lp}_comp_rms"), normed.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_comp_rms"), normed.to_vec_f32().iter().sum::<f32>());
 
     let comp = ctx
         .mul(
@@ -1984,7 +2087,7 @@ fn overlap_compressor_5tok<'c>(
         .view_3d(&comp, n_nope, 1, n_blocks, head_stride, head_stride, 0)
         .expect("comp nope");
     ctx.compute(&nope, 12).expect("compute");
-    check(s, &format!("{lp}_comp_nope"), nope.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_comp_nope"), nope.to_vec_f32().iter().sum::<f32>());
 
     let pe_in = ctx
         .view_3d(
@@ -1998,7 +2101,7 @@ fn overlap_compressor_5tok<'c>(
         )
         .expect("comp pe view");
     ctx.compute(&pe_in, 12).expect("compute");
-    check(s, &format!("{lp}_comp_pe_in"), pe_in.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_comp_pe_in"), pe_in.to_vec_f32().iter().sum::<f32>());
 
     let comp_pos = ctx.new_i32_1d(n_blocks).expect("comp_pos");
     let block_pos: Vec<i32> = (0..n_blocks).map(|b| (b * ratio) as i32).collect();
@@ -2016,7 +2119,7 @@ fn overlap_compressor_5tok<'c>(
         )
         .expect("comp rope");
     ctx.compute(&pe, 12).expect("compute");
-    check(s, &format!("{lp}_comp_pe"), pe.to_vec_f32().iter().sum::<f32>());
+    check_opt(s, &format!("{lp}_comp_pe"), pe.to_vec_f32().iter().sum::<f32>());
 
     let out = ctx.concat(&nope, &pe, 0).expect("concat comp");
     ctx.compute(&out, 12).expect("compute comp out");
@@ -2068,114 +2171,154 @@ fn hadamard_rotate<'c>(ctx: &'c Context, x: &Tensor<'c>, rot: &Tensor<'c>, n: i6
     ctx.mul_mat(rot, &flat).expect("hadamard matmul")
 }
 
-/// **CSA attention**: the fused kernel over raw *and* compressed keys.
+/// **The HCA compressor** — the *other* one, for a prefill from an empty cache.
 ///
-/// A compressed-sparse layer attends to two things at once — the recent raw KV
-/// window and the compressor's summaries of everything before it — concatenated
-/// along the key axis, with a mask that is causal on the raw half and
-/// visibility-limited on the compressed half.
+/// Heavily Compressed Attention summarises every `DSV4_HCA_RATIO` (128)
+/// positions into one entry. It is **not** the overlap compressor with a
+/// different ratio, which is the mistake the shapes invite:
 ///
-/// # Why the indexer does not appear here
+/// | | overlap (CSA) | this (HCA) |
+/// |---|---|---|
+/// | state width | `2*n_embd_head` | `n_embd_head` |
+/// | reads | `2*ratio*n_blocks` | `ratio*n_blocks` |
+/// | windows | previous **and** current | current only |
+/// | zero row appended | yes, for the first block's previous half | no |
 ///
-/// It runs, and at this length it cannot change the answer.
-/// `n_top_k = min(n_lid, indexer_top_k)` is `min(256, 512) = 256`
-/// (`deepseek4.cpp`, end of `build_lid_top_k`), so the indexer selects **every**
-/// compressed slot. `build_top_k_mask` then fills -inf, writes 0 at every
-/// selected index, and adds the visibility mask — which leaves exactly the
-/// visibility mask. The sparsity is inert.
-///
-/// Making it bite needs `n_lid > 512`, i.e. more than 512 completed blocks, i.e.
-/// **over 2048 tokens**. Until such a capture exists the indexer's *selection*
-/// is unverifiable, and this function is the honest shape of what can be
-/// checked: everything else, exactly.
-///
-/// # What the trace cannot check either
-///
-/// `lid_score_masked`, `csa_top_k_mask` and `csa_lid_kq_mask` all sum to -inf,
-/// and `lid_top_k` sums to 163200 for *any* permutation. Those rows cannot
-/// distinguish a right answer from a wrong one. `attn_csa_lid` is the only
-/// number in the indexer's half of this layer that can, which is why it is the
-/// one asserted.
-fn csa_attention_5tok<'c>(
+/// With no previous window there are no negative positions, so no padding row
+/// is needed at all. Everything after the gather — softmax, weighted sum,
+/// RMS-norm, decoupled RoPE — is identical to the overlap compressor's tail.
+fn hca_compressor<'c>(
     s: &LayerSums,
     ctx: &'c Context,
     weights: &WeightSet<'c>,
     config: &Deepseek4Config,
-    q_full: &Tensor<'c>,
-    kv_full: &Tensor<'c>,
-    comp: &Tensor<'c>,
+    attn_norm: &Tensor<'c>,
 ) -> Tensor<'c> {
+    let il = s.il;
     let nt = s.tokens.len() as i64;
+    let ratio = Deepseek4Config::HCA_RATIO;
     let head = config.kv_lora_rank as i64;
-    let n_head = config.n_head as i64;
-    let ratio = Deepseek4Config::CSA_RATIO;
-    // Each half of the key axis is padded to 256, as llama.cpp's caches are.
-    const HALF: i64 = 256;
-    let n_kv = 2 * HALF;
+    let n_blocks = nt / ratio;
+    assert!(n_blocks > 0, "no HCA block completes at {nt} tokens");
+    // The persistent state's height; on a prefill it is all zeros and is never
+    // read, but the indices are offsets into the concatenation.
+    let state_rows = ratio;
 
-    // The raw KV cache: this ubatch's compressed KV at rows 0..nt.
-    let kv_vals = kv_full.to_vec_f32();
-    let mut raw = vec![0u16; (head * HALF) as usize];
-    bigtea_ggml::f32_to_f16(&kv_vals, &mut raw[..kv_vals.len()]);
-    let mut back = vec![0f32; raw.len()];
-    bigtea_ggml::f16_to_f32(&raw, &mut back);
-    check(s, "csa_raw_k", back.iter().sum::<f32>());
+    let kv = ctx
+        .mul_mat(
+            weights
+                .get(&format!("blk.{il}.attn_compressor_kv.weight"))
+                .expect("bound"),
+            attn_norm,
+        )
+        .expect("hca_state_kv");
+    ctx.compute(&kv, 12).expect("compute");
+    check(s, "hca_state_kv", kv.to_vec_f32().iter().sum::<f32>());
 
-    // The compressed cache: one entry per completed block, so one row here.
-    let comp_vals = comp.to_vec_f32();
-    let mut cmp = vec![0u16; (head * HALF) as usize];
-    bigtea_ggml::f32_to_f16(&comp_vals, &mut cmp[..comp_vals.len()]);
-    let mut back = vec![0f32; cmp.len()];
-    bigtea_ggml::f16_to_f32(&cmp, &mut back);
-    check(s, "csa_comp_k", back.iter().sum::<f32>());
+    let score = ctx
+        .mul_mat(
+            weights
+                .get(&format!("blk.{il}.attn_compressor_gate.weight"))
+                .expect("bound"),
+            attn_norm,
+        )
+        .expect("hca_state_score");
+    ctx.compute(&score, 12).expect("compute");
+    check(s, "hca_state_score", score.to_vec_f32().iter().sum::<f32>());
 
-    // Concatenated along the key axis: raw first, then compressed.
-    let mut all = raw.clone();
-    all.extend_from_slice(&cmp);
-    let mut back = vec![0f32; all.len()];
-    bigtea_ggml::f16_to_f32(&all, &mut back);
-    check(s, "csa_k_all", back.iter().sum::<f32>());
+    let state_pos: Vec<i32> = (0..nt).map(|p| (p % ratio) as i32).collect();
+    let pos_t = ctx.new_i32_1d(nt).expect("state_pos");
+    pos_t.set_i32(&state_pos).expect("set");
+    let ape = ctx
+        .get_rows(
+            weights
+                .get(&format!("blk.{il}.attn_compressor_ape.weight"))
+                .expect("bound"),
+            &pos_t,
+        )
+        .expect("ape rows");
+    let score = ctx.add(&score, &ape).expect("score + ape");
+    ctx.compute(&score, 12).expect("compute");
+    check(s, "hca_state_score_ape", score.to_vec_f32().iter().sum::<f32>());
 
-    let k = ctx.new_f16_3d(head, n_kv, 1).expect("k_all");
-    let bytes: Vec<u8> = all.iter().flat_map(|h| h.to_le_bytes()).collect();
-    k.set_bytes(&bytes).expect("fill k_all");
+    // [empty state | this ubatch]. No appended row: without a previous window
+    // there is nothing to pad.
+    let total = state_rows + nt;
+    let assemble = |cur: &[f32]| {
+        let mut v = vec![0.0f32; (state_rows * head) as usize];
+        v.extend_from_slice(cur);
+        let t = ctx.new_f32_2d(head, total).expect("state");
+        t.set_f32(&v).expect("fill state");
+        t
+    };
+    let kv_state = assemble(&kv.to_vec_f32());
+    let score_state = assemble(&score.to_vec_f32());
 
-    // The mask, in two halves. Causal over the raw window; over the compressed
-    // half a token sees block b only once that block is complete and behind it,
-    // which is (pos + 1) / ratio entries.
-    const F16_NEG_INF: [u8; 2] = [0x00, 0xFC];
-    let mut mask = vec![0u8; (n_kv * nt) as usize * 2];
-    for query in 0..nt {
-        let row = (query * n_kv) as usize * 2;
-        for key in (query + 1)..HALF {
-            let at = row + key as usize * 2;
-            mask[at..at + 2].copy_from_slice(&F16_NEG_INF);
-        }
-        let visible = (query + 1) / ratio;
-        for blk in visible..HALF {
-            let at = row + (HALF + blk) as usize * 2;
-            mask[at..at + 2].copy_from_slice(&F16_NEG_INF);
-        }
-    }
-    let mask_t = ctx
-        .new_typed_2d(bigtea_gguf::GgmlType(1), n_kv, nt)
-        .expect("mask");
-    mask_t.set_bytes(&mask).expect("fill mask");
+    let idxs: Vec<i32> = (0..ratio * n_blocks)
+        .map(|j| (state_rows + j) as i32)
+        .collect();
+    let idx_t = ctx.new_i32_1d(ratio * n_blocks).expect("idxs");
+    idx_t.set_i32(&idxs).expect("set idxs");
 
-    let q_perm = ctx.permute(q_full, [0, 2, 1, 3]).expect("permute q");
-    ctx.compute(&q_perm, 12).expect("compute q_perm");
-    check(s, "q_perm", q_perm.to_vec_f32().iter().sum::<f32>());
+    let gather = |src: &Tensor<'c>, label: &str| -> Tensor<'c> {
+        let rows = ctx.get_rows(src, &idx_t).expect("gather");
+        let r3 = ctx.reshape_3d(&rows, head, ratio, n_blocks).expect("reshape");
+        ctx.compute(&r3, 12).expect("compute");
+        check_opt(s, label, r3.to_vec_f32().iter().sum::<f32>());
+        let p = ctx
+            .cont(&ctx.permute(&r3, [1, 0, 2, 3]).expect("permute"))
+            .expect("cont");
+        ctx.compute(&p, 12).expect("compute");
+        check_opt(s, &format!("{label}_perm"), p.to_vec_f32().iter().sum::<f32>());
+        p
+    };
 
-    let sinks = weights
-        .get(&format!("blk.{}.attn_sinks.weight", s.il))
-        .expect("bound");
-    let scale = 1.0f32 / (head as f32).sqrt();
-    let out = ctx
-        .flash_attn_ext_with_sinks(&q_perm, &k, &k, &mask_t, sinks, scale)
-        .expect("csa flash_attn");
-    ctx.compute(&out, 12).expect("compute csa attention");
-    check(s, "flash_attn", out.to_vec_f32().iter().sum::<f32>());
-    let _ = n_head;
+    let values = gather(&kv_state, "hca_kv");
+    let scores = gather(&score_state, "hca_score");
+
+    let w = ctx.soft_max(&scores).expect("softmax");
+    let weighted = ctx.mul(&values, &w).expect("weight");
+    let summed = ctx.sum_rows(&weighted).expect("sum_rows");
+    let comp = ctx
+        .cont(&ctx.permute(&summed, [1, 0, 2, 3]).expect("permute back"))
+        .expect("cont");
+    ctx.compute(&comp, 12).expect("compute");
+    check(s, "hca_comp_raw", comp.to_vec_f32().iter().sum::<f32>());
+
+    let normed = ctx.rms_norm(&comp, config.rms_eps).expect("rms");
+    let comp = ctx
+        .mul(
+            &normed,
+            weights
+                .get(&format!("blk.{il}.attn_compressor_norm.weight"))
+                .expect("bound"),
+        )
+        .expect("comp norm");
+    ctx.compute(&comp, 12).expect("compute");
+    check(s, "hca_comp_normed", comp.to_vec_f32().iter().sum::<f32>());
+
+    // comp_pos is the block's start position — 0 for the first block, so this
+    // rotation is the identity here and is NOT verified.
+    let n_rot = config.n_rot as i64;
+    let n_nope = config.n_rot_none() as i64;
+    let f32_size = std::mem::size_of::<f32>();
+    let stride = head as usize * f32_size;
+    let nope = ctx
+        .view_3d(&comp, n_nope, 1, n_blocks, stride, stride, 0)
+        .expect("nope");
+    let pe_in = ctx
+        .view_3d(&comp, n_rot, 1, n_blocks, stride, stride, n_nope as usize * f32_size)
+        .expect("pe view");
+    let comp_pos = ctx.new_i32_1d(n_blocks).expect("comp_pos");
+    let bp: Vec<i32> = (0..n_blocks).map(|b| (b * ratio) as i32).collect();
+    comp_pos.set_i32(&bp).expect("set");
+    let (rope, rope_orig) = rope_for(config, il);
+    let pe = ctx
+        .rope_ext(&pe_in, &comp_pos, None, n_rot as i32, ROPE_MODE_NORM, rope_orig, rope)
+        .expect("rope");
+    let out = ctx.concat(&nope, &pe, 0).expect("concat");
+    ctx.compute(&out, 12).expect("compute");
+    check(s, "hca_comp", out.to_vec_f32().iter().sum::<f32>());
     out
 }
 
@@ -2374,7 +2517,7 @@ fn csa_compressor_matches_llama_cpp() {
     // ...and attention over raw + compressed keys, which is the only number in
     // the indexer's half of this layer that a sum can actually check.
     let (q, kv) = q_and_kv_5tok(&s, &ctx, &weights, &config, &p.attn_norm);
-    let _ = csa_attention_5tok(&s, &ctx, &weights, &config, &q, &kv, &csa);
+    let _ = attention_5tok(&s, &ctx, &weights, &config, &q, &kv, Some((&csa, "csa")));
 }
 
 /// Read just the named experts out of a stacked tensor and bind them as a
@@ -2524,6 +2667,7 @@ fn attention_5tok<'c>(
     config: &Deepseek4Config,
     q_full: &Tensor<'c>,
     kv_full: &Tensor<'c>,
+    comp: Option<(&Tensor<'c>, &str)>,
 ) -> Tensor<'c> {
     let nt = s.tokens.len() as i64;
     let head_dim = config.kv_lora_rank as i64;
@@ -2547,7 +2691,28 @@ fn attention_5tok<'c>(
     bigtea_ggml::f16_to_f32(&cache_f16, &mut round_tripped);
     check(s, "cache_k", round_tripped.iter().sum::<f32>());
 
-    let k = ctx.new_f16_3d(head_dim, N_KV, 1).expect("k cache");
+    // A compressed layer attends to the raw window *and* the compressor's
+    // summaries, concatenated along the key axis, each half padded to N_KV.
+    let (n_kv, cache_f16) = match comp {
+        None => (N_KV, cache_f16),
+        Some((c, pfx)) => {
+            check(s, &format!("{pfx}_raw_k"), round_tripped.iter().sum::<f32>());
+            let cv = c.to_vec_f32();
+            let mut ch = vec![0u16; (head_dim * N_KV) as usize];
+            bigtea_ggml::f32_to_f16(&cv, &mut ch[..cv.len()]);
+            let mut back = vec![0f32; ch.len()];
+            bigtea_ggml::f16_to_f32(&ch, &mut back);
+            check(s, &format!("{pfx}_comp_k"), back.iter().sum::<f32>());
+            let mut all = cache_f16;
+            all.extend_from_slice(&ch);
+            let mut back = vec![0f32; all.len()];
+            bigtea_ggml::f16_to_f32(&all, &mut back);
+            check(s, &format!("{pfx}_k_all"), back.iter().sum::<f32>());
+            (2 * N_KV, all)
+        }
+    };
+
+    let k = ctx.new_f16_3d(head_dim, n_kv, 1).expect("k cache");
     let bytes: Vec<u8> = cache_f16.iter().flat_map(|h| h.to_le_bytes()).collect();
     k.set_bytes(&bytes).expect("fill k");
 
@@ -2555,18 +2720,39 @@ fn attention_5tok<'c>(
     // [n_kv, n_tokens], F16 and contiguous — ggml asserts both. Only 0 and -inf
     // occur, so the bit patterns go in directly: -inf must stay exactly -inf.
     const F16_NEG_INF: [u8; 2] = [0x00, 0xFC];
-    let mut mask_bytes = vec![0u8; (N_KV * nt) as usize * 2];
+    let ratio = config.compress_block(s.il).unwrap_or(1);
+    let mut mask_bytes = vec![0u8; (n_kv * nt) as usize * 2];
     for query in 0..nt {
-        let row = (query * N_KV) as usize * 2;
+        let row = (query * n_kv) as usize * 2;
         // Everything strictly after this query's own position, which includes
         // all 251 unused cache slots.
-        for key in (query + 1)..N_KV {
-            let at = row + key as usize * 2;
-            mask_bytes[at..at + 2].copy_from_slice(&F16_NEG_INF);
+        // Causal, and **sliding**: every raw layer is an SWA layer with window
+        // `attention.sliding_window` (128). llama.cpp masks when
+        // `query - key >= n_swa` (`llama-hparams.h:414`,
+        // `LLAMA_SWA_TYPE_STANDARD`). Shorter captures never reached back far
+        // enough to notice, so this was an unverified assumption until a
+        // 165-token prompt made layer 0's attention wrong by 4.7%.
+        let window = config.sliding_window as i64;
+        for key in 0..N_KV {
+            let masked = key > query || (window > 0 && query - key >= window);
+            if masked {
+                let at = row + key as usize * 2;
+                mask_bytes[at..at + 2].copy_from_slice(&F16_NEG_INF);
+            }
+        }
+        // The compressed half is visibility-limited rather than causal: a token
+        // sees block b only once that block is complete and behind it, which is
+        // (pos + 1) / ratio entries.
+        if comp.is_some() {
+            let visible = (query + 1) / ratio;
+            for blk in visible..N_KV {
+                let at = row + (N_KV + blk) as usize * 2;
+                mask_bytes[at..at + 2].copy_from_slice(&F16_NEG_INF);
+            }
         }
     }
     let mask = ctx
-        .new_typed_2d(bigtea_gguf::GgmlType(1), N_KV, nt)
+        .new_typed_2d(bigtea_gguf::GgmlType(1), n_kv, nt)
         .expect("mask");
     mask.set_bytes(&mask_bytes).expect("fill mask");
 

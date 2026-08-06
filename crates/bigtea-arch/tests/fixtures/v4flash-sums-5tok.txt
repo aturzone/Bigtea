@@ -216,6 +216,8 @@
 2|cache_k|119.986458
 2|q_perm|3424.232178
 2|flash_attn|4314.597656
+2|out_nope|4527.108398
+2|out_pe_in|-212.517426
 2|rope_back|-131.199753
 2|attn_derope|4395.916016
 2|attn_derope_perm|4395.943359
@@ -280,8 +282,7 @@
 2|ffn_gates.post_sigmoid|1.242566
 2|ffn_gates.post|2.485133
 2|ffn_gates.comb|19.999983
-# Layer 2's CSA compressor, from v4flash-layer2-oracle-5tok.txt.
-# ratio 4, so exactly one block completes at five tokens: n_blocks = 1.
+# --- hand-added: the CSA compressor, indexer and attention on layer 2 ---
 2|csa_state_kv|-0.462958
 2|csa_state_score|-40.580250
 2|csa_ape_rows|-485.705994
@@ -300,9 +301,6 @@
 2|csa_comp_pe_in|-8.879123
 2|csa_comp_pe|-8.879123
 2|csa_comp|5.163465
-# Layer 2's INDEXER compressor: same overlap compressor, head 128 not 512,
-# indexer_compressor_* weights, and a Walsh-Hadamard rotation afterwards that
-# the attention compressor does not get.
 2|lid_state_kv|20.726961
 2|lid_state_score|-111.030731
 2|lid_ape_rows|-42.738277
@@ -322,15 +320,12 @@
 2|lid_comp_pe|3.530700
 2|lid_comp|27.113394
 2|lid_comp_rot|-8.839934
-# Layer 2's indexer query path. Unlike the compressor's RoPE (block position 0,
-# identity), this one rotates by token position and is genuinely checked.
 2|lid_q|-50.949944
 2|lid_q_nope|-72.231865
 2|lid_q_pe_in|21.281902
 2|lid_q_pe|17.747589
 2|lid_q_rot|96.376190
 2|lid_weights|2.556244
-# Layer 2's CSA attention: raw window and compressed summaries, concatenated.
 2|csa_raw_k|119.986458
 2|csa_comp_k|5.166124
 2|csa_k_all|125.152557

@@ -380,3 +380,31 @@
 3|ffn_gates.post_sigmoid|50.113682
 3|ffn_gates.post|100.227364
 3|ffn_gates.comb|659.998413
+# Layer 2's CSA compressor at 165 tokens: 41 completed blocks, so comp_pos runs
+# 0,4,...,160 and the compressed entries' RoPE is REAL here -- csa_comp_normed
+# (-572.6) differs from csa_comp (-708.4). At five tokens there was one block at
+# position 0 and that rotation was the identity.
+2|csa_state_kv|-181.097137
+2|csa_state_score|-67554.148438
+2|csa_state_score_ape|-84510.718750
+2|csa_comp_raw|-35.224449
+2|csa_comp_normed|-572.616333
+2|csa_comp|-708.369995
+2|csa_raw_k|1829.752197
+2|csa_comp_k|-708.338684
+2|csa_k_all|1121.416260
+# Layer 3's HCA compressor: ratio 128, so exactly one block at 165 tokens, and
+# its comp_pos IS 0 -- this one's RoPE is still the identity and unverified.
+3|hca_state_kv|153.621796
+3|hca_state_score|-25145.382812
+3|hca_state_score_ape|-25169.607422
+3|hca_kv|119.809006
+3|hca_kv_perm|119.808937
+3|hca_score|-18665.412109
+3|hca_score_perm|-18665.458984
+3|hca_comp_raw|0.106534
+3|hca_comp_normed|1.598190
+3|hca_comp|1.598190
+3|hca_raw_k|2257.824219
+3|hca_comp_k|1.598249
+3|hca_k_all|2259.421631
