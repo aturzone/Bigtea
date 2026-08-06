@@ -14,6 +14,7 @@
 //! people bring — transposes every matrix and produces confident nonsense.
 
 mod deepseek4;
+mod deepseek4_forward;
 mod kv;
 mod qwen3;
 mod stream;
