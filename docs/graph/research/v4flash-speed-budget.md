@@ -182,3 +182,63 @@ project, not an afternoon.
 **What does not need a research project: 4.25-bit experts at 0.87 tok/s, which is already
 1.9x llama.cpp**, once residency, the copy removal, and the read-rate gap are done. That is
 the honest 8 GiB target to aim at first.
+
+## The ceiling by hardware class — where the speed actually is
+
+The 8 GiB question is the wrong one to optimise for. **Below ~150 GiB of RAM the bottleneck is
+disk and the ceiling is low no matter what the code does.** Above it, the model stops touching
+disk at all and the ceiling jumps by an order of magnitude. The interesting question is what
+V4-Flash can do on a machine that fits it.
+
+Per token V4-Flash touches **10.59 GiB of weights**: 7.38 GiB always-read plus 3.21 GiB of
+routed experts. Which tier that traffic comes from is the entire story.
+
+| class | RAM | what streams | bottleneck | ceiling |
+|---|---|---|---|---|
+| this laptop | 15.7 GiB (7.5 usable) | all 3.21 GiB of experts | NVMe 2.55 GB/s | **0.87 tok/s** |
+| desktop, 64 GiB | ~50 GiB cache | ~40% of experts | mixed | **~2 tok/s** |
+| desktop, 192 GiB DDR5 dual | nothing | RAM ~60 GB/s | dequant | **~5.6 tok/s** |
+| workstation, 8-channel DDR5 | nothing | RAM ~300 GB/s | dequant | **~28 tok/s** |
+
+Two things follow, and they change what is worth building.
+
+**1. The laptop ceiling is 0.87 tok/s and no engineering passes it.** 3.21 GiB per token over a
+2.55 GB/s disk is 1.26 s/token. That is 1.9x llama.cpp's measured 0.45 — a real win, and the
+most this machine will ever give. Chasing 5 tok/s here is chasing a number the hardware cannot
+produce.
+
+**2. Once the model fits RAM the bottleneck stops being I/O and becomes dequantisation**, which
+is exactly where Bigtea currently *loses* to llama.cpp on Qwen3 (1.07 vs 2.16 tok/s,
+generation). Expert compute there is neither barrier-bound nor bandwidth-bound — 2.4 GB/s
+against DDR5 — it is unpacking Q4_K one block at a time while llama.cpp interleaves rows so
+several unpack per SIMD op. **On a big machine that gap is the whole race.** The repacking work
+already scoped in `CLAUDE.md` item 3 is not a laptop optimisation; it is what decides the
+desktop and workstation numbers above.
+
+## What "fully winning against llama.cpp" requires, concretely
+
+Three separate wins, in the order they become provable:
+
+**a. Short context, disk-bound — 1.9x, needs only engineering already scoped.** Build
+generation, pin the resident set, remove the copy, close the 43% read-rate gap. 0.87 vs 0.45.
+
+**b. Long context — the structural win, and the only one llama.cpp cannot copy.** llama.cpp
+mmaps all 144 GB, so its dense weights compete with 137 GiB of cold expert traffic and get
+evicted. Its projected dense re-read climbs to 7.38 GiB/token at 128k. Then:
+
+```
+llama.cpp @128k:  (7.38 dense re-read + 3.21 experts) / 2.55 GB/s  =  4.2 s/token  =  0.24 tok/s
+Bigtea    @128k:   3.21 experts only                  / 2.55 GB/s  =  1.26 s/token =  0.79 tok/s
+                                                                                       ~3.3x
+```
+
+**That gap widens with context and is a property of the design, not the code.** It is also
+completely unmeasured, because generation does not exist yet.
+
+**c. In-RAM, compute-bound — currently a LOSS, ~2x behind on Qwen3.** Requires expert repacking
+on cache admission. Until that lands, any claim about big machines is a claim we would lose.
+
+The order matters: (a) and (b) are winnable with work already understood. (c) is where the
+"big bang" lives, and it is a kernel problem, not an I/O problem. Sub-2-bit experts multiply
+whichever regime you are in — but per `sub-2bit-k3-fixed-hardware.md`, scalar 2-bit collapses
+and the VQ methods that work have never been shown on an MoE this size.
