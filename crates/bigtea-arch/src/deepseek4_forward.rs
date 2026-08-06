@@ -687,8 +687,15 @@ fn bind_expert_slices<'c>(
     let n_expert = *loc.dims.last().expect("stacked");
     let slice = loc.size / n_expert;
     let mut buf = Vec::with_capacity(unique.len() * slice as usize);
+    let mut disk = 0f64;
     for e in unique {
-        buf.extend_from_slice(&model.read_tensor_range(name, *e as u64 * slice, slice)?);
+        let t = std::time::Instant::now();
+        let got = model.read_tensor_range(name, *e as u64 * slice, slice)?;
+        disk += t.elapsed().as_secs_f64();
+        buf.extend_from_slice(&got);
+    }
+    if std::env::var("BIGTEA_IO_TIMING").is_ok() {
+        eprintln!("    io {name}: disk {disk:.3}s");
     }
     let mut dims = loc.dims.clone();
     *dims.last_mut().expect("stacked") = unique.len() as u64;

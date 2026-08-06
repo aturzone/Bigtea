@@ -109,3 +109,76 @@ exist yet.
 
 Steps 2-4 are ~3x on prefill. Step 5 is where "better than llama.cpp" is either proven or
 retracted.
+
+## The expert step, decomposed (2026-08-06, measured)
+
+The 15.4s "expert reads" figure was a timer around read *and* copy *and* bind. Split:
+
+```
+pure disk read    11.3s   11.5 GiB at 1.02 GiB/s
+copies + bind      5.9s   34% of the step
+                  ------
+                  17.1s
+```
+
+And the disk's own ceiling, measured by `bigtea-probe` (not assumed):
+
+```
+sequential, 8 MiB blocks, sized above RAM:   2.55 GB/s
+expert slices, 12.7 MiB at scattered offsets: 1.10 GB/s   ← 43% of it
+```
+
+Two separate problems, both worth real seconds:
+
+1. **34% of the step is memcpy.** `read_tensor_range` allocates a `Vec`, `extend_from_slice`
+   concatenates into the compact stack, `bind` takes an `Arc<[u8]>`. Reading directly into one
+   pre-sized buffer removes a full copy of 11.5 GiB. **Worth ~5.9s**, and it needs no new
+   idea — the project's own facts list already says memcpy was the largest cost in generation.
+2. **The disk is running at 43% of its own sequential rate.** 12.7 MiB is a large read, so
+   this is not per-request latency — parallelising it made things *worse*. It is scattered
+   offsets across five shards with no readahead, under cache-bypassing direct I/O. **Worth up
+   to ~6.5s** if it can be closed, and the first thing to check is whether `bigtea-io` splits
+   these into smaller physical reads.
+
+Together the expert step could go 17.1s → ~5s.
+
+## Can V4-Flash run well in 8 GiB?
+
+Yes, with one trade. The arithmetic:
+
+```
+per-block dense weights   145 MiB x 43   =  6.09 GiB   must be resident
+token_embd                                  0.53 GiB   NOT needed resident: get_rows touches
+                                                       only the prompt's rows, ~10 KB
+output.weight                               0.53 GiB   read once per token, keep resident
+activations + arena                       ~0.50 GiB
+                                            --------
+                                            7.12 GiB   fits 8 GiB, ~0.9 GiB left for cache
+```
+
+**Dropping `token_embd` from residency is free** — it is a lookup table, and a forward pass
+reads only the rows for its own tokens. That alone is what makes 8 GiB feasible at all.
+
+Speed then follows the expert bytes, and only those:
+
+| expert bits | GiB/token | tok/s | vs llama.cpp 0.45 |
+|---|---|---|---|
+| 4.25 (MXFP4, today) | 3.21 | 0.87 | 1.9x |
+| 3.0 | 2.27 | 1.23 | 2.7x |
+| 2.5 | 1.89 | 1.48 | 3.3x |
+
+Plus ~0.9 GiB of cache (roughly 70 slices of 11,008) — a small hit rate, maybe 10-15%,
+worth another ~1.15x.
+
+**So ~1.5 tok/s in 8 GiB is reachable, at 2.5-bit routed experts.** That is 3.3x llama.cpp
+and the first configuration that would be genuinely usable.
+
+The trade is quality, and `sub-2bit-k3-fixed-hardware.md` is unambiguous about the shape of
+it: **scalar 2-bit collapses** (GPTQ/AWQ hit 10^4-10^6 perplexity), so this needs
+additive/residual VQ in the AQLM family, which reaches 2-3 bpw on dense 7B-70B — **never
+demonstrated on an MoE this size**. It also needs a CPU decode kernel. That is a research
+project, not an afternoon.
+
+**What does not need a research project: 4.25-bit experts at 0.87 tok/s, which is already
+1.9x llama.cpp**, once residency, the copy removal, and the read-rate gap are done. That is
+the honest 8 GiB target to aim at first.
