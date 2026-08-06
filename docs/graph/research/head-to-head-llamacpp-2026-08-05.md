@@ -258,3 +258,52 @@ is a multi-session piece of work, not an afternoon's.
 - Where does generation time go now? At 565 tokens: 3.2s disk, 5.4s expert compute, 1.0s
   attention, ~3.3s unattributed. The expert compute is single-column matmuls against Q4_K
   weights — llama.cpp repacks for this and we do not.
+
+## V4-Flash prefill: a failed optimisation, and what the numbers actually say (2026-08-06)
+
+Bigtea runs V4-Flash end to end now — `bigtea-run <shard1>.gguf "The capital of France is"`
+answers `" Paris"` — and the first profile of its 31.4s prefill (5 tokens, 43 blocks):
+
+```
+expert reads  15.4s   49%   11.5 GiB at 0.75 GiB/s
+dense reads    7.1s   23%
+compute        8.9s   28%
+```
+
+**Hypothesis: the expert reads are latency-bound.** 15-29 experts across three stacked
+tensors is 45-87 separate positional reads per block, issued serially, at a quarter of the
+2.79 GB/s this NVMe measured. Overlapping them looked like a free 3.7x on half the runtime.
+
+**Tried it. It got slower: 17.6s, 0.65 GiB/s.** Scoped threads across 12 workers, same bytes.
+Reverted.
+
+### Why the hypothesis was wrong
+
+Each expert slice is **~12.7 MiB**. Sixty-odd reads of 12.7 MiB is not a latency-bound
+workload — the seek is amortised hundreds of times over within each read. There was never a
+per-request stall to hide, so adding threads only added contention on a device already doing
+one large read at a time as fast as it will.
+
+The 2.79 GB/s figure is also not the right comparison: it was measured with a different access
+shape, and `io_mode` here is **direct (cache bypassed)**, which trades throughput for
+predictability.
+
+### Where the time probably goes instead
+
+Copies, and the project already knows this: *"the largest cost in generation was memcpy —
+slices copied twice per use — not disk and not arithmetic. Nothing suggested it until it was
+timed."* The current path copies each slice at least twice — `read_tensor_range` allocates a
+`Vec`, then `extend_from_slice` concatenates into the compact stack, then `bind` takes an
+`Arc<[u8]>`. **At 11.5 GiB per prefill, two extra copies at DDR5 speeds is several seconds of
+the 15.4.**
+
+That is the next measurement: time the read separately from the concatenation before touching
+either. Not another guess.
+
+### The ceiling this all runs into
+
+Worth stating plainly because it bounds every optimisation below it. V4-Flash reads **3.21
+GiB of routed experts per token**. At 2.79 GB/s that is ~1.15 s/token, so **~0.87 tok/s is the
+hard ceiling with a cold cache** — llama.cpp's 0.45 tok/s is beatable, 2 tok/s is not, by any
+amount of kernel work. Going decisively past 1 tok/s requires reading *less*: cache hits, and
+on layers 0-2 the expert set is knowable from the token id before any compute runs.
