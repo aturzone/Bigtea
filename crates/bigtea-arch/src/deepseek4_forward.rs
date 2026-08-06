@@ -48,7 +48,7 @@
 
 use bigtea_ggml::{Context, RopeParams, Tensor, WeightSet};
 use bigtea_io::SkewedBuf;
-use bigtea_model::Model;
+use bigtea_model::{Model, ResidentSet};
 
 use crate::{AttentionKind, Deepseek4Config, Deepseek4Model, Result};
 
@@ -67,12 +67,22 @@ pub struct Deepseek4Forward<'m> {
     model: &'m Model,
     config: Deepseek4Config,
     arch: Deepseek4Model,
+    /// Always-read weights held in RAM. `None` re-reads them per block, which
+    /// is correct but costs 23% of a prefill and would cost it again on every
+    /// generated token.
+    resident: Option<&'m ResidentSet>,
 }
 
 impl<'m> Deepseek4Forward<'m> {
     pub fn new(model: &'m Model, config: Deepseek4Config) -> Self {
         let arch = Deepseek4Model::new(config.clone());
-        Deepseek4Forward { model, config, arch }
+        Deepseek4Forward { model, config, arch, resident: None }
+    }
+
+    /// Serve always-read weights from `resident` instead of from disk.
+    pub fn with_resident(mut self, resident: &'m ResidentSet) -> Self {
+        self.resident = Some(resident);
+        self
     }
 
     pub fn config(&self) -> &Deepseek4Config {
@@ -856,6 +866,45 @@ fn ffn<'c>(
     Ok(out)
 }
 
+/// Bind one always-read tensor, from RAM if it is resident and from disk if it
+/// is not. Returns its size, so a caller can report what it moved.
+///
+/// # Why residency is the difference between a demo and a runner
+///
+/// V4-Flash's always-read weights are 7.38 GiB and every one of them is touched
+/// on **every token**. Read per block, they cost 7.1s of a 5-token prefill — 23%
+/// — and a generation loop would pay that again for each token produced, forever.
+/// Held in RAM they cost one read for the whole session.
+///
+/// Binding from the resident set is a refcount bump, not a copy: the same bytes
+/// are pointed at by a fresh `ggml` tensor on every block of every token, and
+/// copying 7.38 GiB per token to achieve that would defeat the purpose.
+///
+/// Falling back to disk is not a failure path but the design working: the
+/// budget is a hard ceiling, and a machine too small for the whole set streams
+/// the remainder rather than swapping. Swapping is slower than the streaming it
+/// replaces.
+fn bind_dense<'c>(
+    fw: &Deepseek4Forward<'_>,
+    wctx: &'c Context,
+    weights: &mut WeightSet<'c>,
+    name: &str,
+) -> Result<u64> {
+    let loc = fw.model.location(name).expect("present").clone();
+    match fw.resident.and_then(|r| r.get_shared(name)) {
+        Some(shared) => {
+            weights.bind_shared(wctx, name, loc.ty, &loc.dims, shared)?;
+            Ok(0)
+        }
+        None => {
+            let data = fw.model.read_tensor_shared(name)?;
+            let n = data.len() as u64;
+            weights.bind_shared(wctx, name, loc.ty, &loc.dims, data)?;
+            Ok(n)
+        }
+    }
+}
+
 /// One whole block, in its own arena, streams in and streams out as floats.
 ///
 /// Owning the arena per block is what makes depth free: chaining blocks inside
@@ -883,10 +932,7 @@ pub fn block(
     let t_bind = std::time::Instant::now();
     let mut dense_bytes = 0u64;
     for name in &names {
-        let loc = fw.model.location(name).expect("present").clone();
-        let data = fw.model.read_tensor(name)?;
-        dense_bytes += data.len() as u64;
-        weights.bind(&wctx, name, loc.ty, &loc.dims, data)?;
+        dense_bytes += bind_dense(fw, &wctx, &mut weights, name)?;
     }
     let dense_secs = t_bind.elapsed().as_secs_f64();
 
@@ -954,9 +1000,7 @@ pub fn head(fw: &Deepseek4Forward<'_>, streams: &[f32], arena: usize) -> Result<
         "output_norm.weight",
         "output.weight",
     ] {
-        let loc = fw.model.location(name).expect("present").clone();
-        let data = fw.model.read_tensor(name)?;
-        weights.bind(&wctx, name, loc.ty, &loc.dims, data)?;
+        bind_dense(fw, &wctx, &mut weights, name)?;
     }
 
     let hc = config.hc_mult as i64;

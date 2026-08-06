@@ -25,9 +25,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bigtea_gguf::{GgmlType, Gguf};
-use bigtea_io::{DirectFile, IoMode};
+use bigtea_io::{DirectFile, IoMode, SkewedBuf};
 
 mod discover;
 mod resident;
@@ -391,6 +392,25 @@ impl Model {
         self.tensors
             .get(name)
             .is_some_and(|loc| (loc.file_offset + offset) % bigtea_io::ALIGN as u64 == 0)
+    }
+
+    /// Read a whole tensor into a buffer shaped for the drive to fill directly,
+    /// shared so it can be bound repeatedly without ever being copied.
+    ///
+    /// This is what residency wants: the bytes are read once, then bound into a
+    /// `ggml` context on every block of every token. Returning `Vec<u8>` would
+    /// mean copying them into an `Arc` to share them, and the skew is what lets
+    /// the drive write into the allocation in the first place — see
+    /// [`bigtea_io::SkewedBuf`].
+    pub fn read_tensor_shared(&self, name: &str) -> Result<Arc<SkewedBuf>> {
+        let loc = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::UnknownTensor(name.to_string()))?;
+        let (size, file_offset) = (loc.size, loc.file_offset);
+        let mut buf = SkewedBuf::new(size as usize, SkewedBuf::skew_for(file_offset));
+        self.read_range_into(name, 0, &mut buf)?;
+        Ok(Arc::new(buf))
     }
 
     /// Read a tensor's raw bytes, exactly as stored (still quantized).

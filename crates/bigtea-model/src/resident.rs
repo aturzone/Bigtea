@@ -21,14 +21,23 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
+
+use bigtea_io::SkewedBuf;
 
 use crate::{Error, Model, Result};
 
 const GIB: f64 = (1u64 << 30) as f64;
 
 /// Weights held in RAM for the whole session.
+///
+/// Buffers are shared rather than owned outright, because residency only pays
+/// off if binding is free. Every block of every token binds these into a `ggml`
+/// context; handing out `&[u8]` would force the binder to copy, which is the
+/// cost residency exists to avoid. [`Self::get_shared`] hands out a refcount
+/// bump instead, and the address never moves.
 pub struct ResidentSet {
-    tensors: HashMap<String, Vec<u8>>,
+    tensors: HashMap<String, Arc<SkewedBuf>>,
     bytes: u64,
     skipped: Vec<Skipped>,
 }
@@ -243,7 +252,7 @@ impl ResidentSet {
                 continue;
             }
 
-            let data = model.read_tensor(&name)?;
+            let data = model.read_tensor_shared(&name)?;
             if data.len() as u64 != size {
                 // A short read here would put wrong bytes into the model.
                 return Err(Error::NotDownloaded {
@@ -284,7 +293,12 @@ impl ResidentSet {
     /// A resident tensor's bytes, or `None` if it is not resident — in which
     /// case the caller must stream it.
     pub fn get(&self, name: &str) -> Option<&[u8]> {
-        self.tensors.get(name).map(Vec::as_slice)
+        self.tensors.get(name).map(|b| &b[..])
+    }
+
+    /// The same bytes as a shared handle, for binding without copying.
+    pub fn get_shared(&self, name: &str) -> Option<Arc<SkewedBuf>> {
+        self.tensors.get(name).cloned()
     }
 
     pub fn contains(&self, name: &str) -> bool {
@@ -343,8 +357,8 @@ impl Plan {
 }
 
 /// Read a tensor, refusing anything but its exact declared size.
-fn read_checked(model: &Model, name: &str, size: u64) -> Result<Vec<u8>> {
-    let data = model.read_tensor(name)?;
+fn read_checked(model: &Model, name: &str, size: u64) -> Result<Arc<SkewedBuf>> {
+    let data = model.read_tensor_shared(name)?;
     if data.len() as u64 != size {
         return Err(Error::NotDownloaded {
             name: name.to_string(),

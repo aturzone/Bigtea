@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use bigtea_arch::{KvCache, Qwen3Config, Qwen3Model};
 use bigtea_ggml::{Context, WeightSet};
-use bigtea_model::Model;
+use bigtea_model::{Model, ResidentSet};
 use bigtea_tokenizer::Tokenizer;
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -407,6 +407,56 @@ fn run(
 /// prefill can skip, a growing KV cache, and the expert cache; see
 /// `deepseek4_forward`'s module docs. Timing this first is deliberate: if
 /// prefill is slow, that changes what generation should look like.
+/// Say what a residency shortfall costs and what would fix it.
+///
+/// This is the difference between a tool that is slow and a tool that is slow
+/// *and inexplicable*. Weights that do not fit are re-read on every token
+/// forever, so the shortfall is not a one-off — it is a permanent tax, and the
+/// user is the only one who can decide whether closing an editor is worth
+/// paying less of it. Naming the processes turns "it's slow" into a choice.
+///
+/// The saving is quoted as a range because a re-read costs somewhere between
+/// the drive's sequential rate and what these scattered tensor reads actually
+/// achieve; promising the optimistic end would be a lie the first time someone
+/// timed it.
+fn report_residency_shortfall(report: &bigtea_model::LoadReport, machine: &bigtea_probe::Machine) {
+    if report.complete() {
+        return;
+    }
+    let missing = report.skipped_over_budget;
+    if missing == 0 {
+        return; // the shortfall is undownloaded weights, not RAM
+    }
+    // What re-reading them costs per token, at the rate this load just achieved.
+    let rate = if report.bytes_per_sec() > 0.0 { report.bytes_per_sec() } else { 1e9 };
+    println!(
+        "           {:.2} GiB will be re-read from disk on EVERY token (~{:.1}s each)",
+        missing as f64 / GIB,
+        missing as f64 / rate
+    );
+
+    let holders = bigtea_probe::processes::grouped(256 << 20);
+    if holders.is_empty() {
+        println!("           nothing large is closeable; this model needs more RAM than this machine has");
+        return;
+    }
+    let free: u64 = holders.iter().map(|(_, b, _)| *b).sum();
+    println!("           closing these would free up to {:.2} GiB:", free as f64 / GIB);
+    for (name, bytes, count) in holders.iter().take(4) {
+        let n = if *count > 1 { format!(" ({count} processes)") } else { String::new() };
+        println!("             {name:<28} {:.2} GiB{n}", *bytes as f64 / GIB);
+    }
+    if free >= missing {
+        println!("           that is enough to make the whole model resident.");
+    } else {
+        println!(
+            "           still {:.2} GiB short after that — a smaller quant would fit.",
+            (missing - free) as f64 / GIB
+        );
+    }
+    let _ = machine;
+}
+
 fn run_deepseek4(
     model: &Model,
     tokenizer: &Tokenizer,
@@ -415,7 +465,6 @@ fn run_deepseek4(
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = bigtea_arch::Deepseek4Config::from_model(model)?;
-    let fw = bigtea_arch::Deepseek4Forward::new(model, config.clone());
 
     let tokens: Vec<i32> = tokenizer.encode(prompt).iter().map(|t| *t as i32).collect();
     if tokens.is_empty() {
@@ -428,6 +477,24 @@ fn run_deepseek4(
         config.n_expert_used, config.n_expert_shared
     );
     println!("prompt     {} tokens", tokens.len());
+
+    // Hold the always-read weights in RAM. Without this every block re-reads
+    // them from disk on every forward pass — 23% of a prefill, and the whole
+    // cost again for each generated token.
+    //
+    // The budget is what the machine has free now, minus room for the compute
+    // arena and the expert slices in flight. Over-estimating makes the OS swap,
+    // and swapping is slower than the streaming it was meant to replace, so the
+    // reserve is deliberate and what does not fit is reported rather than hidden.
+    let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
+    // Compute arena, plus the expert slices in flight, plus slack for the OS.
+    // A flat constant here is either wasteful or wrong depending on the block.
+    let reserve = ((arena_mib as u64) << 20) + (512 << 20) + (768 << 20);
+    let budget = machine.usable_ram_for_weights(reserve);
+    let (resident, report) = ResidentSet::load(model, budget)?;
+    println!("resident   {report}");
+    report_residency_shortfall(&report, &machine);
+    let fw = bigtea_arch::Deepseek4Forward::new(model, config.clone()).with_resident(&resident);
     if !fw.indexer_is_exact(tokens.len()) {
         // Below this length skipping the indexer is exact; above it, it is not.
         println!(
