@@ -242,3 +242,47 @@ The order matters: (a) and (b) are winnable with work already understood. (c) is
 "big bang" lives, and it is a kernel problem, not an I/O problem. Sub-2-bit experts multiply
 whichever regime you are in — but per `sub-2bit-k3-fixed-hardware.md`, scalar 2-bit collapses
 and the VQ methods that work have never been shown on an MoE this size.
+
+## The "1.06 GiB/s disk" is not the disk (2026-08-06)
+
+Every measurement in this node called `read_tensor_range` "disk time". It is not. The path is
+`direct.rs:118-151`:
+
+```rust
+let mut buf = AlignedBuf::new(span);        // allocate (and the OS zeroes fresh pages)
+let got = self.read_exact_at(&mut buf, ...)?;  // the actual read
+Ok(buf[skip..skip + len].to_vec())          // ALLOCATE AGAIN AND COPY EVERYTHING
+```
+
+**Every read copies all of its bytes one extra time inside the I/O layer**, on top of the two
+copies already identified higher up (`extend_from_slice` into the compact stack, then `bind`
+into an `Arc<[u8]>`). That is **three full copies of 11.5 GiB per prefill**, plus the
+allocation and page-zeroing of both buffers.
+
+This reframes every number here:
+
+- The 1.06 GiB/s "expert read rate" is *allocate + read + copy*, not read.
+- The 43% gap against 2.55 GB/s sequential is therefore not a seek penalty or an access-shape
+  problem, and was never evidence for one.
+- **It also explains why parallelising the reads made things worse**: twelve threads
+  contending on the allocator and memory bandwidth, not on the disk.
+
+That is the third time in this project that memcpy has turned out to be the cost — after the
+Qwen3 generation profile and the expert-step split above. It is already the entry in
+`CLAUDE.md` that says to profile first, and it has now been rediscovered twice since.
+
+### The fix, and what it is worth
+
+`read_at` should fill a caller-owned buffer rather than returning a fresh `Vec`. The expert
+path then reads each slice **directly into its final position in the compact stack**, which
+removes both the `to_vec` and the `extend_from_slice` — two of the three copies — and the
+second allocation.
+
+If the disk is genuinely near 2.55 GB/s once the copies are gone, 3.21 GiB/token becomes
+**1.35 s/token = 0.74 tok/s**, against a currently-measured effective rate that would put
+generation nearer 0.33. **This single change is plausibly the difference between losing to
+llama.cpp's 0.45 tok/s and beating it**, and it is ordinary engineering with no quality risk
+and no research.
+
+**Measure it first**: time `read_exact_at` alone versus `read_at` as a whole. If the copy is
+not the gap, the API change is not worth making.
