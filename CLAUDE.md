@@ -10,7 +10,7 @@
 ```
 # ggml must be built first; point GGML_LIB_DIR at ggml-base.a, ggml-cpu.a, ggml.a
 export GGML_LIB_DIR=C:/Projects/llamacpp-unsloth/build/ggml/src   # PowerShell: $env:GGML_LIB_DIR=...
-cargo test --release          # 138 tests
+cargo test --release          # 153 tests (+12 container-backed, --ignored)
 cargo build --release
 ./target/release/bigtea-run <model.gguf> "prompt" -n 16
 ./target/release/bigtea-probe --quick          # RAM/disk/GPU + what to close
