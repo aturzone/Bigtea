@@ -77,9 +77,10 @@ Qwen3-30B-A3B Q4_K_M prefill, Bigtea / llama.cpp:
   0.45 — about 10x slower, because the V4-Flash path has no KV cache yet.
   Qwen3-30B-A3B: 1.07 against 2.16, about 2x. No claim to the contrary is made
   anywhere in this repository.
-- **Linux and macOS are untested at runtime.** Per-platform direct-I/O paths
-  exist for all three operating systems; only the Windows one has been executed.
-  CI covers the build and unit tests.
+- **Linux and macOS build and pass the unit tests in CI, but no model has been
+  run on either.** macOS additionally has no direct-I/O path — `F_NOCACHE` needs
+  an `fcntl` after opening and is not written yet — so it falls back to buffered
+  reads and the page-cache problems this design exists to avoid.
 - No model downloader; bring your own `.gguf`.
 - No server or API.
 - No prebuilt binaries; ggml must be built first and `GGML_LIB_DIR` set.

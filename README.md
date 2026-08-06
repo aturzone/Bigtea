@@ -9,6 +9,7 @@
   <a href="#status"><img alt="status" src="https://img.shields.io/badge/status-v0.0.0%20preview-orange"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue"></a>
   <a href="#building"><img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-informational"></a>
+  <a href="https://github.com/aturzone/Bigtea/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aturzone/Bigtea/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="tests" src="https://img.shields.io/badge/tests-157%20passing-brightgreen">
 </p>
 
@@ -94,7 +95,7 @@ not built yet.
 | ⚠️ **Generation is slow** | see above — no KV cache yet on the V4-Flash path |
 | ❌ No model downloader | you bring your own `.gguf` |
 | ❌ No server / API | no OpenAI-compatible endpoint yet |
-| ❌ **Linux and macOS are untested** | the code has paths for both; only Windows has been run. CI covers the build |
+| ⚠️ **Linux and macOS build and pass tests in CI** | but no model has been *run* there yet, and macOS falls back to buffered I/O (`F_NOCACHE` is not wired up) |
 | ❌ No prebuilt binaries | you build from source, and you need ggml |
 
 Architectures implemented: **Qwen3 / Qwen3-MoE** and **DeepSeek-V4-Flash**

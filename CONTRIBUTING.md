@@ -77,10 +77,12 @@ written-down failures.
 - Say in the description what you measured, on what hardware, and how.
 - CI must be green: build and unit tests on Linux, macOS and Windows.
 
-Note that **Linux and macOS are currently untested at runtime.** The code has
-per-platform direct-I/O paths (`O_DIRECT`, `F_NOCACHE`, `FILE_FLAG_NO_BUFFERING`)
-and only the Windows one has ever been executed. If you run Bigtea on Linux or
-macOS — even if it just fails — that is a genuinely useful bug report.
+Note that **Linux and macOS build and pass the unit tests in CI, but no model
+has been run on either.** Direct I/O is `O_DIRECT` on Linux and
+`FILE_FLAG_NO_BUFFERING` on Windows; **macOS has no direct-I/O path at all** and
+falls back to buffered reads, because `F_NOCACHE` must be set after opening via
+`fcntl` and that is not written yet. If you run Bigtea on Linux or macOS — even
+if it just fails — that is a genuinely useful bug report.
 
 ## Good first issues
 
