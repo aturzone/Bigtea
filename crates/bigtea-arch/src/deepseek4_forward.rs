@@ -808,6 +808,7 @@ pub fn block(
 ) -> Result<Streams> {
     let config = fw.config.clone();
     let nt = tokens.len() as i64;
+    let t_block = std::time::Instant::now();
     let ctx = Context::new(arena)?;
     let wctx = Context::new_no_alloc(32 << 20)?;
     let mut weights = WeightSet::new();
@@ -816,11 +817,15 @@ pub fn block(
     if il == 0 {
         names.push("token_embd.weight".to_string());
     }
+    let t_bind = std::time::Instant::now();
+    let mut dense_bytes = 0u64;
     for name in &names {
         let loc = fw.model.location(name).expect("present").clone();
         let data = fw.model.read_tensor(name)?;
+        dense_bytes += data.len() as u64;
         weights.bind(&wctx, name, loc.ty, &loc.dims, data)?;
     }
+    let dense_secs = t_bind.elapsed().as_secs_f64();
 
     let streams = match streams_in {
         None => embed(&ctx, &weights, &config, tokens)?,
@@ -858,6 +863,15 @@ pub fn block(
 
     let out = ctx.dsv4_hc_post(&ffn_out, &streams, &ffn_gates.post, &ffn_gates.comb)?;
     ctx.compute(&out, 12)?;
+
+    if std::env::var("BIGTEA_BLOCK_TIMING").is_ok() {
+        eprintln!(
+            "  block {il:>2}  dense {:.2}s ({:.0} MiB)  rest {:.2}s",
+            dense_secs,
+            dense_bytes as f64 / (1 << 20) as f64,
+            t_block.elapsed().as_secs_f64() - dense_secs,
+        );
+    }
     Ok(out.to_vec_f32())
 }
 
