@@ -47,6 +47,7 @@
 //! approximation and [`Deepseek4Forward::indexer_is_exact`] returns false.
 
 use bigtea_ggml::{Context, RopeParams, Tensor, WeightSet};
+use bigtea_io::SkewedBuf;
 use bigtea_model::Model;
 
 use crate::{AttentionKind, Deepseek4Config, Deepseek4Model, Result};
@@ -676,6 +677,20 @@ fn moe_routing<'c>(
 /// `i` starts at `i * size / n_expert`. Binding all 256 for one block is 3.19
 /// GiB and does not fit this machine; the tokens' own selection is a fraction of
 /// that. **This is what the runner has to do anyway**, not a test convenience.
+///
+/// # Why the destination is deliberately misaligned
+///
+/// Each slice is read straight into its final position in one stacked buffer,
+/// so no byte is copied between the drive and `ggml`. That only works if the
+/// memory address and the file offset agree modulo the sector size — and GGUF
+/// pads tensor data to `general.alignment`, which is **32**, so V4-Flash's
+/// experts sit at file offsets ≡ 2816 (mod 4096). A conventionally aligned
+/// buffer can never match, and every byte bounces through a scratch.
+///
+/// The slices of one tensor are all the same size, and that size is a sector
+/// multiple, so **one skew serves the whole stack**. Measured on
+/// `blk.5.ffn_up_exps.weight`: 0.78 → 1.57 GiB/s, with 0.09% of bytes copied
+/// (the two edge sectors of each 4.25 MiB slice) instead of 300%.
 fn bind_expert_slices<'c>(
     model: &Model,
     ctx: &'c Context,
@@ -686,22 +701,28 @@ fn bind_expert_slices<'c>(
     let loc = model.location(name).expect("stacked tensor").clone();
     let n_expert = *loc.dims.last().expect("stacked");
     let slice = loc.size / n_expert;
-    let mut buf = Vec::with_capacity(unique.len() * slice as usize);
+    let total = unique.len() * slice as usize;
+
+    let mut buf = SkewedBuf::new(total, SkewedBuf::skew_for(loc.file_offset));
     let mut disk = 0f64;
-    for e in unique {
+    let mut copied = 0usize;
+    for (i, e) in unique.iter().enumerate() {
+        let at = i * slice as usize;
         let t = std::time::Instant::now();
-        let got = model.read_tensor_range(name, *e as u64 * slice, slice)?;
+        copied += model.read_range_into(name, *e as u64 * slice, &mut buf[at..at + slice as usize])?;
         disk += t.elapsed().as_secs_f64();
-        buf.extend_from_slice(&got);
     }
     if std::env::var("BIGTEA_IO_TIMING").is_ok() {
-        eprintln!("    io {name}: disk {disk:.3}s");
+        eprintln!(
+            "    io {name}: disk {disk:.3}s  {:.2} GiB/s  {:.2}% copied",
+            total as f64 / (1u64 << 30) as f64 / disk,
+            copied as f64 / total.max(1) as f64 * 100.0
+        );
     }
     let mut dims = loc.dims.clone();
     *dims.last_mut().expect("stacked") = unique.len() as u64;
-    let read = buf.len() as u64;
     weights.bind(ctx, name, loc.ty, &dims, buf)?;
-    Ok((read, dims))
+    Ok((total as u64, dims))
 }
 
 /// The routed experts and the shared one, summed into the block's FFN output.

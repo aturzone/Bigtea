@@ -339,6 +339,60 @@ impl Model {
             })
     }
 
+    /// Read part of a tensor **into memory the caller already owns**.
+    ///
+    /// The streaming path stacks several expert slices into one buffer to bind
+    /// as a single tensor. [`Self::read_tensor_range`] makes that cost two full
+    /// copies of every byte — one out of the I/O scratch into a fresh `Vec`,
+    /// another out of that `Vec` into the stack. This writes the slice straight
+    /// into its final position instead.
+    ///
+    /// Returns **how many bytes were copied** through a scratch buffer on the
+    /// way in; zero means the drive wrote every byte into `dst` itself. See
+    /// [`bigtea_io::SkewedBuf`] for how a caller arranges that.
+    pub fn read_range_into(&self, name: &str, offset: u64, dst: &mut [u8]) -> Result<usize> {
+        let len = dst.len() as u64;
+        let loc = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::UnknownTensor(name.to_string()))?;
+        if offset + len > loc.size {
+            return Err(Error::NotDownloaded {
+                name: format!("{name} (range {offset}+{len})"),
+                need: offset + len,
+                have: loc.size,
+            });
+        }
+        let shard = &self.shards[loc.shard];
+        let at = loc.file_offset + offset;
+        if at + len > shard.on_disk {
+            return Err(Error::NotDownloaded {
+                name: name.to_string(),
+                need: at + len,
+                have: shard.on_disk,
+            });
+        }
+        shard
+            .file
+            .read_at_into(at, dst)
+            .map_err(|source| Error::Io {
+                path: shard.file.path().to_path_buf(),
+                source,
+            })
+    }
+
+    /// Where a tensor's bytes begin in its shard file, and whether that offset
+    /// is sector-aligned.
+    ///
+    /// Callers stacking slices need this to know whether they can build an
+    /// aligned destination that the drive can write into directly — GGUF pads
+    /// tensor data to `general.alignment`, which defaults to 32, not 4096.
+    pub fn range_is_sector_aligned(&self, name: &str, offset: u64) -> bool {
+        self.tensors
+            .get(name)
+            .is_some_and(|loc| (loc.file_offset + offset) % bigtea_io::ALIGN as u64 == 0)
+    }
+
     /// Read a tensor's raw bytes, exactly as stored (still quantized).
     pub fn read_tensor(&self, name: &str) -> Result<Vec<u8>> {
         let loc = self

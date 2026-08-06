@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::aligned::{align_down, align_up, AlignedBuf, ALIGN};
+use crate::aligned::{align_down, align_up, AlignedBuf, SkewedBuf, ALIGN};
 
 /// Whether the cache is actually being bypassed.
 ///
@@ -149,6 +149,135 @@ impl DirectFile {
             ));
         }
         Ok(buf[skip..skip + len].to_vec())
+    }
+
+    /// Read exactly `dst.len()` bytes at `offset` **into `dst`**.
+    ///
+    /// [`Self::read_at`] returns a fresh `Vec`, which costs an allocation and a
+    /// full copy on every call — and a streaming runner calls it for every
+    /// expert slice of every token. This fills memory the caller already owns,
+    /// so a slice can land directly in its final position in a stacked buffer.
+    ///
+    /// Returns **how many bytes had to be copied** through a scratch buffer.
+    /// Zero means the drive wrote every byte straight into `dst`. A bool would
+    /// be the wrong shape: a 4 MiB slice whose two edge sectors bounce is
+    /// 99.9% direct, and calling that "not direct" would hide the win.
+    pub fn read_at_into(&self, offset: u64, dst: &mut [u8]) -> io::Result<usize> {
+        if dst.is_empty() {
+            return Ok(0);
+        }
+        let end = offset.checked_add(dst.len() as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "offset + len overflows")
+        })?;
+        if end > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "read of {} bytes at {offset} runs past end of file ({})",
+                    dst.len(),
+                    self.len
+                ),
+            ));
+        }
+
+        // Buffered mode has no constraints at all — the kernel is copying out
+        // of its own cache, so any address and length will do.
+        if self.mode == IoMode::Buffered {
+            let done = self.read_straight(offset, dst)?;
+            if done < dst.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("short read: wanted {} bytes, got {done}", dst.len()),
+                ));
+            }
+            return Ok(0);
+        }
+
+        // Direct I/O transfers only when the file offset and the memory address
+        // agree modulo the sector size. When they do — which a caller can
+        // arrange with `SkewedBuf` — the bulk of the range goes straight into
+        // `dst` and only the two edge fragments, under a sector each, bounce.
+        let Some((head, middle)) = self.dma_split(offset, dst) else {
+            self.read_bounced(offset, dst)?;
+            return Ok(dst.len());
+        };
+
+        if middle > 0 {
+            let done = self.read_straight(offset + head as u64, &mut dst[head..head + middle])?;
+            if done < middle {
+                // A partial count left us mid-sector; the scratch finishes it.
+                let rest = dst.len() - head - done;
+                self.read_bounced(offset + (head + done) as u64, &mut dst[head + done..])?;
+                self.read_bounced(offset, &mut dst[..head])?;
+                return Ok(head + rest);
+            }
+        }
+        if head > 0 {
+            self.read_bounced(offset, &mut dst[..head])?;
+        }
+        let tail = head + middle;
+        if tail < dst.len() {
+            self.read_bounced(offset + tail as u64, &mut dst[tail..])?;
+        }
+        Ok(dst.len() - middle)
+    }
+
+    /// Split a read into `(head fragment, directly transferable middle)`.
+    ///
+    /// `None` when the destination's residue does not match the file's, so no
+    /// part of the range can be transferred in place.
+    fn dma_split(&self, offset: u64, dst: &[u8]) -> Option<(usize, usize)> {
+        let addr = dst.as_ptr() as usize % ALIGN;
+        if addr != (offset % ALIGN as u64) as usize {
+            return None;
+        }
+        let head = (ALIGN - addr) % ALIGN;
+        let middle = dst.len().checked_sub(head)? & !(ALIGN - 1);
+        // Two syscalls and two small copies are not worth it for a read that is
+        // barely a sector long; below that, one bounce is cheaper.
+        if middle == 0 {
+            return None;
+        }
+        Some((head, middle))
+    }
+
+    /// Read into `dst` directly, stopping if a partial count breaks alignment.
+    fn read_straight(&self, offset: u64, dst: &mut [u8]) -> io::Result<usize> {
+        let want = dst.len();
+        let mut done = 0usize;
+        while done < want {
+            if self.mode == IoMode::Direct && done % ALIGN != 0 {
+                break; // the caller finishes this tail through the scratch
+            }
+            let n = self.read_chunk(&mut dst[done..], offset + done as u64)?;
+            if n == 0 {
+                break;
+            }
+            done += n;
+        }
+        Ok(done)
+    }
+
+    /// Read into `dst` via an aligned scratch buffer, for ranges the drive
+    /// cannot address directly.
+    fn read_bounced(&self, offset: u64, dst: &mut [u8]) -> io::Result<()> {
+        let len = dst.len();
+        let end = offset + len as u64;
+        let start = align_down(offset);
+        let aligned_end = align_up(end).min(align_up(self.len));
+        let span = (aligned_end - start) as usize;
+
+        let mut buf = AlignedBuf::new(span);
+        let got = self.read_exact_at(&mut buf, start, span)?;
+        let skip = (offset - start) as usize;
+        if got < skip + len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("short read: wanted {} bytes, got {got}", skip + len),
+            ));
+        }
+        dst.copy_from_slice(&buf[skip..skip + len]);
+        Ok(())
     }
 
     /// Fill `buf` from `offset`, looping until `want` bytes are read or EOF.
@@ -303,6 +432,93 @@ mod tests {
         // Whichever mode we got, it must be stated -- never assumed.
         assert!(matches!(f.mode(), IoMode::Direct | IoMode::Buffered));
         assert_eq!(f.len(), 4096);
+    }
+
+    #[test]
+    fn reading_into_a_buffer_returns_the_same_bytes_as_allocating_one() {
+        // The zero-copy path must never disagree with the path it replaces.
+        let data = pattern(100_000);
+        let tmp = Temp::with(&data);
+        let f = DirectFile::open(&tmp.0).expect("open");
+
+        for &(offset, len) in &[
+            (0u64, 1usize),
+            (1, 1),
+            (4095, 2),
+            (4096, 4096),
+            (7777, 9999),
+            (0, 100_000),
+        ] {
+            let mut into = vec![0xEE; len];
+            f.read_at_into(offset, &mut into).expect("read into");
+            assert_eq!(
+                into,
+                f.read_at(offset, len).expect("read_at"),
+                "paths disagree at offset {offset}, len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_aligned_destination_is_filled_without_a_bounce() {
+        // The whole point of the API: when the caller's buffer is aligned and
+        // the range is whole sectors, the drive writes into it directly. If
+        // this regresses to `false` the copy is back and nobody would notice.
+        let data = pattern(4096 * 8);
+        let tmp = Temp::with(&data);
+        let f = DirectFile::open(&tmp.0).expect("open");
+
+        let mut buf = AlignedBuf::new(4096 * 2);
+        let copied = f.read_at_into(4096, &mut buf[..4096 * 2]).expect("read");
+        assert_eq!(&buf[..4096 * 2], &data[4096..4096 * 3]);
+        if f.mode() == IoMode::Direct {
+            assert_eq!(copied, 0, "an aligned whole-sector read still bounced");
+        }
+
+        // Mismatched residues: nothing can land in place, and it must say so
+        // rather than quietly returning wrong bytes.
+        let copied = f.read_at_into(17, &mut buf[..4096]).expect("read");
+        assert_eq!(&buf[..4096], &data[17..17 + 4096]);
+        if f.mode() == IoMode::Direct {
+            assert_eq!(copied, 4096, "a bounced read claimed to be direct");
+        }
+    }
+
+    #[test]
+    fn a_skewed_destination_transfers_all_but_the_edge_sectors() {
+        // The finding this API exists for: GGUF pads tensor data to 32 bytes,
+        // so real tensors start mid-sector. Matching the destination's residue
+        // to the file's turns a whole-range copy into two edge fragments.
+        let data = pattern(4096 * 40);
+        let tmp = Temp::with(&data);
+        let f = DirectFile::open(&tmp.0).expect("open");
+
+        let offset = 4096 * 3 + 2816;
+        // The copied amount must be *constant* in the length of the read, not
+        // proportional to it. That is the whole property: at the 4.25 MiB an
+        // expert slice actually is, one sector is 0.09% and rounds to free.
+        for len in [4096 * 8, 4096 * 16, 4096 * 32] {
+            let mut buf = SkewedBuf::new(len, SkewedBuf::skew_for(offset));
+            assert!(buf.has_skew(2816), "buffer did not get the requested skew");
+
+            let copied = f.read_at_into(offset, &mut buf).expect("read");
+            assert_eq!(&buf[..], &data[offset as usize..offset as usize + len]);
+            if f.mode() == IoMode::Direct {
+                assert_eq!(copied, ALIGN, "expected exactly the two edge fragments at len {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn reading_into_past_the_end_is_an_error_not_garbage() {
+        let data = pattern(8192);
+        let tmp = Temp::with(&data);
+        let f = DirectFile::open(&tmp.0).expect("open");
+
+        let mut buf = vec![0u8; 1000];
+        assert!(f.read_at_into(8000, &mut buf).is_err());
+        assert!(f.read_at_into(u64::MAX, &mut buf).is_err());
+        assert!(f.read_at_into(0, &mut []).is_ok(), "empty read is a no-op");
     }
 
     #[test]

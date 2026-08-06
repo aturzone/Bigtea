@@ -78,6 +78,87 @@ impl AlignedBuf {
     }
 }
 
+/// A heap buffer whose start address is congruent to `skew` modulo [`ALIGN`].
+///
+/// # Why anyone would want a *deliberately* misaligned buffer
+///
+/// Direct I/O can only transfer when the file offset and the memory address
+/// agree modulo the sector size. GGUF pads tensor data to `general.alignment`,
+/// which defaults to **32** — so a real container puts the experts of
+/// `blk.5.ffn_up_exps.weight` at file offsets ≡ 2816 (mod 4096). Reading those
+/// into an aligned buffer can never be direct: every byte has to bounce through
+/// a scratch buffer and be copied into place.
+///
+/// Skewing the destination by the same 2816 makes the residues match, and the
+/// drive writes straight into the caller's memory. The skew is not a hack
+/// around alignment — it is alignment, measured from the file rather than from
+/// zero.
+///
+/// Because every expert slice in a stacked tensor is the same size, they all
+/// share one residue, so a single skew serves the whole stack.
+pub struct SkewedBuf {
+    inner: AlignedBuf,
+    skew: usize,
+    len: usize,
+}
+
+impl SkewedBuf {
+    /// A buffer of `len` bytes whose first byte sits at an address ≡ `skew`.
+    ///
+    /// # Panics
+    /// If `skew >= ALIGN`, which would mean the caller computed it wrong
+    /// rather than merely chose it oddly.
+    pub fn new(len: usize, skew: usize) -> Self {
+        assert!(skew < ALIGN, "skew {skew} must be less than one sector");
+        // One extra sector so a direct read of the aligned middle, which may
+        // start before the view does, always has room.
+        let inner = AlignedBuf::new(skew + len + ALIGN);
+        SkewedBuf { inner, skew, len }
+    }
+
+    /// The skew the drive must see for reads into this buffer to be direct:
+    /// `file_offset % ALIGN`.
+    pub fn skew_for(file_offset: u64) -> usize {
+        (file_offset % ALIGN as u64) as usize
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// True when the view really does start at the requested residue.
+    pub fn has_skew(&self, skew: usize) -> bool {
+        self[..].as_ptr() as usize % ALIGN == skew
+    }
+}
+
+impl Deref for SkewedBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.inner[self.skew..self.skew + self.len]
+    }
+}
+
+impl DerefMut for SkewedBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        let (skew, len) = (self.skew, self.len);
+        &mut self.inner[skew..skew + len]
+    }
+}
+
+impl std::fmt::Debug for SkewedBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SkewedBuf")
+            .field("len", &self.len)
+            .field("skew", &self.skew)
+            .finish()
+    }
+}
+
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
         if self.len == 0 {

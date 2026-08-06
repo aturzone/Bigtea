@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "bigtea-ggml",
  "bigtea-gguf",
+ "bigtea-io",
  "bigtea-model",
  "bigtea-probe",
  "bigtea-tokenizer",

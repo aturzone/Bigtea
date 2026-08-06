@@ -37,5 +37,5 @@
 mod aligned;
 mod direct;
 
-pub use aligned::{align_down, align_up, AlignedBuf, ALIGN};
+pub use aligned::{align_down, align_up, AlignedBuf, SkewedBuf, ALIGN};
 pub use direct::{DirectFile, IoMode};

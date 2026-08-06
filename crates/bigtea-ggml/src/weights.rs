@@ -61,6 +61,30 @@ pub(crate) struct RawTensor {
     pub padding: [u8; 8],
 }
 
+/// Bytes a bound tensor may point into.
+///
+/// Anything heap-allocated that derefs to `[u8]` qualifies: `Vec<u8>`,
+/// `Arc<[u8]>`, and the aligned and skewed buffers the I/O layer reads into.
+/// The trait exists so [`WeightSet`] can hold **the caller's own allocation**
+/// rather than converting it.
+///
+/// That conversion was not free. `bind` previously took `impl Into<Arc<[u8]>>`,
+/// and `Arc<[u8]>: From<Vec<u8>>` allocates a second buffer and copies every
+/// byte into it — on the streaming path, a full extra copy of every expert
+/// slice of every token, purely to change the shape of a pointer.
+pub trait WeightBytes: Send + Sync + 'static {
+    fn as_bytes(&self) -> &[u8];
+}
+
+impl<T> WeightBytes for T
+where
+    T: std::ops::Deref<Target = [u8]> + Send + Sync + 'static,
+{
+    fn as_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
 /// Weights bound into a `ggml` context, backed by memory we own.
 ///
 /// Buffers are held here so they outlive every tensor pointing into them.
@@ -74,7 +98,7 @@ pub struct WeightSet<'ctx> {
     /// the cache and copying it again into the binder — around a gigabyte of
     /// memcpy per token, for bytes that never change. An `Arc` clone is a
     /// refcount bump, and the address is as stable as a `Box`'s.
-    _buffers: Vec<Arc<[u8]>>,
+    _buffers: Vec<Arc<dyn WeightBytes>>,
 }
 
 impl<'ctx> WeightSet<'ctx> {
@@ -97,7 +121,20 @@ impl<'ctx> WeightSet<'ctx> {
         name: &str,
         ty: GgmlType,
         dims: &[u64],
-        data: impl Into<Arc<[u8]>>,
+        data: impl WeightBytes,
+    ) -> Result<(), GgmlError> {
+        self.bind_shared(ctx, name, ty, dims, Arc::new(data))
+    }
+
+    /// Bind bytes that are already shared — the expert cache's case, where the
+    /// same slice is bound again on every token that routes to it.
+    pub fn bind_shared(
+        &mut self,
+        ctx: &'ctx Context,
+        name: &str,
+        ty: GgmlType,
+        dims: &[u64],
+        data: Arc<dyn WeightBytes>,
     ) -> Result<(), GgmlError> {
         let (ne0, ne1) = match dims {
             [] => return Err(GgmlError::WrongSize { expected: 1, actual: 0 }),
@@ -111,16 +148,15 @@ impl<'ctx> WeightSet<'ctx> {
         let tensor = ctx.new_typed_2d(ty, ne0, ne1)?;
 
         // The buffer must outlive the tensor, and its address must not move.
-        let shared: Arc<[u8]> = data.into();
+        // Both hold: the bytes live behind an `Arc` this set owns, and moving
+        // the `Arc` moves the pointer, never the allocation.
         let expected = tensor.bytes();
-        if shared.len() != expected {
-            return Err(GgmlError::WrongSize {
-                expected,
-                actual: shared.len(),
-            });
+        let actual = data.as_bytes().len();
+        if actual != expected {
+            return Err(GgmlError::WrongSize { expected, actual });
         }
-        let ptr = shared.as_ptr() as *mut c_void;
-        self._buffers.push(shared);
+        let ptr = data.as_bytes().as_ptr() as *mut c_void;
+        self._buffers.push(data);
 
         // SAFETY: `tensor` is a live tensor in `ctx`, created with no_alloc so
         // its `data` is null and nothing is orphaned by overwriting it. `ptr`
@@ -147,7 +183,7 @@ impl<'ctx> WeightSet<'ctx> {
     /// Bytes held. Should equal what the loader reported — if it does not,
     /// something was copied that should have been borrowed.
     pub fn bytes(&self) -> usize {
-        self._buffers.iter().map(|b| b.len()).sum()
+        self._buffers.iter().map(|b| b.as_bytes().len()).sum()
     }
 }
 

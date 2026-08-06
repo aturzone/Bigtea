@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 bigtea-gguf = { path = "../bigtea-gguf" }
 bigtea-ggml = { path = "../bigtea-ggml" }
+bigtea-io = { path = "../bigtea-io" }
 bigtea-model = { path = "../bigtea-model" }
 bigtea-probe = { path = "../bigtea-probe" }
 bigtea-tokenizer = { path = "../bigtea-tokenizer" }
