@@ -280,3 +280,23 @@
 2|ffn_gates.post_sigmoid|1.242566
 2|ffn_gates.post|2.485133
 2|ffn_gates.comb|19.999983
+# Layer 2's CSA compressor, from v4flash-layer2-oracle-5tok.txt.
+# ratio 4, so exactly one block completes at five tokens: n_blocks = 1.
+2|csa_state_kv|-0.462958
+2|csa_state_score|-40.580250
+2|csa_ape_rows|-485.705994
+2|csa_state_score_ape|-526.286499
+2|csa_gathered|0.451978
+2|csa_kv_prev|0.000000
+2|csa_kv_cur|5.799850
+2|csa_values_perm|5.799858
+2|csa_weights|511.999969
+2|csa_weighted|0.745368
+2|csa_summed|0.745372
+2|csa_comp_raw|0.745372
+2|csa_comp_rms|4.493681
+2|csa_comp_normed|5.163465
+2|csa_comp_nope|14.042590
+2|csa_comp_pe_in|-8.879123
+2|csa_comp_pe|-8.879123
+2|csa_comp|5.163465

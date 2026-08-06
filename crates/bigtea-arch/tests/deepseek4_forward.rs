@@ -1761,6 +1761,299 @@ fn output_head(
     out
 }
 
+/// **The CSA compressor**, for a prefill from an empty cache.
+///
+/// Every compressed-sparse layer keeps a running summary of the raw KV it has
+/// seen: one entry per completed block of `ratio` positions, each a
+/// score-weighted average over `2*ratio` raw positions — two windows, which is
+/// what "overlap" means. Attention then attends to the raw window *and* these
+/// summaries.
+///
+/// # Why the persistent cache is not needed here
+///
+/// llama.cpp reads this state through index tensors computed in
+/// `llama-kv-cache-dsv4.cpp` (1978 lines). But `state_source_idx` resolves to an
+/// appended zero row when `pos < 0` and to the **current ubatch** otherwise, so
+/// on a prefill from empty the persistent ring is never read. The indices are
+/// then constructible directly, which is what this does. Generation, where
+/// earlier ubatches are read back, will need the real ring.
+///
+/// At five tokens with `ratio = 4`: one completed block, so `n_blocks = 1`, the
+/// previous window is four copies of the zero row and the current window is
+/// positions 0-3. Position 4 belongs to no completed block yet.
+///
+/// # The shape that hides a bug
+///
+/// The state is `2*n_embd_head` wide — **two entries per row**. `kv_prev` reads
+/// the first 512 of one set of rows and `kv_cur` the *second* 512 of the next
+/// set. Reading it as one entry per row gives a correctly-shaped compressor
+/// summarising the wrong span, with no error.
+fn csa_compressor_5tok<'c>(
+    s: &LayerSums,
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    config: &Deepseek4Config,
+    attn_norm: &Tensor<'c>,
+) -> Tensor<'c> {
+    let il = s.il;
+    let nt = s.tokens.len() as i64;
+    let ratio = Deepseek4Config::CSA_RATIO;
+    let head = config.kv_lora_rank as i64;
+    let wide = 2 * head; // the state's row width: two entries per row
+    let n_blocks = nt / ratio;
+    assert!(n_blocks > 0, "no block completes at {nt} tokens");
+    let n_read = ratio * n_blocks;
+    // The persistent CSA state, all zeros on a prefill. Its height only has to
+    // be large enough for the indices below to land inside it.
+    let state_rows = 8i64;
+
+    let kv = ctx
+        .mul_mat(
+            weights
+                .get(&format!("blk.{il}.attn_compressor_kv.weight"))
+                .expect("bound"),
+            attn_norm,
+        )
+        .expect("csa_state_kv");
+    ctx.compute(&kv, 12).expect("compute");
+    check(s, "csa_state_kv", kv.to_vec_f32().iter().sum::<f32>());
+
+    let score = ctx
+        .mul_mat(
+            weights
+                .get(&format!("blk.{il}.attn_compressor_gate.weight"))
+                .expect("bound"),
+            attn_norm,
+        )
+        .expect("csa_state_score");
+    ctx.compute(&score, 12).expect("compute");
+    check(s, "csa_state_score", score.to_vec_f32().iter().sum::<f32>());
+
+    // The gate gets an absolute-position embedding indexed by the token's
+    // offset *within its block*, not by its absolute position.
+    let state_pos: Vec<i32> = (0..nt).map(|p| (p % ratio) as i32).collect();
+    let pos_t = ctx.new_i32_1d(nt).expect("state_pos");
+    pos_t.set_i32(&state_pos).expect("set");
+    let ape = ctx
+        .get_rows(
+            weights
+                .get(&format!("blk.{il}.attn_compressor_ape.weight"))
+                .expect("bound"),
+            &pos_t,
+        )
+        .expect("ape rows");
+    ctx.compute(&ape, 12).expect("compute");
+    check(s, "csa_ape_rows", ape.to_vec_f32().iter().sum::<f32>());
+
+    let score = ctx.add(&score, &ape).expect("score + ape");
+    ctx.compute(&score, 12).expect("compute");
+    check(s, "csa_state_score_ape", score.to_vec_f32().iter().sum::<f32>());
+
+    // Assemble the state as llama.cpp's graph does: [empty ring | this ubatch |
+    // one appended row]. The appended row is zero for values and -inf for
+    // scores, so the softmax below ignores the padding rather than averaging
+    // it in.
+    let total = state_rows + nt + 1;
+    let kv_state = {
+        let mut v = vec![0.0f32; (state_rows * wide) as usize];
+        v.extend_from_slice(&kv.to_vec_f32());
+        v.extend(std::iter::repeat(0.0f32).take(wide as usize));
+        let t = ctx.new_f32_2d(wide, total).expect("kv state");
+        t.set_f32(&v).expect("fill kv state");
+        t
+    };
+    let score_state = {
+        let mut v = vec![0.0f32; (state_rows * wide) as usize];
+        v.extend_from_slice(&score.to_vec_f32());
+        v.extend(std::iter::repeat(f32::NEG_INFINITY).take(wide as usize));
+        let t = ctx.new_f32_2d(wide, total).expect("score state");
+        t.set_f32(&v).expect("fill score state");
+        t
+    };
+
+    // The read indices: every block's previous window first, then every
+    // block's current window. A negative position means the zero row.
+    let zero_row = (state_rows + nt) as i32;
+    let mut idxs: Vec<i32> = Vec::with_capacity((2 * n_read) as usize);
+    for b in 0..n_blocks {
+        let start = b * ratio - ratio;
+        for j in 0..ratio {
+            let p = start + j;
+            idxs.push(if p < 0 { zero_row } else { (state_rows + p) as i32 });
+        }
+    }
+    for b in 0..n_blocks {
+        let start = b * ratio;
+        for j in 0..ratio {
+            idxs.push((state_rows + start + j) as i32);
+        }
+    }
+    let idx_t = ctx.new_i32_1d(2 * n_read).expect("idxs");
+    idx_t.set_i32(&idxs).expect("set idxs");
+
+    let f32_size = std::mem::size_of::<f32>();
+    let row = wide as usize * f32_size;
+
+    let split = |src: &Tensor<'c>, is_kv: bool| -> Tensor<'c> {
+        let rows = ctx.get_rows(src, &idx_t).expect("gather");
+        ctx.compute(&rows, 12).expect("compute");
+        if is_kv {
+            check(s, "csa_gathered", rows.to_vec_f32().iter().sum::<f32>());
+        }
+        // First 512 of the first n_read rows; second 512 of the next n_read.
+        let prev = ctx
+            .cont(&ctx.view_2d(&rows, head, n_read, row, 0).expect("prev view"))
+            .expect("prev");
+        let cur = ctx
+            .cont(
+                &ctx.view_2d(
+                    &rows,
+                    head,
+                    n_read,
+                    row,
+                    n_read as usize * row + head as usize * f32_size,
+                )
+                .expect("cur view"),
+            )
+            .expect("cur");
+        let prev = ctx.reshape_3d(&prev, head, ratio, n_blocks).expect("prev 3d");
+        let cur = ctx.reshape_3d(&cur, head, ratio, n_blocks).expect("cur 3d");
+        if is_kv {
+            ctx.compute(&prev, 12).expect("compute");
+            check(s, "csa_kv_prev", prev.to_vec_f32().iter().sum::<f32>());
+            ctx.compute(&cur, 12).expect("compute");
+            check(s, "csa_kv_cur", cur.to_vec_f32().iter().sum::<f32>());
+        }
+        let joined = ctx.concat(&prev, &cur, 1).expect("concat windows");
+        ctx.cont(&ctx.permute(&joined, [1, 0, 2, 3]).expect("permute"))
+            .expect("cont")
+    };
+
+    let values = split(&kv_state, true);
+    ctx.compute(&values, 12).expect("compute values");
+    check(s, "csa_values_perm", values.to_vec_f32().iter().sum::<f32>());
+    let scores = split(&score_state, false);
+
+    let w = ctx.soft_max(&scores).expect("softmax scores");
+    ctx.compute(&w, 12).expect("compute weights");
+    check(s, "csa_weights", w.to_vec_f32().iter().sum::<f32>());
+
+    let weighted = ctx.mul(&values, &w).expect("weight values");
+    ctx.compute(&weighted, 12).expect("compute weighted");
+    check(s, "csa_weighted", weighted.to_vec_f32().iter().sum::<f32>());
+
+    let summed = ctx.sum_rows(&weighted).expect("sum_rows");
+    ctx.compute(&summed, 12).expect("compute summed");
+    check(s, "csa_summed", summed.to_vec_f32().iter().sum::<f32>());
+
+    let comp = ctx
+        .cont(&ctx.permute(&summed, [1, 0, 2, 3]).expect("permute back"))
+        .expect("cont");
+    ctx.compute(&comp, 12).expect("compute comp");
+    check(s, "csa_comp_raw", comp.to_vec_f32().iter().sum::<f32>());
+
+    let normed = ctx.rms_norm(&comp, config.rms_eps).expect("comp rms");
+    ctx.compute(&normed, 12).expect("compute");
+    check(s, "csa_comp_rms", normed.to_vec_f32().iter().sum::<f32>());
+
+    let comp = ctx
+        .mul(
+            &normed,
+            weights
+                .get(&format!("blk.{il}.attn_compressor_norm.weight"))
+                .expect("bound"),
+        )
+        .expect("comp norm");
+    ctx.compute(&comp, 12).expect("compute");
+    check(s, "csa_comp_normed", comp.to_vec_f32().iter().sum::<f32>());
+
+    // Rotated at the *block* position, which is 0 for the first block — so at
+    // five tokens this rotation is the identity and is NOT verified here. Same
+    // shape of hole as the one-token capture had for the main RoPE.
+    let n_rot = config.n_rot as i64;
+    let n_nope = config.n_rot_none() as i64;
+    let head_stride = head as usize * f32_size;
+    let nope = ctx
+        .view_3d(&comp, n_nope, 1, n_blocks, head_stride, head_stride, 0)
+        .expect("comp nope");
+    ctx.compute(&nope, 12).expect("compute");
+    check(s, "csa_comp_nope", nope.to_vec_f32().iter().sum::<f32>());
+
+    let pe_in = ctx
+        .view_3d(
+            &comp,
+            n_rot,
+            1,
+            n_blocks,
+            head_stride,
+            head_stride,
+            n_nope as usize * f32_size,
+        )
+        .expect("comp pe view");
+    ctx.compute(&pe_in, 12).expect("compute");
+    check(s, "csa_comp_pe_in", pe_in.to_vec_f32().iter().sum::<f32>());
+
+    let comp_pos = ctx.new_i32_1d(n_blocks).expect("comp_pos");
+    let block_pos: Vec<i32> = (0..n_blocks).map(|b| (b * ratio) as i32).collect();
+    comp_pos.set_i32(&block_pos).expect("set comp_pos");
+    let (rope, rope_orig) = rope_for(config, il);
+    let pe = ctx
+        .rope_ext(
+            &pe_in,
+            &comp_pos,
+            None,
+            n_rot as i32,
+            ROPE_MODE_NORM,
+            rope_orig,
+            rope,
+        )
+        .expect("comp rope");
+    ctx.compute(&pe, 12).expect("compute");
+    check(s, "csa_comp_pe", pe.to_vec_f32().iter().sum::<f32>());
+
+    let out = ctx.concat(&nope, &pe, 0).expect("concat comp");
+    ctx.compute(&out, 12).expect("compute comp out");
+    check(s, "csa_comp", out.to_vec_f32().iter().sum::<f32>());
+    out
+}
+
+/// The CSA compressor, checked against llama.cpp on layer 2 at five tokens.
+///
+/// Layer 2 is the first Compressed Sparse layer, and at five tokens it is the
+/// first length at which a block actually completes (`ratio` is 4). This is the
+/// first piece of compressed attention to exist at all.
+#[test]
+#[ignore = "reads weights from a 144 GB container"]
+fn csa_compressor_matches_llama_cpp() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+
+    let ctx = Context::new(2048 << 20).expect("compute context");
+    let wctx = Context::new_no_alloc(32 << 20).expect("weight context");
+    let mut weights = WeightSet::new();
+    for il in 0..3u32 {
+        bind_all(&model, &wctx, &mut weights, &block_weights(il));
+        bind_all(&model, &wctx, &mut weights, &optional_block_weights(&model, il));
+    }
+    let comp: Vec<String> = [
+        "attn_compressor_kv",
+        "attn_compressor_gate",
+        "attn_compressor_ape",
+        "attn_compressor_norm",
+    ]
+    .iter()
+    .map(|x| format!("blk.2.{x}.weight"))
+    .collect();
+    bind_all(&model, &wctx, &mut weights, &comp);
+
+    let l0 = layer0_5tok(&sums_5tok(0), &model, &ctx, &wctx, &mut weights, &config);
+    let l1 = layer_5tok(&sums_5tok(1), &model, &ctx, &wctx, &mut weights, &config, &l0);
+
+    let s = sums_5tok(2);
+    let p = layer_entry_5tok(&s, &ctx, &weights, &config, &l1);
+    let _ = csa_compressor_5tok(&s, &ctx, &weights, &config, &p.attn_norm);
+}
+
 /// Read just the named experts out of a stacked tensor and bind them as a
 /// compact stack, returning `(bytes read, the compact dims)`.
 ///
