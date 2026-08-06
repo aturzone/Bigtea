@@ -76,6 +76,15 @@ fn main() {
         _ => println!("cargo:rustc-link-lib=dylib=stdc++"),
     }
 
+    // On Apple platforms ggml's cmake enables Accelerate by default and calls
+    // into vDSP for the vector kernels. Without the framework the link ends in
+    // `Undefined symbols for architecture arm64: _vDSP_vadd, _vDSP_vmul, ...`
+    // — a list that names Apple's library rather than ggml, which is why it is
+    // easy to misread as a ggml problem.
+    if matches!(target_os.as_str(), "macos" | "ios") {
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+    }
+
     // ggml's quantization kernels *may* be built with OpenMP, in which case
     // GOMP_* symbols must resolve or the link fails with a wall of undefined
     // references from ggml-quants.c and nothing else.

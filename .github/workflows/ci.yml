@@ -85,7 +85,12 @@ jobs:
         # ggml's static archives are produced by MSYS2's gcc and pull in libgomp,
         # which the MSVC linker cannot resolve.
         if: runner.os == 'Windows'
-        run: rustup default stable-x86_64-pc-windows-gnu
+        # `rust-toolchain` installed clippy for the MSVC toolchain; switching
+        # default does not bring components across, so add them here or the
+        # lint step fails with "cargo-clippy.exe is not installed".
+        run: |
+          rustup default stable-x86_64-pc-windows-gnu
+          rustup component add clippy --toolchain stable-x86_64-pc-windows-gnu
 
       # ggml must be built by the *same* toolchain that links it. The Visual
       # Studio generator emits COFF `.lib` archives, which the GNU linker Bigtea
