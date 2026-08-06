@@ -110,3 +110,54 @@ every byte of a chosen expert must be read, and that assumption is the weakest o
 stack** — the router's 6-of-256 is the *first* sparsity, and the literature says there is a
 second one worth 5-10x sitting inside it, unexploited. That is where a step change lives, if
 one exists.
+
+## MEASURED (2026-08-06): the experiment above, run
+
+`sparse_row_reads_versus_whole_slice` in `tests/deepseek4_forward.rs`. One expert slice of
+`blk.5.ffn_up_exps.weight` — 4.25 MiB, 2048 rows of 2176 B — read three ways, cache-bypassing,
+each repetition on a different expert so the previous read cannot help:
+
+```
+whole slice        1.06 GiB/s      what the runner does today
+10% scattered      0.02 GiB/s      what a naive sparsity predictor would ask for
+10% packed         0.75 GiB/s      the same bytes, contiguous
+```
+
+**Reading 10% of the rows as scattered fragments takes 4.45x LONGER than reading all 100%.**
+A 2176-byte read is far below this NVMe's efficient size, and 205 of them cost more than one
+4.25 MiB read. Contextual sparsity implemented directly against the current layout is not a
+5-10x win, it is a **4.5x regression**.
+
+**The same 10%, contiguous, takes 0.14x the time — a 7.1x win, and a 31x difference between
+the two layouts.**
+
+So the finding is sharper than the hypothesis. Contextual sparsity is real and worth ~7x on
+this hardware, but it is **entirely a layout problem, not a prediction problem**. The predictor
+is the easy half; the hard requirement is an offline repack of the expert tensors that orders
+each expert's rows by activation frequency so the hot fraction is one contiguous span.
+
+### What this does to the stack
+
+```
+3288 MB/token
+  ÷ 7.1   packed contextual sparsity   ->  463 MB      0.87 -> 6.2 tok/s
+  ÷ 2.2   speculative decoding         ->  210 MB      -> 13.6 tok/s
+  ÷ 1.7   2.5-bit experts              ->  124 MB      -> 23 tok/s
+  ÷ 2.0   50% cache hits               ->   62 MB      -> 28+ tok/s
+```
+
+The first two alone give **~13.6 tok/s, which is coding-agent territory and 30x llama.cpp**,
+and neither needs new numerics — one is a container repack, the other is a published
+technique. That is the realistic target. The last two are quality-risky and RAM-bound
+respectively, and are what would take it to 28.
+
+### Why the repack is cheap to get right
+
+The row ordering does not have to be perfect or even per-token: activation frequency is a
+static property measurable by running a calibration corpus once and counting. Rows that are hot
+for *most* tokens go first. A predictor then only has to decide *how many* leading rows to
+read, not which — which turns a scattered gather into a prefix read, the friendliest possible
+pattern for an SSD.
+
+**That is the big bang, and it is an offline data-layout change plus a prefix read.** No new
+kernel, no new quantiser, no accuracy loss — the same weights in a different order.

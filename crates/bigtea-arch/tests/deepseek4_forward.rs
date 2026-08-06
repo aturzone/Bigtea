@@ -2922,3 +2922,112 @@ fn the_library_forward_pass_matches_llama_cpp() {
         .expect("non-empty logits");
     eprintln!("  library predicts token {best} after {:?}", TOKENS_2);
 }
+
+/// **Does contextual sparsity survive contact with the disk?**
+///
+/// The router picks 6 experts of 256. Inside a chosen expert there is a
+/// *second* sparsity — for one token, 80-95% of the 2048 intermediate SwiGLU
+/// neurons are near zero after `silu` and contribute nothing, so only their rows
+/// of `up` and columns of `down` are needed. Deja Vu (2310.17157) and PowerInfer
+/// (2312.12456) both build on it, and at 90% it would be 3.21 GiB/token → 0.32,
+/// which is ~8 tok/s on this laptop instead of 0.87.
+///
+/// **The catch is that fewer bytes is not less time.** This project measured
+/// whole-slice reads at 1.10 GB/s against 2.55 GB/s sequential; scattered rows
+/// are far smaller than a slice, and a 2 KB random read is nothing like a 12.7
+/// MiB one. If reading 10% of the rows costs more than reading all of them, the
+/// idea is dead in this form and the fix is a layout change — repack experts
+/// with rows ordered by activation frequency so the hot fraction is contiguous.
+///
+/// This decides it, before any predictor or kernel is built.
+#[test]
+#[ignore = "reads from a 144 GB container; a disk benchmark, not a correctness test"]
+fn sparse_row_reads_versus_whole_slice() {
+    let Some(model) = open() else { return };
+    let name = "blk.5.ffn_up_exps.weight";
+    let loc = model.location(name).expect("expert tensor present").clone();
+    let n_expert = *loc.dims.last().expect("stacked");
+    let slice = loc.size / n_expert;
+    let n_rows = loc.dims[1];
+    let row = slice / n_rows;
+
+    eprintln!(
+        "  slice {:.2} MiB, {} rows of {} B",
+        slice as f64 / (1 << 20) as f64,
+        n_rows,
+        row
+    );
+
+    // Warm nothing: every read below is cache-bypassing, and each uses a
+    // different expert so the previous one cannot help.
+    let mut expert = 0u64;
+    let mut next = || {
+        expert = (expert + 37) % n_expert;
+        expert
+    };
+
+    // (a) the whole slice, one contiguous read — what the runner does today.
+    let mut whole = 0f64;
+    let reps = 8;
+    for _ in 0..reps {
+        let off = next() * slice;
+        let t = std::time::Instant::now();
+        let got = model.read_tensor_range(name, off, slice).expect("read slice");
+        whole += t.elapsed().as_secs_f64();
+        std::hint::black_box(&got);
+    }
+    let whole_mb = (slice * reps) as f64 / (1 << 20) as f64;
+
+    // (b) 10% of the rows, scattered — what a sparsity predictor would ask for.
+    let keep = (n_rows / 10).max(1);
+    let mut sparse = 0f64;
+    let mut sparse_bytes = 0u64;
+    for _ in 0..reps {
+        let base = next() * slice;
+        let t = std::time::Instant::now();
+        for i in 0..keep {
+            // Spread across the slice, as active neurons would be.
+            let r = (i * 10 + 3) % n_rows;
+            let got = model
+                .read_tensor_range(name, base + r * row, row)
+                .expect("read row");
+            std::hint::black_box(&got);
+        }
+        sparse += t.elapsed().as_secs_f64();
+        sparse_bytes += keep * row;
+    }
+    let sparse_mb = sparse_bytes as f64 / (1 << 20) as f64;
+
+    eprintln!("  whole slice   {whole:6.2}s  {whole_mb:8.1} MiB  {:5.2} GiB/s",
+        whole_mb / 1024.0 / whole);
+    eprintln!("  10% of rows   {sparse:6.2}s  {sparse_mb:8.1} MiB  {:5.2} GiB/s",
+        sparse_mb / 1024.0 / sparse);
+    // (c) the same 10% of bytes, but CONTIGUOUS -- what an offline repack that
+    // orders rows by activation frequency would produce. Same bytes as (b),
+    // one read instead of .
+    let hot = keep * row;
+    let mut packed = 0f64;
+    for _ in 0..reps {
+        let off = next() * slice;
+        let t = std::time::Instant::now();
+        let got = model.read_tensor_range(name, off, hot).expect("read hot span");
+        packed += t.elapsed().as_secs_f64();
+        std::hint::black_box(&got);
+    }
+    eprintln!("  10% packed    {packed:6.2}s  {sparse_mb:8.1} MiB  {:5.2} GiB/s",
+        sparse_mb / 1024.0 / packed);
+
+    eprintln!(
+        "  VERDICT: reading 10% of the bytes takes {:.2}x the time of reading 100%",
+        sparse / whole
+    );
+    eprintln!(
+        "           but PACKED the same 10% takes {:.2}x -- a {:.0}x layout win",
+        packed / whole,
+        sparse / packed
+    );
+    eprintln!(
+        "           so contextual sparsity is worth {:.2}x here, not 10x",
+        whole / sparse
+    );
+}
