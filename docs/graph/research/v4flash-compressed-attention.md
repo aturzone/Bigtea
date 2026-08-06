@@ -77,9 +77,17 @@ and `lid_state_compress` (11 rows) both run. `lid_state_compress_rot` applies a 
 rotation (`llama_mul_mat_hadamard`) that no other path uses. `ggml_lightning_indexer` is
 already bound, so the indexer scoring itself is a call, not an implementation.
 
-## Two holes in the *verified* work that these layers expose
+## Two holes in the *verified* work — BOTH NOW CLOSED (2026-08-06)
 
-Both are cases where passing tests cover less than they appear to.
+Closed not by building the compressed attention, but by capturing a **shorter** prompt.
+The compressed builders are guarded on their compressed caches being populated
+(`deepseek4.cpp:1049-1063`); at **two tokens** those caches are empty, so layers 2 and 3
+fall through to `build_raw_attention` — already built, already verified. Their compressor
+projections still run; nothing reads them at that length.
+
+Layers 0-3 now run end to end at two tokens, finishing on `next_norm-3` = 427.686554, the
+exact tensor layer 4 receives. Both items below executed for the first time. Kept as written
+because the *reasoning* still applies to the compressed paths, which remain unbuilt.
 
 **The compressed RoPE branch has never run.** `Deepseek4Config::rope_for_layer` returns
 YaRN parameters (base 160000) for all 41 compressed layers, transcribed from
@@ -118,6 +126,8 @@ the harder one and CSA must be built first.**
 Recorded rather than quietly fixed, because the mistake is instructive: "smallest next step"
 was chosen by looking at the two kinds in isolation and not at what feeds what.
 
+0. ~~Both holes~~ **closed** — see above. A shorter capture reached further than a longer
+   one, which is the opposite of the intuition that produced the original ordering.
 1. ~~Finish layer 1~~ **done** — both `Raw` layers run in full through one generic layer
    function, and the helpers now take a block index plus a table of that layer's sums.
 2. ~~The seam into layer 2~~ **done** — a layer's *entry* (hyper-connection gates,
@@ -131,8 +141,24 @@ was chosen by looking at the two kinds in isolation and not at what feeds what.
 5. **A capture longer than 128 tokens**, to make HCA's compression observable at all — at
    five tokens `hca_state_compress` never runs.
 
-### A shortcut worth considering for step 3
+### The shortcut, tried and better than expected
 
-CSA compresses every 4 tokens. **A capture of 3 or fewer tokens would reduce layer 2 to CSA
-without any compression**, leaving only the indexer over raw keys — a strictly smaller first
-target, and positions 1-2 still make RoPE checkable. Untried, but cheap to find out.
+The guess was that ≤3 tokens would reduce CSA to "the indexer over raw keys". It does more
+than that: **at two tokens the compressed builders do not run at all.** The whole of layers
+2 and 3 goes through the Raw path.
+
+### What stops this from covering all 43 layers today
+
+Memory, not correctness. Four layers in one `ggml` context needs a 2.5 GiB arena, and each
+layer's routed experts add ~150 MiB of slices at two tokens. Eight layers would want ~5 GiB
+of arena alone, against 5.2 GiB free on this machine.
+
+Freeing a layer's weights as the chain advances is **not** safe as the code stands: every
+`compute` rebuilds the graph back through its sources, and a dropped weight buffer leaves a
+dangling pointer that reads freed memory *successfully*.
+
+The fix is a **per-layer context**: give each layer its own arena and `WeightSet`, seed it
+from the previous layer's output as a plain `Vec<f32>`, and drop the whole thing before the
+next. That bounds memory to one layer regardless of depth — and it is what the streaming
+runner has to do anyway, so it is not scaffolding. That is the next structural step, and it
+is what would let all 43 layers be verified in one run.
