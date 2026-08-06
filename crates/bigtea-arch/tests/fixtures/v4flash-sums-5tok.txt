@@ -300,3 +300,25 @@
 2|csa_comp_pe_in|-8.879123
 2|csa_comp_pe|-8.879123
 2|csa_comp|5.163465
+# Layer 2's INDEXER compressor: same overlap compressor, head 128 not 512,
+# indexer_compressor_* weights, and a Walsh-Hadamard rotation afterwards that
+# the attention compressor does not get.
+2|lid_state_kv|20.726961
+2|lid_state_score|-111.030731
+2|lid_ape_rows|-42.738277
+2|lid_state_score_ape|-153.769058
+2|lid_gathered|17.928518
+2|lid_kv_prev|0.000000
+2|lid_kv_cur|21.197027
+2|lid_values_perm|21.197035
+2|lid_weights|128.000015
+2|lid_weighted|4.506220
+2|lid_summed|4.506221
+2|lid_comp_raw|4.506221
+2|lid_comp_rms|20.726313
+2|lid_comp_normed|27.113394
+2|lid_comp_nope|23.582695
+2|lid_comp_pe_in|3.530700
+2|lid_comp_pe|3.530700
+2|lid_comp|27.113394
+2|lid_comp_rot|-8.839934

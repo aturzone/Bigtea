@@ -1788,17 +1788,22 @@ fn output_head(
 /// the first 512 of one set of rows and `kv_cur` the *second* 512 of the next
 /// set. Reading it as one entry per row gives a correctly-shaped compressor
 /// summarising the wrong span, with no error.
-fn csa_compressor_5tok<'c>(
+fn overlap_compressor_5tok<'c>(
     s: &LayerSums,
     ctx: &'c Context,
     weights: &WeightSet<'c>,
     config: &Deepseek4Config,
     attn_norm: &Tensor<'c>,
+    // head: 512 for the attention compressor, 128 for the indexer's.
+    head: i64,
+    // wp: "attn_compressor" or "indexer_compressor".
+    wp: &str,
+    // lp: "csa" or "lid", the label prefix in the fixture.
+    lp: &str,
 ) -> Tensor<'c> {
     let il = s.il;
     let nt = s.tokens.len() as i64;
     let ratio = Deepseek4Config::CSA_RATIO;
-    let head = config.kv_lora_rank as i64;
     let wide = 2 * head; // the state's row width: two entries per row
     let n_blocks = nt / ratio;
     assert!(n_blocks > 0, "no block completes at {nt} tokens");
@@ -1810,24 +1815,24 @@ fn csa_compressor_5tok<'c>(
     let kv = ctx
         .mul_mat(
             weights
-                .get(&format!("blk.{il}.attn_compressor_kv.weight"))
+                .get(&format!("blk.{il}.{wp}_kv.weight"))
                 .expect("bound"),
             attn_norm,
         )
         .expect("csa_state_kv");
     ctx.compute(&kv, 12).expect("compute");
-    check(s, "csa_state_kv", kv.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_state_kv"), kv.to_vec_f32().iter().sum::<f32>());
 
     let score = ctx
         .mul_mat(
             weights
-                .get(&format!("blk.{il}.attn_compressor_gate.weight"))
+                .get(&format!("blk.{il}.{wp}_gate.weight"))
                 .expect("bound"),
             attn_norm,
         )
         .expect("csa_state_score");
     ctx.compute(&score, 12).expect("compute");
-    check(s, "csa_state_score", score.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_state_score"), score.to_vec_f32().iter().sum::<f32>());
 
     // The gate gets an absolute-position embedding indexed by the token's
     // offset *within its block*, not by its absolute position.
@@ -1837,17 +1842,17 @@ fn csa_compressor_5tok<'c>(
     let ape = ctx
         .get_rows(
             weights
-                .get(&format!("blk.{il}.attn_compressor_ape.weight"))
+                .get(&format!("blk.{il}.{wp}_ape.weight"))
                 .expect("bound"),
             &pos_t,
         )
         .expect("ape rows");
     ctx.compute(&ape, 12).expect("compute");
-    check(s, "csa_ape_rows", ape.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_ape_rows"), ape.to_vec_f32().iter().sum::<f32>());
 
     let score = ctx.add(&score, &ape).expect("score + ape");
     ctx.compute(&score, 12).expect("compute");
-    check(s, "csa_state_score_ape", score.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_state_score_ape"), score.to_vec_f32().iter().sum::<f32>());
 
     // Assemble the state as llama.cpp's graph does: [empty ring | this ubatch |
     // one appended row]. The appended row is zero for values and -inf for
@@ -1898,7 +1903,7 @@ fn csa_compressor_5tok<'c>(
         let rows = ctx.get_rows(src, &idx_t).expect("gather");
         ctx.compute(&rows, 12).expect("compute");
         if is_kv {
-            check(s, "csa_gathered", rows.to_vec_f32().iter().sum::<f32>());
+            check(s, &format!("{lp}_gathered"), rows.to_vec_f32().iter().sum::<f32>());
         }
         // First 512 of the first n_read rows; second 512 of the next n_read.
         let prev = ctx
@@ -1920,9 +1925,9 @@ fn csa_compressor_5tok<'c>(
         let cur = ctx.reshape_3d(&cur, head, ratio, n_blocks).expect("cur 3d");
         if is_kv {
             ctx.compute(&prev, 12).expect("compute");
-            check(s, "csa_kv_prev", prev.to_vec_f32().iter().sum::<f32>());
+            check(s, &format!("{lp}_kv_prev"), prev.to_vec_f32().iter().sum::<f32>());
             ctx.compute(&cur, 12).expect("compute");
-            check(s, "csa_kv_cur", cur.to_vec_f32().iter().sum::<f32>());
+            check(s, &format!("{lp}_kv_cur"), cur.to_vec_f32().iter().sum::<f32>());
         }
         let joined = ctx.concat(&prev, &cur, 1).expect("concat windows");
         ctx.cont(&ctx.permute(&joined, [1, 0, 2, 3]).expect("permute"))
@@ -1931,53 +1936,55 @@ fn csa_compressor_5tok<'c>(
 
     let values = split(&kv_state, true);
     ctx.compute(&values, 12).expect("compute values");
-    check(s, "csa_values_perm", values.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_values_perm"), values.to_vec_f32().iter().sum::<f32>());
     let scores = split(&score_state, false);
 
     let w = ctx.soft_max(&scores).expect("softmax scores");
     ctx.compute(&w, 12).expect("compute weights");
-    check(s, "csa_weights", w.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_weights"), w.to_vec_f32().iter().sum::<f32>());
 
     let weighted = ctx.mul(&values, &w).expect("weight values");
     ctx.compute(&weighted, 12).expect("compute weighted");
-    check(s, "csa_weighted", weighted.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_weighted"), weighted.to_vec_f32().iter().sum::<f32>());
 
     let summed = ctx.sum_rows(&weighted).expect("sum_rows");
     ctx.compute(&summed, 12).expect("compute summed");
-    check(s, "csa_summed", summed.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_summed"), summed.to_vec_f32().iter().sum::<f32>());
 
     let comp = ctx
         .cont(&ctx.permute(&summed, [1, 0, 2, 3]).expect("permute back"))
         .expect("cont");
     ctx.compute(&comp, 12).expect("compute comp");
-    check(s, "csa_comp_raw", comp.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_comp_raw"), comp.to_vec_f32().iter().sum::<f32>());
 
     let normed = ctx.rms_norm(&comp, config.rms_eps).expect("comp rms");
     ctx.compute(&normed, 12).expect("compute");
-    check(s, "csa_comp_rms", normed.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_comp_rms"), normed.to_vec_f32().iter().sum::<f32>());
 
     let comp = ctx
         .mul(
             &normed,
             weights
-                .get(&format!("blk.{il}.attn_compressor_norm.weight"))
+                .get(&format!("blk.{il}.{wp}_norm.weight"))
                 .expect("bound"),
         )
         .expect("comp norm");
     ctx.compute(&comp, 12).expect("compute");
-    check(s, "csa_comp_normed", comp.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_comp_normed"), comp.to_vec_f32().iter().sum::<f32>());
 
     // Rotated at the *block* position, which is 0 for the first block — so at
     // five tokens this rotation is the identity and is NOT verified here. Same
     // shape of hole as the one-token capture had for the main RoPE.
     let n_rot = config.n_rot as i64;
-    let n_nope = config.n_rot_none() as i64;
+    // Relative to THIS compressor's head, not the attention head:
+    // Deepseek4Config::n_rot_none() is 512-64, and the indexer's is 128-64.
+    let n_nope = head - n_rot;
     let head_stride = head as usize * f32_size;
     let nope = ctx
         .view_3d(&comp, n_nope, 1, n_blocks, head_stride, head_stride, 0)
         .expect("comp nope");
     ctx.compute(&nope, 12).expect("compute");
-    check(s, "csa_comp_nope", nope.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_comp_nope"), nope.to_vec_f32().iter().sum::<f32>());
 
     let pe_in = ctx
         .view_3d(
@@ -1991,7 +1998,7 @@ fn csa_compressor_5tok<'c>(
         )
         .expect("comp pe view");
     ctx.compute(&pe_in, 12).expect("compute");
-    check(s, "csa_comp_pe_in", pe_in.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_comp_pe_in"), pe_in.to_vec_f32().iter().sum::<f32>());
 
     let comp_pos = ctx.new_i32_1d(n_blocks).expect("comp_pos");
     let block_pos: Vec<i32> = (0..n_blocks).map(|b| (b * ratio) as i32).collect();
@@ -2009,19 +2016,64 @@ fn csa_compressor_5tok<'c>(
         )
         .expect("comp rope");
     ctx.compute(&pe, 12).expect("compute");
-    check(s, "csa_comp_pe", pe.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_comp_pe"), pe.to_vec_f32().iter().sum::<f32>());
 
     let out = ctx.concat(&nope, &pe, 0).expect("concat comp");
     ctx.compute(&out, 12).expect("compute comp out");
-    check(s, "csa_comp", out.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_comp"), out.to_vec_f32().iter().sum::<f32>());
     out
 }
 
-/// The CSA compressor, checked against llama.cpp on layer 2 at five tokens.
+/// The orthonormal Walsh-Hadamard rotation the lightning indexer runs its keys
+/// and queries through.
 ///
-/// Layer 2 is the first Compressed Sparse layer, and at five tokens it is the
-/// first length at which a block actually completes (`ratio` is 4). This is the
-/// first piece of compressed attention to exist at all.
+/// Sylvester's construction scaled by `1/sqrt(n)`, transcribed from
+/// `llama-kv-cache.cpp:22`. It is its own inverse (`H² = I`), which is why the
+/// same matrix un-rotates the attention output.
+///
+/// **It is generated, not stored.** Nothing in the container holds it — a port
+/// that goes looking for a `*_rot` tensor will not find one and may conclude
+/// the rotation is optional. llama.cpp builds it at cache-init time for
+/// DeepSeek indexers unconditionally (`llama-kv-cache.cpp:352`).
+fn walsh_hadamard(n: usize) -> Vec<f32> {
+    assert!(n.is_power_of_two(), "Walsh-Hadamard needs a power of two");
+    let mut m = vec![0.0f32; n * n];
+    m[0] = 1.0 / (n as f32).sqrt();
+    let mut s = 1usize;
+    while s < n {
+        for i in 0..s {
+            for j in 0..s {
+                let v = m[i * n + j];
+                m[(i + s) * n + j] = v;
+                m[i * n + (j + s)] = v;
+                m[(i + s) * n + (j + s)] = -v;
+            }
+        }
+        s *= 2;
+    }
+    m
+}
+
+/// Apply the Hadamard rotation: reshape to `[n, ..]`, matmul, reshape back.
+///
+/// Mirrors `llama_mul_mat_hadamard` (`llama-impl.h:57`).
+fn hadamard_rotate<'c>(ctx: &'c Context, x: &Tensor<'c>, rot: &Tensor<'c>, n: i64) -> Tensor<'c> {
+    let total = x.len();
+    let flat = if x.is_contiguous() {
+        ctx.reshape_2d(x, n, total / n).expect("reshape for hadamard")
+    } else {
+        let c = ctx.cont(x).expect("cont for hadamard");
+        ctx.reshape_2d(&c, n, total / n).expect("reshape for hadamard")
+    };
+    ctx.mul_mat(rot, &flat).expect("hadamard matmul")
+}
+
+/// Both compressors of a Compressed Sparse layer, and the indexer's rotation.
+///
+/// A CSA layer runs the overlap compressor **twice** with different weights and
+/// different widths: once at 512 for attention, once at 128 for the lightning
+/// indexer. The indexer's output is then put through the Walsh-Hadamard
+/// rotation; the attention one is not.
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn csa_compressor_matches_llama_cpp() {
@@ -2040,6 +2092,10 @@ fn csa_compressor_matches_llama_cpp() {
         "attn_compressor_gate",
         "attn_compressor_ape",
         "attn_compressor_norm",
+        "indexer_compressor_kv",
+        "indexer_compressor_gate",
+        "indexer_compressor_ape",
+        "indexer_compressor_norm",
     ]
     .iter()
     .map(|x| format!("blk.2.{x}.weight"))
@@ -2051,7 +2107,40 @@ fn csa_compressor_matches_llama_cpp() {
 
     let s = sums_5tok(2);
     let p = layer_entry_5tok(&s, &ctx, &weights, &config, &l1);
-    let _ = csa_compressor_5tok(&s, &ctx, &weights, &config, &p.attn_norm);
+
+    // The attention compressor, at the full head width.
+    let _csa = overlap_compressor_5tok(
+        &s,
+        &ctx,
+        &weights,
+        &config,
+        &p.attn_norm,
+        config.kv_lora_rank as i64,
+        "attn_compressor",
+        "csa",
+    );
+
+    // The indexer's own compressor, at its narrower head.
+    let head_lid = config.indexer_key_length as i64;
+    let lid = overlap_compressor_5tok(
+        &s,
+        &ctx,
+        &weights,
+        &config,
+        &p.attn_norm,
+        head_lid,
+        "indexer_compressor",
+        "lid",
+    );
+
+    // ...then the Hadamard, which only the indexer applies.
+    let rot = ctx
+        .new_f32_2d(head_lid, head_lid)
+        .expect("hadamard");
+    rot.set_f32(&walsh_hadamard(head_lid as usize)).expect("fill hadamard");
+    let rotated = hadamard_rotate(&ctx, &lid, &rot, head_lid);
+    ctx.compute(&rotated, 12).expect("compute hadamard");
+    check(&s, "lid_comp_rot", rotated.to_vec_f32().iter().sum::<f32>());
 }
 
 /// Read just the named experts out of a stacked tensor and bind them as a
