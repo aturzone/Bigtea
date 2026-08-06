@@ -2068,6 +2068,117 @@ fn hadamard_rotate<'c>(ctx: &'c Context, x: &Tensor<'c>, rot: &Tensor<'c>, n: i6
     ctx.mul_mat(rot, &flat).expect("hadamard matmul")
 }
 
+/// **CSA attention**: the fused kernel over raw *and* compressed keys.
+///
+/// A compressed-sparse layer attends to two things at once — the recent raw KV
+/// window and the compressor's summaries of everything before it — concatenated
+/// along the key axis, with a mask that is causal on the raw half and
+/// visibility-limited on the compressed half.
+///
+/// # Why the indexer does not appear here
+///
+/// It runs, and at this length it cannot change the answer.
+/// `n_top_k = min(n_lid, indexer_top_k)` is `min(256, 512) = 256`
+/// (`deepseek4.cpp`, end of `build_lid_top_k`), so the indexer selects **every**
+/// compressed slot. `build_top_k_mask` then fills -inf, writes 0 at every
+/// selected index, and adds the visibility mask — which leaves exactly the
+/// visibility mask. The sparsity is inert.
+///
+/// Making it bite needs `n_lid > 512`, i.e. more than 512 completed blocks, i.e.
+/// **over 2048 tokens**. Until such a capture exists the indexer's *selection*
+/// is unverifiable, and this function is the honest shape of what can be
+/// checked: everything else, exactly.
+///
+/// # What the trace cannot check either
+///
+/// `lid_score_masked`, `csa_top_k_mask` and `csa_lid_kq_mask` all sum to -inf,
+/// and `lid_top_k` sums to 163200 for *any* permutation. Those rows cannot
+/// distinguish a right answer from a wrong one. `attn_csa_lid` is the only
+/// number in the indexer's half of this layer that can, which is why it is the
+/// one asserted.
+fn csa_attention_5tok<'c>(
+    s: &LayerSums,
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    config: &Deepseek4Config,
+    q_full: &Tensor<'c>,
+    kv_full: &Tensor<'c>,
+    comp: &Tensor<'c>,
+) -> Tensor<'c> {
+    let nt = s.tokens.len() as i64;
+    let head = config.kv_lora_rank as i64;
+    let n_head = config.n_head as i64;
+    let ratio = Deepseek4Config::CSA_RATIO;
+    // Each half of the key axis is padded to 256, as llama.cpp's caches are.
+    const HALF: i64 = 256;
+    let n_kv = 2 * HALF;
+
+    // The raw KV cache: this ubatch's compressed KV at rows 0..nt.
+    let kv_vals = kv_full.to_vec_f32();
+    let mut raw = vec![0u16; (head * HALF) as usize];
+    bigtea_ggml::f32_to_f16(&kv_vals, &mut raw[..kv_vals.len()]);
+    let mut back = vec![0f32; raw.len()];
+    bigtea_ggml::f16_to_f32(&raw, &mut back);
+    check(s, "csa_raw_k", back.iter().sum::<f32>());
+
+    // The compressed cache: one entry per completed block, so one row here.
+    let comp_vals = comp.to_vec_f32();
+    let mut cmp = vec![0u16; (head * HALF) as usize];
+    bigtea_ggml::f32_to_f16(&comp_vals, &mut cmp[..comp_vals.len()]);
+    let mut back = vec![0f32; cmp.len()];
+    bigtea_ggml::f16_to_f32(&cmp, &mut back);
+    check(s, "csa_comp_k", back.iter().sum::<f32>());
+
+    // Concatenated along the key axis: raw first, then compressed.
+    let mut all = raw.clone();
+    all.extend_from_slice(&cmp);
+    let mut back = vec![0f32; all.len()];
+    bigtea_ggml::f16_to_f32(&all, &mut back);
+    check(s, "csa_k_all", back.iter().sum::<f32>());
+
+    let k = ctx.new_f16_3d(head, n_kv, 1).expect("k_all");
+    let bytes: Vec<u8> = all.iter().flat_map(|h| h.to_le_bytes()).collect();
+    k.set_bytes(&bytes).expect("fill k_all");
+
+    // The mask, in two halves. Causal over the raw window; over the compressed
+    // half a token sees block b only once that block is complete and behind it,
+    // which is (pos + 1) / ratio entries.
+    const F16_NEG_INF: [u8; 2] = [0x00, 0xFC];
+    let mut mask = vec![0u8; (n_kv * nt) as usize * 2];
+    for query in 0..nt {
+        let row = (query * n_kv) as usize * 2;
+        for key in (query + 1)..HALF {
+            let at = row + key as usize * 2;
+            mask[at..at + 2].copy_from_slice(&F16_NEG_INF);
+        }
+        let visible = (query + 1) / ratio;
+        for blk in visible..HALF {
+            let at = row + (HALF + blk) as usize * 2;
+            mask[at..at + 2].copy_from_slice(&F16_NEG_INF);
+        }
+    }
+    let mask_t = ctx
+        .new_typed_2d(bigtea_gguf::GgmlType(1), n_kv, nt)
+        .expect("mask");
+    mask_t.set_bytes(&mask).expect("fill mask");
+
+    let q_perm = ctx.permute(q_full, [0, 2, 1, 3]).expect("permute q");
+    ctx.compute(&q_perm, 12).expect("compute q_perm");
+    check(s, "q_perm", q_perm.to_vec_f32().iter().sum::<f32>());
+
+    let sinks = weights
+        .get(&format!("blk.{}.attn_sinks.weight", s.il))
+        .expect("bound");
+    let scale = 1.0f32 / (head as f32).sqrt();
+    let out = ctx
+        .flash_attn_ext_with_sinks(&q_perm, &k, &k, &mask_t, sinks, scale)
+        .expect("csa flash_attn");
+    ctx.compute(&out, 12).expect("compute csa attention");
+    check(s, "flash_attn", out.to_vec_f32().iter().sum::<f32>());
+    let _ = n_head;
+    out
+}
+
 /// The lightning indexer's **query path**: its own low-rank Q, its own RoPE,
 /// and the Hadamard rotation.
 ///
@@ -2224,7 +2335,7 @@ fn csa_compressor_matches_llama_cpp() {
     let p = layer_entry_5tok(&s, &ctx, &weights, &config, &l1);
 
     // The attention compressor, at the full head width.
-    let _csa = overlap_compressor_5tok(
+    let csa = overlap_compressor_5tok(
         &s,
         &ctx,
         &weights,
@@ -2259,6 +2370,11 @@ fn csa_compressor_matches_llama_cpp() {
 
     // The indexer's query side, which shares the rotation but not much else.
     let _ = lid_query_5tok(&s, &ctx, &weights, &config, &p.attn_norm, &rot);
+
+    // ...and attention over raw + compressed keys, which is the only number in
+    // the indexer's half of this layer that a sum can actually check.
+    let (q, kv) = q_and_kv_5tok(&s, &ctx, &weights, &config, &p.attn_norm);
+    let _ = csa_attention_5tok(&s, &ctx, &weights, &config, &q, &kv, &csa);
 }
 
 /// Read just the named experts out of a stacked tensor and bind them as a

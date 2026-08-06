@@ -330,3 +330,7 @@
 2|lid_q_pe|17.747589
 2|lid_q_rot|96.376190
 2|lid_weights|2.556244
+# Layer 2's CSA attention: raw window and compressed summaries, concatenated.
+2|csa_raw_k|119.986458
+2|csa_comp_k|5.166124
+2|csa_k_all|125.152557
