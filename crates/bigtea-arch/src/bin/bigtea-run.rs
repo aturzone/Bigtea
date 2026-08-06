@@ -260,7 +260,7 @@ fn run(
     if model.architecture() == "deepseek4" {
         println!("model      {} ({})", model.architecture(), model.io_mode());
         let tokenizer = Tokenizer::from_metadata(model.metadata())?;
-        run_deepseek4(&model, &tokenizer, prompt, 1024, t0)?;
+        run_deepseek4(&model, &tokenizer, prompt, n_predict, 1024, t0)?;
         return Ok(());
     }
 
@@ -461,6 +461,7 @@ fn run_deepseek4(
     model: &Model,
     tokenizer: &Tokenizer,
     prompt: &str,
+    n_predict: usize,
     arena_mib: usize,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -506,20 +507,62 @@ fn run_deepseek4(
     println!("loaded     {:.1}s", t0.elapsed().as_secs_f64());
 
     let t_prefill = std::time::Instant::now();
-    let logits = bigtea_arch::prefill(&fw, &tokens, arena_mib << 20)?;
-    let secs = t_prefill.elapsed().as_secs_f64();
+    let mut seq = tokens.clone();
+    let logits = bigtea_arch::prefill(&fw, &seq, arena_mib << 20)?;
+    let prefill_secs = t_prefill.elapsed().as_secs_f64();
+    println!(
+        "prefill    {} tokens in {prefill_secs:.1}s ({:.2} tok/s)",
+        seq.len(),
+        seq.len() as f64 / prefill_secs
+    );
 
-    let (best, _) = logits
+    let mut next = argmax(&logits)?;
+    print!("output     {}", tokenizer.decode(&[next as u32]));
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
+    // Generate by re-running the whole sequence, one forward pass per token.
+    //
+    // This is the honest version of a generation loop and not the fast one. A
+    // KV cache would let each token attend over the previous ones without
+    // recomputing them; without it, token N costs a forward pass over N tokens.
+    //
+    // It is much less wasteful here than it sounds, because the cost of a
+    // forward pass on this model is dominated by reading 3.21 GiB of routed
+    // experts — which is paid **per pass, not per token** — and not by the
+    // attention that the cache would save. The quadratic term is real but small
+    // at these lengths. What it buys is a loop that is correct by construction:
+    // every pass is stateless and identical to a prefill, so there is no cache
+    // to get subtly wrong, and on this architecture a wrong cache produces
+    // fluent nonsense rather than an error.
+    let t_gen = std::time::Instant::now();
+    let mut generated = 0usize;
+    while generated + 1 < n_predict {
+        seq.push(next);
+        let logits = bigtea_arch::prefill(&fw, &seq, arena_mib << 20)?;
+        next = argmax(&logits)?;
+        generated += 1;
+        print!("{}", tokenizer.decode(&[next as u32]));
+        let _ = std::io::stdout().flush();
+    }
+    println!();
+
+    if generated > 0 {
+        let secs = t_gen.elapsed().as_secs_f64();
+        println!(
+            "generate   {generated} tokens in {secs:.1}s ({:.3} tok/s, {:.1}s per token)",
+            generated as f64 / secs,
+            secs / generated as f64
+        );
+    }
+    Ok(())
+}
+
+fn argmax(logits: &[f32]) -> Result<i32, Box<dyn std::error::Error>> {
+    logits
         .iter()
         .enumerate()
         .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
-        .ok_or("no logits")?;
-
-    println!(
-        "prefill    {} tokens in {secs:.1}s ({:.2} tok/s)",
-        tokens.len(),
-        tokens.len() as f64 / secs
-    );
-    println!("next       {} {:?}", best, tokenizer.decode(&[best as u32]));
-    Ok(())
+        .map(|(i, _)| i as i32)
+        .ok_or_else(|| "no logits".into())
 }
