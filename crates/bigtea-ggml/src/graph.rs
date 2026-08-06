@@ -196,6 +196,11 @@ extern "C" {
         b: *mut ggml_tensor,
     ) -> *mut ggml_tensor;
     fn ggml_top_k(ctx: *mut ggml_context, a: *mut ggml_tensor, k: c_int) -> *mut ggml_tensor;
+    fn ggml_argsort_top_k(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        k: c_int,
+    ) -> *mut ggml_tensor;
     #[allow(clippy::too_many_arguments)]
     fn ggml_rope_ext(
         ctx: *mut ggml_context,
@@ -893,6 +898,19 @@ impl Context {
         self.tensor(unsafe { ggml_top_k(self.raw.as_ptr(), a.raw.as_ptr(), k) })
     }
 
+    /// The `k` largest per row, as indices, via a full descending argsort.
+    ///
+    /// Not the same op as [`Self::top_k`], and the difference matters here:
+    /// `top_k` returns its indices in *no particular order* — already a
+    /// hard-won note in this project — whereas this is `argsort` followed by a
+    /// view, so index 0 is the largest. llama.cpp selects MoE experts with this
+    /// one (`llama-graph.cpp:1932`), and the captured trace shows both nodes:
+    /// `ffn_moe_argsort` for the sort and `ffn_moe_topk` for the view.
+    pub fn argsort_top_k<'a>(&'a self, a: &Tensor<'a>, k: i32) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: valid context and tensor.
+        self.tensor(unsafe { ggml_argsort_top_k(self.raw.as_ptr(), a.raw.as_ptr(), k) })
+    }
+
     /// Rotary position embedding.
     ///
     /// `positions` must be an I32 tensor of token positions. `freq_factors`
@@ -1129,14 +1147,43 @@ impl Tensor<'_> {
         Ok(())
     }
 
-    /// Read an I32 tensor back — `top_k` returns indices, not values.
+    /// Read an I32 tensor back, in logical index order — index tensors, not
+    /// values.
+    ///
+    /// **Strides are honoured**, for the same reason as [`Self::to_vec_f32`]
+    /// and with a sharper failure mode. `argsort_top_k` returns a *view* of the
+    /// full sort — 6 indices out of every row of 256 — so a flat read returns
+    /// the first `6 * n_tokens` entries of token 0's ranking and calls them
+    /// every token's experts. Token 0 then looks perfect and every later token
+    /// silently routes to the wrong experts. Nothing about the result's shape,
+    /// type or magnitude gives it away.
     pub fn to_vec_i32(&self) -> Vec<i32> {
         let n = self.len() as usize;
-        // SAFETY: valid tensor holding `n` contiguous i32 values.
-        unsafe {
-            let src = ggml_get_data(self.raw.as_ptr()) as *const i32;
-            std::slice::from_raw_parts(src, n).to_vec()
+        // SAFETY: valid tensor of i32 for the context's lifetime.
+        let src = unsafe { ggml_get_data(self.raw.as_ptr()) } as *const u8;
+        if self.is_contiguous() {
+            // SAFETY: contiguous, so `n` i32s follow the data pointer.
+            return unsafe { std::slice::from_raw_parts(src as *const i32, n).to_vec() };
         }
+
+        let (ne, nb) = self.dims_and_strides();
+        let mut out = Vec::with_capacity(n);
+        for i3 in 0..ne[3] {
+            for i2 in 0..ne[2] {
+                for i1 in 0..ne[1] {
+                    for i0 in 0..ne[0] {
+                        let off = i3 as usize * nb[3]
+                            + i2 as usize * nb[2]
+                            + i1 as usize * nb[1]
+                            + i0 as usize * nb[0];
+                        // SAFETY: offset built from this tensor's own extents
+                        // and strides, so it lands inside its buffer.
+                        out.push(unsafe { *(src.add(off) as *const i32) });
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// This tensor's data pointer, read through the mirrored struct layout.
@@ -1280,6 +1327,33 @@ mod tests {
             pe.to_vec_f32(),
             vec![2.0, 3.0, 6.0, 7.0, 10.0, 11.0, 14.0, 15.0]
         );
+    }
+
+    /// The i32 twin of the strided-view test, and the one with teeth.
+    ///
+    /// `argsort_top_k` hands back a view of the full sort — k indices out of
+    /// every row — so reading it flat returns token 0's ranking spread across
+    /// every token. In a MoE that means token 0 routes correctly and every
+    /// other token routes to whatever happened to follow in memory, with the
+    /// right count of plausible expert ids and no error anywhere.
+    #[test]
+    fn a_strided_i32_view_reads_its_own_indices() {
+        let ctx = Context::new(ARENA).expect("context");
+
+        // 3 rows of 4: a full "ranking" per row.
+        let t = ctx.new_i32_2d(4, 3).expect("t");
+        t.set_i32(&(0..12).collect::<Vec<i32>>()).expect("set");
+
+        // The top 2 of each row, as argsort_top_k would return them.
+        let i32_size = std::mem::size_of::<i32>();
+        let top2 = ctx
+            .view_2d(&t, 2, 3, 4 * i32_size, 0)
+            .expect("view");
+
+        assert!(!top2.is_contiguous());
+        assert_eq!(top2.to_vec_i32(), vec![0, 1, 4, 5, 8, 9]);
+        // What a flat read gave instead: row 0 spilling into every other row.
+        assert_ne!(top2.to_vec_i32(), vec![0, 1, 2, 3, 4, 5]);
     }
 
     #[test]

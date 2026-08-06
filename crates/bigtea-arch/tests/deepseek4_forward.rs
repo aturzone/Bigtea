@@ -39,32 +39,39 @@ const TOKEN: i32 = 23166;
 ///
 /// The point of a longer prompt is positions 1..4: at position 0 alone RoPE is
 /// the identity and cannot be checked at all.
-const TOKENS_5: [i32; 5] = [671, 6102, 294, 8760, 344];
+const TOKENS_5: &[i32] = &[671, 6102, 294, 8760, 344];
+
+/// "Hello there" — two tokens, from a second capture taken deliberately short.
+///
+/// **At two tokens every layer takes the Raw attention path.** The compressed
+/// builders are guarded on their compressed caches being populated
+/// (`deepseek4.cpp:1049-1063`), and at this length they are not, so layers 2+
+/// fall through to `build_raw_attention` — code that is already built and
+/// verified. That makes two things reachable that five tokens could not reach
+/// without the indexer: the **compressed RoPE branch** (layers 2+ use it
+/// regardless of which attention runs) and the **normal MoE routing path**
+/// (layers 3+). Both were open holes.
+const TOKENS_2: &[i32] = &[19923, 1031];
 
 /// `LLAMA_ROPE_TYPE_NORM`. deepseek4 is in the NORM list in `llama-model.cpp`,
 /// **not** the NEOX one — so rotated pairs are adjacent (`x[2i]`, `x[2i+1]`),
 /// not offset by `n_rot/2`. Both conventions run, and one of them is wrong.
 const ROPE_MODE_NORM: i32 = 0;
 
-/// RoPE for layer 0, from the shipped [`Deepseek4Config::rope_for_layer`].
+/// RoPE for `il`, from the shipped [`Deepseek4Config::rope_for_layer`].
 ///
 /// Deliberately not a local copy of the rules. `rope_for_layer` is what a real
-/// forward pass will call, so it is what these checkpoints have to exercise —
-/// a helper written out again here would verify the test and not the code.
+/// forward pass calls, so it is what these checkpoints have to exercise — a
+/// helper written out again here would verify the test and not the code.
 ///
-/// It also asserts layer 0 is the *uncompressed* branch. `deepseek4.cpp:822-829`
-/// picks per layer, and the container's YaRN settings (factor 16, original
-/// context 65536, beta_fast 32, beta_slow 1) belong to the other 41 layers;
-/// applying them here would be wrong in a way nothing reports.
-fn rope_layer_0(config: &Deepseek4Config) -> RopeParams {
-    assert!(
-        !config.uses_compress_rope(0),
-        "layer 0 must be uncompressed; compress_ratios[0] = {:?}",
-        config.compress_ratios.first()
-    );
-    let rope = config.rope_for_layer(0);
-    assert_eq!(rope.n_ctx_orig, 0, "no context extension on an uncompressed layer");
-    rope.params
+/// **This started out hardcoded to layer 0 and that was a real bug**: layers 2
+/// and 3 take the compressed branch (base 160000, YaRN on, `n_ctx_orig` 65536)
+/// and were being given layer 0's plain parameters with `n_ctx_orig` 0. It
+/// survived because until layer 2 ran, every layer under test *was* layer 0's
+/// branch. `rope_for_layer` itself was correct.
+fn rope_for(config: &Deepseek4Config, il: u32) -> (RopeParams, i32) {
+    let r = config.rope_for_layer(il);
+    (r.params, r.n_ctx_orig)
 }
 
 /// Every checkpoint for one layer, keyed by a layer-agnostic label.
@@ -76,6 +83,9 @@ fn rope_layer_0(config: &Deepseek4Config) -> RopeParams {
 /// one accidentally fitted to layer 0's weights.
 struct LayerSums {
     il: u32,
+    /// The prompt this layer's numbers were captured at. Two captures are in
+    /// play and mixing them would compare a layer against the wrong run.
+    tokens: &'static [i32],
     attn_gates: HcGateSums,
     ffn_gates: HcGateSums,
     /// Each routed expert's weighted contribution, checked individually so a
@@ -106,6 +116,7 @@ fn check(s: &LayerSums, label: &str, got: f32) {
 /// Layer 0, from `v4flash-layer0-oracle-5tok.txt`.
 const LAYER0: LayerSums = LayerSums {
     il: 0,
+    tokens: TOKENS_5,
     attn_gates: ATTN_GATE_SUMS,
     ffn_gates: FFN_GATE_SUMS,
     weighted: [1.238907, 6.887056, 6.492266, 3.250872, -5.103240, 5.806348],
@@ -138,6 +149,7 @@ const LAYER0: LayerSums = LayerSums {
 /// `l_last` directly. Asking for one panics, which is the right outcome.
 const LAYER1: LayerSums = LayerSums {
     il: 1,
+    tokens: TOKENS_5,
     attn_gates: LAYER1_ATTN_GATE_SUMS,
     ffn_gates: LAYER1_FFN_GATE_SUMS,
     weighted: [-3.130055, 3.890552, -1.967723, -5.374112, -17.948400, 6.997021],
@@ -172,6 +184,7 @@ const LAYER1: LayerSums = LayerSums {
 /// the attention itself will be new.
 const LAYER2_ENTRY: LayerSums = LayerSums {
     il: 2,
+    tokens: TOKENS_5,
     attn_gates: LAYER2_ATTN_GATE_SUMS,
     ffn_gates: LAYER2_ATTN_GATE_SUMS, // unused: the FFN half is not reached
     weighted: [0.0; 6],
@@ -196,6 +209,400 @@ const LAYER2_ATTN_GATE_SUMS: HcGateSums = HcGateSums {
     post: 0.217185,
     comb: 19.999975,
 };
+
+const L0T2_ATTN_GATES: HcGateSums = HcGateSums {
+    pre_view: 209.370789,
+    pre_scaled: 434.659210,
+    pre_biased: 429.955353,
+    pre_sigmoid: 8.000000,
+    pre: 8.000008,
+    post_view: -2760.560059,
+    post_scaled: -51.701687,
+    post_biased: -107.926743,
+    post_sigmoid: 0.049193,
+    post: 0.098386,
+    comb: 7.999992,
+};
+const L0T2_FFN_GATES: HcGateSums = HcGateSums {
+    pre_view: -46.849030,
+    pre_scaled: -5.309858,
+    pre_biased: -12.922791,
+    pre_sigmoid: 2.537631,
+    pre: 2.537638,
+    post_view: -1059.511353,
+    post_scaled: -38.037712,
+    post_biased: -59.640213,
+    post_sigmoid: 1.009126,
+    post: 2.018253,
+    comb: 7.999992,
+};
+const L0T2: LayerSums = LayerSums {
+    il: 0,
+    tokens: TOKENS_2,
+    attn_gates: L0T2_ATTN_GATES,
+    ffn_gates: L0T2_FFN_GATES,
+    weighted: [2.690806, 3.103284, 1.483350, 4.910249, -1.308418, 0.460610],
+    rows: &[
+        ("hc_mixes_attn", -2551.319580),
+        ("hc_attn_pre", 6.423793),
+        ("norm_attn", -1.717879),
+        ("attn_norm", 0.001301),
+        ("qr", -1.779395),
+        ("qr_rms", -24.776793),
+        ("qr_norm", -0.961105),
+        ("q_b", 0.905390),
+        ("q_norm", 44.419037),
+        ("q_nope", 97.833832),
+        ("q_pe_in", -53.416119),
+        ("q_pe", 237.916412),
+        ("q", 335.751648),
+        ("kv_a", 6.459026),
+        ("kv_rms", 70.477623),
+        ("kv_norm", 45.408470),
+        ("kv_nope", 27.834160),
+        ("kv_pe_in", 17.574301),
+        ("kv_pe", 27.742146),
+        ("kv", 55.576317),
+        ("cache_k", 55.579575),
+        ("q_perm", 335.750671),
+        ("flash_attn", 1372.857910),
+        ("out_nope", 624.717163),
+        ("out_pe_in", 748.141052),
+        ("rope_back", 218.285583),
+        ("attn_derope", 843.000610),
+        ("attn_derope_perm", 842.997192),
+        ("attn_wo_a", -129.421265),
+        ("attn_wo_a_cont", -129.421600),
+        ("attn_out", 189.549622),
+        ("hc_attn_post", 14.272767),
+        ("post_norm", 115.687309),
+        ("hc_mixes_ffn", -1174.730103),
+        ("hc_ffn_pre", 9.980318),
+        ("norm_ffn", 74.270218),
+        ("ffn_norm", 10.745688),
+        ("moe_logits", -239.519104),
+        ("moe_softplus", 380.650543),
+        ("moe_probs", 389.258514),
+        ("moe_topk", 1489.000000),
+        ("moe_weights", 8.878812),
+        ("moe_weights_sum", 8.878812),
+        ("moe_weights_sum_clamped", 8.878812),
+        ("moe_weights_norm", 2.000000),
+        ("moe_weights_scaled", 3.000000),
+        ("shexp_gate", 1304.182739),
+        ("shexp_gate_clamped", 1304.182739),
+        ("shexp_up", 46.957611),
+        ("shexp_up_clamped", 46.957611),
+        ("shexp_swiglu", -17.843456),
+        ("shexp", 23.385096),
+        ("moe_gate", -996.341431),
+        ("moe_up", 32.241657),
+        ("moe_swiglu", 28.105509),
+        ("moe_down", 40.416405),
+        ("moe_weighted", 11.339972),
+        ("moe_out", 11.339869),
+        ("ffn_out", 34.725060),
+        ("l_last", 48.880856),
+        ("next_norm", 278.791321),
+        ("embd", 1.605949),
+        ("hc_init", 6.423725),
+        ("hc_init_norm", -6.837732),
+    ],
+};
+
+const L1T2_ATTN_GATES: HcGateSums = HcGateSums {
+    pre_view: -19.943457,
+    pre_scaled: -1.810599,
+    pre_biased: -11.711184,
+    pre_sigmoid: 2.078893,
+    pre: 2.078902,
+    post_view: -928.173157,
+    post_scaled: -28.170483,
+    post_biased: -138.429504,
+    post_sigmoid: 0.074534,
+    post: 0.149069,
+    comb: 7.999992,
+};
+const L1T2_FFN_GATES: HcGateSums = HcGateSums {
+    pre_view: -245.671432,
+    pre_scaled: -21.606079,
+    pre_biased: -36.009747,
+    pre_sigmoid: 1.643103,
+    pre: 1.643111,
+    post_view: -576.170471,
+    post_scaled: -33.862514,
+    post_biased: -41.283554,
+    post_sigmoid: 0.882652,
+    post: 1.765305,
+    comb: 7.999992,
+};
+const L1T2: LayerSums = LayerSums {
+    il: 1,
+    tokens: TOKENS_2,
+    attn_gates: L1T2_ATTN_GATES,
+    ffn_gates: L1T2_FFN_GATES,
+    weighted: [-3.639457, 0.028346, -4.889457, -3.136386, 1.335585, -0.239741],
+    rows: &[
+        ("hc_mixes_attn", -1037.038818),
+        ("hc_attn_pre", 10.950562),
+        ("norm_attn", 114.471718),
+        ("attn_norm", 4.476905),
+        ("qr", 0.608606),
+        ("qr_rms", 7.972394),
+        ("qr_norm", 0.414442),
+        ("q_b", -5.684414),
+        ("q_norm", -129.545334),
+        ("q_nope", 1134.758911),
+        ("q_pe_in", -1264.305176),
+        ("q_pe", -698.882568),
+        ("q", 435.879791),
+        ("kv_a", -4.307814),
+        ("kv_rms", -38.171127),
+        ("kv_norm", -38.070057),
+        ("kv_nope", -34.932976),
+        ("kv_pe_in", -3.137122),
+        ("kv_pe", -0.894517),
+        ("kv", -35.827446),
+        ("cache_k", -35.825783),
+        ("q_perm", 435.880096),
+        ("flash_attn", -339.987518),
+        ("out_nope", -135.980682),
+        ("out_pe_in", -204.004913),
+        ("rope_back", -335.867615),
+        ("attn_derope", -471.849945),
+        ("attn_derope_perm", -471.850739),
+        ("attn_wo_a", 11.147385),
+        ("attn_wo_a_cont", 11.147484),
+        ("attn_out", -1.024545),
+        ("hc_attn_post", 48.594090),
+        ("post_norm", 289.686951),
+        ("hc_mixes_ffn", -800.463989),
+        ("hc_ffn_pre", 7.422015),
+        ("norm_ffn", 88.181358),
+        ("ffn_norm", 22.388680),
+        ("moe_logits", 112.637177),
+        ("moe_softplus", 433.809448),
+        ("moe_probs", 463.523590),
+        ("moe_topk", 1424.000000),
+        ("moe_weights", 10.837965),
+        ("moe_weights_sum", 10.837965),
+        ("moe_weights_sum_clamped", 10.837965),
+        ("moe_weights_norm", 2.000000),
+        ("moe_weights_scaled", 3.000000),
+        ("shexp_gate", -478.736237),
+        ("shexp_gate_clamped", -478.736237),
+        ("shexp_up", -7.797753),
+        ("shexp_up_clamped", -7.797753),
+        ("shexp_swiglu", -29.932285),
+        ("shexp", 9.406198),
+        ("moe_gate", -91.637253),
+        ("moe_up", -66.311356),
+        ("moe_swiglu", -13.228956),
+        ("moe_down", -37.769482),
+        ("moe_weighted", -10.541123),
+        ("moe_out", -10.541110),
+        ("ffn_out", -1.134963),
+        ("l_last", 48.674198),
+        ("next_norm", 202.615189),
+    ],
+};
+
+const L2T2_ATTN_GATES: HcGateSums = HcGateSums {
+    pre_view: -66.417557,
+    pre_scaled: -2.860979,
+    pre_biased: -15.979107,
+    pre_sigmoid: 2.423081,
+    pre: 2.423090,
+    post_view: -697.689209,
+    post_scaled: -19.012312,
+    post_biased: -117.489227,
+    post_sigmoid: 0.065951,
+    post: 0.131902,
+    comb: 7.999992,
+};
+const L2T2_FFN_GATES: HcGateSums = HcGateSums {
+    pre_view: 63.886581,
+    pre_scaled: 9.101670,
+    pre_biased: -4.527986,
+    pre_sigmoid: 2.914737,
+    pre: 2.914745,
+    post_view: -211.144928,
+    post_scaled: -17.000410,
+    post_biased: -23.442335,
+    post_sigmoid: 0.581446,
+    post: 1.162891,
+    comb: 7.999992,
+};
+const L2T2: LayerSums = LayerSums {
+    il: 2,
+    tokens: TOKENS_2,
+    attn_gates: L2T2_ATTN_GATES,
+    ffn_gates: L2T2_FFN_GATES,
+    weighted: [3.269274, 2.185421, 1.311456, 1.190008, -3.560312, 0.731329],
+    rows: &[
+        ("hc_mixes_attn", -773.708740),
+        ("hc_attn_pre", 13.370720),
+        ("norm_attn", 43.803864),
+        ("attn_norm", 5.764471),
+        ("qr", 5.323662),
+        ("qr_rms", 44.813297),
+        ("qr_norm", 1.362917),
+        ("q_b", 31.656322),
+        ("q_norm", 1072.781616),
+        ("q_nope", 1477.194702),
+        ("q_pe_in", -404.419312),
+        ("q_pe", -564.463867),
+        ("q", 912.738342),
+        ("kv_a", 3.730389),
+        ("kv_rms", 16.242336),
+        ("kv_norm", 6.633435),
+        ("kv_nope", 17.739407),
+        ("kv_pe_in", -11.105971),
+        ("kv_pe", -10.623191),
+        ("kv", 7.116213),
+        ("cache_k", 7.117183),
+        ("q_perm", 912.735718),
+        ("flash_attn", 1227.910034),
+        ("out_nope", 1378.445557),
+        ("out_pe_in", -150.534897),
+        ("rope_back", -126.964722),
+        ("attn_derope", 1251.483276),
+        ("attn_derope_perm", 1251.483521),
+        ("attn_wo_a", 49.200817),
+        ("attn_wo_a_cont", 49.200695),
+        ("attn_out", -4.513974),
+        ("hc_attn_post", 47.364868),
+        ("post_norm", 203.504044),
+        ("hc_mixes_ffn", -129.856979),
+        ("hc_ffn_pre", 9.273748),
+        ("norm_ffn", 54.077953),
+        ("ffn_norm", 16.603214),
+        ("moe_logits", 195.286179),
+        ("moe_softplus", 485.156067),
+        ("moe_probs", 488.993378),
+        ("moe_topk", 1127.000000),
+        ("moe_weights", 11.893110),
+        ("moe_weights_sum", 11.893110),
+        ("moe_weights_sum_clamped", 11.893110),
+        ("moe_weights_norm", 2.000000),
+        ("moe_weights_scaled", 3.000000),
+        ("shexp_gate", -519.246338),
+        ("shexp_gate_clamped", -519.246338),
+        ("shexp_up", 2.633580),
+        ("shexp_up_clamped", 2.633580),
+        ("shexp_swiglu", 3.505288),
+        ("shexp", 3.952679),
+        ("moe_gate", -797.049194),
+        ("moe_up", 49.092308),
+        ("moe_swiglu", 7.136783),
+        ("moe_down", 26.848846),
+        ("moe_weighted", 5.127125),
+        ("moe_out", 5.127162),
+        ("ffn_out", 9.079841),
+        ("l_last", 52.540024),
+        ("next_norm", 220.934692),
+    ],
+};
+
+const L3T2_ATTN_GATES: HcGateSums = HcGateSums {
+    pre_view: 118.016075,
+    pre_scaled: 9.362187,
+    pre_biased: -1.522255,
+    pre_sigmoid: 3.695869,
+    pre: 3.695877,
+    post_view: -708.020691,
+    post_scaled: -28.494911,
+    post_biased: -45.285225,
+    post_sigmoid: 0.111723,
+    post: 0.223446,
+    comb: 7.999992,
+};
+const L3T2_FFN_GATES: HcGateSums = HcGateSums {
+    pre_view: 84.676689,
+    pre_scaled: 7.280041,
+    pre_biased: -4.989226,
+    pre_sigmoid: 2.965539,
+    pre: 2.965547,
+    post_view: -285.240814,
+    post_scaled: -16.522358,
+    post_biased: -24.049160,
+    post_sigmoid: 0.857103,
+    post: 1.714206,
+    comb: 7.999993,
+};
+const L3T2: LayerSums = LayerSums {
+    il: 3,
+    tokens: TOKENS_2,
+    attn_gates: L3T2_ATTN_GATES,
+    ffn_gates: L3T2_FFN_GATES,
+    weighted: [59.109970, 3.667929, -1.341033, 0.643734, 1.267123, -0.377637],
+    rows: &[
+        ("hc_mixes_attn", -598.809387),
+        ("hc_attn_pre", 24.208088),
+        ("norm_attn", 79.563873),
+        ("attn_norm", 4.056807),
+        ("qr", 3.573563),
+        ("qr_rms", 35.861706),
+        ("qr_norm", 0.928110),
+        ("q_b", -12.809828),
+        ("q_norm", -522.932495),
+        ("q_nope", -2075.611328),
+        ("q_pe_in", 1552.682373),
+        ("q_pe", 1503.679077),
+        ("q", -571.931274),
+        ("kv_a", 3.354357),
+        ("kv_rms", 26.248386),
+        ("kv_norm", 10.826424),
+        ("kv_nope", 44.097580),
+        ("kv_pe_in", -33.271152),
+        ("kv_pe", -37.037834),
+        ("kv", 7.059739),
+        ("cache_k", 7.060322),
+        ("q_perm", -571.931824),
+        ("flash_attn", -101.196808),
+        ("out_nope", 667.009460),
+        ("out_pe_in", -768.201477),
+        ("rope_back", -726.776123),
+        ("attn_derope", -59.771351),
+        ("attn_derope_perm", -59.771358),
+        ("attn_wo_a", -104.886375),
+        ("attn_wo_a_cont", -104.886482),
+        ("attn_out", 27.662806),
+        ("hc_attn_post", 55.305370),
+        ("post_norm", 220.449265),
+        ("hc_mixes_ffn", -228.237274),
+        ("hc_ffn_pre", 11.994062),
+        ("norm_ffn", 69.295235),
+        ("ffn_norm", 18.009119),
+        ("moe_logits", -1966.536499),
+        ("moe_softplus", 18.498667),
+        ("moe_probs", 83.329803),
+        ("moe_probs_biased", 4685.573242),
+        ("moe_argsort", 65280.000000),
+        ("moe_topk", 1634.000000),
+        ("moe_weights", 5.837240),
+        ("moe_weights_sum", 5.837240),
+        ("moe_weights_sum_clamped", 5.837240),
+        ("moe_weights_norm", 2.000000),
+        ("moe_weights_scaled", 3.000000),
+        ("shexp_gate", -1346.839722),
+        ("shexp_gate_clamped", -1346.839722),
+        ("shexp_up", -9.172648),
+        ("shexp_up_clamped", -9.172648),
+        ("shexp_swiglu", -0.316023),
+        ("shexp", 6.563107),
+        ("moe_gate", -2352.544434),
+        ("moe_up", 85.588280),
+        ("moe_swiglu", 5.400528),
+        ("moe_down", 105.462456),
+        ("moe_weighted", 62.970425),
+        ("moe_out", 62.970127),
+        ("ffn_out", 69.533234),
+        ("l_last", 113.606995),
+        ("next_norm", 427.686554),
+    ],
+};
+
 
 /// Layer 1's FFN gate block.
 const LAYER1_FFN_GATE_SUMS: HcGateSums = HcGateSums {
@@ -533,10 +940,10 @@ fn prologue_5tok<'c>(
     config: &Deepseek4Config,
 ) -> Prologue5<'c> {
     let hc = config.hc_mult as i64;
-    let nt = TOKENS_5.len() as i64;
+    let nt = s.tokens.len() as i64;
 
     let tok = ctx.new_i32_1d(nt).expect("tok");
-    tok.set_i32(&TOKENS_5).expect("set");
+    tok.set_i32(s.tokens).expect("set");
     let embd = ctx
         .get_rows(weights.get("token_embd.weight").expect("bound"), &tok)
         .expect("get_rows");
@@ -581,7 +988,7 @@ fn layer_entry_5tok<'c>(
     config: &Deepseek4Config,
     streams: &Tensor<'c>,
 ) -> Prologue5<'c> {
-    let nt = TOKENS_5.len() as i64;
+    let nt = s.tokens.len() as i64;
     let flat = ctx
         .reshape_2d(streams, config.hc_dim() as i64, nt)
         .expect("flatten streams");
@@ -593,7 +1000,7 @@ fn layer_entry_5tok<'c>(
     ctx.compute(&mixes, 12).expect("compute mixes");
     check(s, "hc_mixes_attn", mixes.to_vec_f32().iter().sum::<f32>());
 
-    let gates = hc_gates(ctx, weights, config, &format!("blk.{}.hc_attn", s.il), &mixes, s.attn_gates);
+    let gates = hc_gates(ctx, weights, config, &format!("blk.{}.hc_attn", s.il), &mixes, s.attn_gates, nt);
 
     let collapsed = ctx.dsv4_hc_pre(streams, &gates.pre).expect("dsv4_hc_pre");
     ctx.compute(&collapsed, 12).expect("compute hc_pre op");
@@ -696,9 +1103,9 @@ fn hc_gates<'c>(
     prefix: &str,
     mixes: &Tensor<'c>,
     want: HcGateSums,
+    nt: i64,
 ) -> HcGates<'c> {
     let hc = config.hc_mult as i64;
-    let nt = TOKENS_5.len() as i64;
     let f32_size = std::mem::size_of::<f32>();
     // The stride is the *source's* row, `hc_mix_dim = (2 + hc) * hc` = 24
     // floats (`deepseek4.cpp:277`, and `dsv4_view_2d` passes `t->nb[1]`), not
@@ -809,6 +1216,7 @@ fn rope_and_kv_match_llama_cpp_at_five_tokens() {
     let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
     let mut weights = WeightSet::new();
     bind_all(&model, &wctx, &mut weights, &block_weights(0));
+    bind_all(&model, &wctx, &mut weights, &optional_block_weights(&model, 0));
 
     let s = &LAYER0;
     let p = prologue_5tok(s, &ctx, &weights, &config);
@@ -830,12 +1238,25 @@ fn block_weights(il: u32) -> Vec<String> {
         "attn_norm", "attn_q_a", "attn_q_a_norm", "attn_q_b",
         "attn_kv", "attn_kv_a_norm", "attn_sinks",
         "attn_output_a", "attn_output_b",
-        "ffn_norm", "ffn_gate_inp", "ffn_gate_tid2eid",
+        "ffn_norm", "ffn_gate_inp",
         "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
     ] {
         names.push(format!("blk.{il}.{suffix}.weight"));
     }
     names
+}
+
+/// Weights only some blocks carry, bound when they exist.
+///
+/// `ffn_gate_tid2eid` is on 3 blocks and `exp_probs_b` on 40 — and they are
+/// mutually exclusive, being the two routing schemes. Binding blindly would
+/// panic on whichever the block lacks.
+fn optional_block_weights(model: &Model, il: u32) -> Vec<String> {
+    ["ffn_gate_tid2eid.weight", "exp_probs_b.bias"]
+        .iter()
+        .map(|suffix| format!("blk.{il}.{suffix}"))
+        .filter(|n| model.location(n).is_some())
+        .collect()
 }
 
 /// Q and KV at five tokens, rotation included, checked step by step.
@@ -850,19 +1271,20 @@ fn q_and_kv_5tok<'c>(
     config: &Deepseek4Config,
     attn_norm: &Tensor<'c>,
 ) -> (Tensor<'c>, Tensor<'c>) {
-    let nt = TOKENS_5.len() as i64;
+    let nt = s.tokens.len() as i64;
     let head_dim = config.kv_lora_rank as i64;
     let n_rot = config.n_rot as i64;
     let n_nope = config.n_rot_none() as i64;
     let f32_size = std::mem::size_of::<f32>();
     let head_stride = head_dim as usize * f32_size;
-    let rope = rope_layer_0(config);
+    let (rope, rope_n_ctx_orig) = rope_for(config, s.il);
 
     // Positions 0..4. This tensor is the whole difference from the one-token
     // capture: with a single zero in it, every assertion below still passes on
     // a forward pass that never rotates anything.
     let pos = ctx.new_i32_1d(nt).expect("pos");
-    pos.set_i32(&[0, 1, 2, 3, 4]).expect("set pos");
+    let positions: Vec<i32> = (0..nt as i32).collect();
+    pos.set_i32(&positions).expect("set pos");
 
     // ---- Q ----
     let qr = ctx
@@ -927,7 +1349,7 @@ fn q_and_kv_5tok<'c>(
     check(s, "q_pe_in", unrotated);
 
     let q_pe = ctx
-        .rope_ext(&q_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, 0, rope)
+        .rope_ext(&q_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, rope_n_ctx_orig, rope)
         .expect("rope q_pe");
     ctx.compute(&q_pe, 12).expect("compute rope");
     let rotated: f32 = q_pe.to_vec_f32().iter().sum();
@@ -985,7 +1407,7 @@ fn q_and_kv_5tok<'c>(
     check(s, "kv_pe_in", kv_pe_in.to_vec_f32().iter().sum::<f32>());
 
     let kv_pe = ctx
-        .rope_ext(&kv_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, 0, rope)
+        .rope_ext(&kv_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, rope_n_ctx_orig, rope)
         .expect("rope kv_pe");
     ctx.compute(&kv_pe, 12).expect("compute rope kv");
     check(s, "kv_pe", kv_pe.to_vec_f32().iter().sum::<f32>());
@@ -1036,6 +1458,7 @@ fn attention_matches_llama_cpp_at_five_tokens() {
     let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
     let mut weights = WeightSet::new();
     bind_all(&model, &wctx, &mut weights, &block_weights(0));
+    bind_all(&model, &wctx, &mut weights, &optional_block_weights(&model, 0));
 
     let p = prologue_5tok(&LAYER0, &ctx, &weights, &config);
     let (q, kv) = q_and_kv_5tok(&LAYER0, &ctx, &weights, &config, &p.attn_norm);
@@ -1083,6 +1506,7 @@ fn post_hyper_connection_matches_llama_cpp_at_five_tokens() {
     let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
     let mut weights = WeightSet::new();
     bind_all(&model, &wctx, &mut weights, &block_weights(0));
+    bind_all(&model, &wctx, &mut weights, &optional_block_weights(&model, 0));
 
     let p = prologue_5tok(&LAYER0, &ctx, &weights, &config);
     let (q, kv) = q_and_kv_5tok(&LAYER0, &ctx, &weights, &config, &p.attn_norm);
@@ -1143,6 +1567,7 @@ fn moe_router_and_shared_expert_match_llama_cpp_at_five_tokens() {
     let wctx = Context::new_no_alloc(8 << 20).expect("weight context");
     let mut weights = WeightSet::new();
     bind_all(&model, &wctx, &mut weights, &block_weights(0));
+    bind_all(&model, &wctx, &mut weights, &optional_block_weights(&model, 0));
 
     let p = prologue_5tok(&LAYER0, &ctx, &weights, &config);
     let (q, kv) = q_and_kv_5tok(&LAYER0, &ctx, &weights, &config, &p.attn_norm);
@@ -1165,7 +1590,7 @@ fn moe_routing_5tok<'c>(
     config: &Deepseek4Config,
     ffn_norm: &Tensor<'c>,
 ) -> (Tensor<'c>, Tensor<'c>) {
-    let nt = TOKENS_5.len() as i64;
+    let nt = s.tokens.len() as i64;
     let n_expert = config.n_expert as i64;
     let n_used = config.n_expert_used as i64;
 
@@ -1184,19 +1609,44 @@ fn moe_routing_5tok<'c>(
     ctx.compute(&probs, 12).expect("compute sqrt");
     check(s, "moe_probs", probs.to_vec_f32().iter().sum::<f32>());
 
-    // Hash routing: the six experts are a lookup on the token id, and the
-    // router never picks anything.
     let probs3 = ctx.reshape_3d(&probs, 1, n_expert, nt).expect("reshape probs");
-    let tok = ctx.new_i32_1d(nt).expect("tok");
-    tok.set_i32(&TOKENS_5).expect("set");
-    let topk = ctx
-        .get_rows(weights.get(&format!("blk.{}.ffn_gate_tid2eid.weight", s.il)).expect("bound"), &tok)
-        .expect("topk");
+
+    // Two entirely different ways of choosing experts, and which one a layer
+    // uses is decided by `hash_layer_count`.
+    let topk = if s.il < config.hash_layer_count {
+        // Hash routing (layers 0-2): the six experts are a lookup on the token
+        // id and the router never picks anything. `exp_probs_b` is not applied
+        // at all on these layers.
+        let tok = ctx.new_i32_1d(nt).expect("tok");
+        tok.set_i32(s.tokens).expect("set");
+        ctx.get_rows(
+            weights.get(&format!("blk.{}.ffn_gate_tid2eid.weight", s.il)).expect("bound"),
+            &tok,
+        )
+        .expect("topk")
+    } else {
+        // The path the other 40 layers use. The selection bias is added to a
+        // *copy* — llama.cpp's own comment is "leave probs unbiased as it's
+        // later used to get expert weights" (`llama-graph.cpp:1885`). Biasing
+        // the weights too is the natural mistake: it changes every expert
+        // weight and no shape.
+        let biased = ctx
+            .add(&probs, weights.get(&format!("blk.{}.exp_probs_b.bias", s.il)).expect("bound"))
+            .expect("probs_biased");
+        ctx.compute(&biased, 12).expect("compute biased");
+        check(s, "moe_probs_biased", biased.to_vec_f32().iter().sum::<f32>());
+
+        // argsort_top_k, not top_k: this one's indices *are* in score order.
+        let sel = ctx.argsort_top_k(&biased, n_used as i32).expect("argsort_top_k");
+        ctx.compute(&sel, 12).expect("compute argsort");
+        sel
+    };
     ctx.compute(&topk, 12).expect("compute topk");
     let ids = topk.to_vec_i32();
     assert_eq!(ids.len(), (n_used * nt) as usize, "six experts per token");
     check(s, "moe_topk", ids.iter().sum::<i32>() as f32);
 
+    // Always from the unbiased probabilities, on both routing paths.
     let w = ctx.get_rows(&probs3, &topk).expect("weights");
     ctx.compute(&w, 12).expect("compute weights");
     check(s, "moe_weights", w.to_vec_f32().iter().sum::<f32>());
@@ -1268,6 +1718,7 @@ fn routed_experts_and_layer_output_match_llama_cpp_at_five_tokens() {
     let wctx = Context::new_no_alloc(16 << 20).expect("weight context");
     let mut weights = WeightSet::new();
     bind_all(&model, &wctx, &mut weights, &block_weights(0));
+    bind_all(&model, &wctx, &mut weights, &optional_block_weights(&model, 0));
 
     let _ = layer0_5tok(&LAYER0, &model, &ctx, &wctx, &mut weights, &config);
 }
@@ -1319,7 +1770,7 @@ fn layer_body_5tok<'c>(
     let (w_scaled, topk) = moe_routing_5tok(s, ctx, weights, config, &ffn_norm);
     let shexp = shared_expert_5tok(s, ctx, weights, &ffn_norm);
 
-    let nt = TOKENS_5.len() as i64;
+    let nt = s.tokens.len() as i64;
     let n_embd = config.n_embd as i64;
     let n_used = config.n_expert_used as i64;
     let f32_size = std::mem::size_of::<f32>();
@@ -1514,8 +1965,10 @@ fn layers_compose_through_the_first_compressed_layer() {
     let wctx = Context::new_no_alloc(16 << 20).expect("weight context");
     let mut weights = WeightSet::new();
     bind_all(&model, &wctx, &mut weights, &block_weights(0));
+    bind_all(&model, &wctx, &mut weights, &optional_block_weights(&model, 0));
 
     bind_all(&model, &wctx, &mut weights, &block_weights(1));
+    bind_all(&model, &wctx, &mut weights, &optional_block_weights(&model, 1));
 
     let l_last = layer0_5tok(&LAYER0, &model, &ctx, &wctx, &mut weights, &config);
 
@@ -1543,7 +1996,68 @@ fn layers_compose_through_the_first_compressed_layer() {
         "layer 2 is where the compressed layers begin"
     );
     bind_all(&model, &wctx, &mut weights, &block_weights(2));
+    bind_all(&model, &wctx, &mut weights, &optional_block_weights(&model, 2));
     let _ = layer_entry_5tok(&LAYER2_ENTRY, &ctx, &weights, &config, &l_last);
+}
+
+
+/// **Four layers, and the two remaining holes closed.**
+///
+/// Runs layers 0-3 end to end at a *two-token* prompt, ending on the exact
+/// tensor layer 4 would receive.
+///
+/// The reason a shorter prompt reaches further than a longer one is the guard
+/// on the compressed attention builders (`deepseek4.cpp:1049-1063`): they need
+/// their compressed caches populated, and at two tokens those caches are empty,
+/// so **layers 2 and 3 fall through to `build_raw_attention`** — already built
+/// and already verified. Their compressor projections still run, but nothing
+/// reads them at this length.
+///
+/// That makes two things checkable that five tokens could not reach without
+/// first building the lightning indexer:
+///
+/// 1. **The compressed RoPE branch.** `compress_ratios[il] != 0` from layer 2
+///    on, and that choice is independent of which attention builder runs — so
+///    `rope_for_layer`'s YaRN branch, transcribed from source and until now
+///    checked against nothing, finally executes. `q_pe-2` and `q_pe-3` both
+///    rotate against base 160000, not 10000.
+/// 2. **The normal MoE routing path**, which 40 of 43 layers use. Layers 0-2
+///    are the `hash_layer_count` layers and select by token-id lookup; layer 3
+///    is the first to do `probs + exp_probs_b -> argsort_top_k`. The bias
+///    steers *selection only* — the weights are gathered from the unbiased
+///    probabilities, which llama.cpp spells out at `llama-graph.cpp:1885` and
+///    which changes every expert weight if got wrong, with no shape to catch it.
+///
+/// It is also a third independent input for layers 0 and 1, whose numbers here
+/// share nothing with either earlier capture.
+#[test]
+#[ignore = "reads weights from a 144 GB container"]
+fn four_layers_at_two_tokens_close_the_compressed_rope_and_routing_holes() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+
+    // Four layers in one arena; ggml aborts rather than erroring if this is
+    // short, so it is sized for the whole chain up front.
+    let ctx = Context::new(2560 << 20).expect("compute context");
+    let wctx = Context::new_no_alloc(32 << 20).expect("weight context");
+    let mut weights = WeightSet::new();
+    for il in 0..4u32 {
+        bind_all(&model, &wctx, &mut weights, &block_weights(il));
+        bind_all(&model, &wctx, &mut weights, &optional_block_weights(&model, il));
+    }
+
+    // The premise, asserted rather than assumed: layer 0-1 uncompressed, 2-3
+    // compressed, and only 0-2 hash-routed.
+    assert!(!config.uses_compress_rope(1));
+    assert!(config.uses_compress_rope(2), "layer 2 must take the YaRN branch");
+    assert!(config.uses_compress_rope(3));
+    assert_eq!(config.hash_layer_count, 3);
+
+    let mut streams = layer0_5tok(&L0T2, &model, &ctx, &wctx, &mut weights, &config);
+    for s in [&L1T2, &L2T2, &L3T2] {
+        streams = layer_5tok(s, &model, &ctx, &wctx, &mut weights, &config, &streams);
+    }
+    let _ = streams;
 }
 
 /// Read just the named experts out of a stacked tensor and bind them as a
@@ -1639,7 +2153,7 @@ fn layer_tail_5tok<'c>(
     p: &Prologue5<'c>,
     attn_out: &Tensor<'c>,
 ) -> (Tensor<'c>, Tensor<'c>, HcGates<'c>) {
-    let nt = TOKENS_5.len() as i64;
+    let nt = s.tokens.len() as i64;
 
     // x = attn_out, residual = the streams as they were *before* attention.
     let streams = ctx
@@ -1663,7 +2177,7 @@ fn layer_tail_5tok<'c>(
     ctx.compute(&mixes, 12).expect("compute mixes");
     check(s, "hc_mixes_ffn", mixes.to_vec_f32().iter().sum::<f32>());
 
-    let gates = hc_gates(ctx, weights, config, &format!("blk.{}.hc_ffn", s.il), &mixes, s.ffn_gates);
+    let gates = hc_gates(ctx, weights, config, &format!("blk.{}.hc_ffn", s.il), &mixes, s.ffn_gates, nt);
 
     let collapsed = ctx.dsv4_hc_pre(&streams, &gates.pre).expect("dsv4_hc_pre");
     ctx.compute(&collapsed, 12).expect("compute hc_ffn_pre");
@@ -1694,7 +2208,7 @@ fn attention_5tok<'c>(
     q_full: &Tensor<'c>,
     kv_full: &Tensor<'c>,
 ) -> Tensor<'c> {
-    let nt = TOKENS_5.len() as i64;
+    let nt = s.tokens.len() as i64;
     let head_dim = config.kv_lora_rank as i64;
     let n_head = config.n_head as i64;
     // The padded cache window llama.cpp's trace shows: cache_k_l0 is viewed as
@@ -1783,9 +2297,10 @@ fn attention_5tok<'c>(
     let n_rot = config.n_rot as i64;
     let f32_size = std::mem::size_of::<f32>();
     let head_stride = head_dim as usize * f32_size;
-    let rope = rope_layer_0(config);
+    let (rope, rope_n_ctx_orig) = rope_for(config, s.il);
     let pos = ctx.new_i32_1d(nt).expect("pos");
-    pos.set_i32(&[0, 1, 2, 3, 4]).expect("set pos");
+    let positions: Vec<i32> = (0..nt as i32).collect();
+    pos.set_i32(&positions).expect("set pos");
 
     // flash_attn_ext returns [head_dim, n_head, tokens] already, so this
     // reshape is a no-op on the layout and only re-labels it.
@@ -1814,7 +2329,7 @@ fn attention_5tok<'c>(
     // 3432.8 -> 28.5 is not a small correction, and a forward rope here instead
     // of a backward one would be neither an error nor obviously wrong.
     let out_pe = ctx
-        .rope_ext_back(&out_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, 0, rope)
+        .rope_ext_back(&out_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, rope_n_ctx_orig, rope)
         .expect("rope_back");
     ctx.compute(&out_pe, 12).expect("compute rope_back");
     check(s, "rope_back", out_pe.to_vec_f32().iter().sum::<f32>());

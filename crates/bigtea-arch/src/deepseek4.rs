@@ -208,6 +208,20 @@ pub struct Deepseek4Config {
     /// Parallel residual streams the hyper-connection block carries.
     pub hc_mult: u32,
 
+    /// How many leading blocks route experts by a **token-id lookup** instead
+    /// of by the router.
+    ///
+    /// The first `hash_layer_count` blocks (3 here) carry `ffn_gate_tid2eid`, a
+    /// `[n_expert_used, vocab]` I32 table, and their six experts come straight
+    /// out of it — `ffn_moe_topk` on those layers is a `GET_ROWS`, not a top-k,
+    /// and `exp_probs_b` is not applied at all. Every other block selects by
+    /// `argsort_top_k` over the biased probabilities.
+    ///
+    /// Worth more than a correctness detail to a streaming runner: on these
+    /// layers the expert set is knowable from the token id **before any compute
+    /// runs**, so their reads can be issued as early as tokenisation.
+    pub hash_layer_count: u32,
+
     /// SwiGLU clamp limit **per layer**, for the routed experts.
     ///
     /// 43 values. Applied asymmetrically: the gate is clamped to
@@ -287,6 +301,7 @@ impl Deepseek4Config {
             n_rot: opt("rope.dimension_count", 0) as u32,
             output_group_count: opt("attention.output_group_count", 1) as u32,
             hc_mult: opt("hyper_connection.count", 1) as u32,
+            hash_layer_count: opt("hash_layer_count", 0) as u32,
 
             swiglu_clamp_exp: model.arch_f32_array("swiglu_clamp_exp").unwrap_or_default(),
             // llama.cpp falls back to the routed limits when the shared-expert
@@ -743,6 +758,7 @@ mod tests {
             n_rot: 64,
             output_group_count: 8,
             hc_mult: 4,
+            hash_layer_count: 3,
             // Layers 0-1 uncompressed, the rest compressed — the container's
             // own shape, so the per-layer branches are exercised.
             swiglu_clamp_exp: vec![10.0; 43],
