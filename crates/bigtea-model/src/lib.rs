@@ -38,14 +38,24 @@ pub use resident::{LoadReport, ResidentSet, SkipReason, Skipped};
 
 #[derive(Debug)]
 pub enum Error {
-    Io { path: PathBuf, source: std::io::Error },
-    Parse { path: PathBuf, source: bigtea_gguf::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Parse {
+        path: PathBuf,
+        source: bigtea_gguf::Error,
+    },
     NoShards,
     /// Two shards claimed the same tensor name.
     DuplicateTensor(String),
     UnknownTensor(String),
     /// A tensor's bytes are not (yet) on disk.
-    NotDownloaded { name: String, need: u64, have: u64 },
+    NotDownloaded {
+        name: String,
+        need: u64,
+        have: u64,
+    },
     /// The tensor's ggml type is one we cannot size.
     Unsizable(String),
 }
@@ -160,7 +170,9 @@ impl Model {
             }
 
             for t in &gguf.tensors {
-                let size = t.size_bytes().ok_or_else(|| Error::Unsizable(t.name.clone()))?;
+                let size = t
+                    .size_bytes()
+                    .ok_or_else(|| Error::Unsizable(t.name.clone()))?;
                 let loc = Location {
                     shard: idx,
                     file_offset: gguf.data_offset + t.offset,

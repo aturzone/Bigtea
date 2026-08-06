@@ -73,7 +73,10 @@ fn property_pruning_the_pool_does_not_change_speed() {
     let a = predict_on_laptop(&full, 14.5);
     let b = predict_on_laptop(&pruned, 14.5);
 
-    assert!(b.container_bytes < a.container_bytes, "pruning must shrink disk");
+    assert!(
+        b.container_bytes < a.container_bytes,
+        "pruning must shrink disk"
+    );
     assert_eq!(
         b.bytes_per_token, a.bytes_per_token,
         "pruning must NOT change bytes per token"
@@ -123,7 +126,14 @@ fn disk_shortfall_is_flagged_not_hidden() {
 #[test]
 fn missing_bandwidth_yields_no_speed_rather_than_a_guess() {
     let profile = v4_flash(4.0, 5.5);
-    let p = Prediction::new(&profile, Some(14 * GIB), None, None, 3 * GIB, DEFAULT_EFFICIENCY);
+    let p = Prediction::new(
+        &profile,
+        Some(14 * GIB),
+        None,
+        None,
+        3 * GIB,
+        DEFAULT_EFFICIENCY,
+    );
     assert!(p.tokens_per_sec_realistic.is_none());
     assert!(p.seconds_per_token.is_none());
     // But the byte accounting is still valid and useful.

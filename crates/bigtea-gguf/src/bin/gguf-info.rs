@@ -59,7 +59,12 @@ fn main() -> ExitCode {
             .get_u64("split.tensors.count")
             .map(|t| t.to_string())
             .unwrap_or_else(|| "?".into());
-        println!("split          shard {} of {} ({} tensors overall)", no + 1, count, total);
+        println!(
+            "split          shard {} of {} ({} tensors overall)",
+            no + 1,
+            count,
+            total
+        );
     }
 
     // Architecture facts the model itself declares.
@@ -135,7 +140,10 @@ fn main() -> ExitCode {
         .filter(|t| t.size_bytes().is_none())
         .collect();
     if !unknown.is_empty() {
-        println!("\n! {} tensor(s) had an unknown type or a partial block:", unknown.len());
+        println!(
+            "\n! {} tensor(s) had an unknown type or a partial block:",
+            unknown.len()
+        );
         for t in unknown.iter().take(5) {
             println!("    {} ({}, {:?})", t.name, t.ty, t.dims);
         }

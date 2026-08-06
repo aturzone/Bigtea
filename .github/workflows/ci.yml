@@ -1,0 +1,134 @@
+name: CI
+
+# Bigtea links against a prebuilt ggml. Rather than vendor it, each job builds
+# ggml from llama.cpp and points GGML_LIB_DIR at the result — the same steps a
+# contributor follows by hand, so a green CI means the documented steps work.
+#
+# Linux and macOS have never been executed at runtime. These jobs are the first
+# thing that will tell us whether the per-platform direct-I/O paths compile and
+# whether the unit tests pass there.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast feedback that needs no C toolchain at all.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt }
+      - run: cargo fmt --all --check
+
+  # Seven of the eight crates must keep building without ggml, and the eighth
+  # must fail with instructions rather than a wall of unresolved imports. Both
+  # halves are promises the README makes, so both are tested.
+  without-ggml:
+    name: usable without ggml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - uses: Swatinem/rust-cache@v2
+
+      - name: The ggml-free crates build, test and lint
+        run: |
+          CRATES="-p bigtea-gguf -p bigtea-probe -p bigtea-plan -p bigtea-io -p bigtea-model -p bigtea-tokenizer -p bigtea-ggml"
+          cargo build $CRATES
+          cargo test $CRATES
+          cargo clippy $CRATES --all-targets -- -D warnings
+
+      - name: bigtea-arch fails with instructions, not with import errors
+        run: |
+          if cargo build -p bigtea-arch 2>build.log; then
+            echo "::error::bigtea-arch built without ggml; the guard in its build.rs is not working"
+            exit 1
+          fi
+          grep -q "GGML_LIB_DIR is not set" build.log \
+            || { echo "::error::missing the actionable message"; cat build.log; exit 1; }
+          grep -q "github.com/ggml-org/llama.cpp" build.log \
+            || { echo "::error::error message does not tell the user what to do"; exit 1; }
+          echo "bigtea-arch failed correctly, with instructions."
+
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  name: linux }
+          - { os: macos-latest,   name: macos }
+          - { os: windows-latest, name: windows }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+
+      - name: Use the GNU toolchain on Windows
+        # ggml's static archives are produced by MSYS2's gcc and pull in libgomp,
+        # which the MSVC linker cannot resolve.
+        if: runner.os == 'Windows'
+        run: rustup default stable-x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache the ggml build
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: ggml-libs
+          key: ggml-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      - name: Build ggml
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp
+          cmake -S llama.cpp -B llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DGGML_NATIVE=OFF
+          cmake --build llama.cpp/build --config Release --target ggml ggml-base ggml-cpu -j
+          mkdir -p ggml-libs
+          # Archive names and locations differ between generators, so collect
+          # whatever landed and normalise the names build.rs expects.
+          find llama.cpp/build \( -name 'libggml*.a' -o -name 'ggml*.a' \) -print | while read -r f; do
+            cp "$f" "ggml-libs/$(basename "$f" | sed 's/^lib//')"
+          done
+          ls -la ggml-libs
+
+      - name: Build, lint and test
+        shell: bash
+        env:
+          GGML_LIB_DIR: ${{ github.workspace }}/ggml-libs
+        run: |
+          cargo build --release --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --release --workspace
+
+      # The container-backed tests skip themselves when no model is on disk.
+      # This proves the skip path works, not that the tests pass.
+      - name: Container tests skip cleanly without a model
+        shell: bash
+        env:
+          GGML_LIB_DIR: ${{ github.workspace }}/ggml-libs
+        run: cargo test --release --workspace -- --ignored

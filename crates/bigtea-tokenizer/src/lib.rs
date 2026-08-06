@@ -40,7 +40,10 @@ impl fmt::Display for TokenizerError {
                 f.write_str("container has no tokenizer.ggml.tokens array")
             }
             TokenizerError::UnsupportedModel(m) => {
-                write!(f, "unsupported tokenizer model {m:?} (only byte-level BPE is implemented)")
+                write!(
+                    f,
+                    "unsupported tokenizer model {m:?} (only byte-level BPE is implemented)"
+                )
             }
             TokenizerError::BadMerge(m) => write!(f, "malformed merge rule {m:?}"),
         }
@@ -104,9 +107,7 @@ impl Tokenizer {
         }
 
         let id_of = |key: &str| meta.get(key).and_then(Value::as_u64).map(|v| v as u32);
-        let flag = |key: &str| {
-            matches!(meta.get(key), Some(Value::Bool(true)))
-        };
+        let flag = |key: &str| matches!(meta.get(key), Some(Value::Bool(true)));
 
         Ok(Tokenizer {
             tokens,
@@ -165,10 +166,7 @@ impl Tokenizer {
     /// Lossy on invalid UTF-8, because a partial multi-byte character is
     /// normal when streaming one token at a time.
     pub fn decode(&self, ids: &[u32]) -> String {
-        let joined: String = ids
-            .iter()
-            .filter_map(|&id| self.token_text(id))
-            .collect();
+        let joined: String = ids.iter().filter_map(|&id| self.token_text(id)).collect();
         String::from_utf8_lossy(&bytes::decode(&joined)).into_owned()
     }
 

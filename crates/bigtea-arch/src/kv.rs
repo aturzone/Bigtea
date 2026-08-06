@@ -148,7 +148,11 @@ pub enum KvError {
 impl std::fmt::Display for KvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            KvError::WrongSize { expected, got_k, got_v } => write!(
+            KvError::WrongSize {
+                expected,
+                got_k,
+                got_v,
+            } => write!(
                 f,
                 "kv cache expected {expected} floats per position, got k={got_k} v={got_v}"
             ),
@@ -176,7 +180,7 @@ mod tests {
         let exp = ((bits >> 10) & 0x1f) as u32;
         let frac = (bits & 0x3ff) as u32;
         let f = if exp == 0 {
-            (sign << 31) | 0 // zero (or subnormal, treated as zero here)
+            sign << 31 // zero (or subnormal, treated as zero here)
         } else {
             (sign << 31) | ((exp + 112) << 23) | (frac << 13)
         };
@@ -235,7 +239,10 @@ mod tests {
         let mut c = cache();
         let short = vec![1.0f32; 16];
         assert!(c.push(0, &short, &short).is_err());
-        assert!(c.is_consistent(), "a refused push must not mutate the cache");
+        assert!(
+            c.is_consistent(),
+            "a refused push must not mutate the cache"
+        );
     }
 
     #[test]

@@ -177,7 +177,9 @@ impl ResidentSet {
                         scope.spawn(move || {
                             let mut out = Vec::new();
                             for (name, size) in slice.iter().skip(t).step_by(threads) {
-                                out.push(read_checked(model, name, *size).map(|d| (name.clone(), d)));
+                                out.push(
+                                    read_checked(model, name, *size).map(|d| (name.clone(), d)),
+                                );
                             }
                             out
                         })
@@ -243,12 +245,20 @@ impl ResidentSet {
         for (name, size) in planned {
             if bytes.saturating_add(size) > budget_bytes {
                 over_budget += size;
-                skipped.push(Skipped { name, size, reason: SkipReason::OverBudget });
+                skipped.push(Skipped {
+                    name,
+                    size,
+                    reason: SkipReason::OverBudget,
+                });
                 continue;
             }
             if !model.is_available(&name)? {
                 not_downloaded += size;
-                skipped.push(Skipped { name, size, reason: SkipReason::NotDownloaded });
+                skipped.push(Skipped {
+                    name,
+                    size,
+                    reason: SkipReason::NotDownloaded,
+                });
                 continue;
             }
 
@@ -274,7 +284,14 @@ impl ResidentSet {
             skipped_not_downloaded: not_downloaded,
             seconds: start.elapsed().as_secs_f64(),
         };
-        Ok((ResidentSet { tensors, bytes, skipped }, report))
+        Ok((
+            ResidentSet {
+                tensors,
+                bytes,
+                skipped,
+            },
+            report,
+        ))
     }
 
     /// Bytes held in RAM.
@@ -341,18 +358,31 @@ impl Plan {
         for (name, size) in planned {
             if running.saturating_add(size) > budget_bytes {
                 over_budget += size;
-                skipped.push(Skipped { name, size, reason: SkipReason::OverBudget });
+                skipped.push(Skipped {
+                    name,
+                    size,
+                    reason: SkipReason::OverBudget,
+                });
                 continue;
             }
             if !model.is_available(&name)? {
                 not_downloaded += size;
-                skipped.push(Skipped { name, size, reason: SkipReason::NotDownloaded });
+                skipped.push(Skipped {
+                    name,
+                    size,
+                    reason: SkipReason::NotDownloaded,
+                });
                 continue;
             }
             running += size;
             to_load.push((name, size));
         }
-        Ok(Plan { to_load, skipped, over_budget, not_downloaded })
+        Ok(Plan {
+            to_load,
+            skipped,
+            over_budget,
+            not_downloaded,
+        })
     }
 }
 

@@ -16,7 +16,10 @@ fn parse_shard_name(file_name: &str) -> Option<(&str, u32, u32, &str)> {
         if digits_start == head.len() {
             return None; // no digits before "-of-"
         }
-        (&head[..digits_start], head[digits_start..].parse::<u32>().ok()?)
+        (
+            &head[..digits_start],
+            head[digits_start..].parse::<u32>().ok()?,
+        )
     };
     let digits_len = tail.chars().take_while(char::is_ascii_digit).count();
     if digits_len == 0 {
@@ -100,6 +103,9 @@ mod tests {
     fn shard_numbers_keep_their_padding() {
         // Naive formatting would look for "model-1-of-5.gguf" and find nothing.
         let (prefix, _, total, suffix) = parse_shard_name("model-00001-of-00012.gguf").unwrap();
-        assert_eq!(format!("{prefix}{:05}-of-{total:05}{suffix}", 7), "model-00007-of-00012.gguf");
+        assert_eq!(
+            format!("{prefix}{:05}-of-{total:05}{suffix}", 7),
+            "model-00007-of-00012.gguf"
+        );
     }
 }

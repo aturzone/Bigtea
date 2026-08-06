@@ -158,7 +158,6 @@ impl ReadPool {
         let mut workers = Vec::with_capacity(threads);
         for _ in 0..threads {
             let rx = Arc::clone(&rx);
-            let model = model;
             workers.push(std::thread::spawn(move || loop {
                 // Hold the lock only long enough to take a job, never across
                 // the read itself.
@@ -172,7 +171,10 @@ impl ReadPool {
                 let _ = done.send((idx, got));
             }));
         }
-        ReadPool { jobs: Some(tx), workers }
+        ReadPool {
+            jobs: Some(tx),
+            workers,
+        }
     }
 
     fn submit(&self, job: ReadJob) {
@@ -192,6 +194,13 @@ impl Drop for ReadPool {
         }
     }
 }
+
+/// Expert slices keyed by `(tensor name, expert index)`.
+///
+/// `Arc` rather than `Vec` because the same slice is bound again on every
+/// token that routes to it; handing back an owned copy meant memcpying about
+/// a gigabyte per token for bytes that never change.
+type ExpertSlices = HashMap<(String, u32), Arc<[u8]>>;
 
 pub struct StreamingRunner<'m> {
     model: &'m Model,
@@ -231,7 +240,7 @@ impl<'m> StreamingRunner<'m> {
         // Generation runs single-column matmuls, where the work per thread can
         // be smaller than the barrier that synchronises them. Overridable so
         // the trade-off can be measured rather than assumed.
-        let threads = std::env::var("BIGTEA_EXPERT_THREADS")
+        let _threads = std::env::var("BIGTEA_EXPERT_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
@@ -341,7 +350,10 @@ impl<'m> StreamingRunner<'m> {
         // BTreeMap keeps the read order ascending by expert index.
         let mut by_expert: BTreeMap<u32, Vec<(usize, f32)>> = BTreeMap::new();
         for t in 0..n_tokens {
-            let picks = self.route(&probs[t * n_expert..(t + 1) * n_expert], c.n_expert_used as usize);
+            let picks = self.route(
+                &probs[t * n_expert..(t + 1) * n_expert],
+                c.n_expert_used as usize,
+            );
             for (expert, weight) in picks {
                 by_expert.entry(expert).or_default().push((t, weight));
             }
@@ -395,71 +407,85 @@ impl<'m> StreamingRunner<'m> {
             let threads = self.threads;
             let mut group_secs = 0f64;
             let group_result = (|| -> Result<()> {
-            for &expert in group {
-                let members = &by_expert[&expert];
-                let take = |n: &String| -> Result<Arc<[u8]>> {
-                    fetched
-                        .get(&(n.clone(), expert))
-                        .cloned()
-                        .ok_or_else(|| ArchError::MissingTensor(format!("{n}[{expert}]")))
-                };
-                let gate_bytes = take(&gate_name)?;
-                let up_bytes = take(&up_name)?;
-                let down_bytes = take(&down_name)?;
+                for &expert in group {
+                    let members = &by_expert[&expert];
+                    let take = |n: &String| -> Result<Arc<[u8]>> {
+                        fetched
+                            .get(&(n.clone(), expert))
+                            .cloned()
+                            .ok_or_else(|| ArchError::MissingTensor(format!("{n}[{expert}]")))
+                    };
+                    let gate_bytes = take(&gate_name)?;
+                    let up_bytes = take(&up_name)?;
+                    let down_bytes = take(&down_name)?;
 
-                let m = members.len() as i64;
-            let need = arena_for(
-                &[
-                    (n_embd_i, m), // this expert's tokens, gathered
-                    (n_ff, m),     // gate
-                    (n_ff, m),     // up
-                    (n_ff, m),     // silu(gate) * up
-                    (n_embd_i, m), // down projection
-                ],
-                24,
-            ) + gate_bytes.len() + up_bytes.len() + down_bytes.len();
-            if buf.len() < need {
-                buf.resize(need, 0);
-            }
-            // SAFETY: `buf` is a local outliving `ctx`; each expert's context
-            // is dropped and its output copied out before the next is built.
-            let ctx = unsafe { Context::in_buffer(&mut buf, false)? };
-            let mut ws = WeightSet::new();
-            ws.bind(&ctx, "gate", gate_ty, &[n_embd_i as u64, n_ff as u64], gate_bytes)?;
-            ws.bind(&ctx, "up", up_ty, &[n_embd_i as u64, n_ff as u64], up_bytes)?;
-            ws.bind(&ctx, "down", down_ty, &[n_ff as u64, n_embd_i as u64], down_bytes)?;
+                    let m = members.len() as i64;
+                    let need = arena_for(
+                        &[
+                            (n_embd_i, m), // this expert's tokens, gathered
+                            (n_ff, m),     // gate
+                            (n_ff, m),     // up
+                            (n_ff, m),     // silu(gate) * up
+                            (n_embd_i, m), // down projection
+                        ],
+                        24,
+                    ) + gate_bytes.len()
+                        + up_bytes.len()
+                        + down_bytes.len();
+                    if buf.len() < need {
+                        buf.resize(need, 0);
+                    }
+                    // SAFETY: `buf` is a local outliving `ctx`; each expert's context
+                    // is dropped and its output copied out before the next is built.
+                    let ctx = unsafe { Context::in_buffer(&mut buf, false)? };
+                    let mut ws = WeightSet::new();
+                    ws.bind(
+                        &ctx,
+                        "gate",
+                        gate_ty,
+                        &[n_embd_i as u64, n_ff as u64],
+                        gate_bytes,
+                    )?;
+                    ws.bind(&ctx, "up", up_ty, &[n_embd_i as u64, n_ff as u64], up_bytes)?;
+                    ws.bind(
+                        &ctx,
+                        "down",
+                        down_ty,
+                        &[n_ff as u64, n_embd_i as u64],
+                        down_bytes,
+                    )?;
 
-            // Gather this expert's tokens into one contiguous matrix so the
-            // three matmuls run once for the group rather than once per token.
-            let mut gathered = vec![0f32; n_embd * members.len()];
-            for (slot, (t, _)) in members.iter().enumerate() {
-                gathered[slot * n_embd..(slot + 1) * n_embd]
-                    .copy_from_slice(&normed[t * n_embd..(t + 1) * n_embd]);
-            }
-            let xt = ctx.new_f32_2d(n_embd_i, m)?;
-            xt.set_f32(&gathered)?;
+                    // Gather this expert's tokens into one contiguous matrix so the
+                    // three matmuls run once for the group rather than once per token.
+                    let mut gathered = vec![0f32; n_embd * members.len()];
+                    for (slot, (t, _)) in members.iter().enumerate() {
+                        gathered[slot * n_embd..(slot + 1) * n_embd]
+                            .copy_from_slice(&normed[t * n_embd..(t + 1) * n_embd]);
+                    }
+                    let xt = ctx.new_f32_2d(n_embd_i, m)?;
+                    xt.set_f32(&gathered)?;
 
-            let g = ctx.mul_mat(ws.get("gate").expect("bound"), &xt)?;
-            let u = ctx.mul_mat(ws.get("up").expect("bound"), &xt)?;
-            let act = ctx.mul(&ctx.silu(&g)?, &u)?;
-            let out = ctx.mul_mat(ws.get("down").expect("bound"), &act)?;
-            // Not 0: `compute` floors the count at 1, so passing 0 ran every
-            // expert matmul on a single thread — the bulk of the model's
-            // arithmetic, on one core of twelve.
-            let t_exp = std::time::Instant::now();
-            ctx.compute(&out, threads)?;
-            group_secs += t_exp.elapsed().as_secs_f64();
+                    let g = ctx.mul_mat(ws.get("gate").expect("bound"), &xt)?;
+                    let u = ctx.mul_mat(ws.get("up").expect("bound"), &xt)?;
+                    let act = ctx.mul(&ctx.silu(&g)?, &u)?;
+                    let out = ctx.mul_mat(ws.get("down").expect("bound"), &act)?;
+                    // Not 0: `compute` floors the count at 1, so passing 0 ran every
+                    // expert matmul on a single thread — the bulk of the model's
+                    // arithmetic, on one core of twelve.
+                    let t_exp = std::time::Instant::now();
+                    ctx.compute(&out, threads)?;
+                    group_secs += t_exp.elapsed().as_secs_f64();
 
-                let produced = out.to_vec_f32();
-                for (slot, (t, weight)) in members.iter().enumerate() {
-                    let src = &produced[slot * n_embd..(slot + 1) * n_embd];
-                    let dst = &mut accum[t * n_embd..(t + 1) * n_embd];
-                    for (d, v) in dst.iter_mut().zip(src) {
-                        *d += v * weight;
+                    let produced = out.to_vec_f32();
+                    for (slot, (t, weight)) in members.iter().enumerate() {
+                        let src = &produced[slot * n_embd..(slot + 1) * n_embd];
+                        let dst = &mut accum[t * n_embd..(t + 1) * n_embd];
+                        for (d, v) in dst.iter_mut().zip(src) {
+                            *d += v * weight;
+                        }
                     }
                 }
-            }
-            Ok(())
+                Ok(())
             })();
             self.scratch = buf;
             group_result?;
@@ -545,9 +571,27 @@ impl<'m> StreamingRunner<'m> {
                     format!("u{expert}"),
                     format!("d{expert}"),
                 );
-                ws.bind(&ctx, &gk, gate_ty, &[n_embd as u64, n_ff as u64], take(gate_name)?)?;
-                ws.bind(&ctx, &uk, up_ty, &[n_embd as u64, n_ff as u64], take(up_name)?)?;
-                ws.bind(&ctx, &dk, down_ty, &[n_ff as u64, n_embd as u64], take(down_name)?)?;
+                ws.bind(
+                    &ctx,
+                    &gk,
+                    gate_ty,
+                    &[n_embd as u64, n_ff as u64],
+                    take(gate_name)?,
+                )?;
+                ws.bind(
+                    &ctx,
+                    &uk,
+                    up_ty,
+                    &[n_embd as u64, n_ff as u64],
+                    take(up_name)?,
+                )?;
+                ws.bind(
+                    &ctx,
+                    &dk,
+                    down_ty,
+                    &[n_ff as u64, n_embd as u64],
+                    take(down_name)?,
+                )?;
 
                 let g = ctx.mul_mat(ws.get(&gk).expect("bound"), &xt)?;
                 let u = ctx.mul_mat(ws.get(&uk).expect("bound"), &xt)?;
@@ -661,11 +705,8 @@ impl<'m> StreamingRunner<'m> {
     /// `seek_read` carries its own offset, so concurrent reads through one
     /// handle are positional and do not race — the same property
     /// `ResidentSet::load_parallel` already relies on.
-    fn read_slices_parallel(
-        &mut self,
-        wanted: &[(String, u32)],
-    ) -> Result<HashMap<(String, u32), Arc<[u8]>>> {
-        let mut out: HashMap<(String, u32), Arc<[u8]>> = HashMap::with_capacity(wanted.len());
+    fn read_slices_parallel(&mut self, wanted: &[(String, u32)]) -> Result<ExpertSlices> {
+        let mut out: ExpertSlices = HashMap::with_capacity(wanted.len());
         let mut misses: Vec<(String, u32, u64, u64)> = Vec::new();
 
         for key in wanted {
@@ -770,9 +811,21 @@ impl<'m> StreamingRunner<'m> {
             let n_embd = c.n_embd as i64;
             let n_ff = c.n_ff_expert as i64;
 
-            ws.bind(&ctx, "gate", gate_ty, &[n_embd as u64, n_ff as u64], gate_bytes)?;
+            ws.bind(
+                &ctx,
+                "gate",
+                gate_ty,
+                &[n_embd as u64, n_ff as u64],
+                gate_bytes,
+            )?;
             ws.bind(&ctx, "up", up_ty, &[n_embd as u64, n_ff as u64], up_bytes)?;
-            ws.bind(&ctx, "down", down_ty, &[n_ff as u64, n_embd as u64], down_bytes)?;
+            ws.bind(
+                &ctx,
+                "down",
+                down_ty,
+                &[n_ff as u64, n_embd as u64],
+                down_bytes,
+            )?;
 
             let xt = ctx.new_f32_2d(n_embd, 1)?;
             xt.set_f32(x)?;
@@ -828,7 +881,11 @@ impl<'m> StreamingRunner<'m> {
         }
         // The output projection may be tied to the embeddings.
         if self.model.location("output.weight").is_some() {
-            let loc = self.model.location("output.weight").expect("checked").clone();
+            let loc = self
+                .model
+                .location("output.weight")
+                .expect("checked")
+                .clone();
             let data = self.model.read_tensor("output.weight")?;
             total += data.len() as u64;
             weights.bind(ctx, "output.weight", loc.ty, &loc.dims, data)?;
@@ -923,16 +980,16 @@ impl<'m> StreamingRunner<'m> {
                 // Every arena in this function has to scale with the block.
                 let ctx = Context::new(arena_for(
                     &[
-                        (n_embd, n_new),            // input activations
-                        (n_embd, n_new),            // normalised
-                        (n_embd, n_new),            // rms intermediate
+                        (n_embd, n_new),                     // input activations
+                        (n_embd, n_new),                     // normalised
+                        (n_embd, n_new),                     // rms intermediate
                         (c.n_head as i64 * head_dim, n_new), // q
-                        (n_kv * head_dim, n_new),   // k
-                        (n_kv * head_dim, n_new),   // v
+                        (n_kv * head_dim, n_new),            // k
+                        (n_kv * head_dim, n_new),            // v
                         (c.n_head as i64 * head_dim, n_new), // q normalised
-                        (n_kv * head_dim, n_new),   // k normalised
+                        (n_kv * head_dim, n_new),            // k normalised
                         (c.n_head as i64 * head_dim, n_new), // q roped
-                        (n_kv * head_dim, n_new),   // k roped
+                        (n_kv * head_dim, n_new),            // k roped
                     ],
                     32,
                 ))?;
@@ -979,7 +1036,11 @@ impl<'m> StreamingRunner<'m> {
             // K and V for these positions never change again, so store them.
             for t in 0..tokens.len() {
                 let lo = t * kv_width;
-                cache.push(il as usize, &k_v[lo..lo + kv_width], &v_v[lo..lo + kv_width])?;
+                cache.push(
+                    il as usize,
+                    &k_v[lo..lo + kv_width],
+                    &v_v[lo..lo + kv_width],
+                )?;
             }
 
             // Phase 2: attend over the whole history, not just the new part.
@@ -1049,9 +1110,9 @@ impl<'m> StreamingRunner<'m> {
             let (normed_v, probs_v) = {
                 let ctx = Context::new(arena_for(
                     &[
-                        (n_embd, n_new),           // ffn input
-                        (n_embd, n_new),           // normalised
-                        (n_embd, n_new),           // rms intermediate
+                        (n_embd, n_new),            // ffn input
+                        (n_embd, n_new),            // normalised
+                        (n_embd, n_new),            // rms intermediate
                         (c.n_expert as i64, n_new), // router logits
                         (c.n_expert as i64, n_new), // router probabilities
                     ],
@@ -1158,7 +1219,9 @@ impl<'m> StreamingRunner<'m> {
             // and the normed activations can be read from the same pass.
             let ctx = Context::new(1 << 30)?;
             let get = |n: &str| -> Result<&Tensor<'a>> {
-                weights.get(n).ok_or_else(|| ArchError::MissingTensor(n.into()))
+                weights
+                    .get(n)
+                    .ok_or_else(|| ArchError::MissingTensor(n.into()))
             };
 
             let xt = ctx.new_f32_2d(n_embd, n_tokens)?;
@@ -1177,9 +1240,11 @@ impl<'m> StreamingRunner<'m> {
                 ROPE_TYPE_NEOX,
             )?;
             let ffn_input = ctx.add(&attn_out, &xt)?;
-            let normed = self
-                .arch
-                .norm_scaled(&ctx, &ffn_input, get(&format!("blk.{il}.ffn_norm.weight"))?)?;
+            let normed = self.arch.norm_scaled(
+                &ctx,
+                &ffn_input,
+                get(&format!("blk.{il}.ffn_norm.weight"))?,
+            )?;
 
             let logits = ctx.mul_mat(get(&format!("blk.{il}.ffn_gate_inp.weight"))?, &normed)?;
             let probs = ctx.soft_max_ext(&logits, None, 1.0, 0.0)?;

@@ -14,6 +14,10 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=GGML_LIB_DIR");
+    // Declare the cfg we set below, so `--cfg have_ggml` is a known name
+    // rather than 10 "unexpected cfg condition" warnings in every build
+    // that does not have ggml -- which is the build a newcomer runs first.
+    println!("cargo::rustc-check-cfg=cfg(have_ggml)");
 
     let Some(dir) = std::env::var_os("GGML_LIB_DIR").map(PathBuf::from) else {
         println!(

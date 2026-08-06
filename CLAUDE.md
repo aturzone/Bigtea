@@ -38,6 +38,8 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 - **Cache hit rate is not a success metric.** Past ~6 GiB the expert cache reaches 71% hits and is the *slowest* configuration measured: cached bytes get paged out, so a "hit" is a page fault wearing a disguise. Only tok/s at a stated footprint counts.
 - **`flash_attn_ext` does NOT transpose V**, unlike the `mul_mat` attention path, and its mask must be **F16 and contiguous**. Both mistakes give fluent nonsense, not an error. Mask values are only 0 and -inf, so write the bits (`0x0000` / `0xFC00`) rather than converting.
 - **Prompt length decides which code paths run.** V4-Flash's compressed attention builders are guarded on their caches being non-empty, so the *same layer* runs different attention at different lengths: at 2 tokens all 43 blocks fall back to the Raw path, at 5 CSA fires, at 165 HCA fires, and the sparse indexer selects nothing until >2048. A shorter capture can reach *further* than a longer one. See `v4flash-compressed-attention.md`.
+- **GGUF pads tensor data to `general.alignment` (32), not to a disk sector.** So tensors start mid-sector and a conventionally *aligned* buffer can never receive a direct transfer — every byte bounces. Skew the destination to `file_offset % 4096` instead (`SkewedBuf`): 0.80 → 1.58 GiB/s, 0.09% copied.
+- **Threads are not the lever.** 4/12/20 threads all cost the same on a V4-Flash prefill; 1 thread is 4.7x *slower*. Threadpool-churn was the obvious explanation and was wrong.
 - **Every arena must scale with the prefill block.** Fixed-size arenas abort once the block grows; ggml asks and dies rather than returning an error.
 
 ## Working rules
@@ -50,10 +52,12 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 
 ## Next
 
-1. **DeepSeek-V4-Flash — the critical path.** Its 7.38 GiB of always-read weights *fit* this machine, with 137.06 GiB of experts streamed (3.21 GiB/token, 6 of 256). That is the regime the design targets and the only place it should beat llama.cpp, whose dense weights get evicted by cold expert traffic. Bar: 0.45 tok/s. Physics ceiling: ~0.87 tok/s cold. **Forward pass verified**: all 43 blocks + head match llama.cpp and emit a sane token (at 2 tokens, where the compressed builders stay off), and **CSA attention — compressors, Hadamard, indexer query, attention over raw+compressed keys — is verified at 5 tokens**. **Left: HCA attention (20 layers; needs its own compressor, then CSA's verified attention half), and nothing has been timed.** `v4flash-port-recon.md`, `v4flash-compressed-attention.md`.
-2. Choose I/O mode from the model-size-to-RAM ratio. Bypassing the page cache is right when the model dwarfs RAM and wrong when it nearly fits — there we double-buffer against a kernel that uses all free RAM elastically.
-3. **Close the generation gap — the only place we still lose (~2x). Repack Q4_K expert slices on cache admission.** Expert compute is 60% of generation, and it is neither barrier-bound (12→4 threads costs nothing) nor bandwidth-bound (2.4 GB/s against DDR5) — it is dequantisation. llama.cpp interleaves rows so several unpack per SIMD op (`REPACK = 1`); repacking once when a slice enters the cache fits this design well, since it is then reused by every token that routes there.
-4. Auto-tune the prefill block from free RAM. Block size is worth more than any kernel here (512 → 4096 is 30.5 → 43.6 tok/s) and it is currently a fixed 2048 with a `-b` override.
+**v0.0.0 released 2026-08-07.** README/LICENSE/CONTRIBUTING/SECURITY/CHANGELOG/CI all exist; clippy `-D warnings` and fmt are clean and CI enforces both.
+
+1. **Generation is the gap.** V4-Flash generates correct text at **0.042 tok/s vs llama.cpp's 0.45 — 10.7x slower**. No competitive claim ships. `v4flash-generation-first-numbers.md`.
+2. **KV cache** for the V4-Flash path. Worth ~3-4x, and on **disk traffic** not attention: a 5-token pass touches ~26 expert slices/layer, a cached 1-token pass 6. State is bounded (128 raw + 256 compressed) ≈ 33 MB for 43 layers. Needs an oracle capture at two consecutive positions — a wrong cache gives fluent nonsense.
+3. **Profile `layer_tail` + `moe_routing`** — 21% of a pass for a handful of small ops, never examined. Attention is only 4%; do not optimise it.
+4. Then T1-T5 of `lts-0-0-0.md`: cross-OS binaries, `bigtea pull` from Hugging Face, quant selection from the probe, self-configuration, OpenAI-compatible server.
 
 ## Compact Instructions
 

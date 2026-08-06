@@ -76,9 +76,7 @@ impl Qwen3Config {
             rope_freq_base: 1_000_000.0,
             n_expert: model.arch_u64("expert_count").unwrap_or(0) as u32,
             n_expert_used: model.arch_u64("expert_used_count").unwrap_or(0) as u32,
-            n_ff_expert: model
-                .arch_u64("expert_feed_forward_length")
-                .unwrap_or(0) as u32,
+            n_ff_expert: model.arch_u64("expert_feed_forward_length").unwrap_or(0) as u32,
         })
     }
 
@@ -197,7 +195,8 @@ impl Qwen3Model {
             let residual = cur;
 
             // --- attention ---------------------------------------------------
-            let normed = self.rms_norm_mul(ctx, &cur, get(&format!("blk.{il}.attn_norm.weight"))?)?;
+            let normed =
+                self.rms_norm_mul(ctx, &cur, get(&format!("blk.{il}.attn_norm.weight"))?)?;
 
             let q = ctx.mul_mat(get(&format!("blk.{il}.attn_q.weight"))?, &normed)?;
             let k = ctx.mul_mat(get(&format!("blk.{il}.attn_k.weight"))?, &normed)?;
@@ -258,7 +257,6 @@ impl Qwen3Model {
         Ok(ctx.mul_mat(get(out_name)?, &cur)?)
     }
 
-
     /// One layer's attention, from the pre-norm through the output projection.
     ///
     /// Shared by the single-graph path and the streaming path so the
@@ -298,7 +296,6 @@ impl Qwen3Model {
         let attn = self.attention(ctx, &q, &k, &v, n_tokens)?;
         Ok(ctx.mul_mat(get(format!("blk.{il}.attn_output.weight"))?, &attn)?)
     }
-
 
     /// Attention through ggml's fused kernel.
     ///
@@ -467,9 +464,7 @@ impl Qwen3Model {
         il: u32,
     ) -> Result<Tensor<'a>> {
         let get = |name: String| -> Result<&Tensor<'a>> {
-            weights
-                .get(&name)
-                .ok_or(ArchError::MissingTensor(name))
+            weights.get(&name).ok_or(ArchError::MissingTensor(name))
         };
         let gate = ctx.mul_mat(get(format!("blk.{il}.ffn_gate.weight"))?, x)?;
         let up = ctx.mul_mat(get(format!("blk.{il}.ffn_up.weight"))?, x)?;
@@ -492,9 +487,7 @@ impl Qwen3Model {
     ) -> Result<Tensor<'a>> {
         let c = &self.config;
         let get = |name: String| -> Result<&Tensor<'a>> {
-            weights
-                .get(&name)
-                .ok_or(ArchError::MissingTensor(name))
+            weights.get(&name).ok_or(ArchError::MissingTensor(name))
         };
 
         // Router: one score per expert per token, softmaxed into weights.
@@ -507,11 +500,18 @@ impl Qwen3Model {
         let selected = ctx.top_k(&probs, c.n_expert_used as i32)?;
 
         let x3 = ctx.reshape_3d(x, c.n_embd as i64, 1, n_tokens)?;
-        let gate = ctx.mul_mat_id(get(format!("blk.{il}.ffn_gate_exps.weight"))?, &x3, &selected)?;
+        let gate = ctx.mul_mat_id(
+            get(format!("blk.{il}.ffn_gate_exps.weight"))?,
+            &x3,
+            &selected,
+        )?;
         let up = ctx.mul_mat_id(get(format!("blk.{il}.ffn_up_exps.weight"))?, &x3, &selected)?;
         let activated = ctx.mul(&ctx.silu(&gate)?, &up)?;
-        let down =
-            ctx.mul_mat_id(get(format!("blk.{il}.ffn_down_exps.weight"))?, &activated, &selected)?;
+        let down = ctx.mul_mat_id(
+            get(format!("blk.{il}.ffn_down_exps.weight"))?,
+            &activated,
+            &selected,
+        )?;
 
         // Weight each expert's output by its router probability, then sum.
         let weights_sel = ctx.get_rows(&probs, &selected)?;
@@ -559,7 +559,11 @@ mod tests {
     fn attention_scale_is_one_over_sqrt_head_dim() {
         // Not n_embd -- a common and silently wrong substitution.
         let c = dense_config();
-        assert!((c.attn_scale() - 0.25).abs() < 1e-6, "got {}", c.attn_scale());
+        assert!(
+            (c.attn_scale() - 0.25).abs() < 1e-6,
+            "got {}",
+            c.attn_scale()
+        );
     }
 
     #[test]

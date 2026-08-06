@@ -137,7 +137,12 @@ impl<'ctx> WeightSet<'ctx> {
         data: Arc<dyn WeightBytes>,
     ) -> Result<(), GgmlError> {
         let (ne0, ne1) = match dims {
-            [] => return Err(GgmlError::WrongSize { expected: 1, actual: 0 }),
+            [] => {
+                return Err(GgmlError::WrongSize {
+                    expected: 1,
+                    actual: 0,
+                })
+            }
             [a] => (*a as i64, 1i64),
             [a, b] => (*a as i64, *b as i64),
             // Higher-rank weights are reshaped by the graph; binding them as
@@ -215,7 +220,10 @@ mod tests {
 
         // SAFETY: ggml allocated at least 4 f32 here (checked by set_f32).
         let first = unsafe { *(via_struct as *const f32) };
-        assert_eq!(first, 1.0, "data pointer does not address the tensor values");
+        assert_eq!(
+            first, 1.0,
+            "data pointer does not address the tensor values"
+        );
     }
 
     #[test]
@@ -255,7 +263,8 @@ mod tests {
         // 2x2 = [[1,2],[3,4]]
         let w: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
-        ws.bind(&ctx, "w", GgmlType(0), &[2, 2], bytes).expect("bind");
+        ws.bind(&ctx, "w", GgmlType(0), &[2, 2], bytes)
+            .expect("bind");
 
         // The activation still needs real storage, so it is allocated
         // separately from the no_alloc context that holds the weights.

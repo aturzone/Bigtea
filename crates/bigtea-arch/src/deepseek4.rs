@@ -333,7 +333,9 @@ impl Deepseek4Config {
                 Some("yarn") => 1.0,
                 _ => 0.0,
             },
-            rope_beta_fast: model.arch_f32("rope.scaling.yarn_beta_fast").unwrap_or(32.0),
+            rope_beta_fast: model
+                .arch_f32("rope.scaling.yarn_beta_fast")
+                .unwrap_or(32.0),
             rope_beta_slow: model.arch_f32("rope.scaling.yarn_beta_slow").unwrap_or(1.0),
             rope_n_ctx_orig: opt("rope.scaling.original_context_length", 0) as u32,
         })
@@ -563,8 +565,11 @@ impl Deepseek4Model {
     ];
 
     /// The stacked expert tensors, read one slice at a time.
-    const ROUTED_BLOCK_SUFFIXES: &'static [&'static str] =
-        &["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"];
+    const ROUTED_BLOCK_SUFFIXES: &'static [&'static str] = &[
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    ];
 
     /// Tensors outside any block.
     const GLOBAL: &'static [&'static str] = &[
@@ -601,11 +606,7 @@ impl Deepseek4Model {
     /// See [`AttentionKind`]. The indexer implies a compressor, so the check
     /// is ordered most-specific first.
     pub fn attention_kind(&self, model: &Model, layer: u32) -> AttentionKind {
-        let has = |suffix: &str| {
-            model
-                .location(&format!("blk.{layer}.{suffix}"))
-                .is_some()
-        };
+        let has = |suffix: &str| model.location(&format!("blk.{layer}.{suffix}")).is_some();
         if has("indexer.proj.weight") {
             AttentionKind::CompressedSparse
         } else if has("attn_compressor_kv.weight") {
@@ -717,9 +718,7 @@ mod tests {
             !routed.iter().any(|n| n.contains("shexp")),
             "the shared expert must never be streamed"
         );
-        assert!(Deepseek4Model::RESIDENT_BLOCK_SUFFIXES
-            .iter()
-            .any(|s| *s == "ffn_gate_shexp.weight"));
+        assert!(Deepseek4Model::RESIDENT_BLOCK_SUFFIXES.contains(&"ffn_gate_shexp.weight"));
         assert!(!Deepseek4Model::RESIDENT_BLOCK_SUFFIXES
             .iter()
             .any(|s| s.contains("_exps.")));
@@ -728,7 +727,10 @@ mod tests {
     #[test]
     fn every_block_contributes_its_routed_tensors() {
         let model = Deepseek4Model::new(config_for_test());
-        assert_eq!(model.routed_tensor_names().len(), model.config.n_layer as usize * 3);
+        assert_eq!(
+            model.routed_tensor_names().len(),
+            model.config.n_layer as usize * 3
+        );
     }
 
     fn config_for_test() -> Deepseek4Config {
@@ -816,7 +818,11 @@ mod tests {
         assert_eq!(c.swiglu_limit(0, false), Some(10.0));
         assert_eq!(c.swiglu_limit(0, true), Some(10.0));
         c.swiglu_clamp_exp[7] = 0.0;
-        assert_eq!(c.swiglu_limit(7, false), None, "0 means no clamp, not clamp to 0");
+        assert_eq!(
+            c.swiglu_limit(7, false),
+            None,
+            "0 means no clamp, not clamp to 0"
+        );
         // Past the end of the table is not a panic: a shorter array than
         // block_count is a container problem, not a reason to abort mid-run.
         assert_eq!(c.swiglu_limit(99, false), None);
@@ -829,10 +835,9 @@ mod tests {
         let c = config_for_test();
         assert_eq!(c.compress_ratios.len(), 44);
         assert_eq!(c.n_layer, 43);
-        let consulted: Vec<bool> =
-            (0..c.n_layer).map(|il| c.uses_compress_rope(il)).collect();
+        let consulted: Vec<bool> = (0..c.n_layer).map(|il| c.uses_compress_rope(il)).collect();
         assert_eq!(consulted.len(), 43);
-        assert_eq!(consulted[0], false);
-        assert_eq!(consulted[42], true);
+        assert!(!consulted[0]);
+        assert!(consulted[42]);
     }
 }

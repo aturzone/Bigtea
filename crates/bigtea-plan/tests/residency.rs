@@ -29,7 +29,7 @@ fn always_read_weights_are_made_resident_first() {
     let tensors = vec![
         dense("blk.0.attn_q.weight", 2 * GIB),
         expert("blk.0.ffn_gate", 40 * GIB),
-        dense("token_embd.weight", 1 * GIB),
+        dense("token_embd.weight", GIB),
     ];
     let layout = plan_layout(&tensors, 8 * GIB);
 
@@ -48,7 +48,7 @@ fn always_read_weights_are_made_resident_first() {
 fn experts_always_stream_even_with_a_huge_budget() {
     // Even absurd RAM does not make the planner pin a 40 GiB pool, because
     // that is not the regime this tool exists for.
-    let tensors = vec![dense("attn", 1 * GIB), expert("ffn_gate", 40 * GIB)];
+    let tensors = vec![dense("attn", GIB), expert("ffn_gate", 40 * GIB)];
     let layout = plan_layout(&tensors, 500 * GIB);
     for p in &layout.placed {
         if p.routed {
@@ -82,7 +82,11 @@ fn resident_bytes_never_exceed_the_budget() {
     // The budget is a hard ceiling: exceeding it means the OS swaps, which is
     // slower than the streaming it was meant to replace.
     for budget_gib in [0u64, 1, 3, 7, 100] {
-        let tensors = vec![dense("a", 2 * GIB), dense("b", 3 * GIB), dense("c", 5 * GIB)];
+        let tensors = vec![
+            dense("a", 2 * GIB),
+            dense("b", 3 * GIB),
+            dense("c", 5 * GIB),
+        ];
         let layout = plan_layout(&tensors, budget_gib * GIB);
         assert!(
             layout.ram_used_bytes <= budget_gib * GIB,
@@ -139,7 +143,7 @@ fn zero_budget_streams_everything_without_panicking() {
 #[test]
 fn unsized_tensors_are_excluded_and_flagged_not_silently_dropped() {
     let tensors = vec![
-        dense("good", 1 * GIB),
+        dense("good", GIB),
         TensorInfo {
             name: "mystery".into(),
             dims: vec![1024],

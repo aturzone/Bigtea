@@ -14,7 +14,8 @@
 /// Byte value -> the character that represents it.
 pub fn byte_to_char(b: u8) -> char {
     // The three ranges GPT-2 leaves alone: '!'..='~', '¡'..='¬', '®'..='ÿ'.
-    let keep = (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
+    let keep =
+        (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
     if keep {
         return b as char;
     }
@@ -32,7 +33,9 @@ pub fn byte_to_char(b: u8) -> char {
 /// appears in a byte-level vocabulary.
 pub fn char_to_byte(c: char) -> Option<u8> {
     let code = c as u32;
-    if (0x21..=0x7E).contains(&code) || (0xA1..=0xAC).contains(&code) || (0xAE..=0xFF).contains(&code)
+    if (0x21..=0x7E).contains(&code)
+        || (0xA1..=0xAC).contains(&code)
+        || (0xAE..=0xFF).contains(&code)
     {
         return Some(code as u8);
     }
@@ -98,9 +101,18 @@ mod tests {
 
     #[test]
     fn strings_round_trip_including_non_ascii() {
-        for original in ["hello world", "  leading", "tabs\tand\nnewlines", "héllo — ünïcode"] {
+        for original in [
+            "hello world",
+            "  leading",
+            "tabs\tand\nnewlines",
+            "héllo — ünïcode",
+        ] {
             let encoded = encode(original.as_bytes());
-            assert_eq!(decode(&encoded), original.as_bytes(), "failed on {original:?}");
+            assert_eq!(
+                decode(&encoded),
+                original.as_bytes(),
+                "failed on {original:?}"
+            );
         }
     }
 }

@@ -28,7 +28,10 @@ const MIN_PROBE: u64 = 2 * GIB;
 #[derive(Debug)]
 pub enum BandwidthError {
     /// Not enough free space to write a cache-defeating probe file.
-    InsufficientSpace { needed: u64, free: u64 },
+    InsufficientSpace {
+        needed: u64,
+        free: u64,
+    },
     Io(std::io::Error),
     /// The read finished too fast to time meaningfully.
     TooFast,

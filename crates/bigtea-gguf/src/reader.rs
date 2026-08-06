@@ -58,7 +58,10 @@ impl<'a> Cursor<'a> {
     fn string(&mut self, ctx: &'static str) -> Result<String> {
         let len = self.u64(ctx)?;
         if len > MAX_STR {
-            return Err(Error::ImplausibleCount { what: "string length", value: len });
+            return Err(Error::ImplausibleCount {
+                what: "string length",
+                value: len,
+            });
         }
         let bytes = self.take(len as usize, ctx)?;
         String::from_utf8(bytes.to_vec()).map_err(|_| Error::BadUtf8)
@@ -85,7 +88,10 @@ impl<'a> Cursor<'a> {
                 let elem_ty = self.u32("array type")?;
                 let n = self.u64("array length")?;
                 if n > MAX_COUNT {
-                    return Err(Error::ImplausibleCount { what: "array length", value: n });
+                    return Err(Error::ImplausibleCount {
+                        what: "array length",
+                        value: n,
+                    });
                 }
                 // Arrays of arrays are not in the format; rejecting keeps this
                 // non-recursive and therefore not stack-overflowable.
@@ -178,11 +184,17 @@ impl Gguf {
 
         let tensor_count = cur.u64("tensor count")?;
         if tensor_count > MAX_COUNT {
-            return Err(Error::ImplausibleCount { what: "tensor", value: tensor_count });
+            return Err(Error::ImplausibleCount {
+                what: "tensor",
+                value: tensor_count,
+            });
         }
         let kv_count = cur.u64("metadata count")?;
         if kv_count > MAX_COUNT {
-            return Err(Error::ImplausibleCount { what: "metadata", value: kv_count });
+            return Err(Error::ImplausibleCount {
+                what: "metadata",
+                value: kv_count,
+            });
         }
 
         let mut metadata: Metadata = BTreeMap::new();
@@ -208,7 +220,12 @@ impl Gguf {
             }
             let ty = GgmlType(cur.u32("tensor type")?);
             let offset = cur.u64("tensor offset")?;
-            tensors.push(TensorInfo { name, dims, ty, offset });
+            tensors.push(TensorInfo {
+                name,
+                dims,
+                ty,
+                offset,
+            });
         }
 
         // Tensor data starts at the next `general.alignment` boundary.
@@ -220,7 +237,12 @@ impl Gguf {
         let pos = cur.pos as u64;
         let data_offset = pos.div_ceil(alignment) * alignment;
 
-        Ok(Gguf { version, metadata, tensors, data_offset })
+        Ok(Gguf {
+            version,
+            metadata,
+            tensors,
+            data_offset,
+        })
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {

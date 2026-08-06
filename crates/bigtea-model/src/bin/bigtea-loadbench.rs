@@ -35,9 +35,17 @@ fn main() -> ExitCode {
     };
     let budget = (budget_gib * GIB) as u64;
 
-    println!("model    {}  ({} shards, {})", model.architecture(), model.shard_count(), model.io_mode());
+    println!(
+        "model    {}  ({} shards, {})",
+        model.architecture(),
+        model.shard_count(),
+        model.io_mode()
+    );
     println!("budget   {budget_gib:.1} GiB of always-read weights\n");
-    println!("{:>7}  {:>9}  {:>10}  {:>8}", "threads", "seconds", "GB/s", "speedup");
+    println!(
+        "{:>7}  {:>9}  {:>10}  {:>8}",
+        "threads", "seconds", "GB/s", "speedup"
+    );
 
     let mut baseline = 0.0f64;
     for threads in [1usize, 2, 4, 8, 12, 16] {

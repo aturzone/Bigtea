@@ -220,7 +220,10 @@ mod tests {
 
     #[test]
     fn punctuation_separates_from_words() {
-        assert_eq!(pre_tokenize("hello, world!"), vec!["hello", ",", " world", "!"]);
+        assert_eq!(
+            pre_tokenize("hello, world!"),
+            vec!["hello", ",", " world", "!"]
+        );
     }
 
     #[test]

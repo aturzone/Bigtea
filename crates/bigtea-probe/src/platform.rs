@@ -76,7 +76,12 @@ mod imp {
         // SAFETY: `wide` is NUL-terminated and outlives the call; the three
         // out-pointers reference locals of the right type.
         let ok = unsafe {
-            GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_to_caller, &mut total, &mut total_free)
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free_to_caller,
+                &mut total,
+                &mut total_free,
+            )
         } != 0;
         if !ok {
             return None;
@@ -104,7 +109,9 @@ mod imp {
             let mut total = None;
             let mut available = None;
             for line in text.lines() {
-                let Some((key, rest)) = line.split_once(':') else { continue };
+                let Some((key, rest)) = line.split_once(':') else {
+                    continue;
+                };
                 let kb: Option<u64> = rest.split_whitespace().next().and_then(|v| v.parse().ok());
                 match key {
                     "MemTotal" => total = kb.map(|v| v * 1024),
@@ -170,7 +177,11 @@ mod imp {
             return None;
         }
         // f_frsize is the fragment size the block counts are expressed in.
-        let unit = if st.f_frsize > 0 { st.f_frsize } else { st.f_bsize };
+        let unit = if st.f_frsize > 0 {
+            st.f_frsize
+        } else {
+            st.f_bsize
+        };
         // f_bavail, not f_bfree: blocks available to an unprivileged user.
         Some((st.f_blocks * unit, st.f_bavail * unit))
     }

@@ -24,22 +24,6 @@
 //!
 //! # The one deliberate omission
 //!
-//! # STATUS: PARTIAL PORT, NOT YET WIRED IN
-//!
-//! Ported and compiling: the embedding, the hyper-connection gates, the block
-//! entry, Q/KV with per-layer RoPE, both compressors, and attention with the
-//! sliding window and the optional compressed key half.
-//!
-//! **Still living only in `tests/deepseek4_forward.rs`**: the layer tail (post
-//! hyper-connection, FFN gates, `ffn_norm`), both MoE routing schemes, the
-//! routed experts, the shared expert, the output head, and the block loop.
-//! Until those move, `bigtea-run` cannot run this model and the test still
-//! verifies its own copy rather than this one. That is the remaining work for
-//! a 0.0.0, and it is translation rather than discovery — every piece is
-//! already checked against llama.cpp on the test side.
-//!
-//! # The one deliberate omission
-//!
 //! **The lightning indexer is not run**, and below ~2048 tokens that is exact
 //! rather than approximate: `n_top_k = min(n_lid, indexer_top_k)` selects
 //! *every* compressed slot, so the indexer's mask is precisely the visibility
@@ -50,7 +34,7 @@ use bigtea_ggml::{Context, RopeParams, Tensor, WeightSet};
 use bigtea_io::SkewedBuf;
 use bigtea_model::{Model, ResidentSet};
 
-use crate::{AttentionKind, Deepseek4Config, Deepseek4Model, Result};
+use crate::{AttentionKind, Deepseek4Config, Result};
 
 /// `LLAMA_ROPE_TYPE_NORM`: rotated pairs are adjacent, not offset by `n_rot/2`.
 const ROPE_MODE_NORM: i32 = 0;
@@ -61,7 +45,6 @@ const F16_NEG_INF: [u8; 2] = [0x00, 0xFC];
 
 /// The padded key window each half of the cache occupies.
 const N_KV: i64 = 256;
-
 
 /// Threads for every `ggml` graph evaluation in this file.
 ///
@@ -86,7 +69,6 @@ fn threads() -> usize {
 pub struct Deepseek4Forward<'m> {
     model: &'m Model,
     config: Deepseek4Config,
-    arch: Deepseek4Model,
     /// Always-read weights held in RAM. `None` re-reads them per block, which
     /// is correct but costs 23% of a prefill and would cost it again on every
     /// generated token.
@@ -95,8 +77,11 @@ pub struct Deepseek4Forward<'m> {
 
 impl<'m> Deepseek4Forward<'m> {
     pub fn new(model: &'m Model, config: Deepseek4Config) -> Self {
-        let arch = Deepseek4Model::new(config.clone());
-        Deepseek4Forward { model, config, arch, resident: None }
+        Deepseek4Forward {
+            model,
+            config,
+            resident: None,
+        }
     }
 
     /// Serve always-read weights from `resident` instead of from disk.
@@ -123,13 +108,26 @@ impl<'m> Deepseek4Forward<'m> {
     pub fn block_tensor_names(&self, il: u32) -> Vec<String> {
         let mut names = Vec::new();
         for suffix in [
-            "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
-            "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
-            "attn_norm", "attn_q_a", "attn_q_a_norm", "attn_q_b",
-            "attn_kv", "attn_kv_a_norm", "attn_sinks",
-            "attn_output_a", "attn_output_b",
-            "ffn_norm", "ffn_gate_inp",
-            "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+            "hc_attn_fn",
+            "hc_attn_scale",
+            "hc_attn_base",
+            "hc_ffn_fn",
+            "hc_ffn_scale",
+            "hc_ffn_base",
+            "attn_norm",
+            "attn_q_a",
+            "attn_q_a_norm",
+            "attn_q_b",
+            "attn_kv",
+            "attn_kv_a_norm",
+            "attn_sinks",
+            "attn_output_a",
+            "attn_output_b",
+            "ffn_norm",
+            "ffn_gate_inp",
+            "ffn_gate_shexp",
+            "ffn_up_shexp",
+            "ffn_down_shexp",
         ] {
             names.push(format!("blk.{il}.{suffix}.weight"));
         }
@@ -214,8 +212,12 @@ fn hc_gates<'c>(
     // view is wide. At one token the stride is never traversed, so any value
     // passes; only a multi-token prompt pins it.
     let stride = ((2 + hc) * hc) as usize * f32_size;
-    let scale_w = weights.get(&format!("{prefix}_scale.weight")).expect("bound");
-    let base_w = weights.get(&format!("{prefix}_base.weight")).expect("bound");
+    let scale_w = weights
+        .get(&format!("{prefix}_scale.weight"))
+        .expect("bound");
+    let base_w = weights
+        .get(&format!("{prefix}_base.weight"))
+        .expect("bound");
 
     let gate = |mix_off: i64, scale_idx: usize, base_off: i64| -> Result<Tensor<'c>> {
         let view = ctx.view_2d(mixes, hc, nt, stride, mix_off as usize * f32_size)?;
@@ -271,20 +273,35 @@ fn entry<'c>(
     let flat = ctx.reshape_2d(&streams, config.hc_dim() as i64, nt)?;
     let normed = ctx.rms_norm(&flat, config.rms_eps)?;
     let mixes = ctx.mul_mat(
-        weights.get(&format!("blk.{il}.hc_attn_fn.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.hc_attn_fn.weight"))
+            .expect("bound"),
         &normed,
     )?;
     ctx.compute(&mixes, threads())?;
-    let gates = hc_gates(ctx, weights, config, &format!("blk.{il}.hc_attn"), &mixes, nt)?;
+    let gates = hc_gates(
+        ctx,
+        weights,
+        config,
+        &format!("blk.{il}.hc_attn"),
+        &mixes,
+        nt,
+    )?;
 
     let collapsed = ctx.dsv4_hc_pre(&streams, &gates.pre)?;
     let normed = ctx.rms_norm(&collapsed, config.rms_eps)?;
     let attn_norm = ctx.mul(
         &normed,
-        weights.get(&format!("blk.{il}.attn_norm.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.attn_norm.weight"))
+            .expect("bound"),
     )?;
     ctx.compute(&attn_norm, threads())?;
-    Ok(Entry { streams, attn_norm, gates })
+    Ok(Entry {
+        streams,
+        attn_norm,
+        gates,
+    })
 }
 
 /// Q and KV, both low-rank, both with only their trailing `n_rot` dims rotated.
@@ -313,16 +330,22 @@ fn q_and_kv<'c>(
     pos.set_i32(&(0..nt as i32).collect::<Vec<i32>>())?;
 
     let qr = ctx.mul_mat(
-        weights.get(&format!("blk.{il}.attn_q_a.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.attn_q_a.weight"))
+            .expect("bound"),
         attn_norm,
     )?;
     let qr = ctx.rms_norm(&qr, config.rms_eps)?;
     let qr = ctx.mul(
         &qr,
-        weights.get(&format!("blk.{il}.attn_q_a_norm.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.attn_q_a_norm.weight"))
+            .expect("bound"),
     )?;
     let q = ctx.mul_mat(
-        weights.get(&format!("blk.{il}.attn_q_b.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.attn_q_b.weight"))
+            .expect("bound"),
         &qr,
     )?;
     let q = ctx.reshape_3d(&q, head, n_head, nt)?;
@@ -331,26 +354,52 @@ fn q_and_kv<'c>(
 
     let q_nope = ctx.view_3d(&q, n_nope, n_head, nt, hs, hs * n_head as usize, 0)?;
     let q_pe_in = ctx.view_3d(
-        &q, n_rot, n_head, nt, hs, hs * n_head as usize, n_nope as usize * f32_size,
+        &q,
+        n_rot,
+        n_head,
+        nt,
+        hs,
+        hs * n_head as usize,
+        n_nope as usize * f32_size,
     )?;
-    let q_pe = ctx.rope_ext(&q_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, rope_orig, rope)?;
+    let q_pe = ctx.rope_ext(
+        &q_pe_in,
+        &pos,
+        None,
+        n_rot as i32,
+        ROPE_MODE_NORM,
+        rope_orig,
+        rope,
+    )?;
     let q_full = ctx.concat(&q_nope, &q_pe, 0)?;
     ctx.compute(&q_full, threads())?;
 
     let kv = ctx.mul_mat(
-        weights.get(&format!("blk.{il}.attn_kv.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.attn_kv.weight"))
+            .expect("bound"),
         attn_norm,
     )?;
     let kv = ctx.rms_norm(&kv, config.rms_eps)?;
     let kv = ctx.mul(
         &kv,
-        weights.get(&format!("blk.{il}.attn_kv_a_norm.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.attn_kv_a_norm.weight"))
+            .expect("bound"),
     )?;
     let kv = ctx.reshape_3d(&kv, head, 1, nt)?;
     ctx.compute(&kv, threads())?;
     let kv_nope = ctx.view_3d(&kv, n_nope, 1, nt, hs, hs, 0)?;
     let kv_pe_in = ctx.view_3d(&kv, n_rot, 1, nt, hs, hs, n_nope as usize * f32_size)?;
-    let kv_pe = ctx.rope_ext(&kv_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, rope_orig, rope)?;
+    let kv_pe = ctx.rope_ext(
+        &kv_pe_in,
+        &pos,
+        None,
+        n_rot as i32,
+        ROPE_MODE_NORM,
+        rope_orig,
+        rope,
+    )?;
     let kv_full = ctx.concat(&kv_nope, &kv_pe, 0)?;
     ctx.compute(&kv_full, threads())?;
     Ok((q_full, kv_full))
@@ -366,6 +415,13 @@ fn q_and_kv<'c>(
 /// The persistent ring llama.cpp maintains is not needed on a prefill:
 /// `state_source_idx` resolves to an appended zero row for `pos < 0` and to the
 /// current batch otherwise, so the ring is never read.
+/// Argument count is high because the forward pass threads two `ggml`
+/// contexts with *different* lifetimes -- a per-block compute arena and a
+/// longer-lived weight context -- plus the model, the weight set and the
+/// layer index. Bundling them into one struct is the obvious refactor and
+/// the wrong one: it would force both contexts to share a lifetime, which
+/// is exactly the invariant that keeps dropped weights from dangling.
+#[allow(clippy::too_many_arguments)]
 fn compressor<'c>(
     fw: &Deepseek4Forward<'_>,
     ctx: &'c Context,
@@ -384,11 +440,15 @@ fn compressor<'c>(
     let state_rows = if overlap { 8 } else { ratio };
 
     let kv = ctx.mul_mat(
-        weights.get(&format!("blk.{il}.attn_compressor_kv.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.attn_compressor_kv.weight"))
+            .expect("bound"),
         attn_norm,
     )?;
     let score = ctx.mul_mat(
-        weights.get(&format!("blk.{il}.attn_compressor_gate.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.attn_compressor_gate.weight"))
+            .expect("bound"),
         attn_norm,
     )?;
     // The gate's position embedding is indexed by the token's offset *within its
@@ -396,7 +456,9 @@ fn compressor<'c>(
     let pos_t = ctx.new_i32_1d(nt)?;
     pos_t.set_i32(&(0..nt).map(|p| (p % ratio) as i32).collect::<Vec<i32>>())?;
     let ape = ctx.get_rows(
-        weights.get(&format!("blk.{il}.attn_compressor_ape.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.attn_compressor_ape.weight"))
+            .expect("bound"),
         &pos_t,
     )?;
     let score = ctx.add(&score, &ape)?;
@@ -409,13 +471,16 @@ fn compressor<'c>(
     let score_vals = score.to_vec_f32();
     let mut kv_buf = vec![0.0f32; (state_rows * wide) as usize];
     kv_buf.extend_from_slice(&kv_vals);
-    kv_buf.extend(std::iter::repeat(0.0f32).take((pad * wide) as usize));
+    kv_buf.extend(std::iter::repeat_n(0.0f32, (pad * wide) as usize));
     let kv_state = ctx.new_f32_2d(wide, total)?;
     kv_state.set_f32(&kv_buf)?;
     let mut sc_buf = vec![0.0f32; (state_rows * wide) as usize];
     sc_buf.extend_from_slice(&score_vals);
     // -inf so the softmax ignores the padding rather than averaging it in.
-    sc_buf.extend(std::iter::repeat(f32::NEG_INFINITY).take((pad * wide) as usize));
+    sc_buf.extend(std::iter::repeat_n(
+        f32::NEG_INFINITY,
+        (pad * wide) as usize,
+    ));
     let score_state = ctx.new_f32_2d(wide, total)?;
     score_state.set_f32(&sc_buf)?;
 
@@ -425,7 +490,11 @@ fn compressor<'c>(
         for b in 0..n_blocks {
             for j in 0..ratio {
                 let p = b * ratio - ratio + j;
-                idxs.push(if p < 0 { zero_row } else { (state_rows + p) as i32 });
+                idxs.push(if p < 0 {
+                    zero_row
+                } else {
+                    (state_rows + p) as i32
+                });
             }
         }
     }
@@ -472,7 +541,9 @@ fn compressor<'c>(
     let comp = ctx.rms_norm(&comp, config.rms_eps)?;
     let comp = ctx.mul(
         &comp,
-        weights.get(&format!("blk.{il}.attn_compressor_norm.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.attn_compressor_norm.weight"))
+            .expect("bound"),
     )?;
     ctx.compute(&comp, threads())?;
 
@@ -481,11 +552,31 @@ fn compressor<'c>(
     let n_nope = config.n_rot_none() as i64;
     let hs = head as usize * f32_size;
     let nope = ctx.view_3d(&comp, n_nope, 1, n_blocks, hs, hs, 0)?;
-    let pe_in = ctx.view_3d(&comp, n_rot, 1, n_blocks, hs, hs, n_nope as usize * f32_size)?;
+    let pe_in = ctx.view_3d(
+        &comp,
+        n_rot,
+        1,
+        n_blocks,
+        hs,
+        hs,
+        n_nope as usize * f32_size,
+    )?;
     let comp_pos = ctx.new_i32_1d(n_blocks)?;
-    comp_pos.set_i32(&(0..n_blocks).map(|b| (b * ratio) as i32).collect::<Vec<i32>>())?;
+    comp_pos.set_i32(
+        &(0..n_blocks)
+            .map(|b| (b * ratio) as i32)
+            .collect::<Vec<i32>>(),
+    )?;
     let (rope, rope_orig) = fw.rope(il);
-    let pe = ctx.rope_ext(&pe_in, &comp_pos, None, n_rot as i32, ROPE_MODE_NORM, rope_orig, rope)?;
+    let pe = ctx.rope_ext(
+        &pe_in,
+        &comp_pos,
+        None,
+        n_rot as i32,
+        ROPE_MODE_NORM,
+        rope_orig,
+        rope,
+    )?;
     let out = ctx.concat(&nope, &pe, 0)?;
     ctx.compute(&out, threads())?;
     Ok(out)
@@ -499,6 +590,11 @@ fn compressor<'c>(
 /// it went unnoticed until a 165-token capture. The compressed half is
 /// visibility-limited instead: a token sees block `b` once that block is
 /// complete and behind it.
+/// Argument count is high because the forward pass threads two `ggml`
+/// contexts with *different* lifetimes plus the model, the weight set and
+/// the layer index. Bundling them would force both contexts to share a
+/// lifetime, which is the invariant that stops dropped weights dangling.
+#[allow(clippy::too_many_arguments)]
 fn attention<'c>(
     fw: &Deepseek4Forward<'_>,
     ctx: &'c Context,
@@ -556,7 +652,9 @@ fn attention<'c>(
     mask_t.set_bytes(&mask)?;
 
     let q_perm = ctx.permute(q_full, [0, 2, 1, 3])?;
-    let sinks = weights.get(&format!("blk.{il}.attn_sinks.weight")).expect("bound");
+    let sinks = weights
+        .get(&format!("blk.{il}.attn_sinks.weight"))
+        .expect("bound");
     let scale = 1.0f32 / (head as f32).sqrt();
     let out = ctx.flash_attn_ext_with_sinks(&q_perm, &k, &k, &mask_t, sinks, scale)?;
     ctx.compute(&out, threads())?;
@@ -578,8 +676,15 @@ fn attention<'c>(
     let pos = ctx.new_i32_1d(nt)?;
     pos.set_i32(&(0..nt as i32).collect::<Vec<i32>>())?;
     let (rope, rope_orig) = fw.rope(il);
-    let o_pe =
-        ctx.rope_ext_back(&o_pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, rope_orig, rope)?;
+    let o_pe = ctx.rope_ext_back(
+        &o_pe_in,
+        &pos,
+        None,
+        n_rot as i32,
+        ROPE_MODE_NORM,
+        rope_orig,
+        rope,
+    )?;
     let out = ctx.concat(&o_nope, &o_pe, 0)?;
 
     // A batched matmul across `output_group_count` groups, not one matmul —
@@ -587,13 +692,17 @@ fn attention<'c>(
     let group_dim = n_head * head / groups;
     let out = ctx.reshape_3d(&out, group_dim, groups, nt)?;
     let out = ctx.cont(&ctx.permute(&out, [0, 2, 1, 3])?)?;
-    let wo_a = weights.get(&format!("blk.{il}.attn_output_a.weight")).expect("bound");
+    let wo_a = weights
+        .get(&format!("blk.{il}.attn_output_a.weight"))
+        .expect("bound");
     let wo_a = ctx.reshape_3d(wo_a, group_dim, config.output_lora_rank as i64, groups)?;
     let oa = ctx.mul_mat(&wo_a, &out)?;
     let oa = ctx.cont(&ctx.permute(&oa, [0, 2, 1, 3])?)?;
     let oa = ctx.reshape_2d(&oa, config.output_lora_rank as i64 * groups, nt)?;
     let out = ctx.mul_mat(
-        weights.get(&format!("blk.{il}.attn_output_b.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.attn_output_b.weight"))
+            .expect("bound"),
         &oa,
     )?;
     ctx.compute(&out, threads())?;
@@ -626,17 +735,28 @@ fn layer_tail<'c>(
     let flat = ctx.reshape_2d(&streams, config.hc_dim() as i64, nt)?;
     let normed = ctx.rms_norm(&flat, config.rms_eps)?;
     let mixes = ctx.mul_mat(
-        weights.get(&format!("blk.{il}.hc_ffn_fn.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.hc_ffn_fn.weight"))
+            .expect("bound"),
         &normed,
     )?;
     ctx.compute(&mixes, threads())?;
-    let gates = hc_gates(ctx, weights, config, &format!("blk.{il}.hc_ffn"), &mixes, nt)?;
+    let gates = hc_gates(
+        ctx,
+        weights,
+        config,
+        &format!("blk.{il}.hc_ffn"),
+        &mixes,
+        nt,
+    )?;
 
     let collapsed = ctx.dsv4_hc_pre(&streams, &gates.pre)?;
     let normed = ctx.rms_norm(&collapsed, config.rms_eps)?;
     let ffn_norm = ctx.mul(
         &normed,
-        weights.get(&format!("blk.{il}.ffn_norm.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.ffn_norm.weight"))
+            .expect("bound"),
     )?;
     ctx.compute(&ffn_norm, threads())?;
     Ok((streams, ffn_norm, gates))
@@ -663,7 +783,9 @@ fn moe_routing<'c>(
     let n_used = config.n_expert_used as i64;
 
     let logits = ctx.mul_mat(
-        weights.get(&format!("blk.{il}.ffn_gate_inp.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.ffn_gate_inp.weight"))
+            .expect("bound"),
         ffn_norm,
     )?;
     // sqrt(softplus(x)) — `expert_gating_func 4`, neither softmax nor sigmoid.
@@ -675,13 +797,17 @@ fn moe_routing<'c>(
         let tok = ctx.new_i32_1d(nt)?;
         tok.set_i32(tokens)?;
         ctx.get_rows(
-            weights.get(&format!("blk.{il}.ffn_gate_tid2eid.weight")).expect("bound"),
+            weights
+                .get(&format!("blk.{il}.ffn_gate_tid2eid.weight"))
+                .expect("bound"),
             &tok,
         )?
     } else {
         let biased = ctx.add(
             &probs,
-            weights.get(&format!("blk.{il}.exp_probs_b.bias")).expect("bound"),
+            weights
+                .get(&format!("blk.{il}.exp_probs_b.bias"))
+                .expect("bound"),
         )?;
         ctx.compute(&biased, threads())?;
         ctx.argsort_top_k(&biased, n_used as i32)?
@@ -693,7 +819,7 @@ fn moe_routing<'c>(
     // clamped at the smallest F16 normal, not at an epsilon.
     let w = ctx.get_rows(&probs3, &topk)?;
     let w2 = ctx.reshape_2d(&w, n_used, nt)?;
-    let sum = ctx.clamp(&ctx.sum_rows(&w2)?, 6.103515625e-5, f32::INFINITY)?;
+    let sum = ctx.clamp(&ctx.sum_rows(&w2)?, 6.103_515_6e-5, f32::INFINITY)?;
     let w_norm = ctx.div(&w2, &sum)?;
     let w3 = ctx.reshape_3d(&w_norm, 1, n_used, nt)?;
     let w_scaled = ctx.scale(&w3, config.expert_weights_scale)?;
@@ -739,7 +865,8 @@ fn bind_expert_slices<'c>(
     for (i, e) in unique.iter().enumerate() {
         let at = i * slice as usize;
         let t = std::time::Instant::now();
-        copied += model.read_range_into(name, *e as u64 * slice, &mut buf[at..at + slice as usize])?;
+        copied +=
+            model.read_range_into(name, *e as u64 * slice, &mut buf[at..at + slice as usize])?;
         disk += t.elapsed().as_secs_f64();
     }
     if std::env::var("BIGTEA_IO_TIMING").is_ok() {
@@ -761,6 +888,13 @@ fn bind_expert_slices<'c>(
 /// confusing it with the 256 routed ones is the difference between a 7 GiB
 /// resident set and a 144 GiB one. Both clamp their SwiGLU asymmetrically:
 /// `(-inf, limit]` on the gate, `[-limit, limit]` on the up projection.
+/// Argument count is high because the forward pass threads two `ggml`
+/// contexts with *different* lifetimes -- a per-block compute arena and a
+/// longer-lived weight context -- plus the model, the weight set and the
+/// layer index. Bundling them into one struct is the obvious refactor and
+/// the wrong one: it would force both contexts to share a lifetime, which
+/// is exactly the invariant that keeps dropped weights from dangling.
+#[allow(clippy::too_many_arguments)]
 fn ffn<'c>(
     fw: &Deepseek4Forward<'_>,
     model: &Model,
@@ -782,17 +916,23 @@ fn ffn<'c>(
 
     // ---- the shared expert ----
     let sh_gate = ctx.mul_mat(
-        weights.get(&format!("blk.{il}.ffn_gate_shexp.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.ffn_gate_shexp.weight"))
+            .expect("bound"),
         ffn_norm,
     )?;
     let sh_gate = ctx.clamp(&sh_gate, f32::NEG_INFINITY, limit_sh)?;
     let sh_up = ctx.mul_mat(
-        weights.get(&format!("blk.{il}.ffn_up_shexp.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.ffn_up_shexp.weight"))
+            .expect("bound"),
         ffn_norm,
     )?;
     let sh_up = ctx.clamp(&sh_up, -limit_sh, limit_sh)?;
     let sh = ctx.mul_mat(
-        weights.get(&format!("blk.{il}.ffn_down_shexp.weight")).expect("bound"),
+        weights
+            .get(&format!("blk.{il}.ffn_down_shexp.weight"))
+            .expect("bound"),
         &ctx.swiglu_split(&sh_gate, &sh_up)?,
     )?;
     ctx.compute(&sh, threads())?;
@@ -830,7 +970,9 @@ fn ffn<'c>(
     let stack = |suffix: &str| -> Result<Tensor<'c>> {
         let d = &dims_of[suffix];
         Ok(ctx.reshape_3d(
-            weights.get(&format!("blk.{il}.{suffix}.weight")).expect("bound"),
+            weights
+                .get(&format!("blk.{il}.{suffix}.weight"))
+                .expect("bound"),
             d[0] as i64,
             d[1] as i64,
             n_uniq,
@@ -854,8 +996,15 @@ fn ffn<'c>(
         let mut buckets = [0usize; 4]; // >1%, >0.1%, >0.01% of peak, and rest
         for x in &v {
             let r = x.abs() / peak.max(f32::MIN_POSITIVE);
-            if r > 1e-2 { buckets[0] += 1 } else if r > 1e-3 { buckets[1] += 1 }
-            else if r > 1e-4 { buckets[2] += 1 } else { buckets[3] += 1 }
+            if r > 1e-2 {
+                buckets[0] += 1
+            } else if r > 1e-3 {
+                buckets[1] += 1
+            } else if r > 1e-4 {
+                buckets[2] += 1
+            } else {
+                buckets[3] += 1
+            }
         }
         let n = v.len() as f64;
         eprintln!(
@@ -996,7 +1145,16 @@ pub fn block(
 
     let t_phase = std::time::Instant::now();
     let ffn_out = ffn(
-        fw, fw.model, &ctx, &wctx, &mut weights, il, &ffn_norm, &w_scaled, &ids, nt,
+        fw,
+        fw.model,
+        &ctx,
+        &wctx,
+        &mut weights,
+        il,
+        &ffn_norm,
+        &w_scaled,
+        &ids,
+        nt,
     )?;
     let ffn_secs = t_phase.elapsed().as_secs_f64();
 

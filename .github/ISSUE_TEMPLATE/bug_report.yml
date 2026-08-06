@@ -1,0 +1,41 @@
+name: Bug report
+description: Something behaves incorrectly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Wrong output is the most valuable bug you can report.** In this domain a
+        wrong forward pass, tokenizer, mask or cache produces *fluent, plausible
+        text* rather than an error, so a crash is easy and quiet corruption is hard.
+        If the text looks subtly wrong, please say so — that is a real bug.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you expect, and what did you get?
+    validations: {required: true}
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command and full output
+      render: shell
+    validations: {required: true}
+  - type: input
+    id: model
+    attributes:
+      label: Model and quant
+      placeholder: DeepSeek-V4-Flash-UD-Q4_K_XL, 5 shards
+    validations: {required: true}
+  - type: textarea
+    id: machine
+    attributes:
+      label: Machine
+      description: OS, CPU, RAM, disk. `bigtea-probe --quick` output is ideal.
+      render: shell
+    validations: {required: true}
+  - type: input
+    id: version
+    attributes:
+      label: Bigtea version or commit
+    validations: {required: true}

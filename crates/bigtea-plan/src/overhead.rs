@@ -69,11 +69,7 @@ pub struct AttentionShape {
 ///
 /// Both a key and a value are stored per head per layer per token.
 pub fn kv_cache_bytes(shape: &AttentionShape, context_len: u64, bytes_per_elem: u64) -> u64 {
-    2 * shape.n_kv_heads
-        * shape.head_dim
-        * shape.n_layers
-        * context_len
-        * bytes_per_elem
+    2 * shape.n_kv_heads * shape.head_dim * shape.n_layers * context_len * bytes_per_elem
 }
 
 /// Activation scratch for a single token.
@@ -168,7 +164,10 @@ mod tests {
     #[test]
     fn multi_query_attention_is_why_this_model_is_tractable() {
         let mqa = v4_flash();
-        let mha = AttentionShape { n_kv_heads: 64, ..mqa };
+        let mha = AttentionShape {
+            n_kv_heads: 64,
+            ..mqa
+        };
         let a = kv_cache_bytes(&mqa, 8192, KV_BYTES_F16);
         let b = kv_cache_bytes(&mha, 8192, KV_BYTES_F16);
         assert_eq!(b, a * 64, "64 kv heads should cost 64x the cache");
@@ -202,7 +201,10 @@ mod tests {
         assert!(ctx > 4096, "should afford more than 4K, got {ctx}");
 
         // If the weights alone exceed the budget, no context fits.
-        assert_eq!(max_context_for_budget(&shape, 4 * GIB, 8 * GIB, KV_BYTES_F16), 0);
+        assert_eq!(
+            max_context_for_budget(&shape, 4 * GIB, 8 * GIB, KV_BYTES_F16),
+            0
+        );
     }
 
     #[test]

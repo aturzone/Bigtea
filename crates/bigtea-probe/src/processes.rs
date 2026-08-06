@@ -35,24 +35,65 @@ pub struct Process {
 /// user their session or the machine, which is never worth a few GiB.
 const PROTECTED: &[&str] = &[
     // Windows core
-    "system", "registry", "smss", "csrss", "wininit", "winlogon", "services",
-    "lsass", "lsaiso", "dwm", "explorer", "fontdrvhost", "sihost", "ctfmon",
-    "shellexperiencehost", "searchhost", "startmenuexperiencehost",
-    "runtimebroker", "audiodg", "conhost", "svchost", "taskhostw", "spoolsv",
-    "memory compression", "securityhealthservice", "msmpeng", "wudfhost",
+    "system",
+    "registry",
+    "smss",
+    "csrss",
+    "wininit",
+    "winlogon",
+    "services",
+    "lsass",
+    "lsaiso",
+    "dwm",
+    "explorer",
+    "fontdrvhost",
+    "sihost",
+    "ctfmon",
+    "shellexperiencehost",
+    "searchhost",
+    "startmenuexperiencehost",
+    "runtimebroker",
+    "audiodg",
+    "conhost",
+    "svchost",
+    "taskhostw",
+    "spoolsv",
+    "memory compression",
+    "securityhealthservice",
+    "msmpeng",
+    "wudfhost",
     // Linux/macOS core
-    "systemd", "init", "kthreadd", "kernel_task", "launchd", "windowserver",
-    "loginwindow", "dbus-daemon", "pipewire", "pulseaudio", "xorg", "wayland",
+    "systemd",
+    "init",
+    "kthreadd",
+    "kernel_task",
+    "launchd",
+    "windowserver",
+    "loginwindow",
+    "dbus-daemon",
+    "pipewire",
+    "pulseaudio",
+    "xorg",
+    "wayland",
     // Ourselves and our toolchain — killing these kills the run in progress
-    "bigtea", "bigtea-probe", "cargo", "rustc", "git", "ssh",
+    "bigtea",
+    "bigtea-probe",
+    "cargo",
+    "rustc",
+    "git",
+    "ssh",
 ];
 
 fn is_protected(name: &str) -> bool {
     // Lowercase *before* trimming the extension: ".EXE" does not match ".exe",
     // so trimming first lets `CSRSS.EXE` through the deny-list entirely.
-    let lowered = name.rsplit(['/', '\\']).next().unwrap_or(name).to_ascii_lowercase();
+    let lowered = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
     let base = lowered.trim_end_matches(".exe");
-    PROTECTED.iter().any(|p| base == *p)
+    PROTECTED.contains(&base)
 }
 
 /// All processes with a measurable resident set, largest first.
@@ -166,20 +207,11 @@ mod imp {
         fn K32EnumProcesses(ids: *mut u32, cb: u32, bytes_returned: *mut u32) -> i32;
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
         fn CloseHandle(h: isize) -> i32;
-        fn K32GetProcessMemoryInfo(
-            h: isize,
-            counters: *mut ProcessMemoryCounters,
-            cb: u32,
-        ) -> i32;
+        fn K32GetProcessMemoryInfo(h: isize, counters: *mut ProcessMemoryCounters, cb: u32) -> i32;
         /// Unlike `GetModuleBaseName`, this needs only
         /// `PROCESS_QUERY_LIMITED_INFORMATION` — no `PROCESS_VM_READ`, which an
         /// unelevated process cannot get for most other processes.
-        fn QueryFullProcessImageNameW(
-            h: isize,
-            flags: u32,
-            name: *mut u16,
-            size: *mut u32,
-        ) -> i32;
+        fn QueryFullProcessImageNameW(h: isize, flags: u32, name: *mut u16, size: *mut u32) -> i32;
         fn TerminateProcess(h: isize, exit_code: u32) -> i32;
         fn GetLastError() -> u32;
     }
@@ -222,9 +254,7 @@ mod imp {
             };
             // SAFETY: `h` is a valid handle we own; `counters` is sized and
             // its `cb` field declares that size, per the API contract.
-            let got_mem = unsafe {
-                K32GetProcessMemoryInfo(h, &mut counters, counters.cb) != 0
-            };
+            let got_mem = unsafe { K32GetProcessMemoryInfo(h, &mut counters, counters.cb) != 0 };
 
             let mut buf = [0u16; 512];
             let mut size = buf.len() as u32;
@@ -240,11 +270,7 @@ mod imp {
             }
             // QueryFullProcessImageNameW gives a full path; we want the leaf.
             let full = String::from_utf16_lossy(&buf[..size as usize]);
-            let name = full
-                .rsplit(['\\', '/'])
-                .next()
-                .unwrap_or(&full)
-                .to_string();
+            let name = full.rsplit(['\\', '/']).next().unwrap_or(&full).to_string();
             out.push(Process {
                 pid,
                 protected: is_protected(&name),
@@ -302,8 +328,12 @@ mod imp {
 
         for entry in entries.flatten() {
             let file_name = entry.file_name();
-            let Some(pid_str) = file_name.to_str() else { continue };
-            let Ok(pid) = pid_str.parse::<u32>() else { continue };
+            let Some(pid_str) = file_name.to_str() else {
+                continue;
+            };
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                continue;
+            };
             if pid == self_pid {
                 continue;
             }
@@ -350,7 +380,13 @@ mod tests {
 
     #[test]
     fn os_core_processes_are_protected() {
-        for name in ["System", "csrss.exe", "lsass.exe", "systemd", "WindowServer"] {
+        for name in [
+            "System",
+            "csrss.exe",
+            "lsass.exe",
+            "systemd",
+            "WindowServer",
+        ] {
             assert!(is_protected(name), "{name} must be protected");
         }
     }
@@ -365,7 +401,13 @@ mod tests {
 
     #[test]
     fn ordinary_apps_are_not_protected() {
-        for name in ["chrome.exe", "brave.exe", "Telegram.exe", "steam.exe", "code.exe"] {
+        for name in [
+            "chrome.exe",
+            "brave.exe",
+            "Telegram.exe",
+            "steam.exe",
+            "code.exe",
+        ] {
             assert!(!is_protected(name), "{name} should be closeable");
         }
     }

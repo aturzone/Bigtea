@@ -23,7 +23,8 @@ fn model() -> Option<Model> {
     let p = std::env::var("BIGTEA_TEST_GGUF")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_PATH));
-    p.exists().then(|| Model::open_split(&p).expect("open model"))
+    p.exists()
+        .then(|| Model::open_split(&p).expect("open model"))
 }
 
 /// Statistics that separate trained weights from garbage.
@@ -37,7 +38,11 @@ struct Stats {
 
 fn stats(values: &[f32]) -> Stats {
     let finite = values.iter().filter(|v| v.is_finite()).count();
-    let sum: f64 = values.iter().filter(|v| v.is_finite()).map(|&v| v as f64).sum();
+    let sum: f64 = values
+        .iter()
+        .filter(|v| v.is_finite())
+        .map(|&v| v as f64)
+        .sum();
     let max_abs = values
         .iter()
         .filter(|v| v.is_finite())
@@ -129,8 +134,7 @@ fn dequantization_is_deterministic() {
     let Some(name) = m
         .tensor_names()
         .find(|n| {
-            m.location(n).is_some_and(|l| l.ty.is_quantized())
-                && m.is_available(n).unwrap_or(false)
+            m.location(n).is_some_and(|l| l.ty.is_quantized()) && m.is_available(n).unwrap_or(false)
         })
         .map(str::to_string)
     else {
@@ -159,8 +163,7 @@ fn a_corrupted_buffer_does_not_silently_produce_the_same_weights() {
     let Some(name) = m
         .tensor_names()
         .find(|n| {
-            m.location(n).is_some_and(|l| l.ty.is_quantized())
-                && m.is_available(n).unwrap_or(false)
+            m.location(n).is_some_and(|l| l.ty.is_quantized()) && m.is_available(n).unwrap_or(false)
         })
         .map(str::to_string)
     else {

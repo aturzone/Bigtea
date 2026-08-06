@@ -51,17 +51,25 @@ fn main() -> ExitCode {
 fn dump_processes() {
     let all = processes::list();
     println!("{} processes visible\n", all.len());
-    println!("{:<34}{:>10}  {}", "name", "rss", "status");
+    println!("{:<34}{:>10}  status", "name", "rss");
     for p in all.iter().take(30) {
         println!(
             "{:<34}{:>9.0}M  {}",
             p.name,
             p.rss_bytes as f64 / (1 << 20) as f64,
-            if p.protected { "protected" } else { "closeable" }
+            if p.protected {
+                "protected"
+            } else {
+                "closeable"
+            }
         );
     }
     let total: u64 = all.iter().map(|p| p.rss_bytes).sum();
-    let closeable: u64 = all.iter().filter(|p| !p.protected).map(|p| p.rss_bytes).sum();
+    let closeable: u64 = all
+        .iter()
+        .filter(|p| !p.protected)
+        .map(|p| p.rss_bytes)
+        .sum();
     println!(
         "\ntotal {:.2} GiB, of which {:.2} GiB is closeable",
         bigtea_probe::gib(total),

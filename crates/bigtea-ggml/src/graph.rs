@@ -57,19 +57,30 @@ extern "C" {
     fn ggml_get_data_f32(t: *const ggml_tensor) -> *mut f32;
     fn ggml_get_data(t: *const ggml_tensor) -> *mut c_void;
 
-    fn ggml_mul_mat(ctx: *mut ggml_context, a: *mut ggml_tensor, b: *mut ggml_tensor)
-        -> *mut ggml_tensor;
-    fn ggml_add(ctx: *mut ggml_context, a: *mut ggml_tensor, b: *mut ggml_tensor)
-        -> *mut ggml_tensor;
-    fn ggml_mul(ctx: *mut ggml_context, a: *mut ggml_tensor, b: *mut ggml_tensor)
-        -> *mut ggml_tensor;
-    fn ggml_rms_norm(ctx: *mut ggml_context, a: *mut ggml_tensor, eps: f32)
-        -> *mut ggml_tensor;
+    fn ggml_mul_mat(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    fn ggml_add(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    fn ggml_mul(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    fn ggml_rms_norm(ctx: *mut ggml_context, a: *mut ggml_tensor, eps: f32) -> *mut ggml_tensor;
     fn ggml_soft_max(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     fn ggml_fp32_to_fp16_row(src: *const f32, dst: *mut u16, n: i64);
     fn ggml_fp16_to_fp32_row(src: *const u16, dst: *mut f32, n: i64);
-    fn ggml_repeat(ctx: *mut ggml_context, a: *mut ggml_tensor, b: *mut ggml_tensor)
-        -> *mut ggml_tensor;
+    fn ggml_repeat(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
     fn ggml_view_1d(
         ctx: *mut ggml_context,
         a: *mut ggml_tensor,
@@ -123,8 +134,11 @@ extern "C" {
         ne2: i64,
     ) -> *mut ggml_tensor;
 
-    fn ggml_get_rows(ctx: *mut ggml_context, a: *mut ggml_tensor, b: *mut ggml_tensor)
-        -> *mut ggml_tensor;
+    fn ggml_get_rows(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
     fn ggml_concat(
         ctx: *mut ggml_context,
         a: *mut ggml_tensor,
@@ -179,8 +193,11 @@ extern "C" {
     fn ggml_scale(ctx: *mut ggml_context, a: *mut ggml_tensor, s: f32) -> *mut ggml_tensor;
     fn ggml_sigmoid(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     fn ggml_relu(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
-    fn ggml_div(ctx: *mut ggml_context, a: *mut ggml_tensor, b: *mut ggml_tensor)
-        -> *mut ggml_tensor;
+    fn ggml_div(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
     fn ggml_sum_rows(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     fn ggml_softplus(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     fn ggml_sqrt(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
@@ -428,7 +445,10 @@ impl Context {
 
     fn tensor<'a>(&'a self, raw: *mut ggml_tensor) -> Result<Tensor<'a>, GgmlError> {
         NonNull::new(raw)
-            .map(|raw| Tensor { raw, _ctx: PhantomData })
+            .map(|raw| Tensor {
+                raw,
+                _ctx: PhantomData,
+            })
             // A null here means the arena ran out mid-graph, which is a sizing
             // mistake rather than a bug in the graph itself.
             .ok_or(GgmlError::ArenaExhausted)
@@ -515,11 +535,7 @@ impl Context {
     }
 
     /// Embedding lookup: gather rows of `a` at the indices in `b`.
-    pub fn get_rows<'a>(
-        &'a self,
-        a: &Tensor<'a>,
-        b: &Tensor<'a>,
-    ) -> Result<Tensor<'a>, GgmlError> {
+    pub fn get_rows<'a>(&'a self, a: &Tensor<'a>, b: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
         // SAFETY: both tensors belong to this context.
         self.tensor(unsafe { ggml_get_rows(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) })
     }
@@ -531,19 +547,20 @@ impl Context {
         dim: i32,
     ) -> Result<Tensor<'a>, GgmlError> {
         // SAFETY: as above.
-        self.tensor(unsafe {
-            ggml_concat(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr(), dim)
-        })
+        self.tensor(unsafe { ggml_concat(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr(), dim) })
     }
 
-    pub fn permute<'a>(
-        &'a self,
-        a: &Tensor<'a>,
-        axes: [i32; 4],
-    ) -> Result<Tensor<'a>, GgmlError> {
+    pub fn permute<'a>(&'a self, a: &Tensor<'a>, axes: [i32; 4]) -> Result<Tensor<'a>, GgmlError> {
         // SAFETY: as above.
         self.tensor(unsafe {
-            ggml_permute(self.raw.as_ptr(), a.raw.as_ptr(), axes[0], axes[1], axes[2], axes[3])
+            ggml_permute(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                axes[0],
+                axes[1],
+                axes[2],
+                axes[3],
+            )
         })
     }
 
@@ -1049,8 +1066,9 @@ impl Context {
         unsafe { ggml_build_forward_expand(graph, output.raw.as_ptr()) };
         // SAFETY: graph and context match; ggml allocates its own scratch for
         // the requested thread count.
-        let status =
-            unsafe { ggml_graph_compute_with_ctx(self.raw.as_ptr(), graph, threads.max(1) as c_int) };
+        let status = unsafe {
+            ggml_graph_compute_with_ctx(self.raw.as_ptr(), graph, threads.max(1) as c_int)
+        };
         if status != 0 {
             return Err(GgmlError::ComputeFailed(status));
         }
@@ -1191,6 +1209,10 @@ impl Tensor<'_> {
     /// # Safety
     /// The tensor must be live. Verified against ggml's own accessor by
     /// `weights::tests::our_struct_layout_matches_ggmls`.
+    /// Used only by the layout-verification test; the production path writes
+    /// this pointer rather than reading it. Kept because a silent ggml struct
+    /// change would corrupt every weight binding, and that test is the alarm.
+    #[allow(dead_code)]
     pub(crate) unsafe fn data_ptr(&self) -> *mut std::os::raw::c_void {
         (*(self.raw.as_ptr() as *const crate::weights::RawTensor)).data
     }
@@ -1290,7 +1312,8 @@ mod tests {
 
         // 3 rows of 4: [0 1 2 3][4 5 6 7][8 9 10 11]
         let t = ctx.new_f32_2d(4, 3).expect("t");
-        t.set_f32(&(0..12).map(|v| v as f32).collect::<Vec<_>>()).expect("set");
+        t.set_f32(&(0..12).map(|v| v as f32).collect::<Vec<_>>())
+            .expect("set");
 
         // The last 2 of each row: [2 3][6 7][10 11].
         let f32_size = std::mem::size_of::<f32>();
@@ -1315,7 +1338,8 @@ mod tests {
 
         // [4 dims, 2 heads, 2 tokens] filled 0..15.
         let t = ctx.new_f32_3d(4, 2, 2).expect("t");
-        t.set_f32(&(0..16).map(|v| v as f32).collect::<Vec<_>>()).expect("set");
+        t.set_f32(&(0..16).map(|v| v as f32).collect::<Vec<_>>())
+            .expect("set");
 
         let f32_size = std::mem::size_of::<f32>();
         let pe = ctx
@@ -1346,9 +1370,7 @@ mod tests {
 
         // The top 2 of each row, as argsort_top_k would return them.
         let i32_size = std::mem::size_of::<i32>();
-        let top2 = ctx
-            .view_2d(&t, 2, 3, 4 * i32_size, 0)
-            .expect("view");
+        let top2 = ctx.view_2d(&t, 2, 3, 4 * i32_size, 0).expect("view");
 
         assert!(!top2.is_contiguous());
         assert_eq!(top2.to_vec_i32(), vec![0, 1, 4, 5, 8, 9]);
@@ -1464,7 +1486,9 @@ mod tests {
         // weight the wrong experts and produce plausible-looking garbage.
         let ctx = Context::new(ARENA).expect("context");
         let scores = ctx.new_f32_1d(6).expect("scores");
-        scores.set_f32(&[0.1, 0.9, 0.3, 0.7, 0.2, 0.5]).expect("set");
+        scores
+            .set_f32(&[0.1, 0.9, 0.3, 0.7, 0.2, 0.5])
+            .expect("set");
         let top = ctx.top_k(&scores, 2).expect("top_k");
         ctx.compute(&top, 1).expect("compute");
 

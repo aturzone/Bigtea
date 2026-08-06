@@ -50,7 +50,11 @@ fn main() -> ExitCode {
                 if loc.routed_expert { "  routed" } else { "" }
             );
         }
-        println!("\n{} tensors shown of {}", names.len(), model.tensor_count());
+        println!(
+            "\n{} tensors shown of {}",
+            names.len(),
+            model.tensor_count()
+        );
         return ExitCode::SUCCESS;
     }
 

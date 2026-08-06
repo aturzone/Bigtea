@@ -218,7 +218,11 @@ impl std::fmt::Display for Layout {
             g(self.always_read_bytes),
             g(self.always_read_shortfall_bytes)
         )?;
-        writeln!(f, "expert pool      {:.2} GiB (streams)", g(self.expert_pool_bytes))?;
+        writeln!(
+            f,
+            "expert pool      {:.2} GiB (streams)",
+            g(self.expert_pool_bytes)
+        )?;
         writeln!(f, "spare ram        {:.2} GiB", g(self.spare_ram_bytes()))?;
         for note in &self.notes {
             writeln!(f, "  ! {note}")?;

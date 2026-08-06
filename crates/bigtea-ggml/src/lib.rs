@@ -58,7 +58,10 @@ impl fmt::Display for GgmlError {
             GgmlError::UnsupportedType(t) => {
                 write!(f, "ggml cannot convert type {t} to floats")
             }
-            GgmlError::PartialBlock { elements, block_size } => write!(
+            GgmlError::PartialBlock {
+                elements,
+                block_size,
+            } => write!(
                 f,
                 "{elements} elements is not a whole number of {block_size}-element blocks"
             ),
@@ -89,6 +92,9 @@ pub const fn available() -> bool {
 
 /// `GGML_TYPE_F32`. Special-cased because ggml offers no conversion kernel
 /// for it — the conversion is the identity.
+// Referenced only by the ggml-backed paths, so a build without ggml sees it
+// as dead. It is the type tag, not a convenience constant -- keep it.
+#[cfg_attr(not(have_ggml), allow(dead_code))]
 const GGML_TYPE_F32: u32 = 0;
 
 #[cfg(have_ggml)]
@@ -109,6 +115,11 @@ mod ffi {
         pub from_float_ref: Option<FromFloatRef>,
     }
 
+    // Declared as a set even though only `ggml_get_type_traits` is called
+    // today: getting an FFI signature wrong is silent corruption, so these are
+    // transcribed once, together, from one header revision rather than added
+    // piecemeal later under time pressure.
+    #[allow(dead_code)]
     extern "C" {
         pub fn ggml_get_type_traits(ty: c_int) -> *const TypeTraits;
         pub fn ggml_type_size(ty: c_int) -> usize;

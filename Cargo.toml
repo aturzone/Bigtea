@@ -12,11 +12,15 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.82"
 license = "Apache-2.0"
 repository = "https://github.com/aturzone/Bigtea"
+homepage = "https://github.com/aturzone/Bigtea"
+authors = ["Atur Dana <https://github.com/aturzone>"]
+keywords = ["llm", "inference", "moe", "gguf", "streaming"]
+categories = ["science", "command-line-utilities"]
 
 [profile.release]
 opt-level = 3

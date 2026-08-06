@@ -13,8 +13,7 @@
 use bigtea_arch::{AttentionKind, Deepseek4Config, Deepseek4Model};
 use bigtea_model::Model;
 
-const SHARD: &str =
-    r"C:\Projects\models\v4flash\DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf";
+const SHARD: &str = r"C:\Projects\models\v4flash\DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf";
 
 const GIB: f64 = (1u64 << 30) as f64;
 
@@ -38,7 +37,10 @@ fn manifest_matches_the_container() {
     assert_eq!(config.n_head_kv, 1, "MLA: one KV head, not per-head K/V");
     assert_eq!(config.n_expert, 256);
     assert_eq!(config.n_expert_used, 6);
-    assert_eq!(config.n_expert_shared, 1, "a shared expert runs every token");
+    assert_eq!(
+        config.n_expert_shared, 1,
+        "a shared expert runs every token"
+    );
     assert_eq!(config.q_lora_rank, 1024);
     assert_eq!(config.kv_lora_rank, 512);
 
@@ -59,14 +61,20 @@ fn manifest_matches_the_container() {
     let uncompressed = (0..config.n_layer)
         .filter(|il| !config.uses_compress_rope(*il))
         .count();
-    assert_eq!(uncompressed, 2, "exactly two layers skip the compressed RoPE");
+    assert_eq!(
+        uncompressed, 2,
+        "exactly two layers skip the compressed RoPE"
+    );
 
     // The RoPE layer 0 actually gets, which is the one the forward tests
     // verify against llama.cpp's trace.
     let rope0 = config.rope_for_layer(0);
     assert_eq!(rope0.params.freq_base, 10_000.0);
     assert_eq!(rope0.params.freq_scale, 1.0);
-    assert_eq!(rope0.params.ext_factor, 0.0, "no YaRN on an uncompressed layer");
+    assert_eq!(
+        rope0.params.ext_factor, 0.0,
+        "no YaRN on an uncompressed layer"
+    );
     assert_eq!(rope0.n_ctx_orig, 0);
 
     // And a compressed one, which uses a different base entirely. Transcribed
@@ -120,8 +128,14 @@ fn the_two_readings_of_attention_kind_agree_on_every_layer() {
     }
 
     // The alternation, asserted rather than left as a comment.
-    assert_eq!(config.attention_kind_from_ratio(0), Some(AttentionKind::Raw));
-    assert_eq!(config.attention_kind_from_ratio(1), Some(AttentionKind::Raw));
+    assert_eq!(
+        config.attention_kind_from_ratio(0),
+        Some(AttentionKind::Raw)
+    );
+    assert_eq!(
+        config.attention_kind_from_ratio(1),
+        Some(AttentionKind::Raw)
+    );
     for il in 2..config.n_layer {
         let want = if il % 2 == 0 {
             AttentionKind::CompressedSparse
@@ -138,7 +152,11 @@ fn the_two_readings_of_attention_kind_agree_on_every_layer() {
     // And the block sizes, which are why a five-token capture exercises one
     // compressor and not the other: CSA compresses every 4 tokens, HCA every
     // 128, so at five tokens only CSA has ever actually run.
-    assert_eq!(config.compress_block(0), None, "Raw layers have no compressor");
+    assert_eq!(
+        config.compress_block(0),
+        None,
+        "Raw layers have no compressor"
+    );
     assert_eq!(config.compress_block(2), Some(Deepseek4Config::CSA_RATIO));
     assert_eq!(config.compress_block(3), Some(Deepseek4Config::HCA_RATIO));
 }
@@ -214,7 +232,11 @@ fn derived_shapes_match_the_container() {
     let hc_fn = model
         .location("blk.0.hc_attn_fn.weight")
         .expect("hc_attn_fn present");
-    assert_eq!(hc_fn.dims[0], config.hc_dim() as u64, "hc_attn_fn is [hc_dim, mix]");
+    assert_eq!(
+        hc_fn.dims[0],
+        config.hc_dim() as u64,
+        "hc_attn_fn is [hc_dim, mix]"
+    );
 
     // attn_output_a ships 2-D but is used as [n_head*head_dim/groups, rank, groups].
     assert_eq!(config.output_group_count, 8);
@@ -231,7 +253,10 @@ fn derived_shapes_match_the_container() {
     // Q goes down to q_lora_rank then up to n_head * head_dim.
     let wq_b = model.location("blk.0.attn_q_b.weight").expect("wq_b");
     assert_eq!(wq_b.dims[0], config.q_lora_rank as u64);
-    assert_eq!(wq_b.dims[1], config.n_head as u64 * config.kv_lora_rank as u64);
+    assert_eq!(
+        wq_b.dims[1],
+        config.n_head as u64 * config.kv_lora_rank as u64
+    );
 
     // K and V are one shared compressed head, not per-head tensors.
     let wkv = model.location("blk.0.attn_kv.weight").expect("wkv");

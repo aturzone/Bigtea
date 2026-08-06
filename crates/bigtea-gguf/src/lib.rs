@@ -36,7 +36,11 @@ pub enum Error {
     /// A GGUF version this parser does not implement.
     UnsupportedVersion(u32),
     /// The file ended in the middle of a field.
-    Truncated { needed: usize, available: usize, context: &'static str },
+    Truncated {
+        needed: usize,
+        available: usize,
+        context: &'static str,
+    },
     /// A metadata value carried an unknown type tag.
     UnknownValueType(u32),
     /// A tensor declared a `ggml` type this build does not know.
@@ -56,7 +60,11 @@ impl fmt::Display for Error {
                 "not a GGUF file (magic was {found:#010x}, expected {MAGIC:#010x})"
             ),
             Error::UnsupportedVersion(v) => write!(f, "unsupported GGUF version {v}"),
-            Error::Truncated { needed, available, context } => write!(
+            Error::Truncated {
+                needed,
+                available,
+                context,
+            } => write!(
                 f,
                 "truncated while reading {context}: needed {needed} bytes, {available} left"
             ),
@@ -64,7 +72,10 @@ impl fmt::Display for Error {
             Error::UnknownTensorType(t) => write!(f, "unknown tensor type {t}"),
             Error::BadUtf8 => write!(f, "string field was not valid UTF-8"),
             Error::ImplausibleCount { what, value } => {
-                write!(f, "implausible {what} count {value} — file is likely corrupt")
+                write!(
+                    f,
+                    "implausible {what} count {value} — file is likely corrupt"
+                )
             }
         }
     }

@@ -95,6 +95,9 @@ fn main() -> ExitCode {
 ///
 /// A model far larger than RAM runs here because only the always-read part is
 /// held — for Qwen3-30B-A3B that is 0.93 GiB of a 17.28 GiB container.
+// These are command-line options, not coupled state; a config struct here
+// would add a layer without removing a decision.
+#[allow(clippy::too_many_arguments)]
 fn run_streaming(
     model: &Model,
     config: Qwen3Config,
@@ -294,7 +297,15 @@ fn run(
 
     if config.is_moe() {
         return run_streaming(
-            &model, config, &arch, &tokenizer, tokens, n_predict, prefill_block, cache_budget, t0,
+            &model,
+            config,
+            &arch,
+            &tokenizer,
+            tokens,
+            n_predict,
+            prefill_block,
+            cache_budget,
+            t0,
         );
     }
 
@@ -428,7 +439,11 @@ fn report_residency_shortfall(report: &bigtea_model::LoadReport, machine: &bigte
         return; // the shortfall is undownloaded weights, not RAM
     }
     // What re-reading them costs per token, at the rate this load just achieved.
-    let rate = if report.bytes_per_sec() > 0.0 { report.bytes_per_sec() } else { 1e9 };
+    let rate = if report.bytes_per_sec() > 0.0 {
+        report.bytes_per_sec()
+    } else {
+        1e9
+    };
     println!(
         "           {:.2} GiB will be re-read from disk on EVERY token (~{:.1}s each)",
         missing as f64 / GIB,
@@ -441,9 +456,16 @@ fn report_residency_shortfall(report: &bigtea_model::LoadReport, machine: &bigte
         return;
     }
     let free: u64 = holders.iter().map(|(_, b, _)| *b).sum();
-    println!("           closing these would free up to {:.2} GiB:", free as f64 / GIB);
+    println!(
+        "           closing these would free up to {:.2} GiB:",
+        free as f64 / GIB
+    );
     for (name, bytes, count) in holders.iter().take(4) {
-        let n = if *count > 1 { format!(" ({count} processes)") } else { String::new() };
+        let n = if *count > 1 {
+            format!(" ({count} processes)")
+        } else {
+            String::new()
+        };
         println!("             {name:<28} {:.2} GiB{n}", *bytes as f64 / GIB);
     }
     if free >= missing {
@@ -474,8 +496,12 @@ fn run_deepseek4(
 
     println!(
         "shape      {} blocks, {} embd, {} heads, {} experts ({} used, {} shared)",
-        config.n_layer, config.n_embd, config.n_head, config.n_expert,
-        config.n_expert_used, config.n_expert_shared
+        config.n_layer,
+        config.n_embd,
+        config.n_head,
+        config.n_expert,
+        config.n_expert_used,
+        config.n_expert_shared
     );
     println!("prompt     {} tokens", tokens.len());
 

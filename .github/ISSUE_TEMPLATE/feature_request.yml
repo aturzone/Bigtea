@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest something Bigtea should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you unable to do today?
+    validations: {required: true}
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+  - type: textarea
+    id: measured
+    attributes:
+      label: Anything measured
+      description: |
+        If this is about performance, numbers help enormously — including the
+        command line that produced them. This project treats an unmeasured
+        performance claim as an opinion, including its own.

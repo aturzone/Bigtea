@@ -8,7 +8,6 @@
 
 use std::process::ExitCode;
 
-
 use bigtea_model::Model;
 use bigtea_plan::{max_context_for_budget, overhead, AttentionShape, KV_BYTES_F16};
 
@@ -74,9 +73,7 @@ fn report_budget(model: &Model, ram_gib: f64, dense: u64, per_token: u64) {
 
     let max_ctx = max_context_for_budget(&shape, ram, dense, KV_BYTES_F16);
     if max_ctx > 0 {
-        println!(
-            "\n  longest context with all dense weights resident: {max_ctx} tokens"
-        );
+        println!("\n  longest context with all dense weights resident: {max_ctx} tokens");
     } else {
         let ov = overhead(&shape, 4096, KV_BYTES_F16);
         let need = (dense + ov.total()) as f64 / GIB;
@@ -132,12 +129,21 @@ fn main() -> ExitCode {
     let (expert, dense) = model.expert_vs_dense_bytes();
     let sum = expert + dense;
     println!("\nweight layout (indexed tensors):");
-    println!("  always-read   {:>9.2} GiB   read on every token", dense as f64 / GIB);
-    println!("  routed expert {:>9.2} GiB   read only when selected", expert as f64 / GIB);
+    println!(
+        "  always-read   {:>9.2} GiB   read on every token",
+        dense as f64 / GIB
+    );
+    println!(
+        "  routed expert {:>9.2} GiB   read only when selected",
+        expert as f64 / GIB
+    );
     println!("  total         {:>9.2} GiB", sum as f64 / GIB);
 
     // The routing facts that turn a pool size into a per-token cost.
-    if let (Some(n), Some(used)) = (model.arch_u64("expert_count"), model.arch_u64("expert_used_count")) {
+    if let (Some(n), Some(used)) = (
+        model.arch_u64("expert_count"),
+        model.arch_u64("expert_used_count"),
+    ) {
         let per_token = expert / n.max(1) * used;
         println!(
             "\nrouting        {used} of {n} experts per token \

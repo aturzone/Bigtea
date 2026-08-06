@@ -93,7 +93,11 @@ fn common_words_are_single_tokens() {
         return;
     };
     let ids = tk.encode(" the");
-    assert_eq!(ids.len(), 1, "' the' encoded to {ids:?}, expected one token");
+    assert_eq!(
+        ids.len(),
+        1,
+        "' the' encoded to {ids:?}, expected one token"
+    );
 }
 
 #[test]

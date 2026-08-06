@@ -37,7 +37,7 @@ fn direct_io_engages_on_real_storage() {
         "cache-bypassing I/O did not engage on this device; every bandwidth \
          measurement taken through it would be the page cache's, not the disk's"
     );
-    assert!(f.len() > 0);
+    assert!(!f.is_empty());
 }
 
 #[test]
@@ -54,11 +54,11 @@ fn direct_reads_match_buffered_reads_on_a_real_file() {
     let len = direct.len();
 
     let cases: &[(u64, usize)] = &[
-        (0, 4),          // GGUF magic
-        (0, 4096),       // first sector
-        (13, 977),       // deliberately awkward
-        (4095, 8194),    // straddles three sectors
-        (len - 1, 1),    // final byte
+        (0, 4),       // GGUF magic
+        (0, 4096),    // first sector
+        (13, 977),    // deliberately awkward
+        (4095, 8194), // straddles three sectors
+        (len - 1, 1), // final byte
     ];
     for &(offset, want) in cases {
         if offset + want as u64 > len {

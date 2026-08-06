@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::aligned::{align_down, align_up, AlignedBuf, SkewedBuf, ALIGN};
+use crate::aligned::{align_down, align_up, AlignedBuf, ALIGN};
 
 /// Whether the cache is actually being bypassed.
 ///
@@ -57,7 +57,12 @@ impl DirectFile {
             Err(_) => (File::open(&path)?, IoMode::Buffered),
         };
         let len = file.metadata()?.len();
-        Ok(DirectFile { file, path, len, mode })
+        Ok(DirectFile {
+            file,
+            path,
+            len,
+            mode,
+        })
     }
 
     /// Open without attempting direct I/O. Useful for A/B measurement of what
@@ -66,7 +71,12 @@ impl DirectFile {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
         let len = file.metadata()?.len();
-        Ok(DirectFile { file, path, len, mode: IoMode::Buffered })
+        Ok(DirectFile {
+            file,
+            path,
+            len,
+            mode: IoMode::Buffered,
+        })
     }
 
     #[cfg(windows)]
@@ -81,7 +91,10 @@ impl DirectFile {
     #[cfg(target_os = "linux")]
     fn open_direct(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path)
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECT)
+            .open(path)
     }
 
     // macOS has no open-time flag; F_NOCACHE must be set afterwards via fcntl,
@@ -119,9 +132,9 @@ impl DirectFile {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let end = offset.checked_add(len as u64).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "offset + len overflows")
-        })?;
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset + len overflows"))?;
         if end > self.len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -166,9 +179,9 @@ impl DirectFile {
         if dst.is_empty() {
             return Ok(0);
         }
-        let end = offset.checked_add(dst.len() as u64).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "offset + len overflows")
-        })?;
+        let end = offset
+            .checked_add(dst.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset + len overflows"))?;
         if end > self.len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -319,6 +332,7 @@ impl DirectFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SkewedBuf;
     use std::io::Write;
 
     /// A temp file that deletes itself, so a failing test leaves no litter.
@@ -363,7 +377,13 @@ mod tests {
         let f = DirectFile::open(&tmp.0).expect("open");
 
         // Deliberately awkward offsets and lengths: none sector-aligned.
-        for &(offset, len) in &[(0u64, 1usize), (1, 1), (4095, 2), (4096, 4096), (7777, 9999)] {
+        for &(offset, len) in &[
+            (0u64, 1usize),
+            (1, 1),
+            (4095, 2),
+            (4096, 4096),
+            (7777, 9999),
+        ] {
             let got = f.read_at(offset, len).expect("read");
             assert_eq!(got.len(), len);
             assert_eq!(
@@ -504,7 +524,10 @@ mod tests {
             let copied = f.read_at_into(offset, &mut buf).expect("read");
             assert_eq!(&buf[..], &data[offset as usize..offset as usize + len]);
             if f.mode() == IoMode::Direct {
-                assert_eq!(copied, ALIGN, "expected exactly the two edge fragments at len {len}");
+                assert_eq!(
+                    copied, ALIGN,
+                    "expected exactly the two edge fragments at len {len}"
+                );
             }
         }
     }

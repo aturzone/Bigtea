@@ -109,7 +109,10 @@ fn reads_a_real_tensor_and_gets_its_exact_size() {
         loc.size,
         "read must return exactly the tensor's stored size"
     );
-    assert!(!bytes.iter().all(|&b| b == 0), "a real tensor should not be all zeros");
+    assert!(
+        !bytes.iter().all(|&b| b == 0),
+        "a real tensor should not be all zeros"
+    );
 }
 
 #[test]
@@ -172,7 +175,10 @@ fn every_tensor_location_is_inside_its_shard_index() {
     for name in m.tensor_names().take(200) {
         let loc = m.location(name).expect("located");
         assert!(loc.size > 0, "{name} has zero size");
-        assert!(loc.shard < m.shard_count(), "{name} points at a missing shard");
+        assert!(
+            loc.shard < m.shard_count(),
+            "{name} points at a missing shard"
+        );
         assert!(loc.file_offset > 0, "{name} starts before the data section");
     }
 }

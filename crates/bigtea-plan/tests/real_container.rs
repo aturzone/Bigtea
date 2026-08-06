@@ -56,8 +56,14 @@ fn parses_a_real_deepseek_container() {
     assert_eq!(gguf.get_u64(&format!("{arch}.block_count")), Some(43));
     assert_eq!(gguf.get_u64(&format!("{arch}.expert_count")), Some(256));
     assert_eq!(gguf.get_u64(&format!("{arch}.expert_used_count")), Some(6));
-    assert_eq!(gguf.get_u64(&format!("{arch}.expert_shared_count")), Some(1));
-    assert_eq!(gguf.get_u64(&format!("{arch}.embedding_length")), Some(4096));
+    assert_eq!(
+        gguf.get_u64(&format!("{arch}.expert_shared_count")),
+        Some(1)
+    );
+    assert_eq!(
+        gguf.get_u64(&format!("{arch}.embedding_length")),
+        Some(4096)
+    );
     assert_eq!(
         gguf.get_u64(&format!("{arch}.expert_feed_forward_length")),
         Some(2048)
@@ -141,6 +147,9 @@ fn profile_from_a_real_container_predicts_a_runnable_plan() {
         p.bytes_per_token,
         p.dense_shortfall_bytes + p.expert_bytes_per_token
     );
-    assert_eq!(p.dense_resident_bytes + p.dense_shortfall_bytes, p.dense_bytes);
+    assert_eq!(
+        p.dense_resident_bytes + p.dense_shortfall_bytes,
+        p.dense_bytes
+    );
     assert!(p.container_bytes >= p.dense_bytes);
 }

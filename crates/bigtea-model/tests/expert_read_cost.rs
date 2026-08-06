@@ -28,8 +28,7 @@ use std::time::Instant;
 use bigtea_io::{AlignedBuf, SkewedBuf, ALIGN};
 use bigtea_model::Model;
 
-const SHARD: &str =
-    r"C:\Projects\models\v4flash\DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf";
+const SHARD: &str = r"C:\Projects\models\v4flash\DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf";
 
 /// The tensor the runner reads most: one layer's stacked `ffn_up` experts.
 const EXPERTS: &str = "blk.5.ffn_up_exps.weight";
@@ -53,7 +52,10 @@ fn gib(bytes: u64, secs: f64) -> f64 {
 #[ignore = "reads gigabytes from a 144 GB container; a benchmark, not a correctness test"]
 fn expert_read_cost_by_stage() {
     let Some(model) = open() else { return };
-    let loc = model.location(EXPERTS).expect("expert tensor present").clone();
+    let loc = model
+        .location(EXPERTS)
+        .expect("expert tensor present")
+        .clone();
     let n_expert = *loc.dims.last().expect("stacked");
     let slice = loc.size / n_expert;
     let total = slice * SLICES;
@@ -161,8 +163,12 @@ fn expert_read_cost_by_stage() {
     );
 
     // The measurement is worthless if the two paths disagree about the bytes.
-    let check = model.read_tensor_range(EXPERTS, 0, slice.min(1 << 20)).expect("read");
+    let check = model
+        .read_tensor_range(EXPERTS, 0, slice.min(1 << 20))
+        .expect("read");
     let mut mirror = vec![0u8; check.len()];
-    model.read_range_into(EXPERTS, 0, &mut mirror).expect("read into");
+    model
+        .read_range_into(EXPERTS, 0, &mut mirror)
+        .expect("read into");
     assert_eq!(check, mirror, "the two read paths returned different bytes");
 }
