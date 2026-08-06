@@ -1941,7 +1941,7 @@ fn overlap_compressor_5tok<'c>(
 
     let w = ctx.soft_max(&scores).expect("softmax scores");
     ctx.compute(&w, 12).expect("compute weights");
-    check(s, &format!("{lp}_weights"), w.to_vec_f32().iter().sum::<f32>());
+    check(s, &format!("{lp}_comp_weights"), w.to_vec_f32().iter().sum::<f32>());
 
     let weighted = ctx.mul(&values, &w).expect("weight values");
     ctx.compute(&weighted, 12).expect("compute weighted");
@@ -2068,6 +2068,119 @@ fn hadamard_rotate<'c>(ctx: &'c Context, x: &Tensor<'c>, rot: &Tensor<'c>, n: i6
     ctx.mul_mat(rot, &flat).expect("hadamard matmul")
 }
 
+/// The lightning indexer's **query path**: its own low-rank Q, its own RoPE,
+/// and the Hadamard rotation.
+///
+/// Returns `(q_rot, weights)` — the rotated indexer queries shaped
+/// `[indexer_head, n_indexer_head, tokens]` and the per-head scores scale that
+/// `ggml_lightning_indexer` multiplies by.
+///
+/// Three things here are not the attention path's, despite looking like it:
+///
+/// 1. **It reuses `qr`**, the shared Q down-projection, but has its own up
+///    projection (`indexer.attn_q_b`) into a 128-wide head, not 512.
+/// 2. **Its RoPE always uses the compressed base**, unconditionally
+///    (`deepseek4.cpp:555`) — not the per-layer choice the attention path
+///    makes. That happens to agree here because every layer with an indexer is
+///    a compressed layer, but the code says "always", not "per layer".
+/// 3. **The rotation is real at this length.** Unlike the compressor's, whose
+///    `comp_pos` is 0 for the first block, this one rotates by token position:
+///    21.281902 goes to 17.747589.
+fn lid_query_5tok<'c>(
+    s: &LayerSums,
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    config: &Deepseek4Config,
+    attn_norm: &Tensor<'c>,
+    rot: &Tensor<'c>,
+) -> (Tensor<'c>, Tensor<'c>) {
+    let il = s.il;
+    let nt = s.tokens.len() as i64;
+    let head = config.indexer_key_length as i64;
+    let n_head = config.indexer_head_count as i64;
+    let n_rot = config.n_rot as i64;
+    let n_nope = head - n_rot;
+    let f32_size = std::mem::size_of::<f32>();
+    let head_stride = head as usize * f32_size;
+
+    // The shared Q down-projection, which the indexer borrows.
+    let qr = ctx
+        .mul_mat(
+            weights.get(&format!("blk.{il}.attn_q_a.weight")).expect("bound"),
+            attn_norm,
+        )
+        .expect("qr");
+    let qr = ctx.rms_norm(&qr, config.rms_eps).expect("qr rms");
+    let qr = ctx
+        .mul(
+            &qr,
+            weights.get(&format!("blk.{il}.attn_q_a_norm.weight")).expect("bound"),
+        )
+        .expect("qr_norm");
+
+    let q = ctx
+        .mul_mat(
+            weights.get(&format!("blk.{il}.indexer.attn_q_b.weight")).expect("bound"),
+            &qr,
+        )
+        .expect("lid_q");
+    let q = ctx.reshape_3d(&q, head, n_head, nt).expect("reshape lid_q");
+    ctx.compute(&q, 12).expect("compute lid_q");
+    check(s, "lid_q", q.to_vec_f32().iter().sum::<f32>());
+
+    let nope = ctx
+        .view_3d(&q, n_nope, n_head, nt, head_stride, head_stride * n_head as usize, 0)
+        .expect("lid_q nope");
+    ctx.compute(&nope, 12).expect("compute");
+    check(s, "lid_q_nope", nope.to_vec_f32().iter().sum::<f32>());
+
+    let pe_in = ctx
+        .view_3d(
+            &q,
+            n_rot,
+            n_head,
+            nt,
+            head_stride,
+            head_stride * n_head as usize,
+            n_nope as usize * f32_size,
+        )
+        .expect("lid_q pe view");
+    ctx.compute(&pe_in, 12).expect("compute");
+    check(s, "lid_q_pe_in", pe_in.to_vec_f32().iter().sum::<f32>());
+
+    let pos = ctx.new_i32_1d(nt).expect("pos");
+    let positions: Vec<i32> = (0..nt as i32).collect();
+    pos.set_i32(&positions).expect("set pos");
+    // The compressed parameters, always — see the note above.
+    let (rope, rope_orig) = rope_for(config, il);
+    let pe = ctx
+        .rope_ext(&pe_in, &pos, None, n_rot as i32, ROPE_MODE_NORM, rope_orig, rope)
+        .expect("lid_q_pe");
+    ctx.compute(&pe, 12).expect("compute");
+    check(s, "lid_q_pe", pe.to_vec_f32().iter().sum::<f32>());
+
+    let q = ctx.concat(&nope, &pe, 0).expect("concat lid_q");
+    let q_rot = hadamard_rotate(ctx, &q, rot, head);
+    let q_rot = ctx.reshape_3d(&q_rot, head, n_head, nt).expect("reshape q_rot");
+    ctx.compute(&q_rot, 12).expect("compute q_rot");
+    check(s, "lid_q_rot", q_rot.to_vec_f32().iter().sum::<f32>());
+
+    // One score weight per indexer head, scaled by the geometric mean of the
+    // indexer's two dimensions rather than by the head width alone.
+    let w = ctx
+        .mul_mat(
+            weights.get(&format!("blk.{il}.indexer.proj.weight")).expect("bound"),
+            attn_norm,
+        )
+        .expect("lid_weights");
+    let scale = 1.0f32 / ((head * n_head) as f32).sqrt();
+    let w = ctx.scale(&w, scale).expect("scale lid_weights");
+    ctx.compute(&w, 12).expect("compute lid_weights");
+    check(s, "lid_weights", w.to_vec_f32().iter().sum::<f32>());
+
+    (q_rot, w)
+}
+
 /// Both compressors of a Compressed Sparse layer, and the indexer's rotation.
 ///
 /// A CSA layer runs the overlap compressor **twice** with different weights and
@@ -2096,6 +2209,8 @@ fn csa_compressor_matches_llama_cpp() {
         "indexer_compressor_gate",
         "indexer_compressor_ape",
         "indexer_compressor_norm",
+        "indexer.attn_q_b",
+        "indexer.proj",
     ]
     .iter()
     .map(|x| format!("blk.2.{x}.weight"))
@@ -2141,6 +2256,9 @@ fn csa_compressor_matches_llama_cpp() {
     let rotated = hadamard_rotate(&ctx, &lid, &rot, head_lid);
     ctx.compute(&rotated, 12).expect("compute hadamard");
     check(&s, "lid_comp_rot", rotated.to_vec_f32().iter().sum::<f32>());
+
+    // The indexer's query side, which shares the rotation but not much else.
+    let _ = lid_query_5tok(&s, &ctx, &weights, &config, &p.attn_norm, &rot);
 }
 
 /// Read just the named experts out of a stacked tensor and bind them as a
