@@ -36,7 +36,41 @@ it instead from which tensors a block ships. `deepseek4_container.rs` now assert
 agree on all 43 layers; a divergence means one reading is wrong and some layer would run
 through the wrong attention.
 
-## HCA — the simpler kind, but *not* the first one reachable
+## Prompt length decides what is observable — measured, not reasoned
+
+The single most useful planning fact from this whole port. Each row is a capture that exists
+in `tests/fixtures/`.
+
+| tokens | Raw attn | CSA compress | CSA attn | HCA compress | HCA attn | indexer selects |
+|---|---|---|---|---|---|---|
+| 1  | ✅ (RoPE is identity) | — | — | — | — | — |
+| 2  | ✅ | writes only | **falls back to Raw** | writes only | **falls back to Raw** | — |
+| 5  | ✅ | ✅ ratio 4 | ✅ | writes only | **falls back to Raw** | inert |
+| 165| ✅ (layers 0-1) | ✅ | ✅ | ✅ ratio 128 | ✅ | inert |
+| >2048 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+The compressed builders are guarded on their compressed caches being non-empty, so **a layer
+silently runs a different attention at different prompt lengths**. Two tokens was what let
+all 43 blocks be verified before any compressed attention existed; 165 is what makes HCA
+observable at all; and nothing below ~2048 can exercise the indexer, because
+`n_top_k = min(n_lid, indexer_top_k)` selects everything until `n_lid` exceeds 512.
+
+**Whether >2048 is verifiable on this machine is a separate question, and probably no**: at
+that length every layer routes to all 256 experts, which is 3.19 GiB of expert weight per
+layer. Per-layer contexts bound that to one layer at a time, so it is not hopeless, but it is
+right at the edge of the ~5 GiB free here.
+
+## HCA — the map (still unbuilt)
+
+**It needs its own compressor.** `build_hca_compressed_kv_from_state` is a *different*
+function from the overlap compressor CSA uses, and its state is `{512, 128}` — head-wide,
+not `2*head` — so it is not the same code with a different ratio. That is the one thing the
+five-token map got wrong by omission.
+
+Its attention half, by contrast, is exactly CSA's: `concat(raw_k, hca_k, 2)`,
+`concat(raw_mask, hca_mask, 0)`, then the same fused kernel — no indexer, no top-k mask. At
+165 tokens `hca_k_all` is `{512, 1, 512}`, identical to `csa_k_all`. So building HCA is one
+new compressor plus a call into machinery that already exists and is verified.
 
 133 rows against Raw's 121, so it looks like the obvious next step. It is not: layer 3 sits
 behind layer 2, and layers chain. See the corrected order at the bottom of this node.
@@ -58,7 +92,48 @@ prompt length *is* the Raw path plus two matmuls, and the existing capture can c
 state writes but not the compression. Same family of hole as the one-token RoPE capture —
 proving `build_hca_compressed_kv_from_state` needs a prompt of at least 128 tokens.
 
-## CSA — the hardest kind, and the one with no analogue here
+## CSA — BUILT (2026-08-06), except the part that cannot be checked
+
+Verified against llama.cpp on layer 2 at five tokens:
+
+```
+csa_comp-2       5.163465    the attention compressor  (head 512)
+lid_comp-2      27.113394    the indexer's compressor  (head 128)
+lid_comp_rot-2  -8.839936    Walsh-Hadamard, regenerated from scratch
+lid_q_pe-2      17.747589    the indexer's RoPE, and this one really rotates
+csa_k_all-2    125.152557    raw window + compressed summaries
+flash_attn-2  4314.597656    CSA attention
+```
+
+Three things this settled that the map below only guessed at:
+
+* **The overlap compressor is one function run twice** — 512-wide for attention,
+  128-wide for the indexer — differing only in weights and head width. The nope/pe split
+  must follow *that* head (128-64), not the attention head's 448; using the wrong one aborts
+  ggml on the indexer and would be silently correct on the attention side.
+* **The Hadamard rotation is generated, never stored.** Nothing in the container holds it.
+  llama.cpp builds an orthonormal Walsh-Hadamard at cache-init for DeepSeek indexers
+  unconditionally, in a `static` helper whose `ggml_` prefix makes it look like a ggml op it
+  is not. Sylvester's construction scaled by `1/sqrt(n)`; it is its own inverse.
+* **The persistent cache was not on the critical path** — see the state section below.
+
+### What could not be checked, and why
+
+**The indexer's selection is inert below ~2048 tokens.**
+`n_top_k = min(n_lid, indexer_top_k)` = `min(256, 512)` = 256, so it selects *every*
+compressed slot; `build_top_k_mask` then leaves exactly the visibility mask. Making the
+sparsity bite needs `n_lid > 512`, so more than 512 completed blocks, so over 2048 tokens.
+
+**And the trace could not help even if it did fire.** `lid_score_masked`, `csa_top_k_mask`
+and `csa_lid_kq_mask` all sum to `-inf`; `lid_top_k` sums to 163200 for *any* permutation of
+256. Four rows with no discriminating power. `attn_csa_lid` is the only number in the
+indexer's half of the layer that can fail, so it is the one asserted.
+
+**The compressors' own RoPE is unverified.** `comp_pos` is the block's start position, 0 for
+the first block, so at five tokens that rotation is the identity — the same shape of hole the
+one-token capture had. It needs a prompt long enough for a second block (≥8 tokens).
+
+## HCA — the map, from before any of it was built
 
 273 rows. It carries **two** compressor states, not one: `csa_state_*` feeding attention and
 `lid_state_*` feeding the indexer, each with its own kv/score/ape projections and its own
