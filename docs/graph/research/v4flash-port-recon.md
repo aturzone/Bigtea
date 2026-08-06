@@ -182,10 +182,31 @@ right count of plausible floats and all of them the wrong ones — making a
 correct graph look broken. Now stride-aware, with two hand-checkable unit tests
 that need no container.
 
-## Layer 0 is verified end to end (2026-08-06), except the routed experts
+## The whole forward pass is verified (2026-08-06)
 
-Everything from the embedding to `ffn_shexp-0` matches llama.cpp at five tokens. What the
-build found on the way, none of which is derivable from tensor shapes:
+**All 43 blocks plus the output head match llama.cpp**, from a token id to a 129280-wide
+logit vector — roughly sixty checkpoints per layer. At the two-token prompt `"Hello there"`
+the model predicts `","`, which is the sanity check on top of the numbers.
+
+Reached by two things, neither of them more architecture code:
+
+* **A two-token capture.** The compressed attention builders are guarded on their compressed
+  caches being populated (`deepseek4.cpp:1049-1063`); at two tokens those caches are empty,
+  so every layer falls through to `build_raw_attention`, which was already built. A *shorter*
+  capture reached further than a longer one.
+* **Per-layer contexts.** Chaining layers in one `ggml` context costs ~640 MiB of arena each.
+  Each layer now builds its own arena and `WeightSet`, runs, hands its residual streams out
+  as a plain `Vec<f32>`, and drops everything — so depth is free, and the `Vec` boundary is
+  what makes the drop sound. (Freeing weights inside one context is not: every `compute`
+  rebuilds the graph through its sources, so a dropped buffer reads freed memory
+  *successfully*.) It is also the shape the streaming runner needs.
+
+**This is not a complete implementation.** At any real prompt length 41 of 43 blocks take a
+different attention path — the compressors and the lightning indexer are still unbuilt, and
+the sliding window and SwiGLU clamp bounds are still unreached. See
+`v4flash-compressed-attention.md`.
+
+What the build found on the way, none of which is derivable from tensor shapes:
 
 - **Layers 0-2 do not use top-k routing.** `ffn_moe_topk-0` is
   `GET_ROWS(blk.0.ffn_gate_tid2eid.weight{6, 129280}, inp_tokens)` — the six experts are a

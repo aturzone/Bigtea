@@ -4,10 +4,10 @@ status: open
 links: [v4flash-port-recon.md]
 ---
 
-**Layers 0-3 are verified against llama.cpp** — 0 and 1 at five tokens, and all four at two
-tokens. But only 0 and 1 are `Raw` layers: 2 and 3 pass because at two tokens the compressed
+**All 43 blocks and the output head are verified against llama.cpp** at a two-token prompt.
+But only layers 0-1 are `Raw`: every other layer passes because at two tokens the compressed
 builders never fire (see below). **The compressed attention itself is still unbuilt, on 41 of
-43 blocks.** This node maps what those blocks compute, read from the captured trace and
+43 blocks, and at any real prompt length those blocks take a path that does not exist.** This node maps what those blocks compute, read from the captured trace and
 `deepseek4.cpp` rather than reasoned about, so the build has its reference before it starts.
 
 Fixtures already extracted from the existing five-token capture — no new llama.cpp run is
