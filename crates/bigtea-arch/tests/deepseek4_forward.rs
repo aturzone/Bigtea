@@ -2880,3 +2880,45 @@ fn attention_5tok<'c>(
 
     attn_out
 }
+
+/// **The library's own forward pass**, end to end, against the same oracle.
+///
+/// Everything above verifies code that lives in this test file. This verifies
+/// `bigtea_arch::prefill` — the shipped path, the one `bigtea-run` will call —
+/// against the same llama.cpp checkpoint the test-side implementation matches.
+///
+/// The distinction is the whole point. A test that reimplements the rules and
+/// then agrees with itself proves nothing about what ships; this port already
+/// made that mistake once with `rope_for_layer`. Two numbers pin it: the sum of
+/// all 129,280 logits, and the argmax.
+#[test]
+#[ignore = "reads weights from a 144 GB container, 43 blocks"]
+fn the_library_forward_pass_matches_llama_cpp() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+    let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());
+
+    assert!(
+        fw.indexer_is_exact(TOKENS_2.len()),
+        "at this length skipping the indexer must be exact, not an approximation"
+    );
+
+    let logits = bigtea_arch::prefill(&fw, TOKENS_2, 1024 << 20).expect("prefill");
+    assert_eq!(logits.len(), config.vocab_size as usize, "one logit per token id");
+
+    // The head's rows are keyed one past the last block: it is not a block.
+    let last = sums_2tok(config.n_layer);
+    assert_sum(
+        "library result_output",
+        logits.iter().sum::<f32>(),
+        last.get("result_output"),
+    );
+
+    let best = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+        .map(|(i, _)| i)
+        .expect("non-empty logits");
+    eprintln!("  library predicts token {best} after {:?}", TOKENS_2);
+}

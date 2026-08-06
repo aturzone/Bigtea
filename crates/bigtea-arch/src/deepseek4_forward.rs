@@ -568,3 +568,353 @@ fn attention<'c>(
     ctx.compute(&out, 12)?;
     Ok(out)
 }
+
+/// The block tail: write attention back across the streams, then the FFN's own
+/// gate block and `ffn_norm`.
+///
+/// A plain transformer does `x = x + f(x)`. This does
+/// `x[dst] = f(x)*post[dst] + sum_src x[src]*comb[dst, src]`, with `comb` a
+/// Sinkhorn-normalised `hc x hc`. None of that changes a shape.
+///
+/// The FFN's gates come from a **second, independent** mixes matmul against
+/// `hc_ffn_fn` over the post-attention streams — reusing the attention block's
+/// would be free of any error.
+fn layer_tail<'c>(
+    fw: &Deepseek4Forward<'_>,
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    il: u32,
+    e: &Entry<'c>,
+    attn_out: &Tensor<'c>,
+    nt: i64,
+) -> Result<(Tensor<'c>, Tensor<'c>, HcGates<'c>)> {
+    let config = &fw.config;
+    let streams = ctx.dsv4_hc_post(attn_out, &e.streams, &e.gates.post, &e.gates.comb)?;
+    ctx.compute(&streams, 12)?;
+
+    let flat = ctx.reshape_2d(&streams, config.hc_dim() as i64, nt)?;
+    let normed = ctx.rms_norm(&flat, config.rms_eps)?;
+    let mixes = ctx.mul_mat(
+        weights.get(&format!("blk.{il}.hc_ffn_fn.weight")).expect("bound"),
+        &normed,
+    )?;
+    ctx.compute(&mixes, 12)?;
+    let gates = hc_gates(ctx, weights, config, &format!("blk.{il}.hc_ffn"), &mixes, nt)?;
+
+    let collapsed = ctx.dsv4_hc_pre(&streams, &gates.pre)?;
+    let normed = ctx.rms_norm(&collapsed, config.rms_eps)?;
+    let ffn_norm = ctx.mul(
+        &normed,
+        weights.get(&format!("blk.{il}.ffn_norm.weight")).expect("bound"),
+    )?;
+    ctx.compute(&ffn_norm, 12)?;
+    Ok((streams, ffn_norm, gates))
+}
+
+/// The router: probabilities, the six experts, and their normalised weights.
+///
+/// **Two entirely different selection schemes**, chosen by `hash_layer_count`.
+/// The first three blocks look their experts up in `ffn_gate_tid2eid` by *token
+/// id* — no top-k at all, and `exp_probs_b` unused. Every other block adds the
+/// selection bias and takes `argsort_top_k`, where **the bias steers selection
+/// only**: the weights are gathered from the *unbiased* probabilities.
+fn moe_routing<'c>(
+    fw: &Deepseek4Forward<'_>,
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    il: u32,
+    ffn_norm: &Tensor<'c>,
+    tokens: &[i32],
+) -> Result<(Tensor<'c>, Vec<i32>)> {
+    let config = &fw.config;
+    let nt = tokens.len() as i64;
+    let n_expert = config.n_expert as i64;
+    let n_used = config.n_expert_used as i64;
+
+    let logits = ctx.mul_mat(
+        weights.get(&format!("blk.{il}.ffn_gate_inp.weight")).expect("bound"),
+        ffn_norm,
+    )?;
+    // sqrt(softplus(x)) — `expert_gating_func 4`, neither softmax nor sigmoid.
+    let probs = ctx.sqrt(&ctx.softplus(&logits)?)?;
+    ctx.compute(&probs, 12)?;
+    let probs3 = ctx.reshape_3d(&probs, 1, n_expert, nt)?;
+
+    let topk = if il < config.hash_layer_count {
+        let tok = ctx.new_i32_1d(nt)?;
+        tok.set_i32(tokens)?;
+        ctx.get_rows(
+            weights.get(&format!("blk.{il}.ffn_gate_tid2eid.weight")).expect("bound"),
+            &tok,
+        )?
+    } else {
+        let biased = ctx.add(
+            &probs,
+            weights.get(&format!("blk.{il}.exp_probs_b.bias")).expect("bound"),
+        )?;
+        ctx.compute(&biased, 12)?;
+        ctx.argsort_top_k(&biased, n_used as i32)?
+    };
+    ctx.compute(&topk, 12)?;
+    let ids = topk.to_vec_i32();
+
+    // Renormalised over the selected six only, then scaled. The divisor is
+    // clamped at the smallest F16 normal, not at an epsilon.
+    let w = ctx.get_rows(&probs3, &topk)?;
+    let w2 = ctx.reshape_2d(&w, n_used, nt)?;
+    let sum = ctx.clamp(&ctx.sum_rows(&w2)?, 6.103515625e-5, f32::INFINITY)?;
+    let w_norm = ctx.div(&w2, &sum)?;
+    let w3 = ctx.reshape_3d(&w_norm, 1, n_used, nt)?;
+    let w_scaled = ctx.scale(&w3, config.expert_weights_scale)?;
+    ctx.compute(&w_scaled, 12)?;
+    Ok((w_scaled, ids))
+}
+
+/// Read only the expert slices these tokens route to, and bind them compactly.
+///
+/// A stacked expert tensor is `[ne0, ne1, n_expert]` with equal slices, so slice
+/// `i` starts at `i * size / n_expert`. Binding all 256 for one block is 3.19
+/// GiB and does not fit this machine; the tokens' own selection is a fraction of
+/// that. **This is what the runner has to do anyway**, not a test convenience.
+fn bind_expert_slices<'c>(
+    model: &Model,
+    ctx: &'c Context,
+    weights: &mut WeightSet<'c>,
+    name: &str,
+    unique: &[i32],
+) -> Result<(u64, Vec<u64>)> {
+    let loc = model.location(name).expect("stacked tensor").clone();
+    let n_expert = *loc.dims.last().expect("stacked");
+    let slice = loc.size / n_expert;
+    let mut buf = Vec::with_capacity(unique.len() * slice as usize);
+    for e in unique {
+        buf.extend_from_slice(&model.read_tensor_range(name, *e as u64 * slice, slice)?);
+    }
+    let mut dims = loc.dims.clone();
+    *dims.last_mut().expect("stacked") = unique.len() as u64;
+    let read = buf.len() as u64;
+    weights.bind(ctx, name, loc.ty, &dims, buf)?;
+    Ok((read, dims))
+}
+
+/// The routed experts and the shared one, summed into the block's FFN output.
+///
+/// The shared expert runs for **every** token and is therefore resident weight;
+/// confusing it with the 256 routed ones is the difference between a 7 GiB
+/// resident set and a 144 GiB one. Both clamp their SwiGLU asymmetrically:
+/// `(-inf, limit]` on the gate, `[-limit, limit]` on the up projection.
+fn ffn<'c>(
+    fw: &Deepseek4Forward<'_>,
+    model: &Model,
+    ctx: &'c Context,
+    wctx: &'c Context,
+    weights: &mut WeightSet<'c>,
+    il: u32,
+    ffn_norm: &Tensor<'c>,
+    w_scaled: &Tensor<'c>,
+    ids: &[i32],
+    nt: i64,
+) -> Result<Tensor<'c>> {
+    let config = &fw.config;
+    let n_embd = config.n_embd as i64;
+    let n_used = config.n_expert_used as i64;
+    let f32_size = std::mem::size_of::<f32>();
+    let limit = config.swiglu_limit(il, false).unwrap_or(f32::INFINITY);
+    let limit_sh = config.swiglu_limit(il, true).unwrap_or(f32::INFINITY);
+
+    // ---- the shared expert ----
+    let sh_gate = ctx.mul_mat(
+        weights.get(&format!("blk.{il}.ffn_gate_shexp.weight")).expect("bound"),
+        ffn_norm,
+    )?;
+    let sh_gate = ctx.clamp(&sh_gate, f32::NEG_INFINITY, limit_sh)?;
+    let sh_up = ctx.mul_mat(
+        weights.get(&format!("blk.{il}.ffn_up_shexp.weight")).expect("bound"),
+        ffn_norm,
+    )?;
+    let sh_up = ctx.clamp(&sh_up, -limit_sh, limit_sh)?;
+    let sh = ctx.mul_mat(
+        weights.get(&format!("blk.{il}.ffn_down_shexp.weight")).expect("bound"),
+        &ctx.swiglu_split(&sh_gate, &sh_up)?,
+    )?;
+    ctx.compute(&sh, 12)?;
+
+    // ---- the routed experts, read as slices ----
+    let mut unique = ids.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    let compact: Vec<i32> = ids
+        .iter()
+        .map(|e| unique.iter().position(|u| u == e).expect("in set") as i32)
+        .collect();
+    let mut dims_of = std::collections::HashMap::new();
+    for suffix in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
+        let name = format!("blk.{il}.{suffix}.weight");
+        let (_, dims) = bind_expert_slices(model, wctx, weights, &name, &unique)?;
+        dims_of.insert(suffix, dims);
+    }
+    let n_uniq = unique.len() as i64;
+    let ids_t = ctx.new_i32_2d(n_used, nt)?;
+    ids_t.set_i32(&compact)?;
+
+    let stack = |suffix: &str| -> Result<Tensor<'c>> {
+        let d = &dims_of[suffix];
+        Ok(ctx.reshape_3d(
+            weights.get(&format!("blk.{il}.{suffix}.weight")).expect("bound"),
+            d[0] as i64,
+            d[1] as i64,
+            n_uniq,
+        )?)
+    };
+
+    let cur3 = ctx.reshape_3d(ffn_norm, n_embd, 1, nt)?;
+    let gate = ctx.mul_mat_id(&stack("ffn_gate_exps")?, &cur3, &ids_t)?;
+    let gate = ctx.clamp(&gate, f32::NEG_INFINITY, limit)?;
+    let up = ctx.mul_mat_id(&stack("ffn_up_exps")?, &cur3, &ids_t)?;
+    let up = ctx.clamp(&up, -limit, limit)?;
+    let act = ctx.swiglu_split(&gate, &up)?;
+    let down = ctx.mul_mat_id(&stack("ffn_down_exps")?, &act, &ids_t)?;
+    let weighted = ctx.mul(&down, w_scaled)?;
+    ctx.compute(&weighted, 12)?;
+
+    // Sum across the six experts as six strided views and five adds, which is
+    // the shape llama.cpp uses.
+    let row = n_embd as usize * f32_size;
+    let mut moe_out: Option<Tensor<'c>> = None;
+    for j in 0..n_used as usize {
+        let v = ctx.view_2d(&weighted, n_embd, nt, row * n_used as usize, j * row)?;
+        moe_out = Some(match moe_out {
+            None => v,
+            Some(acc) => ctx.add(&acc, &v)?,
+        });
+    }
+    let out = ctx.add(&moe_out.expect("experts"), &sh)?;
+    ctx.compute(&out, 12)?;
+    Ok(out)
+}
+
+/// One whole block, in its own arena, streams in and streams out as floats.
+///
+/// Owning the arena per block is what makes depth free: chaining blocks inside
+/// one `ggml` context costs hundreds of megabytes each. Freeing weights *inside*
+/// a context instead would be unsound — every `compute` rebuilds the graph
+/// through its sources, so a dropped buffer reads freed memory successfully.
+pub fn block(
+    fw: &Deepseek4Forward<'_>,
+    il: u32,
+    tokens: &[i32],
+    streams_in: Option<&[f32]>,
+    arena: usize,
+) -> Result<Streams> {
+    let config = fw.config.clone();
+    let nt = tokens.len() as i64;
+    let ctx = Context::new(arena)?;
+    let wctx = Context::new_no_alloc(32 << 20)?;
+    let mut weights = WeightSet::new();
+
+    let mut names = fw.block_tensor_names(il);
+    if il == 0 {
+        names.push("token_embd.weight".to_string());
+    }
+    for name in &names {
+        let loc = fw.model.location(name).expect("present").clone();
+        let data = fw.model.read_tensor(name)?;
+        weights.bind(&wctx, name, loc.ty, &loc.dims, data)?;
+    }
+
+    let streams = match streams_in {
+        None => embed(&ctx, &weights, &config, tokens)?,
+        Some(v) => {
+            let t = ctx.new_f32_3d(config.n_embd as i64, config.hc_mult as i64, nt)?;
+            t.set_f32(v)?;
+            t
+        }
+    };
+
+    let e = entry(fw, &ctx, &weights, il, streams, nt)?;
+    let (q, kv) = q_and_kv(fw, &ctx, &weights, il, &e.attn_norm, nt)?;
+
+    // Which attention runs is decided by the block's compression ratio *and*
+    // whether a block has completed yet: below the first boundary a compressed
+    // layer falls back to Raw, exactly as llama.cpp's guards do.
+    let kind = config.attention_kind_from_ratio(il).expect("known ratio");
+    let fired = config.compress_block(il).is_some_and(|r| nt / r > 0);
+    let comp = match (kind, fired) {
+        (AttentionKind::Raw, _) | (_, false) => None,
+        (AttentionKind::CompressedSparse, true) => {
+            Some(compressor(fw, &ctx, &weights, il, &e.attn_norm, nt, true)?)
+        }
+        (AttentionKind::HeavilyCompressed, true) => {
+            Some(compressor(fw, &ctx, &weights, il, &e.attn_norm, nt, false)?)
+        }
+    };
+    let attn_out = attention(fw, &ctx, &weights, il, &q, &kv, comp.as_ref(), nt)?;
+
+    let (streams, ffn_norm, ffn_gates) = layer_tail(fw, &ctx, &weights, il, &e, &attn_out, nt)?;
+    let (w_scaled, ids) = moe_routing(fw, &ctx, &weights, il, &ffn_norm, tokens)?;
+    let ffn_out = ffn(
+        fw, fw.model, &ctx, &wctx, &mut weights, il, &ffn_norm, &w_scaled, &ids, nt,
+    )?;
+
+    let out = ctx.dsv4_hc_post(&ffn_out, &streams, &ffn_gates.post, &ffn_gates.comb)?;
+    ctx.compute(&out, 12)?;
+    Ok(out.to_vec_f32())
+}
+
+/// The output head: the **last** token's streams, collapsed and projected.
+///
+/// Its gate block is the `pre` half only — nothing writes back into the streams
+/// after this, so there is no `post` and no combination matrix.
+pub fn head(fw: &Deepseek4Forward<'_>, streams: &[f32], arena: usize) -> Result<Vec<f32>> {
+    let config = &fw.config;
+    let ctx = Context::new(arena)?;
+    let wctx = Context::new_no_alloc(8 << 20)?;
+    let mut weights = WeightSet::new();
+    for name in [
+        "output_hc_fn.weight",
+        "output_hc_scale.weight",
+        "output_hc_base.weight",
+        "output_norm.weight",
+        "output.weight",
+    ] {
+        let loc = fw.model.location(name).expect("present").clone();
+        let data = fw.model.read_tensor(name)?;
+        weights.bind(&wctx, name, loc.ty, &loc.dims, data)?;
+    }
+
+    let hc = config.hc_mult as i64;
+    let n_embd = config.n_embd as i64;
+    let hc_dim = config.hc_dim() as usize;
+    let last = &streams[streams.len() - hc_dim..];
+
+    let x = ctx.new_f32_3d(n_embd, hc, 1)?;
+    x.set_f32(last)?;
+    let flat = ctx.reshape_2d(&x, hc_dim as i64, 1)?;
+    let normed = ctx.rms_norm(&flat, config.rms_eps)?;
+    let mixes = ctx.mul_mat(weights.get("output_hc_fn.weight").expect("bound"), &normed)?;
+    ctx.compute(&mixes, 12)?;
+
+    let scale = ctx.view_1d(weights.get("output_hc_scale.weight").expect("bound"), 1, 0)?;
+    let base = ctx.view_1d(weights.get("output_hc_base.weight").expect("bound"), hc, 0)?;
+    let gated = ctx.sigmoid(&ctx.add(&ctx.mul(&mixes, &scale)?, &base)?)?;
+    let eps = ctx.new_f32_1d(hc)?;
+    eps.set_f32(&vec![1e-6f32; hc as usize])?;
+    let pre = ctx.add(&gated, &eps)?;
+    ctx.compute(&pre, 12)?;
+
+    let collapsed = ctx.dsv4_hc_pre(&x, &pre)?;
+    let normed = ctx.rms_norm(&collapsed, config.rms_eps)?;
+    let result = ctx.mul(&normed, weights.get("output_norm.weight").expect("bound"))?;
+    let logits = ctx.mul_mat(weights.get("output.weight").expect("bound"), &result)?;
+    ctx.compute(&logits, 12)?;
+    Ok(logits.to_vec_f32())
+}
+
+/// Prefill: every block in order, then the head. Returns one logit per token id.
+pub fn prefill(fw: &Deepseek4Forward<'_>, tokens: &[i32], arena: usize) -> Result<Vec<f32>> {
+    let mut streams = block(fw, 0, tokens, None, arena)?;
+    for il in 1..fw.config.n_layer {
+        streams = block(fw, il, tokens, Some(&streams), arena)?;
+    }
+    head(fw, &streams, arena)
+}
