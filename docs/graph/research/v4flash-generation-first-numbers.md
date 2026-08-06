@@ -80,7 +80,7 @@ and the router's `argsort_top_k` over 256 experts. There is no obvious reason
 for it to cost 0.10s per block. This is the next thing to measure, and it is
 listed as a measurement rather than a hypothesis on purpose.
 
-## Threads do not matter, at all
+## Threads: a hypothesis raised and refuted in one command
 
 ```
 BIGTEA_THREADS=4    prefill 5 tokens in 20.4s
@@ -88,16 +88,35 @@ BIGTEA_THREADS=12   prefill 5 tokens in 20.5s
 BIGTEA_THREADS=20   prefill 5 tokens in 20.7s
 ```
 
-Five times the threads, no change. Whatever the non-I/O time is, it is **not
-parallel arithmetic** — so no kernel or threading work can address it, and the
-same conclusion was reached independently on Qwen3 (`CLAUDE.md`: expert compute
-is "neither barrier-bound nor bandwidth-bound"). Anything that looks like a
-SIMD or thread-count optimisation is aimed at the wrong target.
+Five times the threads, no change. The natural explanation was **threadpool
+churn**: `Context::compute` calls `ggml_graph_compute_with_ctx`, which builds a
+fresh threadpool every call, and the forward pass makes 32 such calls per block
+— **1376 create/join cycles per pass**. If each cost ~12 ms that is the entire
+non-I/O budget, and it would explain the flat curve exactly, since more threads
+would buy parallelism and pay for it in spawn cost.
 
-This is why the next step is a measurement and not a plan. This project's record
-on reasoning ahead of measurement is nought for three: parallel expert reads
-were slower, contextual sparsity was absent, and residency was called "likely a
-large multiple" when it was 22%.
+It is wrong. Extending the sweep downwards refutes it in one line:
+
+```
+BIGTEA_THREADS=1    prefill 5 tokens in 94.8s     <- no threads spawned at all
+BIGTEA_THREADS=2    prefill 5 tokens in 23.0s
+BIGTEA_THREADS=12   prefill 5 tokens in 20.0s
+```
+
+One thread spawns nothing, so under the threadpool theory it should have been
+the *fastest* configuration. It is **4.7x the slowest**. The work is real
+arithmetic; it simply stops scaling after two threads.
+
+So the shape is: a large parallel component that saturates by ~2-4 threads
+(the ops are small at 5 tokens and cannot use 12 cores), on top of ~13s of I/O
+that no thread count touches. Going past 4 threads buys nothing and is not
+where the time is.
+
+**Nought for four now.** Parallel expert reads were slower; contextual sparsity
+was absent; residency was "likely a large multiple" and was 22%; threadpool
+churn was the obvious explanation and was not the explanation. The pattern is
+consistent enough to be a rule: on this project, measure first, and extend the
+sweep past where the answer seems obvious.
 
 ## What would have to be true to reach 0.45 tok/s
 
