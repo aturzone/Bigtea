@@ -134,6 +134,51 @@ fn expert_read_cost_by_stage() {
     let skewed = t.elapsed().as_secs_f64();
     std::hint::black_box(&buf[0]);
 
+    // ---- (d) the skewed stack again, filled by several threads ----
+    // Parallel expert reads measured SLOWER than serial before the copies were
+    // removed (17.6s vs 15.4s) and were reverted. That verdict was taken when
+    // every slice was copied three times on its way in, so the contention may
+    // have been the allocator and memory bandwidth rather than the drive. With
+    // the copies gone the question is open again -- and the drive does 2.37
+    // GiB/s sequential against the ~1.6 a single reader achieves.
+    let mut parallel = Vec::new();
+    for threads in [2usize, 4, 8] {
+        let mut nextp = next;
+        let picks: Vec<u64> = (0..SLICES).map(|_| nextp() * slice).collect();
+        let mut buf = SkewedBuf::new(total as usize, skew);
+
+        // One contiguous span of the stack per reader: each thread owns its
+        // bytes outright, so no lock and no shared cursor.
+        let per = (SLICES as usize).div_ceil(threads);
+        let mut regions: Vec<&mut [u8]> = Vec::new();
+        let mut rest: &mut [u8] = &mut buf[..];
+        for t_id in 0..threads {
+            let taken = per.min(SLICES as usize - (t_id * per).min(SLICES as usize));
+            let (head, tail) = rest.split_at_mut(taken * slice as usize);
+            regions.push(head);
+            rest = tail;
+        }
+
+        let t = Instant::now();
+        std::thread::scope(|scope| {
+            for (t_id, region) in regions.into_iter().enumerate() {
+                let model = &model;
+                let picks = &picks;
+                scope.spawn(move || {
+                    for (j, dst) in region.chunks_mut(slice as usize).enumerate() {
+                        let which = t_id * per + j;
+                        model
+                            .read_range_into(EXPERTS, picks[which], dst)
+                            .expect("read into");
+                    }
+                });
+            }
+        });
+        let secs = t.elapsed().as_secs_f64();
+        std::hint::black_box(&buf[0]);
+        parallel.push((threads, secs));
+    }
+
     let pct = |c: usize| c as f64 / total as f64 * 100.0;
     eprintln!(
         "  (a) read_tensor_range + extend + Arc   {today:6.2}s   {:5.2} GiB/s   3 copies",
@@ -153,6 +198,12 @@ fn expert_read_cost_by_stage() {
         gib(total, skewed),
         pct(copied_s)
     );
+    for (threads, secs) in &parallel {
+        eprintln!(
+            "  (d) {threads} readers, skewed stack       {secs:6.2}s   {:5.2} GiB/s",
+            gib(total, *secs)
+        );
+    }
     eprintln!(
         "\n  VERDICT: killing the copies is worth {:.2}x on the expert path",
         today / skewed
