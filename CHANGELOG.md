@@ -51,11 +51,20 @@ llama.cpp's element sums.
 DeepSeek-V4-Flash, same machine, both engines' command lines and outputs in
 [`v4flash-vs-llamacpp-2026-08-07.md`](docs/graph/research/v4flash-vs-llamacpp-2026-08-07.md):
 
+> **⚠ Retracted the same day.** This section originally claimed 3.0x faster load
+> and 1.20x faster prefill. Both were wrong: Bigtea's numbers were fresh and
+> llama.cpp's were copied from a two-day-old document taken under different
+> free-RAM conditions, so the two engines were never run back to back. Corrected
+> figures, measured back to back twice:
+
 | | Bigtea | llama.cpp | |
 |---|---:|---:|:--|
-| load | **4.1s** | 12.3s | 3.0x faster |
-| prefill | **0.49 tok/s** | 0.41 tok/s | 1.20x faster |
-| generation | 0.077 tok/s | **0.45 tok/s** | 5.8x slower |
+| load | 10.0s | 10.5s | parity |
+| prefill, per prompt token | 2440 ms | **1503 ms** | llama.cpp 1.62x faster |
+| generation | 0.064 tok/s | **0.21-0.31 tok/s** | llama.cpp 3-4x faster |
+
+**Bigtea leads on nothing on this model.** The speedups below are real and
+measured against Bigtea's own previous version; they simply did not close the gap.
 
 A single-token forward pass costs **4.0s**. That is what one step of a KV-cached
 loop will cost — 0.25 tok/s — and it is the number to plan against, because the
@@ -127,9 +136,9 @@ Qwen3-30B-A3B Q4_K_M prefill, Bigtea / llama.cpp:
 
 - **Generation is slower than llama.cpp.** DeepSeek-V4-Flash: 0.077 tok/s against
   0.45, because the V4-Flash path has no KV cache yet and each token re-runs the
-  whole sequence. Qwen3-30B-A3B: 1.07 against 2.16, about 2x. Bigtea *is* ahead
-  on V4-Flash prefill (0.49 vs 0.41) and load (4.1s vs 12.3s). No claim beyond
-  that is made anywhere in this repository.
+  whole sequence. Qwen3-30B-A3B: 1.07 against 2.16, about 2x. On V4-Flash
+  **Bigtea leads on nothing** — see the retraction above. It is ahead only on
+  Qwen3-30B-A3B prefill at 565 and 2206 tokens.
 - **Linux and macOS build and pass the unit tests in CI, but no model has been
   run on either.** macOS additionally has no direct-I/O path — `F_NOCACHE` needs
   an `fcntl` after opening and is not written yet — so it falls back to buffered

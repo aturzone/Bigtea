@@ -1,131 +1,110 @@
 ---
-topic: Bigtea vs llama.cpp on DeepSeek-V4-Flash — every number, and the gap that remains
-status: open
-links: [v4flash-generation-first-numbers.md, zero-copy-expert-reads.md, head-to-head-llamacpp-2026-08-05.md, ../backlog/lts-0-0-0.md]
+topic: Bigtea vs llama.cpp on DeepSeek-V4-Flash — measured back to back, and we lose on all three
+status: resolved
+links: [v4flash-generation-first-numbers.md, zero-copy-expert-reads.md, head-to-head-llamacpp-2026-08-05.md, verify-before-citing.md]
 ---
 
-One machine, one model, both engines. **We are faster on prefill and slower on
-generation**, and this node says exactly by how much and exactly why.
+## ⚠ CORRECTION, same day: the first version of this node was wrong
 
-## The machine and the model
+Its first version claimed Bigtea was **3.0x faster on load** and **1.20x faster
+on prefill**. Both are **FALSE** and were published in the README, the CHANGELOG
+and the v0.0.1 release notes before being caught.
+
+The error: Bigtea's numbers were measured today, and llama.cpp's were copied from
+`head-to-head-llamacpp-2026-08-05.md`, taken two days earlier under different
+free-RAM conditions. **The two engines were never run back to back.** This project
+has a written rule against exactly this — *a competitive claim is not citable
+until the competitor's exact command line and its output are in a doc* — and the
+rule was followed for the *format* of the claim while its *substance* was stale.
+
+Corrected below. Run back to back, same machine, same minute, twice.
+
+## The machine
 
 ```
-CPU    20 threads          RAM   15.7 GiB total, ~6.7 GiB free
-Disk   NVMe, 2.55 GB/s sequential (2.37 GiB/s), measured by bigtea-probe
+CPU    20 threads          RAM   15.7 GiB total, 10.5 GiB free at measurement
+Disk   NVMe, 2.55 GB/s sequential (2.37 GiB/s)
 Model  DeepSeek-V4-Flash-UD-Q4_K_XL, 144 GB across 5 shards
-       43 blocks, 4096 embd, 256 experts (6 used + 1 shared)
-       7.38 GiB always-read, 137 GiB routed experts
+       7.38 GiB always-read, 137 GiB routed experts, 6 of 256 per token
 ```
 
-Neither engine can hold this model. The always-read set alone is 7.38 GiB
-against 6.7 GiB free, so **even the resident part does not fit today**.
+**10.5 GiB free is the first time the whole 7.38 GiB always-read set fitted.**
+Every earlier Bigtea measurement was taken with 1-3 GiB of it streaming, so this
+is also the first fair reading of the design as intended.
 
-## llama.cpp — the command and its output
+## The commands, and their output
 
-```
-llama-cli -m DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf \
-          --no-repack -c 512 -t 12 -n 32 -p "..."
-
-load 12.3s   prefill 0.41 tok/s   eval 0.45 tok/s   correct output
-```
-
-`--no-repack` is required: without it llama.cpp builds a `CPU_REPACK` buffer
-outside the mmap and dies. With it, **llama.cpp runs this model fine.** The claim
-that it cannot is retracted — see `head-to-head-llamacpp-2026-08-05.md`.
-
-## Bigtea — the command and its output
+**Bigtea**
 
 ```
 bigtea-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf \
-           "The capital of France is" -n 5
+           "The capital of France is" -n 4
 
-resident   251 tensors, 6.21 GiB of 6.21 GiB budget in 4.1s (1.65 GB/s)
-           1.17 GiB did not fit and will be re-read every token
-prefill    5 tokens in 10.1s (0.49 tok/s)
+resident   loaded 1199 tensors, 7.38 GiB of 8.15 GiB budget in 7.6s (1.04 GB/s)
+loaded     10.0s
+prefill    5 tokens in 12.2s (0.41 tok/s)
 output      Paris.",
-generate   4 tokens in 51.9s (0.077 tok/s, 13.0s per token)
+generate   3 tokens in 46.7s (0.064 tok/s, 15.6s per token)
 ```
+
+**llama.cpp**
+
+```
+llama-completion -m DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf \
+                 --no-repack -c 512 -t 12 -n 4 \
+                 -p "The capital of France is" --no-warmup
+
+The capital of France isParis. The capital
+load time        = 10532.14 ms
+prompt eval time = 10524.22 ms / 7 tokens (1503.46 ms per token, 0.67 tok/s)
+eval time        =  6432.39 ms / 2 runs   (3216.19 ms per token, 0.31 tok/s)
+total time       = 16980.19 ms / 9 tokens
+```
+
+Second run of each, minutes later: Bigtea prefill 0.43 tok/s, generation 0.081;
+llama.cpp prompt eval 0.69 tok/s, eval 0.21.
 
 ## The comparison
 
+The prompt tokenizes to 5 tokens for us and 7 for llama.cpp, so **per prompt
+token** is the only fair prefill comparison.
+
 | | Bigtea | llama.cpp | |
 |---|---:|---:|:--|
-| load | 4.1s | 12.3s | **3.0x faster** |
-| prefill | **0.49 tok/s** | 0.41 tok/s | **1.20x faster** |
-| generation | 0.077 tok/s | **0.45 tok/s** | **5.8x slower** |
+| load | 10.0s | 10.5s | parity |
+| prefill, per prompt token | 2440 ms | **1503 ms** | **llama.cpp 1.62x faster** |
+| generation | 0.064-0.081 tok/s | **0.21-0.31 tok/s** | **llama.cpp 3-4x faster** |
 
-**Prefill is now genuinely ahead. Generation is not, and no claim is made that
-it is.**
+**Bigtea loses on prefill and on generation. It does not lead on anything here.**
 
-## Today moved generation 1.83x and prefill 2.2x
+Note also that llama.cpp's reported "load time" and "prompt eval time" are nearly
+identical (10532 vs 10524 ms) and `load + eval ≈ total`, so its load is
+substantially *overlapped with* the first evaluation via mmap — which is itself
+the finding below.
 
-| change | prefill (5 tok) | 1-token pass |
-|---|---:|---:|
-| starting point | 32.4s | — |
-| zero-copy expert reads | 23.7s | — |
-| residency | 22.0s | 7.9s |
-| **one graph per block, not 24** | **11.5s** | **4.6s** |
-| batched parallel expert reads | **10.1s** | **4.0s** |
+## Why: they overlap I/O with compute and we do not
 
-The single largest win was not I/O at all. `Context::compute` evaluates a
-tensor's *entire ancestor graph*, so calling it on every intermediate **re-does**
-the work once per call. The block had 24 such calls and needed 6. Removing the
-other 18 was worth **1.9x**, and it is invisible on a long prefill because the
-matmuls there are large enough to bury it.
+Both engines are reading the same ~3.2 GiB of routed experts per token from the
+same drive. Neither can cache 137 GiB. So the disk work is equal, and the
+difference is what happens *around* it.
 
-## The number that decides the future: a single-token pass is 4.0s
+llama.cpp `mmap`s the container and the kernel reads ahead **while the CPU is
+computing the previous layer**. Bigtea reads a layer's experts, waits, computes,
+then reads the next layer's — strictly serial. Measured on Bigtea, per token:
+**2.3s of I/O and 1.0s of compute, run one after the other**. Overlapped, that
+same work is `max(2.3, 1.0) = 2.3s` rather than `3.3s`.
 
-Generation has no KV cache yet, so each token re-runs the whole sequence. That
-makes the 0.077 figure pessimistic and not the one to plan against.
+That is the whole gap, and it is an architectural difference rather than a
+constant factor. It is also the single most valuable thing left to build.
 
-**A single-token forward pass costs 4.0s**, and that is exactly what one step of
-a KV-cached loop will cost, because a single token routes to 6 experts per layer
-rather than the ~26 a 5-token pass touches.
+## What this does and does not change
 
-```
-with a KV cache:   4.0 s/token  =  0.25 tok/s
-llama.cpp:         2.2 s/token  =  0.45 tok/s
-                                   still 1.8x short
-```
+**Unchanged and still true**: on Qwen3-30B-A3B, prefill beats llama.cpp at 565
+(27.64 vs 23.55) and 2206 tokens (36.60 vs 33.59), matching at 8775. Those were
+measured back to back in `head-to-head-llamacpp-2026-08-05.md` and stand.
 
-## Where the 4.0s goes, and what is left to take
+**Retracted**: every claim of leading llama.cpp on V4-Flash, on any metric.
 
-Measured per block (`BIGTEA_BLOCK_TIMING=1`), scaled to 43 blocks:
-
-| | per token | share | lever |
-|---|---:|---:|---|
-| expert reads | 2.3s | 58% | 1.4 GiB/s achieved against 2.37 available |
-| dense reads | 0.7s | 18% | **0 if the always-read set fits** — 1.17 GiB short today |
-| compute (ffn, attn, tail) | 1.0s | 24% | flat from 4 to 20 threads |
-
-Three things remain, in order of measured size:
-
-1. **Fit the always-read set.** 1.17 GiB short. Closing an editor does it; so
-   would a smaller quant. Worth 0.7s/token, and it is the user's RAM, not a code
-   change. Bigtea already prints which processes to close and what it costs.
-2. **Overlap reads with compute.** llama.cpp gets this free from `mmap` and
-   kernel readahead; Bigtea reads then computes, serially, per layer. Perfectly
-   overlapped this is `max(2.3, 1.0)` instead of `3.3` — worth ~1.0s/token.
-   **Layers 0-2 route by token id, so their expert set is knowable before any
-   compute runs** and they are trivially prefetchable.
-3. **An expert cache across generated tokens.** Adjacent tokens route to
-   overlapping experts. Unmeasured on this model, and bounded by RAM there is
-   little of.
-
-Optimistically: `4.0 − 0.7 − 1.0 = 2.3 s/token = 0.43 tok/s`. That is **parity
-with llama.cpp, not victory.** Beating them needs the cache, and its size on
-this machine is the thing nobody has measured.
-
-## The honest position
-
-- **Prefill: ahead, 1.20x, measured.**
-- **Load: ahead, 3.0x, measured.**
-- **Generation: behind, 5.8x today, ~1.8x once a KV cache exists.** Parity is a
-  credible target from measured levers. A win is not yet.
-- **Long context is the untested claim with the most upside.** llama.cpp's dense
-  weights get evicted by cold expert traffic; Bigtea's are owned allocations that
-  cannot be. That should widen with context and has never been measured on this
-  model.
-
-Nothing here should be quoted as "Bigtea beats llama.cpp" without the word
-*prefill* attached to it.
+**The lesson, for the third time in this project**: a competitor's number has a
+shelf life. Re-run it in the same session as the number you compare it against,
+or do not make the comparison. See [[verify-before-citing]].

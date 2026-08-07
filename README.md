@@ -40,33 +40,36 @@ generate   4 tokens in 51.9s (0.077 tok/s, 13.0s per token)
 
 ## Read this before you try it
 
-**Bigtea is currently slower than llama.cpp at generation.** On DeepSeek-V4-Flash
-we measure **0.077 tok/s against llama.cpp's 0.45**. On Qwen3-30B-A3B generation
-we are roughly **2x behind** (1.07 vs 2.16 tok/s).
+**Bigtea is slower than llama.cpp.** Measured back to back on the same machine,
+DeepSeek-V4-Flash:
 
-We are **ahead on prefill and on load**. On the same V4-Flash run: prefill
-**0.49 vs 0.41 tok/s** and load **4.1s vs 12.3s**. Every number, both command
-lines and both outputs:
+| | Bigtea | llama.cpp | |
+|---|---:|---:|:--|
+| load | 10.0s | 10.5s | parity |
+| prefill, per prompt token | 2440 ms | **1503 ms** | llama.cpp **1.62x** faster |
+| generation | 0.064 tok/s | **0.21-0.31** | llama.cpp **3-4x** faster |
+
+Both command lines and both outputs:
 [`v4flash-vs-llamacpp-2026-08-07.md`](docs/graph/research/v4flash-vs-llamacpp-2026-08-07.md).
 
-**llama.cpp can also run models larger than RAM**, given `--no-repack`. "Runs a
-model bigger than your memory" is not a thing only Bigtea does, and this project
-spent days believing otherwise because nobody ran the opposing command. That
-claim is retracted, in writing, in
-[`docs/graph/research/head-to-head-llamacpp-2026-08-05.md`](docs/graph/research/head-to-head-llamacpp-2026-08-05.md).
+> **Retraction.** v0.0.1 claimed Bigtea was 3.0x faster on load and 1.20x on
+> prefill for this model. That was **wrong**: Bigtea's numbers were fresh and
+> llama.cpp's were copied from a two-day-old document taken under different
+> conditions. Run back to back, we lose on both. The claim is withdrawn.
 
-Where Bigtea is currently **ahead** is prefill on Qwen3-30B-A3B:
+Where Bigtea **is** ahead is Qwen3-30B-A3B prefill, measured back to back:
 
 | prompt tokens | Bigtea | llama.cpp | |
 |---:|---:|---:|:--|
 | 565 | **27.64** | 23.55 | ahead |
 | 2206 | **36.60** | 33.59 | ahead |
-| 4395 | 38.40 | 40.25 | 95% — behind |
-| 8775 | 34.88 | 35.01 | 99.6% — parity |
-| 4395 (`-b 4096`) | **43.61** | 40.25 | ahead |
+| 4395 | 38.40 | 40.25 | behind |
+| 8775 | 34.88 | 35.01 | parity |
 
-Both engines produce identical, correct output at every length; llama.cpp is
-measured with a fully warm page cache.
+**llama.cpp also runs models larger than RAM**, given `--no-repack`. "Runs a model
+bigger than your memory" is not a thing only Bigtea does; that claim is retracted
+too, in
+[`head-to-head-llamacpp-2026-08-05.md`](docs/graph/research/head-to-head-llamacpp-2026-08-05.md).
 
 If you want the fastest local inference today, use
 [llama.cpp](https://github.com/ggml-org/llama.cpp). Bigtea is worth your time if
