@@ -24,6 +24,55 @@ Planned, in the order the measurements justify — see
 - OpenAI-compatible `/v1/chat/completions` server.
 - Prebuilt binaries for Linux, macOS and Windows.
 
+## [0.0.2] — 2026-08-07
+
+Findings, a retraction, and the measurement that changes the project's direction.
+
+### Added
+
+- `BIGTEA_ROUTING=1` prints how often each expert of each layer is actually
+  selected, and what the hot set would cost to keep resident.
+
+### Discovered
+
+**DeepSeek-V4-Flash's router is violently skewed.** Every speed estimate this
+project ever made assumed it spread evenly over 256 experts:
+
+| top-N per layer | share of selections | resident cost |
+|---:|---:|---:|
+| 1 | 12.1% | 0.54 GiB |
+| 8 | 52.9% | 4.28 GiB |
+| 16 | 70.4% | 8.57 GiB |
+| 64 | **97.8%** | 34.27 GiB |
+
+Uniform routing would give top-16 = 6.2%; measured 70.4%, chi-square 7805 against
+uniform's ~255. With a hot-set cache, bytes read per token fall from 3.21 GiB to
+**72 MiB** — a 33.6 tok/s disk floor, against a 27 tok/s compute floor.
+
+**20 tok/s for a 144 GB model is a cache-sizing problem, not a physics
+violation**, and it needs roughly a **48 GiB desktop** rather than the ~150 GiB
+previously claimed. On a 15.7 GiB laptop the same arithmetic implies ~1.3 tok/s,
+about 4x llama.cpp. Neither is measured yet; both are arithmetic on measurements
+that are. See
+[`routing-skew-changes-everything.md`](docs/graph/research/routing-skew-changes-everything.md).
+
+### Retracted
+
+**v0.0.1's claim that Bigtea leads llama.cpp on DeepSeek-V4-Flash.** It claimed
+3.0x faster load and 1.20x faster prefill. Both were false: Bigtea's numbers were
+measured fresh and llama.cpp's were copied from a two-day-old document taken under
+different free-RAM conditions, so the engines were never run back to back. Run
+back to back, twice:
+
+| | Bigtea | llama.cpp |
+|---|---:|---:|
+| load | 10.0s | 10.5s |
+| prefill, per prompt token | 2440 ms | **1503 ms** |
+| generation | 0.064 tok/s | **0.21–0.31 tok/s** |
+
+**Bigtea leads on nothing on this model.** It remains ahead on Qwen3-30B-A3B
+prefill at 565 and 2206 tokens, measured back to back.
+
 ## [0.0.1] — 2026-08-07
 
 Performance. DeepSeek-V4-Flash prefill is **2.2x** faster than v0.0.0 and
@@ -157,6 +206,7 @@ Qwen3-30B-A3B Q4_K_M prefill, Bigtea / llama.cpp:
   requires a competitor's exact command line and output before any competitive
   claim is citable.
 
-[Unreleased]: https://github.com/aturzone/Bigtea/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/aturzone/Bigtea/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/aturzone/Bigtea/releases/tag/v0.0.2
 [0.0.1]: https://github.com/aturzone/Bigtea/releases/tag/v0.0.1
 [0.0.0]: https://github.com/aturzone/Bigtea/releases/tag/v0.0.0

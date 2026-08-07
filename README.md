@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="#status"><img alt="status" src="https://img.shields.io/badge/status-v0.0.1%20preview-orange"></a>
+  <a href="#status"><img alt="status" src="https://img.shields.io/badge/status-v0.0.2%20preview-orange"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue"></a>
   <a href="#building"><img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-informational"></a>
   <a href="https://github.com/aturzone/Bigtea/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aturzone/Bigtea/actions/workflows/ci.yml/badge.svg"></a>
@@ -91,7 +91,7 @@ measures and reports it rather than guessing.
 
 ## Status
 
-**v0.0.1 — preview.** The engine works and is verified. The product around it is
+**v0.0.2 — preview.** The engine works and is verified. The product around it is
 not built yet.
 
 | | |
@@ -198,6 +198,7 @@ For a split model, pass **any one shard**; the rest are discovered automatically
 | `BIGTEA_BLOCK_TIMING` | per-block, per-phase timing |
 | `BIGTEA_IO_TIMING` | per-tensor read throughput and how much was copied |
 | `BIGTEA_SPARSITY` | activation-magnitude histogram |
+| `BIGTEA_ROUTING` | how often each expert is selected, and what the hot set would cost |
 
 ## How it works
 

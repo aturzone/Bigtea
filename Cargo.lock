@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "bigtea-arch"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bigtea-ggml",
  "bigtea-gguf",
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "bigtea-ggml"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bigtea-gguf",
  "bigtea-model",
@@ -24,15 +24,15 @@ dependencies = [
 
 [[package]]
 name = "bigtea-gguf"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "bigtea-io"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "bigtea-model"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bigtea-gguf",
  "bigtea-io",
@@ -41,18 +41,18 @@ dependencies = [
 
 [[package]]
 name = "bigtea-plan"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bigtea-gguf",
 ]
 
 [[package]]
 name = "bigtea-probe"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "bigtea-tokenizer"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bigtea-gguf",
  "bigtea-model",
