@@ -60,6 +60,18 @@ const F16_NEG_INF: [u8; 2] = [0x00, 0xFC];
 /// cache from its values), the compressor's `kv`/`score`/output, the router's
 /// `topk` (routing decides which expert slices to read from disk, so it cannot
 /// be deferred), and the block's own output.
+/// One expert tensor's selected slices, packed, with the shape to bind them as.
+///
+/// The dims are not the tensor's: the last is the number of slices actually
+/// read, so `[ne0, ne1, 6]` rather than `[ne0, ne1, 256]`.
+type ExpertStack = (SkewedBuf, Vec<u64>);
+
+/// Concurrent readers for a layer's expert slices.
+///
+/// Four, measured: 1.59 GiB/s with one reader, 1.99 with four, and no further
+/// gain at eight. The drive does 2.37 GiB/s sequential.
+const READERS: usize = 4;
+
 /// The padded key window each half of the cache occupies.
 const N_KV: i64 = 256;
 
@@ -826,12 +838,13 @@ fn moe_routing<'c>(
     Ok((w_scaled, ids))
 }
 
-/// Read only the expert slices these tokens route to, and bind them compactly.
+/// Read the expert slices these tokens route to, for **all three** expert
+/// tensors of a layer at once, with several readers.
 ///
 /// A stacked expert tensor is `[ne0, ne1, n_expert]` with equal slices, so slice
 /// `i` starts at `i * size / n_expert`. Binding all 256 for one block is 3.19
 /// GiB and does not fit this machine; the tokens' own selection is a fraction of
-/// that. **This is what the runner has to do anyway**, not a test convenience.
+/// that.
 ///
 /// # Why the destination is deliberately misaligned
 ///
@@ -843,42 +856,101 @@ fn moe_routing<'c>(
 /// buffer can never match, and every byte bounces through a scratch.
 ///
 /// The slices of one tensor are all the same size, and that size is a sector
-/// multiple, so **one skew serves the whole stack**. Measured on
-/// `blk.5.ffn_up_exps.weight`: 0.78 → 1.57 GiB/s, with 0.09% of bytes copied
-/// (the two edge sectors of each 4.25 MiB slice) instead of 300%.
-fn bind_expert_slices<'c>(
+/// multiple, so **one skew serves the whole stack**. Measured: 0.78 → 1.57
+/// GiB/s, with 0.09% of bytes copied instead of 300%.
+///
+/// # Why all three tensors are read together
+///
+/// One reader cannot saturate an NVMe — the drive wants requests in flight, and
+/// a single blocking read leaves most of it idle. Four readers measured 1.59 →
+/// 1.99 GiB/s against a drive that does 2.37 GiB/s sequential.
+///
+/// An earlier attempt spawned readers **per tensor** and was *slower* than
+/// serial: at one token that is only 6 slices per group, 129 groups per forward
+/// pass, and the thread spawns cost more than the queue depth bought. Reading
+/// gate, up and down together triples the work per group and cuts the groups to
+/// 43, which is what makes the parallelism pay.
+fn read_expert_slices(
     model: &Model,
-    ctx: &'c Context,
-    weights: &mut WeightSet<'c>,
-    name: &str,
+    names: &[String],
     unique: &[i32],
-) -> Result<(u64, Vec<u64>)> {
-    let loc = model.location(name).expect("stacked tensor").clone();
-    let n_expert = *loc.dims.last().expect("stacked");
-    let slice = loc.size / n_expert;
-    let total = unique.len() * slice as usize;
-
-    let mut buf = SkewedBuf::new(total, SkewedBuf::skew_for(loc.file_offset));
-    let mut disk = 0f64;
-    let mut copied = 0usize;
-    for (i, e) in unique.iter().enumerate() {
-        let at = i * slice as usize;
-        let t = std::time::Instant::now();
-        copied +=
-            model.read_range_into(name, *e as u64 * slice, &mut buf[at..at + slice as usize])?;
-        disk += t.elapsed().as_secs_f64();
+) -> Result<(Vec<ExpertStack>, u64)> {
+    struct Job {
+        name: usize,
+        offset: u64,
+        len: usize,
     }
+
+    let mut buffers = Vec::with_capacity(names.len());
+    let mut total = 0u64;
+    for name in names {
+        let loc = model.location(name).expect("stacked tensor").clone();
+        let n_expert = *loc.dims.last().expect("stacked");
+        let slice = loc.size / n_expert;
+        let bytes = unique.len() * slice as usize;
+        let mut dims = loc.dims.clone();
+        *dims.last_mut().expect("stacked") = unique.len() as u64;
+        buffers.push((
+            SkewedBuf::new(bytes, SkewedBuf::skew_for(loc.file_offset)),
+            dims,
+        ));
+        total += bytes as u64;
+    }
+
+    // One job per slice per tensor, so every reader gets an equal share of the
+    // bytes rather than an equal share of the tensors.
+    let mut jobs = Vec::with_capacity(names.len() * unique.len());
+    for (n, name) in names.iter().enumerate() {
+        let loc = model.location(name).expect("stacked tensor");
+        let slice = loc.size / *loc.dims.last().expect("stacked");
+        for e in unique {
+            jobs.push(Job {
+                name: n,
+                offset: *e as u64 * slice,
+                len: slice as usize,
+            });
+        }
+    }
+
+    // Hand each reader disjoint destination spans. Positioned reads carry their
+    // own offset, so concurrent reads through one handle need no locking.
+    let mut slots: Vec<Vec<(&Job, &mut [u8])>> = (0..READERS).map(|_| Vec::new()).collect();
+    let mut cursors: Vec<&mut [u8]> = buffers.iter_mut().map(|(b, _)| &mut b[..]).collect();
+    for (j, job) in jobs.iter().enumerate() {
+        let cursor = std::mem::take(&mut cursors[job.name]);
+        let (dst, rest) = cursor.split_at_mut(job.len);
+        cursors[job.name] = rest;
+        slots[j % READERS].push((job, dst));
+    }
+
+    let copied: usize = std::thread::scope(|scope| {
+        let handles: Vec<_> = slots
+            .into_iter()
+            .map(|work| {
+                scope.spawn(move || {
+                    let mut copied = 0usize;
+                    for (job, dst) in work {
+                        copied += model.read_range_into(&names[job.name], job.offset, dst)?;
+                    }
+                    Ok::<usize, crate::ArchError>(copied)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("reader thread did not panic"))
+            .sum::<Result<usize>>()
+    })?;
+
     if std::env::var("BIGTEA_IO_TIMING").is_ok() {
         eprintln!(
-            "    io {name}: disk {disk:.3}s  {:.2} GiB/s  {:.2}% copied",
-            total as f64 / (1u64 << 30) as f64 / disk,
+            "    io {} tensors x {} slices: {:.2}% copied",
+            names.len(),
+            unique.len(),
             copied as f64 / total.max(1) as f64 * 100.0
         );
     }
-    let mut dims = loc.dims.clone();
-    *dims.last_mut().expect("stacked") = unique.len() as u64;
-    weights.bind(ctx, name, loc.ty, &dims, buf)?;
-    Ok((total as u64, dims))
+    Ok((buffers, total))
 }
 
 /// The routed experts and the shared one, summed into the block's FFN output.
@@ -945,12 +1017,19 @@ fn ffn<'c>(
         .collect();
     let mut dims_of = std::collections::HashMap::new();
     let t_exp = std::time::Instant::now();
-    let mut exp_bytes = 0u64;
-    for suffix in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
-        let name = format!("blk.{il}.{suffix}.weight");
-        let (read, dims) = bind_expert_slices(model, wctx, weights, &name, &unique)?;
-        exp_bytes += read;
-        dims_of.insert(suffix, dims);
+    let names: Vec<String> = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+        .iter()
+        .map(|s| format!("blk.{il}.{s}.weight"))
+        .collect();
+    let (buffers, exp_bytes) = read_expert_slices(model, &names, &unique)?;
+    for ((suffix, name), (buf, dims)) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+        .iter()
+        .zip(&names)
+        .zip(buffers)
+    {
+        let ty = model.location(name).expect("stacked tensor").ty;
+        weights.bind(wctx, name, ty, &dims, buf)?;
+        dims_of.insert(*suffix, dims);
     }
     if std::env::var("BIGTEA_BLOCK_TIMING").is_ok() {
         eprintln!(
