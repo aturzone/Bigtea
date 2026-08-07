@@ -43,6 +43,23 @@ const ROPE_MODE_NORM: i32 = 0;
 /// the pattern beats converting.
 const F16_NEG_INF: [u8; 2] = [0x00, 0xFC];
 
+/// When `compute` is actually needed.
+///
+/// `Context::compute` evaluates a tensor's **entire ancestor graph**, so calling
+/// it on every intermediate does not merely dispatch more work — it *re-does*
+/// the work, once per call, and pays a graph build and a threadpool cycle each
+/// time. At a single token the ops are vectors and that overhead is most of the
+/// cost: `layer_tail` plus `moe_routing` measured 0.06s per block for a handful
+/// of normalisations and a top-6 sort.
+///
+/// So a value is computed only where the **CPU** must read it: before a
+/// `to_vec_*` or a `set_*` that consumes it. Everything else stays a graph node
+/// and is evaluated once, as part of whichever sync point subsumes it.
+///
+/// The genuine sync points in a block are: `kv_full` (attention builds an F16
+/// cache from its values), the compressor's `kv`/`score`/output, the router's
+/// `topk` (routing decides which expert slices to read from disk, so it cannot
+/// be deferred), and the block's own output.
 /// The padded key window each half of the cache occupies.
 const N_KV: i64 = 256;
 
@@ -176,7 +193,6 @@ pub fn embed<'c>(
     let tok = ctx.new_i32_1d(nt)?;
     tok.set_i32(tokens)?;
     let embd = ctx.get_rows(weights.get("token_embd.weight").expect("bound"), &tok)?;
-    ctx.compute(&embd, threads())?;
     let embd_r = ctx.reshape_3d(&embd, config.n_embd as i64, 1, nt)?;
     let shape = ctx.new_f32_3d(config.n_embd as i64, hc, nt)?;
     let hc_init = ctx.repeat(&embd_r, &shape)?;
@@ -232,11 +248,9 @@ fn hc_gates<'c>(
     let eps = ctx.new_f32_1d(hc)?;
     eps.set_f32(&vec![1e-6f32; hc as usize])?;
     let pre = ctx.add(&pre_gated, &eps)?;
-    ctx.compute(&pre, threads())?;
 
     let post_gated = gate(hc, 1, hc)?;
     let post = ctx.scale(&post_gated, 2.0)?;
-    ctx.compute(&post, threads())?;
 
     let comb = ctx.dsv4_hc_comb(
         mixes,
@@ -245,7 +259,6 @@ fn hc_gates<'c>(
         1e-6,
         config.hc_sinkhorn_iterations as i32,
     )?;
-    ctx.compute(&comb, threads())?;
     Ok(HcGates { pre, post, comb })
 }
 
@@ -278,7 +291,6 @@ fn entry<'c>(
             .expect("bound"),
         &normed,
     )?;
-    ctx.compute(&mixes, threads())?;
     let gates = hc_gates(
         ctx,
         weights,
@@ -296,7 +308,6 @@ fn entry<'c>(
             .get(&format!("blk.{il}.attn_norm.weight"))
             .expect("bound"),
     )?;
-    ctx.compute(&attn_norm, threads())?;
     Ok(Entry {
         streams,
         attn_norm,
@@ -350,7 +361,6 @@ fn q_and_kv<'c>(
     )?;
     let q = ctx.reshape_3d(&q, head, n_head, nt)?;
     let q = ctx.rms_norm(&q, config.rms_eps)?; // unweighted, deliberately
-    ctx.compute(&q, threads())?;
 
     let q_nope = ctx.view_3d(&q, n_nope, n_head, nt, hs, hs * n_head as usize, 0)?;
     let q_pe_in = ctx.view_3d(
@@ -372,7 +382,6 @@ fn q_and_kv<'c>(
         rope,
     )?;
     let q_full = ctx.concat(&q_nope, &q_pe, 0)?;
-    ctx.compute(&q_full, threads())?;
 
     let kv = ctx.mul_mat(
         weights
@@ -388,7 +397,6 @@ fn q_and_kv<'c>(
             .expect("bound"),
     )?;
     let kv = ctx.reshape_3d(&kv, head, 1, nt)?;
-    ctx.compute(&kv, threads())?;
     let kv_nope = ctx.view_3d(&kv, n_nope, 1, nt, hs, hs, 0)?;
     let kv_pe_in = ctx.view_3d(&kv, n_rot, 1, nt, hs, hs, n_nope as usize * f32_size)?;
     let kv_pe = ctx.rope_ext(
@@ -545,7 +553,6 @@ fn compressor<'c>(
             .get(&format!("blk.{il}.attn_compressor_norm.weight"))
             .expect("bound"),
     )?;
-    ctx.compute(&comp, threads())?;
 
     // Rotated at the *block start* position, with the compressed base.
     let n_rot = config.n_rot as i64;
@@ -657,7 +664,6 @@ fn attention<'c>(
         .expect("bound");
     let scale = 1.0f32 / (head as f32).sqrt();
     let out = ctx.flash_attn_ext_with_sinks(&q_perm, &k, &k, &mask_t, sinks, scale)?;
-    ctx.compute(&out, threads())?;
 
     // The output is **de-roped** before projection. Skipping this leaves the
     // rotation baked into the residual stream, and no shape reveals it.
@@ -705,7 +711,6 @@ fn attention<'c>(
             .expect("bound"),
         &oa,
     )?;
-    ctx.compute(&out, threads())?;
     Ok(out)
 }
 
@@ -730,7 +735,6 @@ fn layer_tail<'c>(
 ) -> Result<(Tensor<'c>, Tensor<'c>, HcGates<'c>)> {
     let config = &fw.config;
     let streams = ctx.dsv4_hc_post(attn_out, &e.streams, &e.gates.post, &e.gates.comb)?;
-    ctx.compute(&streams, threads())?;
 
     let flat = ctx.reshape_2d(&streams, config.hc_dim() as i64, nt)?;
     let normed = ctx.rms_norm(&flat, config.rms_eps)?;
@@ -740,7 +744,6 @@ fn layer_tail<'c>(
             .expect("bound"),
         &normed,
     )?;
-    ctx.compute(&mixes, threads())?;
     let gates = hc_gates(
         ctx,
         weights,
@@ -758,7 +761,6 @@ fn layer_tail<'c>(
             .get(&format!("blk.{il}.ffn_norm.weight"))
             .expect("bound"),
     )?;
-    ctx.compute(&ffn_norm, threads())?;
     Ok((streams, ffn_norm, gates))
 }
 
@@ -790,7 +792,6 @@ fn moe_routing<'c>(
     )?;
     // sqrt(softplus(x)) — `expert_gating_func 4`, neither softmax nor sigmoid.
     let probs = ctx.sqrt(&ctx.softplus(&logits)?)?;
-    ctx.compute(&probs, threads())?;
     let probs3 = ctx.reshape_3d(&probs, 1, n_expert, nt)?;
 
     let topk = if il < config.hash_layer_count {
@@ -809,7 +810,6 @@ fn moe_routing<'c>(
                 .get(&format!("blk.{il}.exp_probs_b.bias"))
                 .expect("bound"),
         )?;
-        ctx.compute(&biased, threads())?;
         ctx.argsort_top_k(&biased, n_used as i32)?
     };
     ctx.compute(&topk, threads())?;
@@ -823,7 +823,6 @@ fn moe_routing<'c>(
     let w_norm = ctx.div(&w2, &sum)?;
     let w3 = ctx.reshape_3d(&w_norm, 1, n_used, nt)?;
     let w_scaled = ctx.scale(&w3, config.expert_weights_scale)?;
-    ctx.compute(&w_scaled, threads())?;
     Ok((w_scaled, ids))
 }
 
@@ -935,7 +934,6 @@ fn ffn<'c>(
             .expect("bound"),
         &ctx.swiglu_split(&sh_gate, &sh_up)?,
     )?;
-    ctx.compute(&sh, threads())?;
 
     // ---- the routed experts, read as slices ----
     let mut unique = ids.to_vec();
@@ -1017,7 +1015,6 @@ fn ffn<'c>(
     }
     let down = ctx.mul_mat_id(&stack("ffn_down_exps")?, &act, &ids_t)?;
     let weighted = ctx.mul(&down, w_scaled)?;
-    ctx.compute(&weighted, threads())?;
 
     // Sum across the six experts as six strided views and five adds, which is
     // the shape llama.cpp uses.
@@ -1031,7 +1028,6 @@ fn ffn<'c>(
         });
     }
     let out = ctx.add(&moe_out.expect("experts"), &sh)?;
-    ctx.compute(&out, threads())?;
     Ok(out)
 }
 
@@ -1200,7 +1196,6 @@ pub fn head(fw: &Deepseek4Forward<'_>, streams: &[f32], arena: usize) -> Result<
     let flat = ctx.reshape_2d(&x, hc_dim as i64, 1)?;
     let normed = ctx.rms_norm(&flat, config.rms_eps)?;
     let mixes = ctx.mul_mat(weights.get("output_hc_fn.weight").expect("bound"), &normed)?;
-    ctx.compute(&mixes, threads())?;
 
     let scale = ctx.view_1d(weights.get("output_hc_scale.weight").expect("bound"), 1, 0)?;
     let base = ctx.view_1d(weights.get("output_hc_base.weight").expect("bound"), hc, 0)?;
@@ -1208,7 +1203,6 @@ pub fn head(fw: &Deepseek4Forward<'_>, streams: &[f32], arena: usize) -> Result<
     let eps = ctx.new_f32_1d(hc)?;
     eps.set_f32(&vec![1e-6f32; hc as usize])?;
     let pre = ctx.add(&gated, &eps)?;
-    ctx.compute(&pre, threads())?;
 
     let collapsed = ctx.dsv4_hc_pre(&x, &pre)?;
     let normed = ctx.rms_norm(&collapsed, config.rms_eps)?;
