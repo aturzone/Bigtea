@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="#status"><img alt="status" src="https://img.shields.io/badge/status-v0.0.0%20preview-orange"></a>
+  <a href="#status"><img alt="status" src="https://img.shields.io/badge/status-v0.0.1%20preview-orange"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue"></a>
   <a href="#building"><img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-informational"></a>
   <a href="https://github.com/aturzone/Bigtea/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aturzone/Bigtea/actions/workflows/ci.yml/badge.svg"></a>
@@ -88,7 +88,7 @@ measures and reports it rather than guessing.
 
 ## Status
 
-**v0.0.0 — preview.** The engine works and is verified. The product around it is
+**v0.0.1 — preview.** The engine works and is verified. The product around it is
 not built yet.
 
 | | |
