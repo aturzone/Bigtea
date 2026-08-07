@@ -39,6 +39,7 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 - **`flash_attn_ext` does NOT transpose V**, unlike the `mul_mat` attention path, and its mask must be **F16 and contiguous**. Both mistakes give fluent nonsense, not an error. Mask values are only 0 and -inf, so write the bits (`0x0000` / `0xFC00`) rather than converting.
 - **Prompt length decides which code paths run.** V4-Flash's compressed attention builders are guarded on their caches being non-empty, so the *same layer* runs different attention at different lengths: at 2 tokens all 43 blocks fall back to the Raw path, at 5 CSA fires, at 165 HCA fires, and the sparse indexer selects nothing until >2048. A shorter capture can reach *further* than a longer one. See `v4flash-compressed-attention.md`.
 - **GGUF pads tensor data to `general.alignment` (32), not to a disk sector.** So tensors start mid-sector and a conventionally *aligned* buffer can never receive a direct transfer — every byte bounces. Skew the destination to `file_offset % 4096` instead (`SkewedBuf`): 0.80 → 1.58 GiB/s, 0.09% copied.
+- **`compute()` re-evaluates the whole ancestor graph.** Calling it per intermediate *re-does* the work each time, plus a graph build and threadpool cycle. 24 calls per block became 6 — **1.9x**. Invisible on prefill (big matmuls bury it), dominant at one token. Compute only before a `to_vec_*`/`set_*`.
 - **Threads are not the lever.** 4/12/20 threads all cost the same on a V4-Flash prefill; 1 thread is 4.7x *slower*. Threadpool-churn was the obvious explanation and was wrong.
 - **Every arena must scale with the prefill block.** Fixed-size arenas abort once the block grows; ggml asks and dies rather than returning an error.
 
@@ -52,12 +53,16 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 
 ## Next
 
-**v0.0.0 released 2026-08-07.** README/LICENSE/CONTRIBUTING/SECURITY/CHANGELOG/CI all exist; clippy `-D warnings` and fmt are clean and CI enforces both.
+**v0.0.0 released 2026-08-07**, CI green on Linux/macOS/Windows. Full head-to-head: `v4flash-vs-llamacpp-2026-08-07.md`.
 
-1. **Generation is the gap.** V4-Flash generates correct text at **0.042 tok/s vs llama.cpp's 0.45 — 10.7x slower**. No competitive claim ships. `v4flash-generation-first-numbers.md`.
-2. **KV cache** for the V4-Flash path. Worth ~3-4x, and on **disk traffic** not attention: a 5-token pass touches ~26 expert slices/layer, a cached 1-token pass 6. State is bounded (128 raw + 256 compressed) ≈ 33 MB for 43 layers. Needs an oracle capture at two consecutive positions — a wrong cache gives fluent nonsense.
-3. **Profile `layer_tail` + `moe_routing`** — 21% of a pass for a handful of small ops, never examined. Attention is only 4%; do not optimise it.
-4. Then T1-T5 of `lts-0-0-0.md`: cross-OS binaries, `bigtea pull` from Hugging Face, quant selection from the probe, self-configuration, OpenAI-compatible server.
+**V4-Flash vs llama.cpp today**: load **3.0x ahead** (4.1s vs 12.3s), prefill **1.20x ahead** (0.49 vs 0.41 tok/s), generation **5.8x behind** (0.077 vs 0.45).
+
+1. **KV cache** — the only thing between us and a real generation number. A single-token pass costs **4.0s**, which is what a cached step will cost (0.25 tok/s); today each token re-runs the whole sequence. State is bounded: 128 raw positions + 256 compressed blocks ≈ 33 MB for 43 layers. Needs an oracle capture at two consecutive positions — a wrong cache gives fluent nonsense.
+2. **Overlap reads with compute.** 2.3s I/O vs 1.0s compute per token, run serially. llama.cpp gets this free from mmap. Layers 0-2 route by token id so their experts are knowable before any compute. Worth ~1.0s/token.
+3. **Fit the always-read set** — 1.17 GiB short on this machine. Worth 0.7s/token, and it is the user's RAM, not code.
+4. Then T1-T5 of `lts-0-0-0.md`: `bigtea pull` from Hugging Face, quant selection from the probe, self-configuration, OpenAI-compatible server, prebuilt binaries.
+
+Levers 1-3 reach **~0.43 tok/s = parity**, not victory. Beating 0.45 needs an expert cache across tokens, unmeasured on this model.
 
 ## Compact Instructions
 

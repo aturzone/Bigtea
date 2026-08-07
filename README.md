@@ -25,24 +25,29 @@ selects them.
 $ bigtea-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf "The capital of France is" -n 5
 model      deepseek4 (direct (cache bypassed))
 shape      43 blocks, 4096 embd, 64 heads, 256 experts (6 used, 1 shared)
-resident   loaded 101 tensors, 3.97 GiB of 3.97 GiB budget in 3.4s (1.24 GB/s)
-           3.40 GiB will be re-read from disk on EVERY token (~3.0s each)
+resident   251 tensors, 6.21 GiB of 6.21 GiB budget in 4.1s (1.65 GB/s)
+           1.17 GiB will be re-read from disk on EVERY token
            closing these would free up to 5.63 GiB:
              Code.exe                     1.55 GiB (15 processes)
              Telegram.exe                 0.66 GiB
            that is enough to make the whole model resident.
-prefill    5 tokens in 20.9s (0.24 tok/s)
+prefill    5 tokens in 10.1s (0.49 tok/s)
 output      Paris.
-generate   4 tokens in 95.6s (0.042 tok/s, 23.9s per token)
+generate   4 tokens in 51.9s (0.077 tok/s, 13.0s per token)
 ```
 
 ---
 
 ## Read this before you try it
 
-**Bigtea is currently slower than llama.cpp at generation.** On the model above we
-measure **0.042 tok/s against llama.cpp's 0.45** — about ten times slower. On
-Qwen3-30B-A3B generation we are roughly **2x behind** (1.07 vs 2.16 tok/s).
+**Bigtea is currently slower than llama.cpp at generation.** On DeepSeek-V4-Flash
+we measure **0.077 tok/s against llama.cpp's 0.45**. On Qwen3-30B-A3B generation
+we are roughly **2x behind** (1.07 vs 2.16 tok/s).
+
+We are **ahead on prefill and on load**. On the same V4-Flash run: prefill
+**0.49 vs 0.41 tok/s** and load **4.1s vs 12.3s**. Every number, both command
+lines and both outputs:
+[`v4flash-vs-llamacpp-2026-08-07.md`](docs/graph/research/v4flash-vs-llamacpp-2026-08-07.md).
 
 **llama.cpp can also run models larger than RAM**, given `--no-repack`. "Runs a
 model bigger than your memory" is not a thing only Bigtea does, and this project

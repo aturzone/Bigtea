@@ -73,10 +73,11 @@ Qwen3-30B-A3B Q4_K_M prefill, Bigtea / llama.cpp:
 
 ### Known limitations
 
-- **Generation is slower than llama.cpp.** DeepSeek-V4-Flash: 0.042 tok/s against
-  0.45 — about 10x slower, because the V4-Flash path has no KV cache yet.
-  Qwen3-30B-A3B: 1.07 against 2.16, about 2x. No claim to the contrary is made
-  anywhere in this repository.
+- **Generation is slower than llama.cpp.** DeepSeek-V4-Flash: 0.077 tok/s against
+  0.45, because the V4-Flash path has no KV cache yet and each token re-runs the
+  whole sequence. Qwen3-30B-A3B: 1.07 against 2.16, about 2x. Bigtea *is* ahead
+  on V4-Flash prefill (0.49 vs 0.41) and load (4.1s vs 12.3s). No claim beyond
+  that is made anywhere in this repository.
 - **Linux and macOS build and pass the unit tests in CI, but no model has been
   run on either.** macOS additionally has no direct-I/O path — `F_NOCACHE` needs
   an `fcntl` after opening and is not written yet — so it falls back to buffered
