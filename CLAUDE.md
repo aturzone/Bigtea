@@ -35,6 +35,8 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 - **`compute(&t, 0)` runs on ONE thread** — the count is floored at 1, not defaulted to all cores. This silently ran every expert matmul single-threaded.
 - **Expert access is a cyclic scan, so recency-based caching is the worst policy available.** Layer 0 is always the oldest entry when layer 47 needs room. Frequency-gated admission took hit rate 17% → 70% at the same budget.
 - **Profile before optimising a streaming runner.** The largest cost in generation was memcpy — slices copied twice per use — not disk and not arithmetic. Nothing suggested it until it was timed.
+- **A hot set scored on the prompt it was chosen from tells you nothing.** "64 experts absorb 97.8% of selections" was in-sample on one prompt; out of sample it is 53.7%, and 37.5% across subjects against 25% for caching at random. Always score a residency policy on data it did not see. Two matching controls are cheap and both were missing: a **uniform null at the same sample size** (with ~1000 draws over 256 experts, top-64 covers 41% by construction) and a **noise ceiling** (resample the same distribution — if cross-prompt sits below it, the divergence is real).
+- **Statistics computed over `bigtea-run`'s output double-count.** Regeneration is stateless, so every generated token re-runs prefill and the routing histogram counts the same prompt again: chi-square went 1282 → 5464 → 11469 for 1/4/8 tokens while coverage never moved. Capture with `-n 1`.
 - **Cache hit rate is not a success metric.** Past ~6 GiB the expert cache reaches 71% hits and is the *slowest* configuration measured: cached bytes get paged out, so a "hit" is a page fault wearing a disguise. Only tok/s at a stated footprint counts.
 - **`flash_attn_ext` does NOT transpose V**, unlike the `mul_mat` attention path, and its mask must be **F16 and contiguous**. Both mistakes give fluent nonsense, not an error. Mask values are only 0 and -inf, so write the bits (`0x0000` / `0xFC00`) rather than converting.
 - **Prompt length decides which code paths run.** V4-Flash's compressed attention builders are guarded on their caches being non-empty, so the *same layer* runs different attention at different lengths: at 2 tokens all 43 blocks fall back to the Raw path, at 5 CSA fires, at 165 HCA fires, and the sparse indexer selects nothing until >2048. A shorter capture can reach *further* than a longer one. See `v4flash-compressed-attention.md`.
@@ -53,16 +55,19 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 
 ## Next
 
-**v0.0.0 released 2026-08-07**, CI green on Linux/macOS/Windows. Full head-to-head: `v4flash-vs-llamacpp-2026-08-07.md`.
+**v0.0.2 released 2026-08-07.** Read `backlog/next-session-handoff.md` first — it carries R0-R6 in measurement order.
 
-**V4-Flash vs llama.cpp today**: load **3.0x ahead** (4.1s vs 12.3s), prefill **1.20x ahead** (0.49 vs 0.41 tok/s), generation **5.8x behind** (0.077 vs 0.45).
+**V4-Flash vs llama.cpp, run back to back**: load parity, prefill **1.62x behind**, generation **3-4x behind**. We lead on nothing on this model. Do not claim otherwise: `v4flash-vs-llamacpp-2026-08-07.md`.
 
-1. **KV cache** — the only thing between us and a real generation number. A single-token pass costs **4.0s**, which is what a cached step will cost (0.25 tok/s); today each token re-runs the whole sequence. State is bounded: 128 raw positions + 256 compressed blocks ≈ 33 MB for 43 layers. Needs an oracle capture at two consecutive positions — a wrong cache gives fluent nonsense.
-2. **Overlap reads with compute.** 2.3s I/O vs 1.0s compute per token, run serially. llama.cpp gets this free from mmap. Layers 0-2 route by token id so their experts are knowable before any compute. Worth ~1.0s/token.
-3. **Fit the always-read set** — 1.17 GiB short on this machine. Worth 0.7s/token, and it is the user's RAM, not code.
-4. Then T1-T5 of `lts-0-0-0.md`: `bigtea pull` from Hugging Face, quant selection from the probe, self-configuration, OpenAI-compatible server, prebuilt binaries.
+**R0 done 2026-08-08** (`routing-skew-is-per-prompt-2026-08-08.md`): the router is genuinely skewed — top-8 takes 5-7x a uniform router — but **the hot set is per-prompt and must be warmed, not pinned.** Pinned from one prompt it covers 61.3% of another on the same subject, 37.5% across subjects, against 25.0% for a *random* cache. This corrected four v0.0.2 figures, killed the "prune the model to its hot set" plan, and reshaped R1.
 
-Levers 1-3 reach **~0.43 tok/s = parity**, not victory. Beating 0.45 needs an expert cache across tokens, unmeasured on this model.
+1. **R0.1 — does prompt routing predict *generated*-token routing?** Gates R1's worth: the answer sits between 1.60 and 7.76 tok/s.
+2. **R1 expert cache**, frequency-gated (the policy in `stream.rs`, never wired into the deepseek4 path). Size from the probe; the cache must own its memory.
+3. **KV cache** — a single-token pass costs 4.0s, which is what a cached step will cost; today each token re-runs the whole sequence. ~33 MB for 43 layers. A wrong cache gives fluent nonsense, so it needs an oracle at two consecutive positions.
+4. **Overlap reads with compute** — 2.3s I/O vs 1.0s compute, strictly serial. Layers 0-2 route by token id, so their experts are knowable before any compute runs.
+5. Then T1-T5 of `lts-0-0-0.md`: `bigtea pull`, quant selection, self-configuration, OpenAI-compatible server, prebuilt binaries.
+
+**No GPU code exists** — `bigtea-probe` detects the card, nothing uses it. A VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer.
 
 ## Compact Instructions
 

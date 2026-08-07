@@ -61,19 +61,44 @@ what we manage today.
 
 ## Remaining work, in the order the measurements justify
 
-### R0 — Re-measure the skew before building anything on it  *(one day, blocks R1)*
+### R0 — Re-measure the skew before building anything on it  ✅ **DONE 2026-08-08**
 
-The skew is from **one coding prompt**. Far too large to be noise, but the
-*shape* may be prompt-dependent.
+Answered on eight prompts across four subjects:
+`../research/routing-skew-is-per-prompt-2026-08-08.md`.
 
-- Several prompts across different domains (code, prose, maths, another language)
-- **Exclude layers 0-2**: they route by token id via `ffn_gate_tid2eid`, not by
-  learned gating, so their skew reflects the token distribution
-- The question to answer: **is the hot set global or per-prompt?** Global → pin
-  it. Per-prompt → warm it adaptively, which is a harder design.
-- `BIGTEA_ROUTING=1` already prints the histogram.
+**The hot set is per-prompt. Warm it adaptively; do not pin it.**
+
+- The skew is real — top-8 takes 5-7x what a uniform router would at the same
+  sample size, on every prompt.
+- But out-of-sample it collapses: a top-64 set pinned from one prompt covers
+  **61.3%** of another on the same subject and **37.5%** across subjects, against
+  **25.0%** for a *random* cache. Sampling noise costs under 2 points, so this is
+  real divergence.
+- Subject matters more than language: a Persian *coding* prompt routes like the
+  English coding prompts, not like Persian prose.
+- **Three v0.0.2 numbers are corrected**, including the 33.6 tok/s disk floor
+  (actually 1.60) and the "~48 GiB desktop" claim (unsupported). See the
+  correction block on `routing-skew-changes-everything.md`.
+- Tooling is committed: `tools/routing/capture.sh` + `analyse.py`,
+  and `BIGTEA_ROUTING_DUMP=<path>` writes raw per-layer counts.
+
+### R0.1 — Does prompt routing predict *generated*-token routing?  *(now blocks R1's value)*
+
+Everything in R0 is prefill. An adaptive cache warms on the prompt and is then
+spent on generated tokens, so its worth is bounded by how well the two agree —
+somewhere between the in-prompt column (90.5% at top-64) and the cross-prompt one
+(53.7%). **That range is the difference between 7.76 and 1.60 tok/s**, so it
+decides whether R1 is worth building at all.
+
+Needs the histogram split by pass rather than accumulated — note `bigtea-run`
+regenerates statelessly, so the naive capture counts the prompt again every token.
 
 ### R1 — Frequency-gated expert cache on the V4-Flash path  *(the big one)*
+
+**Reshaped by R0: the policy stands, the sizing story does not.** Frequency-gated
+admission warms per prompt, which is exactly the regime that transfers. Any
+variant that pins a hot set chosen in advance inherits the 37.5% figure and is
+barely better than caching at random.
 
 The policy already exists in `stream.rs` for Qwen3, where it took hit rate 17% →
 70%. It has **never been wired into the deepseek4 path**.
@@ -141,25 +166,32 @@ that is now the whole problem — a much better problem than "read 64 GiB/s".
 
 Ideas, roughly by expected value:
 
-1. **Prune the model to its hot set.** The skew says 64 of 256 experts per layer
-   carry 97.8% of decisions. A container keeping only those is **34 GiB instead
-   of 144** and loses 2.2% of routing. That is an offline repack with tooling this
-   project already has, and it is a *shippable artefact* others could use. At Q2
-   it is ~17 GiB. **This is the single most promising item and it has no research
-   risk — only a quality measurement.**
+1. ~~**Prune the model to its hot set.**~~ **DEAD — R0 killed it, 2026-08-08.**
+   This was called the most promising item with no research risk. The premise was
+   that 64 of 256 experts per layer carry 97.8% of decisions, so a 34 GiB
+   container would lose 2.2% of routing. Measured **out of sample it loses 46%**:
+   a pinned global top-64 covers only 53.7% of an unseen prompt's selections. A
+   pruned container would route unseen prompts to experts it does not contain.
+   The 97.8% was in-sample on the one prompt the set was chosen from.
 2. **Two-tier precision.** Hot experts resident at 2-bit as a *predictor*, full
    precision fetched only when the router's weight for that expert is high. The
    top-1 expert carries most of the weight mass; the 5th and 6th contribute
    little and may tolerate low precision. Needs a quality measurement, not new
    theory.
-3. **Domain-specialised hot sets.** If R0 finds the hot set is prompt-dependent,
-   a *coding* hot set may be far smaller than a general one — and a coding agent
-   is the target use. A 4 GiB coding-specific cache could plausibly beat a 34 GiB
-   general one for that workload.
-4. **Use the 6 GB of VRAM as a second cache tier.** RTX 3050 at ~200 GB/s is 80x
-   this NVMe. 6 GB holds ~top-11 experts per layer ≈ 60% of selections. Combined
-   with RAM this is a genuine three-tier residency problem, and nothing in the
-   codebase touches the GPU yet.
+3. **Domain-specialised hot sets.** **R0 promoted this.** The hot set *is*
+   prompt-dependent, and subject drives it more than language — so a coding-only
+   hot set is the right shape, and a coding agent is the target use. Measured:
+   within-subject transfer is 61.3% at top-64 against 37.5% across subjects. Two
+   coding prompts is far too thin a base to size one from; that needs a proper
+   coding corpus.
+4. **Use the 6 GB of VRAM as a second cache tier.** RTX 3050, 5682 MiB free
+   measured. One expert index across all 43 layers is 0.535 GiB, so ~5.1 GiB
+   usable holds **~9-10 indices**. **R0 caveat: it must be warmed, not pinned** —
+   pinned it inherits the 37.5% cross-subject figure, barely above a random 25%.
+   Three blockers before any of this is testable: no CUDA toolkit on this machine,
+   the linked ggml has no CUDA backend built, and Bigtea's zero-copy weight
+   binding hands ggml a host pointer, which a device tier cannot do. Nothing in
+   the codebase touches the GPU today — `bigtea-probe` only detects it.
 5. **Speculative decoding**, ~2.2x, proven, independent of all the above, needs a
    draft model sharing V4-Flash's tokenizer.
 6. **Not this**: contextual sparsity. Measured dead — V4-Flash's experts are 9.1%

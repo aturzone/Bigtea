@@ -575,7 +575,7 @@ fn run_deepseek4(
 
     // 137 GiB of routed experts, if the router spreads evenly. If it does not,
     // the hot set is cacheable and every byte-per-token figure changes.
-    bigtea_arch::routing_report(137.06);
+    bigtea_arch::routing_report(137.06, fw.config().hash_layer_count);
 
     if generated > 0 {
         let secs = t_gen.elapsed().as_secs_f64();

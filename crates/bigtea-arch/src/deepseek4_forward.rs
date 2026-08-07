@@ -88,16 +88,51 @@ fn record_routing(il: u32, n_expert: usize, ids: &[i32]) {
 /// cost to keep resident.
 ///
 /// Prints nothing unless `BIGTEA_ROUTING` is set.
-pub fn routing_report(expert_gib_total: f64) {
+///
+/// **Reported twice.** The first `hash_layers` blocks select by *token id* out
+/// of `ffn_gate_tid2eid`, not by a learned gate, so their skew is the token
+/// distribution wearing a router's clothes — a Zipfian prompt would look like a
+/// skewed router. Only the `>= hash_layers` table says anything about gating,
+/// and it is the one a cache should be sized from.
+///
+/// Set `BIGTEA_ROUTING_DUMP=<path>` to also write raw `layer,expert,count` rows,
+/// which is what makes two runs comparable: the question R0 asks is not how
+/// skewed one prompt is but whether two prompts are skewed toward the *same*
+/// experts, and that cannot be read off a summary table.
+pub fn routing_report(expert_gib_total: f64, hash_layers: u32) {
     let Some(hist) = ROUTING.get() else { return };
     let hist = hist.lock().expect("routing histogram");
     if hist.is_empty() {
         return;
     }
-    let n_expert = hist[0].len();
+    if let Ok(path) = std::env::var("BIGTEA_ROUTING_DUMP") {
+        match dump_routing(&hist, &path) {
+            Ok(()) => eprintln!("\nrouting histogram written to {path}"),
+            Err(e) => eprintln!("\nrouting histogram dump to {path} failed: {e}"),
+        }
+    }
+    let hash_layers = (hash_layers as usize).min(hist.len());
+    routing_table(&hist, expert_gib_total, 0, "all layers");
+    if hash_layers > 0 && hash_layers < hist.len() {
+        routing_table(
+            &hist,
+            expert_gib_total,
+            hash_layers,
+            "learned-gating layers only",
+        );
+    }
+}
+
+/// One top-N table over `hist[from..]`.
+fn routing_table(hist: &[Vec<u32>], expert_gib_total: f64, from: usize, label: &str) {
+    let layers = &hist[from..];
+    if layers.is_empty() {
+        return;
+    }
+    let n_expert = layers[0].len();
     eprintln!(
-        "
-routing distribution over {} layers, {n_expert} experts each",
+        "\nrouting distribution — {label} ({} of {} layers, {n_expert} experts each)",
+        layers.len(),
         hist.len()
     );
     eprintln!("  top-N experts per layer   share of selections   resident cost");
@@ -108,7 +143,7 @@ routing distribution over {} layers, {n_expert} experts each",
         }
         let mut covered = 0u64;
         let mut total = 0u64;
-        for layer in hist.iter() {
+        for layer in layers.iter() {
             let mut counts = layer.clone();
             counts.sort_unstable_by(|a, b| b.cmp(a));
             covered += counts.iter().take(top).map(|c| *c as u64).sum::<u64>();
@@ -129,22 +164,63 @@ routing distribution over {} layers, {n_expert} experts each",
 
     // A perfectly uniform router would give exactly top/n_expert. Anything above
     // that is skew, and skew is the only thing that makes caching worth having.
-    let mut counts: Vec<u64> = vec![0; n_expert];
-    for layer in hist.iter() {
+    //
+    // Two statistics, because v0.0.2 published the first one and it is the weaker
+    // of the two. **Pooled** sums every layer's count for expert index i into one
+    // bin, which asks whether an *index* is globally popular — but expert 7 of
+    // layer 3 and expert 7 of layer 30 are unrelated weights, so a pooled figure
+    // can be inflated by one layer or cancelled by two disagreeing ones.
+    // **Per-layer** sums each layer's own chi-square, which is the question a
+    // per-layer cache actually asks. Both are printed so the published 7805 stays
+    // comparable rather than silently replaced.
+    let mut pooled: Vec<u64> = vec![0; n_expert];
+    for layer in layers.iter() {
         for (e, c) in layer.iter().enumerate() {
-            counts[e] += *c as u64;
+            pooled[e] += *c as u64;
         }
     }
-    let total: u64 = counts.iter().sum();
+    let total: u64 = pooled.iter().sum();
     let uniform = total as f64 / n_expert as f64;
-    let chi: f64 = counts
+    let chi_pooled: f64 = pooled
         .iter()
         .map(|c| (*c as f64 - uniform).powi(2) / uniform.max(1.0))
         .sum();
+
+    let mut chi_layer = 0.0;
+    let mut dof = 0usize;
+    for layer in layers.iter() {
+        let total: u64 = layer.iter().map(|c| *c as u64).sum();
+        if total == 0 {
+            continue;
+        }
+        let uniform = total as f64 / n_expert as f64;
+        chi_layer += layer
+            .iter()
+            .map(|c| (*c as f64 - uniform).powi(2) / uniform.max(1e-9))
+            .sum::<f64>();
+        dof += n_expert - 1;
+    }
     eprintln!(
-        "  uniform routing would give top-16 = {:.1}%; chi-square vs uniform = {chi:.0}",
+        "  uniform routing would give top-16 = {:.1}%",
         16.0 / n_expert as f64 * 100.0
     );
+    eprintln!(
+        "  chi-square vs uniform: pooled {chi_pooled:.0} (d.o.f. {}), per-layer {chi_layer:.0} (d.o.f. {dof})",
+        n_expert - 1
+    );
+}
+
+/// Raw `layer,expert,count` rows, so two runs can be compared offline.
+fn dump_routing(hist: &[Vec<u32>], path: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    writeln!(out, "layer,expert,count")?;
+    for (il, layer) in hist.iter().enumerate() {
+        for (e, c) in layer.iter().enumerate() {
+            writeln!(out, "{il},{e},{c}")?;
+        }
+    }
+    out.flush()
 }
 
 /// One expert tensor's selected slices, packed, with the shape to bind them as.
