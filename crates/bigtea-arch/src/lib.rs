@@ -20,7 +20,7 @@ mod qwen3;
 mod stream;
 
 pub use deepseek4::{AttentionKind, Deepseek4Config, Deepseek4Model};
-pub use deepseek4_forward::{prefill, Deepseek4Forward};
+pub use deepseek4_forward::{prefill, routing_report, Deepseek4Forward};
 pub use kv::{KvCache, KvError};
 pub use qwen3::{Qwen3Config, Qwen3Model};
 pub use stream::{StreamStats, StreamingRunner};

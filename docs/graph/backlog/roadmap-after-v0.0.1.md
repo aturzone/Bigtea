@@ -3,6 +3,19 @@
 Written 2026-08-07, immediately after the V4-Flash retraction. Nothing here is a
 plan built on a claim; every number is measured and cited.
 
+## ⚠ SUPERSEDED, hours after writing: see `routing-skew-changes-everything.md`
+
+This section declared 20 tok/s impossible on the assumption that the router
+spreads evenly over 256 experts, so all 137 GiB were equally cold. **Measured,
+that assumption is false**: 64 experts of 256 absorb **97.8%** of selections.
+With a hot-set cache the disk floor is **33.6 tok/s** and the compute floor 27.
+20 tok/s is a cache-sizing problem, and it needs a **~48 GiB desktop**, not the
+150 GiB claimed below. On this 15.7 GiB laptop it implies ~1.3 tok/s — about 4x
+llama.cpp, not 20.
+
+The arithmetic below is correct *given its premise*. The premise was never
+measured, and that is the error.
+
 ## First: is 20 tok/s for V4-Flash possible on this laptop?
 
 **No. Not by streaming, and not by any factor of engineering.** The arithmetic is

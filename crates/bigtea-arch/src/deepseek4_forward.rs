@@ -60,6 +60,93 @@ const F16_NEG_INF: [u8; 2] = [0x00, 0xFC];
 /// cache from its values), the compressor's `kv`/`score`/output, the router's
 /// `topk` (routing decides which expert slices to read from disk, so it cannot
 /// be deferred), and the block's own output.
+/// How often each expert of each layer is actually selected.
+///
+/// The whole streaming budget rests on an assumption nobody has checked: that a
+/// token's 6-of-256 choice is spread evenly, so 137 GiB of experts are all
+/// equally cold and none is worth holding in RAM. **If routing is skewed
+/// instead — if a small hot set absorbs most selections — then that set is
+/// cacheable and the bytes-per-token figure that bounds everything is wrong.**
+///
+/// Set `BIGTEA_ROUTING=1` and the runner prints the distribution at exit.
+static ROUTING: std::sync::OnceLock<std::sync::Mutex<Vec<Vec<u32>>>> = std::sync::OnceLock::new();
+
+fn record_routing(il: u32, n_expert: usize, ids: &[i32]) {
+    let hist = ROUTING.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut hist = hist.lock().expect("routing histogram");
+    while hist.len() <= il as usize {
+        hist.push(vec![0u32; n_expert]);
+    }
+    for id in ids {
+        if let Some(slot) = hist[il as usize].get_mut(*id as usize) {
+            *slot += 1;
+        }
+    }
+}
+
+/// What fraction of selections the hottest experts absorb, and what that would
+/// cost to keep resident.
+///
+/// Prints nothing unless `BIGTEA_ROUTING` is set.
+pub fn routing_report(expert_gib_total: f64) {
+    let Some(hist) = ROUTING.get() else { return };
+    let hist = hist.lock().expect("routing histogram");
+    if hist.is_empty() {
+        return;
+    }
+    let n_expert = hist[0].len();
+    eprintln!(
+        "
+routing distribution over {} layers, {n_expert} experts each",
+        hist.len()
+    );
+    eprintln!("  top-N experts per layer   share of selections   resident cost");
+
+    for top in [1usize, 4, 8, 16, 32, 64, 128] {
+        if top > n_expert {
+            break;
+        }
+        let mut covered = 0u64;
+        let mut total = 0u64;
+        for layer in hist.iter() {
+            let mut counts = layer.clone();
+            counts.sort_unstable_by(|a, b| b.cmp(a));
+            covered += counts.iter().take(top).map(|c| *c as u64).sum::<u64>();
+            total += counts.iter().map(|c| *c as u64).sum::<u64>();
+        }
+        if total == 0 {
+            return;
+        }
+        let share = covered as f64 / total as f64;
+        let gib = expert_gib_total * top as f64 / n_expert as f64;
+        eprintln!(
+            "  {top:>3}   ({:>5.1}% of the model)   {:>6.1}%              {:>6.2} GiB",
+            top as f64 / n_expert as f64 * 100.0,
+            share * 100.0,
+            gib
+        );
+    }
+
+    // A perfectly uniform router would give exactly top/n_expert. Anything above
+    // that is skew, and skew is the only thing that makes caching worth having.
+    let mut counts: Vec<u64> = vec![0; n_expert];
+    for layer in hist.iter() {
+        for (e, c) in layer.iter().enumerate() {
+            counts[e] += *c as u64;
+        }
+    }
+    let total: u64 = counts.iter().sum();
+    let uniform = total as f64 / n_expert as f64;
+    let chi: f64 = counts
+        .iter()
+        .map(|c| (*c as f64 - uniform).powi(2) / uniform.max(1.0))
+        .sum();
+    eprintln!(
+        "  uniform routing would give top-16 = {:.1}%; chi-square vs uniform = {chi:.0}",
+        16.0 / n_expert as f64 * 100.0
+    );
+}
+
 /// One expert tensor's selected slices, packed, with the shape to bind them as.
 ///
 /// The dims are not the tensor's: the last is the number of slices actually
@@ -826,6 +913,9 @@ fn moe_routing<'c>(
     };
     ctx.compute(&topk, threads())?;
     let ids = topk.to_vec_i32();
+    if std::env::var("BIGTEA_ROUTING").is_ok() {
+        record_routing(il, n_expert as usize, &ids);
+    }
 
     // Renormalised over the selected six only, then scaled. The divisor is
     // clamped at the smallest F16 normal, not at an epsilon.
