@@ -560,7 +560,6 @@ fn run_deepseek4(
     // cache backed by the page cache was the *slowest* configuration measured.
     let mut fw = bigtea_arch::Deepseek4Forward::new(model, config.clone()).with_resident(&resident);
     let expert_budget = expert_cache_budget.unwrap_or(0);
-    let _ = reserve;
     if expert_budget > 0 {
         fw = fw.with_expert_cache(expert_budget as usize);
         println!(

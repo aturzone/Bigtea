@@ -31,13 +31,35 @@ tokens each, learned-gating layers only:
 cross-prompt figure, on both.** The regime a cache actually operates in is the
 favourable one, and it does not depend on the subject.
 
-**Continuing to warm adds almost nothing** — about a point at top-64. The prompt
-already dominates the counts, so a cache may be filled during prefill and left
-alone during generation. That is a simpler policy than expected.
+**Over 15 tokens, continuing to warm adds almost nothing** — about a point at
+top-64 — and there is no decay: `code_a` drifts 82.5% → 86.8% across thirds,
+`prose_a` 87.6% → 85.4%.
 
-**No decay over the horizon measured.** `code_a` drifts 82.5% → 86.8% across
-thirds, `prose_a` 87.6% → 85.4%. Neither trend is meaningful; what matters is
-that neither falls away.
+### ⚠ That does not survive a longer horizon
+
+Re-measured over **46** generated tokens (17-token prompt, same method):
+
+| top-64 | frozen at the prompt | kept warming |
+|---|---:|---:|
+| 15 tokens, 166-token prompt | 86.3% | 87.0% |
+| **46 tokens, 17-token prompt** | **59.4%** | **81.7%** |
+
+A frozen set decays steadily — 85% on the first generated token to ~50% by the
+46th, first third 63.9% against last third 55.3% — while one that keeps warming
+holds at 81.7%. **Continuing to warm is worth 22 points, not 0.7.**
+
+So the earlier "fill it during prefill and leave it" was an artefact of a short
+horizon, and is withdrawn. **Keep warming.** The implementation already does —
+frequency-gated admission runs on every miss — so nothing changes in the code,
+only the claim.
+
+Two things confound the comparison and neither is resolved here: the longer run
+also has a *shorter prompt* (17 vs 166 tokens), so its frozen set is estimated
+from 102 selections per layer rather than 996 and starts weaker. Its `in-prompt`
+column reads 100.0% at top-64 for the same reason — a 17-token prompt touches
+only ~40 distinct experts per layer, so that column is saturated and means
+nothing. **What is solid is the direction: the frozen set decays and the warmed
+one does not.**
 
 ```
 per generated token, top-64 frozen
@@ -105,8 +127,17 @@ to trust the old arithmetic.
 - **R1 is worth building, but only after R3.** The hit rates justify the cache;
   the dedup note above says it cannot pay until a step's working set shrinks to
   6 experts per layer. **R3 → R1 → R2**, in that order.
-- **Fill during prefill; do not bother re-warming during generation.** Measured,
-  not assumed — it buys about a point.
+- **Keep warming during generation.** Over 15 tokens it buys a point; over 46 it
+  buys 22, because a frozen set decays and a warmed one does not. The cache
+  already behaves this way.
+- **Routing is not bitwise stable across sequence lengths.** At exactly one
+  transition — 63 → 64 tokens — the net stayed at +6 selections per layer, so
+  one token really was added, but **477 selections (~3%) of tokens already in
+  the sequence moved**. Every other transition had zero. That is the router's
+  top-6-of-256 flipping on near ties when ggml changes matmul blocking at a size
+  boundary: arithmetic, not causality. **Anything that assumes routing is
+  reproducible across batch shapes — a prefetcher, a replay, or R3's
+  equivalence test — must tolerate it.**
 - **R2.3's speculative prefetch is now sized**: prefetching block L+1 on the
   previous token's routing should hit at roughly this rate, because it is the
   same quantity.
@@ -117,10 +148,14 @@ to trust the old arithmetic.
 
 Not settled:
 
-- **15 generated tokens is a short horizon.** A 500-token answer may drift where
-  15 do not. Nothing here measures that, and it is the obvious next check.
-- **Two prompts, one model.** Both are ~165 tokens; very short or very long
-  prompts may behave differently.
+- **46 generated tokens is still not 500.** The decay measured over 46 has not
+  flattened, so a long answer may fall further. The warmed figure is the one to
+  plan with.
+- **The long-horizon run changes two variables at once** (46 tokens *and* a
+  17-token prompt), so the frozen/warmed gap cannot be attributed to horizon
+  alone. Re-running 46 tokens from a 166-token prompt would separate them; it
+  costs about 40 minutes.
+- **Three prompts, one model.**
 - **Disk floor only.** Compute floors at ~27 tok/s, so it does not bind yet, but
   the arena and memcpy costs this project has already hit twice are not in this
   arithmetic.

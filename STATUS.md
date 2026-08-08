@@ -6,7 +6,8 @@ closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
 **Last updated**: 2026-08-08 · **Version**: v0.0.2 · **Branch**: `main` ·
-**Open PR**: [#43](https://github.com/aturzone/Bigtea/pull/43) (R0)
+**Open PR**: [#43](https://github.com/aturzone/Bigtea/pull/43) — R0, R0.1, R1,
+the 256-token fix, and the R3 plan. **Unmerged; Atur merges.**
 
 ---
 
@@ -56,8 +57,10 @@ policy** is.
   numbers and killed the model-pruning plan. PR #43.
 - **R0.1 answered** (2026-08-08): **a set warmed on the prompt covers ~86% of
   what generation goes on to need** (86.3% on a code prompt, 85.9% on a prose
-  one) — within ~4 points of an oracle, ~32 above the cross-prompt figure, no
-  decay over 15 tokens. This is what makes R1 worth building.
+  one) — within ~4 points of an oracle and ~32 above the cross-prompt figure.
+  This is what makes R1 worth building. **Over a longer horizon the cache must
+  keep warming**: across 46 generated tokens a frozen set decays to 59.4% while a
+  warmed one holds 81.7%, so R0.1's "fill it and leave it" is withdrawn.
 - **R1 built** (2026-08-08): frequency-gated expert cache wired into the
   deepseek4 path, sized from the probe, hit rate reported with footprint and
   tok/s. **But it cannot pay until R3 exists** — see the ordering note below.
@@ -66,7 +69,7 @@ policy** is.
 
 | id | work | state | why it is next |
 |---|---|---|---|
-| **R3** | KV cache | **ready — DO THIS NEXT**, fully scoped in `backlog/r3-kv-cache.md` | the unlock for everything else, not just a speed win. ~24 MB of state across **three** structures (the compressor ring is the one that is easy to miss). Verified without a new oracle: `prefill(0..n) then step(n)` must equal `prefill(0..=n)`, at 2, 5 and 165 tokens because each runs a different attention builder. Worth ~0.25 tok/s from the 4.0s single-token pass alone — parity — and it is what makes R1 pay |
+| **R3** | KV cache | **ready — DO THIS NEXT**, fully scoped in `backlog/r3-kv-cache.md` | the unlock for everything else, not just a speed win. ~24 MB of state across **three** structures (the compressor ring is the one that is easy to miss). Verified without a new oracle: `prefill(0..n) then step(n)` must match `prefill(0..=n)` — argmax and a tolerance, **not** bit-identical, since routing already flips ~3% on near ties at a ggml blocking boundary. Test at 2, 5 and 165 tokens because each runs a different attention builder. Worth **~0.33 tok/s** from the measured 3.0s single-token pass alone, against llama.cpp's 0.21–0.31, and it is what makes R1 pay |
 | **R1** | frequency-gated expert cache on the deepseek4 path | **built 2026-08-08, inert until R3** | implemented, tested against the oracle, sized from the probe, `--cache <GiB>` now works on this path. Warms on the prompt, never pinned. Cannot pay while a pass still reads ~123 distinct experts per layer |
 | **R2** | overlap I/O with compute | ready, but smaller than it looks | per block it is ~53 ms read against ~23 ms compute, so the ceiling is ~1.4x — and all three expert tensors already read in one batched call, with everything after depending on them. Scoped against the code in the handoff |
 | **R4** | fit the always-read set | user-side | 7.38 GiB; needs ~10.5 GiB free. Worth 0.7s/token. The runner already names the processes to close |
@@ -102,11 +105,18 @@ Strategy and the bets beyond R6: `docs/graph/backlog/the-big-bang.md`.
   The long-context prefill figures in the docs are Qwen3, a different path.
   **Lifting this is part of R3.**
 - **No KV cache on the V4-Flash path**, so every generated token re-runs prefill
-  over the whole sequence. The 0.064 tok/s generation figure is an artefact of
-  that, not a measure of the engine.
+  over the whole sequence. The 0.015–0.064 tok/s generation figures are an
+  artefact of that, not a measure of the engine. **A single-token pass costs
+  3.0s** (re-measured 2026-08-08 with the whole always-read set resident), so a
+  cached step is worth **~0.33 tok/s against llama.cpp's 0.21–0.31** — R3 alone
+  turns a 3–4x deficit into a slight lead.
 - **No GPU support** anywhere in the compute path.
 - **No installer.** Building needs the GNU Rust toolchain, MSYS2 and a
   hand-built ggml. There are no prebuilt binaries and no model downloader.
+  **Windows binaries are now redistributable** (2026-08-08) — the GNU C++ and
+  OpenMP runtimes link statically, so the `.exe` needs only system DLLs. Before
+  that it died with `0xC0000135` before `main` on any machine without MSYS2,
+  silently. The CI release job is still to write.
 
 ## Things that are true and cost time to rediscover
 

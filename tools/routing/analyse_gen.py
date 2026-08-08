@@ -73,16 +73,37 @@ def main():
             continue
 
         deltas = p[1:] - p[:-1]
-        neg = int((deltas < 0).sum())
         per_layer = deltas.sum(axis=2).mean()
         print(f"\n=== {name} — {p.shape[0]} passes, {len(deltas)} generated tokens ===")
+
+        # A delta is one generated token only while every cell is non-negative.
+        # A negative cell means a token already in the sequence routed somewhere
+        # else this pass, so the subtraction no longer isolates the new token.
+        #
+        # Observed at exactly one sequence length (63 -> 64 tokens): net stays
+        # +6 per layer, so one token really was added, but ~3% of earlier
+        # selections move. That is the router's top-6-of-256 flipping on near
+        # ties when ggml changes matmul blocking at a size boundary — arithmetic,
+        # not causality. Analysing the clean prefix is the right response;
+        # discarding the run is not.
+        bad = [k for k in range(len(deltas)) if (deltas[k] < 0).any()]
+        if bad:
+            k = bad[0]
+            churn = int(-deltas[k][deltas[k] < 0].sum())
+            net = sorted(set(deltas[k].sum(axis=1).tolist()))
+            print(
+                f"  routing is not bitwise stable past this length: at delta {k}"
+                f" ({churn} selections moved, net per layer {net})"
+            )
+            print(f"  using the clean prefix: {k} of {len(deltas)} generated tokens")
+            deltas = deltas[:k]
+            if len(deltas) == 0:
+                print("  nothing clean to analyse")
+                continue
         print(
-            f"  causality check: {neg} negative cells"
-            f" (must be 0), {per_layer:.1f} selections per layer per token"
+            f"  causality check: 0 negative cells over the range used,"
+            f" {per_layer:.1f} selections per layer per token"
         )
-        if neg:
-            print("  ABORT: a token's routing changed between passes; the delta is not one token")
-            continue
 
         prompt = p[0]
         print(f"\n  {'top-K':>6} {'frozen':>9} {'warming':>9} {'in-prompt':>11} {'random':>8}")

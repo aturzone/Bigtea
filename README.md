@@ -169,6 +169,14 @@ cargo build --release
 ```
 
 If linking fails with `cannot find -lgomp`, MSYS2's `mingw64/bin` is not on PATH.
+Note that Git Bash has its own `/mingw64` which is **not** MSYS2's and has no
+`gcc` — check with `which gcc`.
+
+**MSYS2 is needed to build, not to run.** On Windows the GNU C++ and OpenMP
+runtimes are linked statically, so the resulting `.exe` depends only on system
+DLLs and runs on a machine that has never seen MSYS2. Linked dynamically it did
+not: Windows killed it with `0xC0000135` (STATUS_DLL_NOT_FOUND) before `main`,
+printing nothing at all. Costs ~0.7 MB.
 
 Smart App Control may block freshly built unsigned binaries. `[[bin]]` targets in
 this workspace set `test = false` so cargo does not build empty test harnesses

@@ -103,8 +103,23 @@ element sums for all 43 blocks, so it is a trustworthy reference for itself:
 ```
 full      = prefill(tokens[0..=n])                  # already oracle-verified
 stepwise  = prefill(tokens[0..n]) then step(tokens[n])
-assert stepwise == full                             # logits, exactly
+assert stepwise ~= full                             # argmax equal, sum within tolerance
 ```
+
+**Do not assert bit-identical logits.** Measured 2026-08-08: at the 63 → 64
+token boundary the *existing* engine re-routes ~3% of selections that earlier
+tokens had already made — net stays at exactly +6 per layer, so no token was
+lost, but the router's top-6-of-256 flips on near ties when ggml changes matmul
+blocking at a size threshold. A KV-cached step computes attention with a
+different batch shape than a full prefill by construction, so it will hit the
+same effect deliberately rather than incidentally. A test demanding equality
+would fail on correct code, and the natural reaction — loosening it until it
+passes — is how a real cache bug gets shipped.
+
+Assert instead: **argmax equality**, logit sum within `assert_sum`'s existing
+tolerance, and that the step actually consulted the cache. Expect a small number
+of routing differences and state the threshold in the test rather than
+discovering it.
 
 If an incremental step disagrees with the full pass, the cache is wrong. This is
 the same shape as `the_expert_cache_does_not_change_the_answer`, which caught
@@ -128,9 +143,11 @@ actually used the cache (a step that silently re-prefilled would pass).
 
 ## What it is worth
 
-A single-token pass costs **4.0s** today, which is what a cached step will cost
-before any other change — about **0.25 tok/s against llama.cpp's 0.21-0.31**, so
-roughly parity on generation from this alone. Then R1 removes most of the 3.21
+A single-token pass costs **3.0s** — re-measured 2026-08-08 now that the whole
+7.38 GiB always-read set fits, down from the 4.0s in older docs. That is what a
+cached step will cost before any other change: **0.33 tok/s against llama.cpp's
+measured 0.21-0.31**, so R3 alone takes generation from 3-4x behind to slightly
+ahead. Then R1 removes most of the 3.21
 GiB that step reads, and R2 overlaps what is left.
 
 **Do not quote a generation number for V4-Flash again until this exists.** Every

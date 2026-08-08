@@ -57,6 +57,11 @@ Speed work is worth nothing if the thing cannot be installed. All of this is
 
 1. **Prebuilt binaries.** Today it needs the GNU Rust toolchain, MSYS2, and a
    hand-built ggml. That is a wall, not an install.
+   **The Windows half of this is now unblocked** (2026-08-08): the GNU C++ and
+   OpenMP runtimes are linked statically, so the binary depends only on system
+   DLLs. Before that a downloaded `.exe` died with `0xC0000135` before `main`,
+   printing nothing — a release workflow would have shipped binaries that simply
+   did not start. What remains is the CI release job itself.
 2. **`bigtea pull`** with resume, checksums, and a disk-space check *before*
    starting 144 GB.
 3. **Quant selection from the probe**, with the tok/s prediction stated first.

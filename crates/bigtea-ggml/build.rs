@@ -69,10 +69,37 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
-    // ggml has C++ translation units, so its runtime must come along.
+    // ggml has C++ translation units, so its runtime must come along — and on
+    // Windows-GNU it must come along *statically*.
+    //
+    // **This is the difference between a binary somebody can download and one
+    // they cannot.** Linked dynamically, `bigtea-run.exe` needs
+    // `libstdc++-6.dll` and `libgomp-1.dll` from MSYS2. Without them Windows
+    // terminates the process with `0xC0000135` (STATUS_DLL_NOT_FOUND) *before*
+    // `main`, so there is no message, no usage, nothing — it just exits.
+    // Measured on a PATH with no MSYS2: dynamic exits -1073741515 in silence,
+    // static prints its usage. Cost is about 0.7 MB of binary.
+    //
+    // Elsewhere dynamic is right: libstdc++ is a system library on Linux and
+    // Apple's libc++ always is.
+    //
+    // `static=` makes *rustc* resolve the archive, so its directory has to be on
+    // rustc's search path — the linker's own defaults are not enough, and
+    // without it the build fails with "could not find native static library
+    // `stdc++`". Ask the compiler that will do the linking where it keeps them,
+    // rather than hardcoding an MSYS2 path that is wrong on CI and on everyone
+    // else's machine. If that fails, stay dynamic: the build still works for
+    // anyone who has MSYS2 on PATH, which is everyone building from source.
+    let windows_gnu = target_os == "windows"
+        && target_env == "gnu"
+        && link_static_runtime_dir().is_some_and(|dir| {
+            println!("cargo:rustc-link-search=native={dir}");
+            true
+        });
     match (target_os.as_str(), target_env.as_str()) {
         ("macos", _) | ("ios", _) => println!("cargo:rustc-link-lib=dylib=c++"),
         (_, "msvc") => {} // MSVC links its runtime automatically
+        _ if windows_gnu => println!("cargo:rustc-link-lib=static=stdc++"),
         _ => println!("cargo:rustc-link-lib=dylib=stdc++"),
     }
 
@@ -104,7 +131,13 @@ fn main() {
         _ => !matches!(target_os.as_str(), "macos" | "ios") && target_env != "msvc",
     };
     if openmp {
-        println!("cargo:rustc-link-lib=dylib=gomp");
+        // Static on Windows-GNU for the same reason as libstdc++ above: a
+        // downloaded binary has no MSYS2 to find `libgomp-1.dll` in.
+        if windows_gnu {
+            println!("cargo:rustc-link-lib=static=gomp");
+        } else {
+            println!("cargo:rustc-link-lib=dylib=gomp");
+        }
     }
     println!("cargo:rerun-if-env-changed=BIGTEA_GGML_OPENMP");
 
@@ -121,4 +154,29 @@ fn main() {
 
     println!("cargo:rustc-cfg=have_ggml");
     println!("cargo:rustc-check-cfg=cfg(have_ggml)");
+}
+
+/// Where the GNU toolchain keeps `libstdc++.a` and `libgomp.a`.
+///
+/// `gcc -print-file-name=X` returns the full path of the archive it would link,
+/// or the bare name if it has none — which is the signal that static linking is
+/// not available and the caller should stay dynamic.
+fn link_static_runtime_dir() -> Option<String> {
+    let cc = std::env::var("CC").unwrap_or_else(|_| "gcc".into());
+    let mut dir = None;
+    for lib in ["libstdc++.a", "libgomp.a"] {
+        let out = std::process::Command::new(&cc)
+            .arg(format!("-print-file-name={lib}"))
+            .output()
+            .ok()?;
+        let path = String::from_utf8(out.stdout).ok()?;
+        let path = std::path::Path::new(path.trim());
+        // A bare filename back means gcc could not find it.
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+        if !path.exists() {
+            return None;
+        }
+        dir = Some(parent.display().to_string());
+    }
+    dir
 }
