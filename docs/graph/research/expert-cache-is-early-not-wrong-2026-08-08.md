@@ -70,6 +70,23 @@ after R3       a step reads 6 experts/layer       1.5 GiB cache = 47%  useful
 
 **So R1 is not the next task; R3 is.** R1 is already done and waiting for it.
 
+### The same engine already demonstrates this, on the other architecture
+
+Qwen3-30B-A3B **has** a KV cache, so a generated token there needs one token's
+experts rather than the whole sequence's. Run in the same session, same machine,
+same policy:
+
+```
+cache      8.48 GiB for experts
+streaming  streamed 4.87 GiB over 5475 expert reads, 4125 cache hits (43%), 0 evictions
+generated  6 tokens in 4.1s (1.46 tok/s)
+```
+
+**43% hits and zero evictions**, against V4-Flash's 1.9-4.1% and thousands of
+evictions with a cache a fifth the size. The difference is not the policy and not
+the model's routing — it is whether a step re-reads the sequence. That is the
+whole argument for doing R3 first, and it is already running in this repository.
+
 ## Decisions this fixed in the code
 
 - **The cache is off by default.** Turning it on would ship a measured 17%

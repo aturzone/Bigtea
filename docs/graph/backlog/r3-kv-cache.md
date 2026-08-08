@@ -65,6 +65,21 @@ For a step at absolute position `p`, with `nt = 1`:
    position with the compressed base (line 832). Cached entries must never be
    re-rotated.
 
+## Positions are hardcoded, in three places
+
+`pos.set_i32(&(0..nt as i32).collect())` at **line 615** (q/kv RoPE) and **line
+957** (the de-rope before the output projection), plus
+`(p % ratio)` at **line 740** (the compressor's within-block index) and
+`comp_pos` at **846** (block-start rotation). A step at absolute position `p`
+needs all four offset.
+
+**Do not land that offset as a separate refactor.** With `pos0 = 0` everywhere
+today, every existing test would still pass while the `pos0 != 0` path went
+unexercised — a change that looks finished and is wrong, which is the exact
+failure this codebase keeps warning about. Thread it *together with* the first
+incremental step and its equivalence test, so the new path is used the moment it
+exists.
+
 ## Traps, each of which is silent
 
 - **Slot index is currently the absolute position.** Any ring or window slide
