@@ -34,6 +34,7 @@ use bigtea_ggml::{Context, RopeParams, Tensor, WeightSet};
 use bigtea_io::SkewedBuf;
 use bigtea_model::{Model, ResidentSet};
 
+use crate::expert_cache::{slice_key, ExpertCache, SliceKey};
 use crate::{AttentionKind, Deepseek4Config, Result};
 
 /// `LLAMA_ROPE_TYPE_NORM`: rotated pairs are adjacent, not offset by `n_rot/2`.
@@ -69,19 +70,54 @@ const F16_NEG_INF: [u8; 2] = [0x00, 0xFC];
 /// cacheable and the bytes-per-token figure that bounds everything is wrong.**
 ///
 /// Set `BIGTEA_ROUTING=1` and the runner prints the distribution at exit.
-static ROUTING: std::sync::OnceLock<std::sync::Mutex<Vec<Vec<u32>>>> = std::sync::OnceLock::new();
+///
+/// Indexed `[pass][layer][expert]`. The pass dimension exists because
+/// generation here is **stateless** — every generated token re-runs prefill over
+/// the whole sequence — so a single accumulated histogram counts the prompt once
+/// per token. That silently inflated v0.0.2's chi-square by the pass count.
+///
+/// Keeping passes apart also turns the artefact into the measurement. The model
+/// is causal, so token *i*'s routing is identical in every pass that contains it;
+/// the difference between pass *k* and pass *k-1* is therefore exactly the
+/// routing of the one token generated in between. That is the only way to ask
+/// whether a cache warmed on the prompt predicts what generation goes on to need.
+static ROUTING: std::sync::OnceLock<std::sync::Mutex<Vec<Vec<Vec<u32>>>>> =
+    std::sync::OnceLock::new();
+
+fn routing_log() -> &'static std::sync::Mutex<Vec<Vec<Vec<u32>>>> {
+    ROUTING.get_or_init(|| std::sync::Mutex::new(vec![Vec::new()]))
+}
 
 fn record_routing(il: u32, n_expert: usize, ids: &[i32]) {
-    let hist = ROUTING.get_or_init(|| std::sync::Mutex::new(Vec::new()));
-    let mut hist = hist.lock().expect("routing histogram");
-    while hist.len() <= il as usize {
-        hist.push(vec![0u32; n_expert]);
+    let mut log = routing_log().lock().expect("routing histogram");
+    record_into(&mut log, il, n_expert, ids);
+}
+
+/// The counting itself, split out from the global so it can be tested.
+fn record_into(log: &mut [Vec<Vec<u32>>], il: u32, n_expert: usize, ids: &[i32]) {
+    let pass = log.last_mut().expect("one pass always exists");
+    while pass.len() <= il as usize {
+        pass.push(vec![0u32; n_expert]);
     }
     for id in ids {
-        if let Some(slot) = hist[il as usize].get_mut(*id as usize) {
+        if let Some(slot) = pass[il as usize].get_mut(*id as usize) {
             *slot += 1;
         }
     }
+}
+
+/// Start counting a new forward pass.
+///
+/// Call this before each re-prefill in the generation loop. Without it every
+/// pass lands in one bin and the prompt is counted again per generated token.
+pub fn routing_next_pass() {
+    if std::env::var("BIGTEA_ROUTING").is_err() {
+        return;
+    }
+    routing_log()
+        .lock()
+        .expect("routing histogram")
+        .push(Vec::new());
 }
 
 /// What fraction of selections the hottest experts absorb, and what that would
@@ -100,16 +136,32 @@ fn record_routing(il: u32, n_expert: usize, ids: &[i32]) {
 /// skewed one prompt is but whether two prompts are skewed toward the *same*
 /// experts, and that cannot be read off a summary table.
 pub fn routing_report(expert_gib_total: f64, hash_layers: u32) {
-    let Some(hist) = ROUTING.get() else { return };
-    let hist = hist.lock().expect("routing histogram");
-    if hist.is_empty() {
+    let Some(log) = ROUTING.get() else { return };
+    let log = log.lock().expect("routing histogram");
+    if log.iter().all(|p| p.is_empty()) {
         return;
     }
     if let Ok(path) = std::env::var("BIGTEA_ROUTING_DUMP") {
-        match dump_routing(&hist, &path) {
-            Ok(()) => eprintln!("\nrouting histogram written to {path}"),
+        match dump_routing(&log, &path) {
+            Ok(()) => eprintln!(
+                "\nrouting histogram written to {path} ({} passes)",
+                log.len()
+            ),
             Err(e) => eprintln!("\nrouting histogram dump to {path} failed: {e}"),
         }
+    }
+    // The printed tables pool every pass, which is what the pre-existing report
+    // did. Pooled counts are fine for *shares* — repeating a pass scales every
+    // bin alike — and wrong for chi-square, which is why the dump keeps passes
+    // apart and the report names its pass count.
+    let hist = pool_passes(&log);
+    if log.len() > 1 {
+        eprintln!(
+            "\nNOTE: {} forward passes pooled below. Generation re-runs prefill per\n\
+             token, so the prompt is counted once per pass: shares are unaffected,\n\
+             chi-square is inflated by roughly the pass count. Use -n 1 to measure.",
+            log.len()
+        );
     }
     let hash_layers = (hash_layers as usize).min(hist.len());
     routing_table(&hist, expert_gib_total, 0, "all layers");
@@ -210,14 +262,35 @@ fn routing_table(hist: &[Vec<u32>], expert_gib_total: f64, from: usize, label: &
     );
 }
 
-/// Raw `layer,expert,count` rows, so two runs can be compared offline.
-fn dump_routing(hist: &[Vec<u32>], path: &str) -> std::io::Result<()> {
+/// Every pass summed into one `[layer][expert]` histogram.
+fn pool_passes(log: &[Vec<Vec<u32>>]) -> Vec<Vec<u32>> {
+    let mut out: Vec<Vec<u32>> = Vec::new();
+    for pass in log {
+        for (il, layer) in pass.iter().enumerate() {
+            if out.len() <= il {
+                out.push(vec![0u32; layer.len()]);
+            }
+            for (e, c) in layer.iter().enumerate() {
+                out[il][e] += c;
+            }
+        }
+    }
+    out
+}
+
+/// Raw `pass,layer,expert,count` rows, so two runs can be compared offline.
+///
+/// Zero counts are written too. The analysis needs a dense matrix, and 43 x 256
+/// rows per pass is a rounding error next to the model.
+fn dump_routing(log: &[Vec<Vec<u32>>], path: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
-    writeln!(out, "layer,expert,count")?;
-    for (il, layer) in hist.iter().enumerate() {
-        for (e, c) in layer.iter().enumerate() {
-            writeln!(out, "{il},{e},{c}")?;
+    writeln!(out, "pass,layer,expert,count")?;
+    for (p, pass) in log.iter().enumerate() {
+        for (il, layer) in pass.iter().enumerate() {
+            for (e, c) in layer.iter().enumerate() {
+                writeln!(out, "{p},{il},{e},{c}")?;
+            }
         }
     }
     out.flush()
@@ -265,6 +338,13 @@ pub struct Deepseek4Forward<'m> {
     /// is correct but costs 23% of a prefill and would cost it again on every
     /// generated token.
     resident: Option<&'m ResidentSet>,
+    /// Routed expert slices held across blocks and tokens. `None` streams every
+    /// slice from disk on every use.
+    ///
+    /// A `Mutex` rather than `&mut` threading: the read path is reached through
+    /// several layers of `&self`, and the lock is taken once per block on a
+    /// single thread, so it costs nothing measurable next to a 53 ms read.
+    cache: Option<std::sync::Mutex<ExpertCache>>,
 }
 
 impl<'m> Deepseek4Forward<'m> {
@@ -273,6 +353,7 @@ impl<'m> Deepseek4Forward<'m> {
             model,
             config,
             resident: None,
+            cache: None,
         }
     }
 
@@ -280,6 +361,25 @@ impl<'m> Deepseek4Forward<'m> {
     pub fn with_resident(mut self, resident: &'m ResidentSet) -> Self {
         self.resident = Some(resident);
         self
+    }
+
+    /// Hold routed expert slices in `budget` bytes of memory this process owns.
+    ///
+    /// Nothing is pre-loaded. R0 measured that a hot set chosen in advance
+    /// covers only 37.5% of an unseen subject's routing, against 25% for caching
+    /// at random — so the cache warms on the prompt it is given, which R0.1
+    /// measured covers 86.3% of what that prompt goes on to generate.
+    pub fn with_expert_cache(mut self, budget: usize) -> Self {
+        self.cache = Some(std::sync::Mutex::new(ExpertCache::new(budget)));
+        self
+    }
+
+    /// Hits, misses, evictions and footprint, or `None` without a cache.
+    pub fn cache_stats(&self) -> Option<(crate::CacheStats, usize)> {
+        self.cache.as_ref().map(|c| {
+            let c = c.lock().expect("expert cache");
+            (c.stats(), c.bytes())
+        })
     }
 
     pub fn config(&self) -> &Deepseek4Config {
@@ -1040,11 +1140,21 @@ fn read_expert_slices(
     model: &Model,
     names: &[String],
     unique: &[i32],
+    weights_of: &[u32],
+    il: u32,
+    cache: Option<&std::sync::Mutex<ExpertCache>>,
 ) -> Result<(Vec<ExpertStack>, u64)> {
+    /// Where a slice's bytes come from. Both land in the same packed buffer, so
+    /// the destination layout — and the sector skew that makes reads direct —
+    /// is identical whether or not the cache is on.
+    enum Src {
+        Disk { offset: u64 },
+        Memory(std::sync::Arc<[u8]>),
+    }
     struct Job {
         name: usize,
-        offset: u64,
         len: usize,
+        src: Src,
     }
 
     let mut buffers = Vec::with_capacity(names.len());
@@ -1064,17 +1174,41 @@ fn read_expert_slices(
     }
 
     // One job per slice per tensor, so every reader gets an equal share of the
-    // bytes rather than an equal share of the tensors.
+    // bytes rather than an equal share of the tensors. A cached slice becomes a
+    // copy job rather than disappearing, which keeps the destination spans
+    // contiguous and lets the copies run on the same threads as the reads.
     let mut jobs = Vec::with_capacity(names.len() * unique.len());
+    let mut misses: Vec<(usize, usize, SliceKey)> = Vec::new();
+    let mut hit_bytes = 0u64;
     for (n, name) in names.iter().enumerate() {
         let loc = model.location(name).expect("stacked tensor");
         let slice = loc.size / *loc.dims.last().expect("stacked");
-        for e in unique {
-            jobs.push(Job {
-                name: n,
-                offset: *e as u64 * slice,
-                len: slice as usize,
-            });
+        for (p, e) in unique.iter().enumerate() {
+            let key = slice_key(il, n as u8, *e as u32);
+            let src = match cache {
+                Some(c) => c.lock().expect("expert cache").request(key, weights_of[p]),
+                None => None,
+            };
+            match src {
+                Some(bytes) => {
+                    hit_bytes += bytes.len() as u64;
+                    jobs.push(Job {
+                        name: n,
+                        len: slice as usize,
+                        src: Src::Memory(bytes),
+                    });
+                }
+                None => {
+                    misses.push((n, p, key));
+                    jobs.push(Job {
+                        name: n,
+                        len: slice as usize,
+                        src: Src::Disk {
+                            offset: *e as u64 * slice,
+                        },
+                    });
+                }
+            }
         }
     }
 
@@ -1096,7 +1230,12 @@ fn read_expert_slices(
                 scope.spawn(move || {
                     let mut copied = 0usize;
                     for (job, dst) in work {
-                        copied += model.read_range_into(&names[job.name], job.offset, dst)?;
+                        match &job.src {
+                            Src::Disk { offset } => {
+                                copied += model.read_range_into(&names[job.name], *offset, dst)?;
+                            }
+                            Src::Memory(bytes) => dst.copy_from_slice(bytes),
+                        }
                     }
                     Ok::<usize, crate::ArchError>(copied)
                 })
@@ -1108,12 +1247,24 @@ fn read_expert_slices(
             .sum::<Result<usize>>()
     })?;
 
+    // Offer what was actually read. The slices sit in the packed buffer in the
+    // order of `unique`, so a miss's span is found from its position, and
+    // `offer` copies only if it decides to keep — which past warm-up is rare.
+    if let Some(c) = cache {
+        let mut c = c.lock().expect("expert cache");
+        for (n, p, key) in misses {
+            let slice = buffers[n].0.len() / unique.len();
+            c.offer(key, &buffers[n].0[p * slice..(p + 1) * slice]);
+        }
+    }
+
     if std::env::var("BIGTEA_IO_TIMING").is_ok() {
         eprintln!(
-            "    io {} tensors x {} slices: {:.2}% copied",
+            "    io {} tensors x {} slices: {:.2}% copied, {:.0} MiB from cache",
             names.len(),
             unique.len(),
-            copied as f64 / total.max(1) as f64 * 100.0
+            copied as f64 / total.max(1) as f64 * 100.0,
+            hit_bytes as f64 / (1 << 20) as f64,
         );
     }
     Ok((buffers, total))
@@ -1181,13 +1332,23 @@ fn ffn<'c>(
         .iter()
         .map(|e| unique.iter().position(|u| u == e).expect("in set") as i32)
         .collect();
+    // How many of this block's tokens chose each unique expert. Reads are
+    // deduplicated, so without this the cache cannot tell a hot expert from a
+    // cold one — see `ExpertCache::request`.
+    let mut selections = vec![0u32; unique.len()];
+    for e in ids {
+        if let Ok(p) = unique.binary_search(e) {
+            selections[p] += 1;
+        }
+    }
     let mut dims_of = std::collections::HashMap::new();
     let t_exp = std::time::Instant::now();
     let names: Vec<String> = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
         .iter()
         .map(|s| format!("blk.{il}.{s}.weight"))
         .collect();
-    let (buffers, exp_bytes) = read_expert_slices(model, &names, &unique)?;
+    let (buffers, exp_bytes) =
+        read_expert_slices(model, &names, &unique, &selections, il, fw.cache.as_ref())?;
     for ((suffix, name), (buf, dims)) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
         .iter()
         .zip(&names)
@@ -1459,9 +1620,83 @@ pub fn head(fw: &Deepseek4Forward<'_>, streams: &[f32], arena: usize) -> Result<
 
 /// Prefill: every block in order, then the head. Returns one logit per token id.
 pub fn prefill(fw: &Deepseek4Forward<'_>, tokens: &[i32], arena: usize) -> Result<Vec<f32>> {
+    // `attention` builds one F16 cache of `kv_lora_rank * N_KV` and indexes it by
+    // absolute position, so a longer sequence used to run for eight seconds and
+    // then panic on a slice range. Refuse it here, before any weight is read,
+    // with a message that says what the limit is and why.
+    if tokens.len() > N_KV as usize {
+        return Err(crate::ArchError::ContextTooLong {
+            tokens: tokens.len(),
+            limit: N_KV as usize,
+        });
+    }
     let mut streams = block(fw, 0, tokens, None, arena)?;
     for il in 1..fw.config.n_layer {
         streams = block(fw, il, tokens, Some(&streams), arena)?;
     }
     head(fw, &streams, arena)
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::{pool_passes, record_into};
+
+    /// Selections land in the newest pass, and pooling sums every pass.
+    ///
+    /// Pooling is what the printed report uses, and getting it wrong would look
+    /// like a routing finding rather than a bug.
+    #[test]
+    fn passes_are_counted_separately_and_pool_correctly() {
+        let mut log = vec![Vec::new()];
+        record_into(&mut log, 0, 4, &[1, 1, 2]);
+        log.push(Vec::new());
+        record_into(&mut log, 0, 4, &[2, 3]);
+
+        assert_eq!(log[0][0], vec![0, 2, 1, 0], "pass 0 keeps only its own");
+        assert_eq!(log[1][0], vec![0, 0, 1, 1], "pass 1 starts from zero");
+        assert_eq!(pool_passes(&log)[0], vec![0, 2, 2, 1]);
+    }
+
+    /// The property R0.1 rests on: because the model is causal, a later pass
+    /// re-counts every earlier token, so `pass[k] - pass[k-1]` is exactly the
+    /// token generated in between. A regression that carried counts forward, or
+    /// reset them, would break the subtraction silently — the deltas would still
+    /// be numbers, just the wrong ones.
+    #[test]
+    fn later_pass_minus_earlier_is_the_new_token() {
+        let prompt = [3i32, 7, 3];
+        let generated = [5i32];
+
+        let mut log = vec![Vec::new()];
+        record_into(&mut log, 0, 8, &prompt);
+        log.push(Vec::new());
+        record_into(&mut log, 0, 8, &prompt); // the re-prefill
+        record_into(&mut log, 0, 8, &generated);
+
+        let delta: Vec<i64> = log[1][0]
+            .iter()
+            .zip(&log[0][0])
+            .map(|(b, a)| i64::from(*b) - i64::from(*a))
+            .collect();
+        assert!(
+            delta.iter().all(|d| *d >= 0),
+            "a delta must never go negative"
+        );
+        assert_eq!(delta.iter().sum::<i64>(), generated.len() as i64);
+        assert_eq!(delta[5], 1, "the delta is the generated token alone");
+    }
+
+    /// A layer never selected leaves no row, and pooling must not invent one.
+    #[test]
+    fn pooling_tolerates_ragged_passes() {
+        let mut log = vec![Vec::new()];
+        record_into(&mut log, 2, 4, &[0]);
+        log.push(Vec::new());
+        record_into(&mut log, 0, 4, &[1]);
+
+        let pooled = pool_passes(&log);
+        assert_eq!(pooled.len(), 3);
+        assert_eq!(pooled[0], vec![0, 1, 0, 0]);
+        assert_eq!(pooled[2], vec![1, 0, 0, 0]);
+    }
 }

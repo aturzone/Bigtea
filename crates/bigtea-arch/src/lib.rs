@@ -15,12 +15,14 @@
 
 mod deepseek4;
 mod deepseek4_forward;
+mod expert_cache;
 mod kv;
 mod qwen3;
 mod stream;
 
 pub use deepseek4::{AttentionKind, Deepseek4Config, Deepseek4Model};
-pub use deepseek4_forward::{prefill, routing_report, Deepseek4Forward};
+pub use deepseek4_forward::{prefill, routing_next_pass, routing_report, Deepseek4Forward};
+pub use expert_cache::{CacheStats, ExpertCache};
 pub use kv::{KvCache, KvError};
 pub use qwen3::{Qwen3Config, Qwen3Model};
 pub use stream::{StreamStats, StreamingRunner};
@@ -39,6 +41,11 @@ pub enum ArchError {
     Ggml(bigtea_ggml::GgmlError),
     /// The KV cache rejected an append — see [`kv::KvError`].
     Kv(kv::KvError),
+    /// More tokens than the attention window this architecture can hold.
+    ContextTooLong {
+        tokens: usize,
+        limit: usize,
+    },
 }
 
 impl fmt::Display for ArchError {
@@ -53,6 +60,13 @@ impl fmt::Display for ArchError {
             ArchError::Model(e) => write!(f, "{e}"),
             ArchError::Ggml(e) => write!(f, "{e}"),
             ArchError::Kv(e) => write!(f, "{e}"),
+            ArchError::ContextTooLong { tokens, limit } => write!(
+                f,
+                "prompt is {tokens} tokens; this path holds {limit}. \
+                 DeepSeek-V4-Flash builds its attention cache for the whole \
+                 sequence at once, so {limit} is the ceiling until the KV cache \
+                 lands. Shorten the prompt, or use -f with a smaller file."
+            ),
         }
     }
 }

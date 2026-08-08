@@ -1,5 +1,9 @@
 # Bigtea — a runner for models larger than RAM
 
+> **Read `STATUS.md` first.** It is the canonical statement of where the project
+> is, the honest scoreboard, and what remains in order. Update it in the same
+> commit as anything that moves a number or closes a task.
+
 - **What it is**: a Rust inference runner whose job is running models that do *not* fit in memory. Keeps the always-read weights resident, streams routed experts from disk per token. Borrows `ggml` for arithmetic; owns memory, residency, streaming, and the token loop.
 - **Proven**: Qwen3-30B-A3B (17.28 GiB container) generates correct text on a 15.7 GiB machine holding 0.93 GiB resident + a 6.26 GiB expert cache.
 - **Prefill beats llama.cpp** at 565 (27.6 vs 23.6) and 2206 tokens (36.6 vs 33.6), and matches it at 4395 and 8775; `-b 4096` gives 43.6 vs 40.3. **Generation is still ~2x behind** (1.07 vs 2.16) — do not claim otherwise. llama.cpp also runs the 144 GB V4-Flash once `--no-repack` is passed, so "larger than RAM" is not a differentiator. Full ladder, retracted claims, and one experiment that failed: `docs/graph/research/head-to-head-llamacpp-2026-08-05.md`.
@@ -10,7 +14,7 @@
 ```
 # ggml must be built first; point GGML_LIB_DIR at ggml-base.a, ggml-cpu.a, ggml.a
 export GGML_LIB_DIR=C:/Projects/llamacpp-unsloth/build/ggml/src   # PowerShell: $env:GGML_LIB_DIR=...
-cargo test --release          # 153 tests (+12 container-backed, --ignored)
+cargo test --release          # 168 tests (+16 container-backed, --ignored)
 cargo build --release
 ./target/release/bigtea-run <model.gguf> "prompt" -n 16
 ./target/release/bigtea-probe --quick          # RAM/disk/GPU + what to close
@@ -35,6 +39,7 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 - **`compute(&t, 0)` runs on ONE thread** — the count is floored at 1, not defaulted to all cores. This silently ran every expert matmul single-threaded.
 - **Expert access is a cyclic scan, so recency-based caching is the worst policy available.** Layer 0 is always the oldest entry when layer 47 needs room. Frequency-gated admission took hit rate 17% → 70% at the same budget.
 - **Profile before optimising a streaming runner.** The largest cost in generation was memcpy — slices copied twice per use — not disk and not arithmetic. Nothing suggested it until it was timed.
+- **Expert reads are deduplicated per block across the whole batch.** A pass reads the *distinct* experts its tokens select, not one slice per selection (`read_expert_slices` takes `unique`). Measured distinct experts per layer per pass: **6 at one token (3.2 GiB), 39.7 at 17 tokens (21 GiB), 122.8 at 166 tokens (66 GiB)** — selections per layer grow 10x from 17 to 166 tokens while distinct reads only grow 3x. **So a cache's value depends on how many distinct experts a step touches, not on how skewed routing is**, and only a KV-cached single-token step is small enough for a few GiB to cover.
 - **A hot set scored on the prompt it was chosen from tells you nothing.** "64 experts absorb 97.8% of selections" was in-sample on one prompt; out of sample it is 53.7%, and 37.5% across subjects against 25% for caching at random. Always score a residency policy on data it did not see. Two matching controls are cheap and both were missing: a **uniform null at the same sample size** (with ~1000 draws over 256 experts, top-64 covers 41% by construction) and a **noise ceiling** (resample the same distribution — if cross-prompt sits below it, the divergence is real).
 - **Statistics computed over `bigtea-run`'s output double-count.** Regeneration is stateless, so every generated token re-runs prefill and the routing histogram counts the same prompt again: chi-square went 1282 → 5464 → 11469 for 1/4/8 tokens while coverage never moved. Capture with `-n 1`.
 - **Cache hit rate is not a success metric.** Past ~6 GiB the expert cache reaches 71% hits and is the *slowest* configuration measured: cached bytes get paged out, so a "hit" is a page fault wearing a disguise. Only tok/s at a stated footprint counts.

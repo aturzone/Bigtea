@@ -8,7 +8,37 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
-Planned, in the order the measurements justify — see
+### Corrected
+
+**The hot expert set is per-prompt, so it cannot be pinned.** v0.0.2's routing
+figures were all scored *in-sample on a single prompt*. Re-measured on eight
+prompts across four subjects, with the token-id-routed layers 0-2 excluded and a
+uniform-router null at matched sample size:
+
+| published in 0.0.2 | measured |
+|---|---|
+| top-64 = 97.8% of selections | **90.5%** in-sample, **53.7%** on a prompt the set was not chosen from |
+| 33.6 tok/s disk floor at 34.27 GiB | **1.60 tok/s** |
+| 20 tok/s needs a ~48 GiB desktop | unsupported — needs a 96.3% hit rate; a pinned cache gives 76.7% at 68.5 GiB |
+| chi-square 7805 | not a valid statistic — generation re-runs prefill per token, so the prompt was counted once per pass (1282 → 5464 → 11469 for 1, 4, 8 passes, with coverage unmoved) |
+
+The skew itself is real and reproduced on every prompt: top-8 of 256 takes
+34.6–52.0% of selections against a uniform null of 6.8–7.4%. What does not hold
+is *transfer* — across subjects a pinned hot set scores 37.5% against 25.0% for
+caching at random. See
+[`routing-skew-is-per-prompt-2026-08-08.md`](docs/graph/research/routing-skew-is-per-prompt-2026-08-08.md).
+
+### Added
+
+- `BIGTEA_ROUTING_DUMP=<path>` writes raw `pass,layer,expert,count` rows, so two
+  runs can be compared offline and passes are not conflated.
+- `tools/routing/` — the prompts, capture script and analysis behind the above.
+- `STATUS.md` — one canonical statement of where the project stands and what
+  remains, so any session can resume without reconstructing it.
+
+### Planned
+
+In the order the measurements justify — see
 [`docs/graph/backlog/lts-0-0-0.md`](docs/graph/backlog/lts-0-0-0.md):
 
 - KV cache for the DeepSeek-V4-Flash path — the only thing between us and a real
@@ -27,6 +57,10 @@ Planned, in the order the measurements justify — see
 ## [0.0.2] — 2026-08-07
 
 Findings, a retraction, and the measurement that changes the project's direction.
+
+> **⚠ Superseded 2026-08-08.** Every routing figure in this entry was scored
+> in-sample on one prompt and four of them are wrong — see **Corrected** under
+> [Unreleased](#unreleased). The entry is left as released rather than rewritten.
 
 ### Added
 

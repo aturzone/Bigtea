@@ -40,13 +40,31 @@ KS = (8, 16, 32, 64, 128)
 RNG = np.random.default_rng(20260808)
 
 
-def load(path):
-    """[layer, expert] counts, learned-gating layers only."""
+def load_passes(path):
+    """[pass, layer, expert] counts, learned-gating layers only.
+
+    Accepts both dump formats: `pass,layer,expert,count` from the current
+    binary, and the original `layer,expert,count`, which is read as one pass.
+    """
+    with open(path) as f:
+        cols = f.readline().strip().split(",")
     raw = np.loadtxt(path, delimiter=",", skiprows=1, dtype=np.int64)
-    n_layer = int(raw[:, 0].max()) + 1
-    m = np.zeros((n_layer, N_EXPERT), dtype=np.int64)
-    m[raw[:, 0], raw[:, 1]] = raw[:, 2]
-    return m[HASH_LAYERS:]
+    if cols[0] != "pass":
+        raw = np.column_stack([np.zeros(len(raw), dtype=np.int64), raw])
+    n_pass = int(raw[:, 0].max()) + 1
+    n_layer = int(raw[:, 1].max()) + 1
+    m = np.zeros((n_pass, n_layer, N_EXPERT), dtype=np.int64)
+    m[raw[:, 0], raw[:, 1], raw[:, 2]] = raw[:, 3]
+    return m[:, HASH_LAYERS:, :]
+
+
+def load(path):
+    """[layer, expert] counts pooled over passes, learned-gating layers only.
+
+    Pooling is right for *shares* — a repeated pass scales every bin alike — and
+    wrong for chi-square. Capture with `-n 1` for anything distributional.
+    """
+    return load_passes(path).sum(axis=0)
 
 
 def topk_mask(counts, k):

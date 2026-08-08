@@ -3595,3 +3595,99 @@ fn sparse_row_reads_versus_whole_slice() {
         whole / sparse
     );
 }
+
+/// **The expert cache must not change the answer.**
+///
+/// On this architecture a wrong cache does not fail — it returns fluent
+/// nonsense, exactly as a wrong tokenizer or a missing causal mask does. So the
+/// check is not "does it look right" but "is it the same, bit for bit, as the
+/// path already verified against llama.cpp".
+///
+/// Two prefills of the same tokens through one cache. The first populates it and
+/// the second must be served largely from memory — asserted, because a cache
+/// that silently never hits would pass an equality check trivially and prove
+/// nothing. Then both are compared to each other and to the oracle.
+#[test]
+#[ignore = "reads weights from a 144 GB container, 43 blocks, twice"]
+fn the_expert_cache_does_not_change_the_answer() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+    // Big enough to hold a 2-token pass's slices comfortably, so the second
+    // prefill is a near-total hit and the comparison is actually exercising the
+    // cached path rather than re-reading everything.
+    let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone()).with_expert_cache(4 << 30);
+
+    let cold = bigtea_arch::prefill(&fw, TOKENS_2, 1024 << 20).expect("cold prefill");
+    let (after_cold, _) = fw.cache_stats().expect("cache is on");
+    assert_eq!(after_cold.hits, 0, "nothing can hit on a cold cache");
+    assert!(after_cold.admissions > 0, "a cold pass must fill the cache");
+
+    let warm = bigtea_arch::prefill(&fw, TOKENS_2, 1024 << 20).expect("warm prefill");
+    let (after_warm, bytes) = fw.cache_stats().expect("cache is on");
+    assert!(
+        after_warm.hits > 0,
+        "the second pass hit nothing — the cache is not being consulted"
+    );
+    assert!(
+        bytes <= 4 << 30,
+        "the cache must stay inside the budget it was given, held {bytes} bytes"
+    );
+    eprintln!(
+        "  cache {:.1}% hits over both passes, {:.2} GiB resident",
+        after_warm.hit_rate() * 100.0,
+        bytes as f64 / (1u64 << 30) as f64
+    );
+
+    assert_eq!(
+        cold.len(),
+        warm.len(),
+        "both passes produce one logit per token id"
+    );
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+            .map(|(i, _)| i)
+            .expect("non-empty")
+    };
+    assert_eq!(
+        argmax(&cold),
+        argmax(&warm),
+        "the cache changed which token the model predicts"
+    );
+
+    // And still the oracle, so this cannot pass by both paths being wrong
+    // together.
+    let last = sums_2tok(config.n_layer);
+    assert_sum(
+        "cached result_output",
+        warm.iter().sum::<f32>(),
+        last.get("result_output"),
+    );
+}
+
+/// **Too long a prompt must fail with a message, not a panic.**
+///
+/// `attention` builds one F16 cache of `kv_lora_rank * N_KV` and indexes it by
+/// absolute position, so before this check a 388-token prompt read weights for
+/// eight seconds and then panicked with `range end index 198656 out of range
+/// for slice of length 131072`. That is 512 x 388 against 512 x 256 — arithmetic
+/// a user cannot be expected to do. The refusal happens before any weight is
+/// read, so it is also fast.
+#[test]
+#[ignore = "opens the 144 GB container (reads metadata only)"]
+fn a_prompt_longer_than_the_window_is_refused_not_a_panic() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+    let fw = bigtea_arch::Deepseek4Forward::new(&model, config);
+
+    let too_long: Vec<i32> = (0..400).map(|i| i % 1000).collect();
+    match bigtea_arch::prefill(&fw, &too_long, 1024 << 20) {
+        Err(bigtea_arch::ArchError::ContextTooLong { tokens, limit }) => {
+            assert_eq!(tokens, 400);
+            assert_eq!(limit, 256);
+        }
+        Err(other) => panic!("wrong error: {other}"),
+        Ok(_) => panic!("400 tokens should not have been accepted"),
+    }
+}
