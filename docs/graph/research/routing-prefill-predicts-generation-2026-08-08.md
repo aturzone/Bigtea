@@ -37,35 +37,41 @@ top-64 — and there is no decay: `code_a` drifts 82.5% → 86.8% across thirds,
 
 ### ⚠ That does not survive a longer horizon
 
-Re-measured over **46** generated tokens (17-token prompt, same method):
+Three runs. The third exists because the second changed two variables at once:
 
-| top-64 | frozen at the prompt | kept warming |
-|---|---:|---:|
-| 15 tokens, 166-token prompt | 86.3% | 87.0% |
-| **46 tokens, 17-token prompt** | **59.4%** | **81.7%** |
+| top-64 | prompt | generated | frozen | warming |
+|---|---:|---:|---:|---:|
+| a | 166 tok | 15 | **86.3%** | 87.0% |
+| b | 17 tok | 46 | 59.4% | 81.7% |
+| **c** | **166 tok** | **46** | **68.8%** | **75.8%** |
 
-A frozen set decays steadily — 85% on the first generated token to ~50% by the
-46th, first third 63.9% against last third 55.3% — while one that keeps warming
-holds at 81.7%. **Continuing to warm is worth 22 points, not 0.7.**
-
-So the earlier "fill it during prefill and leave it" was an artefact of a short
-horizon, and is withdrawn. **Keep warming.** The implementation already does —
-frequency-gated admission runs on every miss — so nothing changes in the code,
-only the claim.
-
-Two things confound the comparison and neither is resolved here: the longer run
-also has a *shorter prompt* (17 vs 166 tokens), so its frozen set is estimated
-from 102 selections per layer rather than 996 and starts weaker. Its `in-prompt`
-column reads 100.0% at top-64 for the same reason — a 17-token prompt touches
-only ~40 distinct experts per layer, so that column is saturated and means
-nothing. **What is solid is the direction: the frozen set decays and the warmed
-one does not.**
+Run **c** isolates the horizon: same prompt as **a**, three times the generation.
+Its first fifteen per-token values reproduce **a** exactly, which is the
+reproducibility check —
 
 ```
-per generated token, top-64 frozen
-code_a   78 74 85 89 87 90 88 93 90 88 82 85 89 90 87
-prose_a  90 88 85 88 86 87 86 82 85 83 86 86 87 86 82
+a  78 74 85 89 87 90 88 93 90 88 82 85 89 90 87
+c  78 74 85 89 87 90 88 93 90 88 82 85 89 90 87 | 90 88 80 84 84 79 70 70 82 58
+     47 40 44 42 47 38 37 48 41 40 52 55 35 52 44 49 60 81 80 77 77
 ```
+
+**The decay is the horizon, not the prompt.** Same prompt, frozen coverage falls
+86.3% → 68.8% as generation goes 15 → 46 tokens; first third 86.3%, last third
+55.2%. It is not monotonic — it holds above 80% for ~20 tokens, dips into the
+40s around tokens 25-40, then recovers to ~80, which looks like the answer moving
+through a different subject and coming back.
+
+**Warming helps, and how much depends on the prompt.** +7 points with a
+166-token prompt, +22 with a 17-token one — a long prompt gives a better starting
+estimate, so there is less for warming to add. Either way it never hurts.
+
+So R0.1's original "fill it during prefill and leave it" is **withdrawn**: it was
+true only for the first ~20 generated tokens. **Keep warming.** The
+implementation already does — frequency-gated admission runs on every miss — so
+this changes the claim, not the code.
+
+Run **b**'s `in-prompt` column reads 100.0% at top-64 and should be ignored: a
+17-token prompt touches only ~40 distinct experts per layer, so it is saturated.
 
 ## Method, and why the deltas are trustworthy
 
@@ -75,9 +81,12 @@ every pass containing it — which makes `pass[k] - pass[k-1]` **exactly** the
 routing of the one token generated in between.
 
 That property is asserted, not assumed. The analysis checks every delta is
-non-negative and sums to exactly `n_expert_used` per layer; a violation would
-mean a token's routing changed between passes and the subtraction is invalid. On
-both runs: **0 negative cells, 6.0 selections per layer per token.**
+non-negative and sums to exactly `n_expert_used` per layer; a violation means a
+token already in the sequence re-routed and the subtraction no longer isolates
+the new token. Three of the four runs are clean throughout — **0 negative cells,
+6.0 selections per layer per token**. The fourth violated it once, at 63 → 64
+tokens, and the tool now reports the churn and analyses the clean prefix instead
+of discarding the run. **The assertion is why that was noticed at all.**
 
 ```
 BIGTEA_ROUTING=1 BIGTEA_ROUTING_DUMP=gen/code_a.csv \
@@ -101,8 +110,10 @@ per token:
 | 17.13 GiB | 74.0 / 72.6% | 0.83 / 0.88 | 2.84 / 2.70 tok/s |
 | 34.27 GiB | 87.0 / 87.8% | 0.42 / 0.39 | 5.67 / 6.05 tok/s |
 
-`code_a / prose_a`. llama.cpp generates this model at **0.21–0.31 tok/s** on the
-same machine.
+`code_a / prose_a`, **at the 15-token horizon**. Over 46 generated tokens the
+warmed top-64 figure falls to 75.8%, which is 0.78 GiB/token and a 3.05 tok/s
+floor — still far above llama.cpp's measured **0.21–0.31 tok/s** on this machine,
+but plan with the longer number, not the shorter one.
 
 **⚠ These floors describe a KV-cached step, which does not exist yet.** They
 assume a token needs 6 experts per layer. Today a generated token re-runs prefill
@@ -128,15 +139,20 @@ to trust the old arithmetic.
   the dedup note above says it cannot pay until a step's working set shrinks to
   6 experts per layer. **R3 → R1 → R2**, in that order.
 - **Keep warming during generation.** Over 15 tokens it buys a point; over 46 it
-  buys 22, because a frozen set decays and a warmed one does not. The cache
-  already behaves this way.
+  buys **7** with a long prompt and **22** with a short one, because a frozen set
+  decays. The cache already behaves this way.
 - **Routing is not bitwise stable across sequence lengths.** At exactly one
   transition — 63 → 64 tokens — the net stayed at +6 selections per layer, so
   one token really was added, but **477 selections (~3%) of tokens already in
-  the sequence moved**. Every other transition had zero. That is the router's
-  top-6-of-256 flipping on near ties when ggml changes matmul blocking at a size
-  boundary: arithmetic, not causality. **Anything that assumes routing is
-  reproducible across batch shapes — a prefetcher, a replay, or R3's
+  the sequence moved**. The token-id-routed layers 0-2 were untouched, which is
+  what says it comes through attention rather than the router's input. Every
+  other transition in that run had zero.
+  **The obvious explanation is wrong.** "ggml re-blocks at multiples of 64" was
+  the first guess; run **c** above crosses 192 in 46 transitions with **zero**
+  negative cells, so whatever happens at 64 does not recur. The mechanism is
+  unidentified. What is established is the *fact*: near-ties in a top-6-of-256
+  selection can flip when the batch shape changes, so **anything assuming
+  reproducible routing across batch shapes — a prefetcher, a replay, or R3's
   equivalence test — must tolerate it.**
 - **R2.3's speculative prefetch is now sized**: prefetching block L+1 on the
   previous token's routing should hit at roughly this rate, because it is the

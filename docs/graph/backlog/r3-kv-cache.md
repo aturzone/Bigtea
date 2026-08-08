@@ -109,8 +109,10 @@ assert stepwise ~= full                             # argmax equal, sum within t
 **Do not assert bit-identical logits.** Measured 2026-08-08: at the 63 → 64
 token boundary the *existing* engine re-routes ~3% of selections that earlier
 tokens had already made — net stays at exactly +6 per layer, so no token was
-lost, but the router's top-6-of-256 flips on near ties when ggml changes matmul
-blocking at a size threshold. A KV-cached step computes attention with a
+lost, but near-ties in the top-6-of-256 flip when the batch shape changes. (It
+does not recur at 192, so it is not a simple multiple-of-64 blocking threshold;
+the mechanism is unidentified and does not need to be identified to plan around
+it.) A KV-cached step computes attention with a
 different batch shape than a full prefill by construction, so it will hit the
 same effect deliberately rather than incidentally. A test demanding equality
 would fail on correct code, and the natural reaction — loosening it until it

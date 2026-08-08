@@ -59,8 +59,9 @@ policy** is.
   what generation goes on to need** (86.3% on a code prompt, 85.9% on a prose
   one) — within ~4 points of an oracle and ~32 above the cross-prompt figure.
   This is what makes R1 worth building. **Over a longer horizon the cache must
-  keep warming**: across 46 generated tokens a frozen set decays to 59.4% while a
-  warmed one holds 81.7%, so R0.1's "fill it and leave it" is withdrawn.
+  keep warming**: with the same prompt, frozen coverage falls 86.3% → 68.8% as
+  generation goes 15 → 46 tokens, and warming recovers it to 75.8%. R0.1's
+  "fill it and leave it" is withdrawn — it held only for the first ~20 tokens.
 - **R1 built** (2026-08-08): frequency-gated expert cache wired into the
   deepseek4 path, sized from the probe, hit rate reported with footprint and
   tok/s. **But it cannot pay until R3 exists** — see the ordering note below.
