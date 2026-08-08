@@ -66,7 +66,7 @@ policy** is.
 
 | id | work | state | why it is next |
 |---|---|---|---|
-| **R3** | KV cache | **ready — DO THIS NEXT** | it is the unlock for everything else, not just a speed win. Generation re-runs the whole sequence per token, so 0.064 tok/s is an artefact; a single-token pass costs 4.0s. ~21.5 MiB of state for 43 layers. **Confirm the 256-token ceiling below first.** A wrong cache gives fluent nonsense, so it needs an oracle at two consecutive positions |
+| **R3** | KV cache | **ready — DO THIS NEXT**, fully scoped in `backlog/r3-kv-cache.md` | the unlock for everything else, not just a speed win. ~24 MB of state across **three** structures (the compressor ring is the one that is easy to miss). Verified without a new oracle: `prefill(0..n) then step(n)` must equal `prefill(0..=n)`, at 2, 5 and 165 tokens because each runs a different attention builder. Worth ~0.25 tok/s from the 4.0s single-token pass alone — parity — and it is what makes R1 pay |
 | **R1** | frequency-gated expert cache on the deepseek4 path | **built 2026-08-08, inert until R3** | implemented, tested against the oracle, sized from the probe, `--cache <GiB>` now works on this path. Warms on the prompt, never pinned. Cannot pay while a pass still reads ~123 distinct experts per layer |
 | **R2** | overlap I/O with compute | ready, but smaller than it looks | per block it is ~53 ms read against ~23 ms compute, so the ceiling is ~1.4x — and all three expert tensors already read in one batched call, with everything after depending on them. Scoped against the code in the handoff |
 | **R4** | fit the always-read set | user-side | 7.38 GiB; needs ~10.5 GiB free. Worth 0.7s/token. The runner already names the processes to close |
