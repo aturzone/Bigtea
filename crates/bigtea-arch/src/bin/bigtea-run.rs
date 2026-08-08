@@ -263,7 +263,15 @@ fn run(
     if model.architecture() == "deepseek4" {
         println!("model      {} ({})", model.architecture(), model.io_mode());
         let tokenizer = Tokenizer::from_metadata(model.metadata())?;
-        run_deepseek4(&model, &tokenizer, prompt, n_predict, 1024, t0)?;
+        run_deepseek4(
+            &model,
+            &tokenizer,
+            prompt,
+            n_predict,
+            1024,
+            cache_budget,
+            t0,
+        )?;
         return Ok(());
     }
 
@@ -479,12 +487,14 @@ fn report_residency_shortfall(report: &bigtea_model::LoadReport, machine: &bigte
     let _ = machine;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_deepseek4(
     model: &Model,
     tokenizer: &Tokenizer,
     prompt: &str,
     n_predict: usize,
     arena_mib: usize,
+    expert_cache_budget: Option<u64>,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = bigtea_arch::Deepseek4Config::from_model(model)?;
@@ -521,7 +531,50 @@ fn run_deepseek4(
     let (resident, report) = ResidentSet::load(model, budget)?;
     println!("resident   {report}");
     report_residency_shortfall(&report, &machine);
-    let fw = bigtea_arch::Deepseek4Forward::new(model, config.clone()).with_resident(&resident);
+
+    // The expert cache is **off unless asked for**, and that default is measured
+    // rather than cautious.
+    //
+    // Expert reads are deduplicated per block across the batch, so a pass reads
+    // the *distinct* experts its tokens select: 6 per layer at one token, but
+    // 39.7 at 17 tokens and 122.8 at 166 — about 66 GiB in a single pass. The
+    // RAM left on this machine after the 7.38 GiB always-read set is ~1.5 GiB,
+    // which is 2% of that, and 2% is what it returned:
+    //
+    //     17 tokens,  1.51 GiB cache -> 4.1% hits, 0.049 -> 0.050 tok/s
+    //     166 tokens, 1.75 GiB cache -> 1.9% hits, 0.015 -> 0.015 tok/s
+    //     166-token prefill          -> 64.5s -> 75.3s, 17% SLOWER
+    //
+    // The slowdown is the admission copies, paid on every miss that gets kept.
+    // So on today's engine the cache is a regression, and turning it on by
+    // default would ship one.
+    //
+    // It becomes worth having the moment a step stops re-reading the whole
+    // sequence — a KV-cached token needs 6 experts per layer, 3.21 GiB, and R0.1
+    // measured that a set warmed on the prompt covers 86% of what generation
+    // then asks for. **The cache is not wrong; it is early.**
+    //
+    // Nothing is ever pre-loaded: R0 measured a hot set chosen in advance
+    // covering 37.5% of an unseen subject against 25% for caching at random.
+    // And the cache owns its memory, because past ~6 GiB on Qwen3 a 71%-hit
+    // cache backed by the page cache was the *slowest* configuration measured.
+    let mut fw = bigtea_arch::Deepseek4Forward::new(model, config.clone()).with_resident(&resident);
+    let expert_budget = expert_cache_budget.unwrap_or(0);
+    if expert_budget > 0 {
+        fw = fw.with_expert_cache(expert_budget as usize);
+        println!(
+            "cache      {:.2} GiB for routed experts, warmed from the prompt (not pinned)",
+            expert_budget as f64 / GIB
+        );
+    } else {
+        println!(
+            "cache      off — a pass reads ~123 distinct experts per layer (~66 GiB);\n\
+             cache      measured 1.9-4.1% hits and a 17% slower prefill at the sizes\n\
+             cache      this machine can spare. Worth turning on once the KV cache\n\
+             cache      lands. --cache <GiB> forces it."
+        );
+    }
+    let fw = fw;
     if !fw.indexer_is_exact(tokens.len()) {
         // Below this length skipping the indexer is exact; above it, it is not.
         println!(
@@ -565,6 +618,10 @@ fn run_deepseek4(
     let mut generated = 0usize;
     while generated + 1 < n_predict {
         seq.push(next);
+        // Each iteration is a fresh pass over the whole sequence. Telling the
+        // routing histogram so keeps the prompt from being counted again per
+        // token — and makes the per-pass difference a single token's routing.
+        bigtea_arch::routing_next_pass();
         let logits = bigtea_arch::prefill(&fw, &seq, arena_mib << 20)?;
         next = argmax(&logits)?;
         generated += 1;
@@ -575,7 +632,25 @@ fn run_deepseek4(
 
     // 137 GiB of routed experts, if the router spreads evenly. If it does not,
     // the hot set is cacheable and every byte-per-token figure changes.
-    bigtea_arch::routing_report(137.06);
+    bigtea_arch::routing_report(137.06, fw.config().hash_layer_count);
+
+    // Hit rate is reported **with** footprint and next to tok/s below, never
+    // alone. This project has measured a 71%-hit cache being the slowest
+    // configuration it had, because the cached bytes were being paged out — so a
+    // hit rate on its own is not evidence of anything.
+    if let Some((stats, bytes)) = fw.cache_stats() {
+        println!(
+            "cache      {:.1}% hits ({} of {}), {:.2} GiB resident of {:.2} GiB, \
+             {} evictions, {:.1} GiB not read",
+            stats.hit_rate() * 100.0,
+            stats.hits,
+            stats.hits + stats.misses,
+            bytes as f64 / GIB,
+            expert_budget as f64 / GIB,
+            stats.evictions,
+            stats.bytes_saved as f64 / GIB,
+        );
+    }
 
     if generated > 0 {
         let secs = t_gen.elapsed().as_secs_f64();

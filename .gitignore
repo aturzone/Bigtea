@@ -29,6 +29,9 @@ venv/
 # Node
 node_modules/
 
+# Routing captures — regenerate with tools/routing/capture.sh
+tools/routing/captures/
+
 # Junk
 *.log
 .DS_Store

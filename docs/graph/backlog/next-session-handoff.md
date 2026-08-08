@@ -61,29 +61,72 @@ what we manage today.
 
 ## Remaining work, in the order the measurements justify
 
-### R0 — Re-measure the skew before building anything on it  *(one day, blocks R1)*
+### R0 — Re-measure the skew before building anything on it  ✅ **DONE 2026-08-08**
 
-The skew is from **one coding prompt**. Far too large to be noise, but the
-*shape* may be prompt-dependent.
+Answered on eight prompts across four subjects:
+`../research/routing-skew-is-per-prompt-2026-08-08.md`.
 
-- Several prompts across different domains (code, prose, maths, another language)
-- **Exclude layers 0-2**: they route by token id via `ffn_gate_tid2eid`, not by
-  learned gating, so their skew reflects the token distribution
-- The question to answer: **is the hot set global or per-prompt?** Global → pin
-  it. Per-prompt → warm it adaptively, which is a harder design.
-- `BIGTEA_ROUTING=1` already prints the histogram.
+**The hot set is per-prompt. Warm it adaptively; do not pin it.**
 
-### R1 — Frequency-gated expert cache on the V4-Flash path  *(the big one)*
+- The skew is real — top-8 takes 5-7x what a uniform router would at the same
+  sample size, on every prompt.
+- But out-of-sample it collapses: a top-64 set pinned from one prompt covers
+  **61.3%** of another on the same subject and **37.5%** across subjects, against
+  **25.0%** for a *random* cache. Sampling noise costs under 2 points, so this is
+  real divergence.
+- Subject matters more than language: a Persian *coding* prompt routes like the
+  English coding prompts, not like Persian prose.
+- **Three v0.0.2 numbers are corrected**, including the 33.6 tok/s disk floor
+  (actually 1.60) and the "~48 GiB desktop" claim (unsupported). See the
+  correction block on `routing-skew-changes-everything.md`.
+- Tooling is committed: `tools/routing/capture.sh` + `analyse.py`,
+  and `BIGTEA_ROUTING_DUMP=<path>` writes raw per-layer counts.
 
-The policy already exists in `stream.rs` for Qwen3, where it took hit rate 17% →
-70%. It has **never been wired into the deepseek4 path**.
+### R0.1 — Does prompt routing predict *generated*-token routing?  ✅ **DONE 2026-08-08 — yes**
 
-- Size it from `bigtea-probe`, not a constant
-- **The cache must own its memory.** This project has already measured that past
-  ~6 GiB on Qwen3 a 71%-hit cache was the *slowest* configuration, because cached
-  bytes got paged out and a "hit" became a page fault in disguise. That is
-  exactly why an mmap-based engine cannot do this and Bigtea can.
-- Report hit rate **next to** tok/s and footprint, never instead of them
+`../research/routing-prefill-predicts-generation-2026-08-08.md`.
+
+A top-64 set taken from the prompt alone covers **86.3%** of the routing of the
+tokens generated after it — against a 90.8% in-prompt oracle and R0's 53.7%
+cross-prompt figure. **The regime a cache actually operates in is the favourable
+one, and R1 lands near the top of its range, not the bottom.**
+
+- **Fill the cache during prefill and leave it.** Continuing to warm during
+  generation is worth 0.7 points (87.0% vs 86.3%) — not worth the complexity.
+- **No decay** over 15 generated tokens; it drifts slightly *up*.
+- Projected disk floor on this laptop's reachable 4.28 GiB tier: **~1.3 tok/s
+  against llama.cpp's measured 0.21–0.31.**
+- Method: passes are kept apart in the dump, and because the model is causal
+  `pass[k] - pass[k-1]` is exactly one generated token's routing. The analysis
+  asserts every delta is non-negative and sums to 6 per layer.
+
+### R1 — Frequency-gated expert cache  ✅ **BUILT 2026-08-08, and it is early, not wrong**
+
+`../research/expert-cache-is-early-not-wrong-2026-08-08.md`.
+
+Built, verified against the llama.cpp oracle, **off by default** — because
+measured on today's engine it is a regression:
+
+| run | cache | hit rate | prefill | generation |
+|---|---|---:|---:|---:|
+| 17 tokens | none | — | 18.2s | 0.049 tok/s |
+| 17 tokens | 1.51 GiB | 4.1% | 19.3s | 0.050 tok/s |
+| 166 tokens | none | — | **64.5s** | 0.015 tok/s |
+| 166 tokens | 1.75 GiB | 1.9% | **75.3s** | 0.015 tok/s |
+
+Both pairs produced **identical text**, so the cache is correct. It simply has
+nothing to cache: a pass reads the *distinct* experts its tokens select, which is
+**122.8 per layer, ~66 GiB** at 166 tokens, and 1.75 GiB is 2% of that. The 17%
+slower prefill is the admission copy.
+
+**It inverts the moment R3 lands** — a KV-cached step needs 6 experts per layer,
+3.21 GiB, and R0.1 measured a prompt-warmed set covering 86% of it. Nothing about
+the cache needs changing; the thing it feeds on does not exist yet.
+
+Already handled inside it: sized from `--cache`/the probe, never pre-loaded,
+owns its memory, frequency weighted **by selections rather than requests**
+(reads are deduplicated, so unweighted counts tie and the cache freezes), and hit
+rate reported beside footprint and tok/s.
 
 ### R2 — Overlap I/O with compute
 
@@ -98,7 +141,76 @@ waits, computes, reads: measured **2.3s I/O + 1.0s compute, strictly serial**.
 - **R2.3** Layers 3-42: prefetch on the previous token's routing. A miss costs a
   wasted read, not a wrong answer.
 
-### R3 — KV cache
+**Scoped against the code, 2026-08-08** — read before estimating this.
+
+Per block the split is roughly **53 ms of read against 23 ms of compute**
+(2.3s and 1.0s over 43 blocks), so reads dominate and the ceiling on perfect
+overlap within a block is ~1.4x, not 2x.
+
+The awkward part is that **there is almost nothing to overlap with.** All three
+expert tensors are already read in *one* batched parallel call —
+`read_expert_slices` at `deepseek4_forward.rs:1262`, four readers, and batching
+them together was itself a win (`d242f1c`). Everything after that read depends on
+the weights it returns, and the next block's attention depends on this block's
+FFN output, so there is no independent work sitting idle.
+
+That leaves exactly three seams, in order of confidence:
+
+- **R2.1** is real but smaller than it sounds. `down` is not consumed until
+  `deepseek4_forward.rs:1333`, after `gate` (1298), `up` (1300) and `swiglu`
+  (1302). So `down`'s third of the bytes can stream behind roughly half the
+  block's compute — perhaps 10 ms of 53. **Caution: splitting one 3-tensor batch
+  into two smaller ones may cost more read throughput than the overlap gains.**
+  `0fd2036` already recorded parallel expert reads winning 1.25x in isolation and
+  *losing* in the runner. Measure the split before building on it.
+- **R2.2** needs `ffn_gate_tid2eid` looked up for the whole sequence up front,
+  which is a table read — cheap, exact, and it proves the prefetch machinery on
+  3 of 43 blocks.
+- **R2.3** is where the real bytes are (40 of 43 blocks) and it is speculative.
+  **Its hit rate is exactly what R0.1 measures**, so do not size it before R0.1
+  reports.
+
+**Do R3 first.** The KV cache removes whole passes rather than overlapping one,
+and 0.064 tok/s is an artefact of re-running the sequence per token.
+
+### R3 — KV cache  *(now the critical path)*
+
+**Scoped against the code, 2026-08-08.**
+
+State to keep, from the config rather than guessed: `kv_lora_rank` 512,
+`N_KV` 256, `sliding_window` 128, `CSA_RATIO` 4, 43 layers. The KV is a low-rank
+latent, so a position costs 512 F16 values:
+
+```
+43 layers x (256 raw + 256 compressed) x 512 x 2 B = 21.5 MiB
+```
+
+Today `attention()` rebuilds that F16 cache **from scratch every pass**
+(`deepseek4_forward.rs:898`), converting the whole sequence's `kv_full` each
+time. The cached version appends one position instead.
+
+Three traps, all of which give fluent nonsense rather than an error:
+
+- **Slot index is currently the absolute position.** The mask loop compares
+  `key > query` and `query - key >= window` with `key` indexing the raw cache
+  directly. Any ring buffer or window slide breaks that identity, and the mask
+  must be rewritten in the same change, not after.
+- **RoPE is applied at the absolute position** before the value enters the
+  cache, so cached entries must never be re-rotated — but a wrap changes which
+  slot holds which position.
+- **The compressor works on blocks of `CSA_RATIO` = 4.** A generated token
+  usually does *not* complete a block, so the compressed half updates on one
+  step in four. Getting that cadence wrong is invisible at short lengths.
+
+**⚠ 256-token ceiling — CONFIRMED 2026-08-08.** A 388-token prompt read weights
+for eight seconds and then panicked: `range end index 198656 out of range for
+slice of length 131072`, which is 512 x 388 against 512 x 256. **V4-Flash's
+usable context today is 256 tokens**, and the long-context prefill figures in the
+docs are Qwen3-only. `prefill` now refuses over-long prompts before reading
+anything (`ArchError::ContextTooLong`), with a container test. **Lifting the
+ceiling is part of this ticket** — it is the same allocation.
+
+### R3 — KV cache, original notes
 
 Generation re-runs the whole sequence per token, so 0.064 tok/s is an artefact.
 **A single-token pass costs 4.0s** — that is what a cached step will cost.
@@ -141,25 +253,32 @@ that is now the whole problem — a much better problem than "read 64 GiB/s".
 
 Ideas, roughly by expected value:
 
-1. **Prune the model to its hot set.** The skew says 64 of 256 experts per layer
-   carry 97.8% of decisions. A container keeping only those is **34 GiB instead
-   of 144** and loses 2.2% of routing. That is an offline repack with tooling this
-   project already has, and it is a *shippable artefact* others could use. At Q2
-   it is ~17 GiB. **This is the single most promising item and it has no research
-   risk — only a quality measurement.**
+1. ~~**Prune the model to its hot set.**~~ **DEAD — R0 killed it, 2026-08-08.**
+   This was called the most promising item with no research risk. The premise was
+   that 64 of 256 experts per layer carry 97.8% of decisions, so a 34 GiB
+   container would lose 2.2% of routing. Measured **out of sample it loses 46%**:
+   a pinned global top-64 covers only 53.7% of an unseen prompt's selections. A
+   pruned container would route unseen prompts to experts it does not contain.
+   The 97.8% was in-sample on the one prompt the set was chosen from.
 2. **Two-tier precision.** Hot experts resident at 2-bit as a *predictor*, full
    precision fetched only when the router's weight for that expert is high. The
    top-1 expert carries most of the weight mass; the 5th and 6th contribute
    little and may tolerate low precision. Needs a quality measurement, not new
    theory.
-3. **Domain-specialised hot sets.** If R0 finds the hot set is prompt-dependent,
-   a *coding* hot set may be far smaller than a general one — and a coding agent
-   is the target use. A 4 GiB coding-specific cache could plausibly beat a 34 GiB
-   general one for that workload.
-4. **Use the 6 GB of VRAM as a second cache tier.** RTX 3050 at ~200 GB/s is 80x
-   this NVMe. 6 GB holds ~top-11 experts per layer ≈ 60% of selections. Combined
-   with RAM this is a genuine three-tier residency problem, and nothing in the
-   codebase touches the GPU yet.
+3. **Domain-specialised hot sets.** **R0 promoted this.** The hot set *is*
+   prompt-dependent, and subject drives it more than language — so a coding-only
+   hot set is the right shape, and a coding agent is the target use. Measured:
+   within-subject transfer is 61.3% at top-64 against 37.5% across subjects. Two
+   coding prompts is far too thin a base to size one from; that needs a proper
+   coding corpus.
+4. **Use the 6 GB of VRAM as a second cache tier.** RTX 3050, 5682 MiB free
+   measured. One expert index across all 43 layers is 0.535 GiB, so ~5.1 GiB
+   usable holds **~9-10 indices**. **R0 caveat: it must be warmed, not pinned** —
+   pinned it inherits the 37.5% cross-subject figure, barely above a random 25%.
+   Three blockers before any of this is testable: no CUDA toolkit on this machine,
+   the linked ggml has no CUDA backend built, and Bigtea's zero-copy weight
+   binding hands ggml a host pointer, which a device tier cannot do. Nothing in
+   the codebase touches the GPU today — `bigtea-probe` only detects it.
 5. **Speculative decoding**, ~2.2x, proven, independent of all the above, needs a
    draft model sharing V4-Flash's tokenizer.
 6. **Not this**: contextual sparsity. Measured dead — V4-Flash's experts are 9.1%

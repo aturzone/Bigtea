@@ -71,6 +71,24 @@ fn report_budget(model: &Model, ram_gib: f64, dense: u64, per_token: u64) {
         );
     }
 
+    // What the arithmetic above assumes, and where this engine does not yet
+    // deliver it. `per_token` is one token's expert working set — i.e. the cost
+    // of a **KV-cached** step. The deepseek4 path has no KV cache: every
+    // generated token re-runs prefill over the whole sequence, and because
+    // expert reads are deduplicated per block the real cost scales with the
+    // *distinct* experts the sequence selects (measured: 6 per layer at one
+    // token, 122.8 at 166). Quoting the figures above as generation speed would
+    // overstate this path by more than an order of magnitude.
+    if model.architecture() == "deepseek4" {
+        println!(
+            "\n  NOTE  read/token above is one token's working set — the cost of a\n  \
+             NOTE  KV-cached step. This path has no KV cache yet: each generated\n  \
+             NOTE  token re-runs the whole sequence, so real generation is far\n  \
+             NOTE  slower. It is also capped at 256 prompt tokens today, so the\n  \
+             NOTE  larger contexts above are what the weights allow, not the runner."
+        );
+    }
+
     let max_ctx = max_context_for_budget(&shape, ram, dense, KV_BYTES_F16);
     if max_ctx > 0 {
         println!("\n  longest context with all dense weights resident: {max_ctx} tokens");

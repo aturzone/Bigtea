@@ -10,10 +10,14 @@
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue"></a>
   <a href="#building"><img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-informational"></a>
   <a href="https://github.com/aturzone/Bigtea/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aturzone/Bigtea/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-157%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-168%20passing-brightgreen">
 </p>
 
 ---
+
+> **[STATUS.md](STATUS.md)** is the current state of the project in one page —
+> the honest scoreboard against llama.cpp, what works, the known limitations, and
+> what is being worked on next. Read it before quoting any number from here.
 
 Bigtea runs a **144 GB** Mixture-of-Experts model on a **15.7 GiB** laptop, on CPU,
 and produces correct text. It does that by never loading the model: the weights
@@ -97,10 +101,11 @@ not built yet.
 | | |
 |---|---|
 | ✅ Runs models several times larger than RAM, on CPU | Qwen3-30B-A3B (17.28 GiB) and DeepSeek-V4-Flash (144 GB) both on a 15.7 GiB machine |
-| ✅ Correct output, verified against llama.cpp | 157 unit tests + 16 container-backed tests |
+| ✅ Correct output, verified against llama.cpp | 168 unit tests + 16 container-backed tests |
 | ✅ Cache-bypassing direct I/O with zero-copy expert reads | |
 | ✅ Honest reporting of residency, throughput and shortfalls | |
 | ⚠️ **Generation is slow** | see above — no KV cache yet on the V4-Flash path |
+| ⚠️ **V4-Flash is limited to 256 prompt tokens** | it builds its attention cache for the whole sequence at once; longer prompts are refused with a message. Lifting this is part of the KV-cache work |
 | ❌ No model downloader | you bring your own `.gguf` |
 | ❌ No server / API | no OpenAI-compatible endpoint yet |
 | ⚠️ **Linux and macOS build and pass tests in CI** | but no model has been *run* there yet, and macOS falls back to buffered I/O (`F_NOCACHE` is not wired up) |
@@ -164,6 +169,14 @@ cargo build --release
 ```
 
 If linking fails with `cannot find -lgomp`, MSYS2's `mingw64/bin` is not on PATH.
+Note that Git Bash has its own `/mingw64` which is **not** MSYS2's and has no
+`gcc` — check with `which gcc`.
+
+**MSYS2 is needed to build, not to run.** On Windows the GNU C++ and OpenMP
+runtimes are linked statically, so the resulting `.exe` depends only on system
+DLLs and runs on a machine that has never seen MSYS2. Linked dynamically it did
+not: Windows killed it with `0xC0000135` (STATUS_DLL_NOT_FOUND) before `main`,
+printing nothing at all. Costs ~0.7 MB.
 
 Smart App Control may block freshly built unsigned binaries. `[[bin]]` targets in
 this workspace set `test = false` so cargo does not build empty test harnesses

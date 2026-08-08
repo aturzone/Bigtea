@@ -1,8 +1,34 @@
 ---
 topic: V4-Flash's router is violently skewed — 25% of experts serve 97.8% of tokens, and that makes 20 tok/s reachable
-status: open
-links: [v4flash-vs-llamacpp-2026-08-07.md, v4flash-28-tokens-per-second.md, roadmap-after-v0.0.1.md]
+status: superseded
+links: [routing-skew-is-per-prompt-2026-08-08.md, v4flash-vs-llamacpp-2026-08-07.md, v4flash-28-tokens-per-second.md, roadmap-after-v0.0.1.md]
 ---
+
+## ⚠ CORRECTION BLOCK, 2026-08-08 — read before citing anything below
+
+R0 re-measured this on **eight** prompts across four subjects instead of one.
+Full node: `routing-skew-is-per-prompt-2026-08-08.md`.
+
+**What survives.** The router really is skewed. Top-8 of 256 takes 34.6-52.0% of
+selections against a uniform-router null of 6.8-7.4% at the same sample size —
+5 to 7x. That finding is solid and reproduced on every prompt.
+
+**What does not.**
+
+| published below | measured on eight prompts |
+|---|---|
+| top-64 = **97.8%** | **90.5%** in-sample, and only **53.7%** on a prompt the set was not chosen from |
+| chi-square **7805** | not a valid statistic — `bigtea-run` regenerates statelessly, so each generated token re-counts the whole prompt. Measured: 1282 → 5464 → 11469 for 1, 4, 8 passes of one prompt, with coverage unchanged |
+| 34.27 GiB → **33.6 tok/s** disk floor | **1.60 tok/s** at the same size, because the hot set does not transfer between prompts |
+| 20 tok/s needs a **~48 GiB desktop** | unsupported. 96.3% hit rate needed; a pinned cache gives 76.7% at 68.5 GiB |
+
+**The error.** Every number below was scored **in-sample on one prompt**. A cache
+is pinned before the prompt arrives, so the honest metric is coverage of a prompt
+the hot set was not built from. Across subjects that is 37.5%, against 25.0% for
+a *random* cache. The hot set is per-prompt, so it must be warmed, not pinned.
+
+The tables below are left unedited because the arithmetic is correct given its
+input; the input was one in-sample measurement, and that is the whole lesson.
 
 ## The measurement
 
