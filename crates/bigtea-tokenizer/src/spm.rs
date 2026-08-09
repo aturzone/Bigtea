@@ -134,9 +134,9 @@ pub fn encode(
     let piece = |s: &Symbol| &text[s.start..s.start + s.len];
     let mut queue = std::collections::BinaryHeap::new();
     let push = |queue: &mut std::collections::BinaryHeap<Bigram>,
-                    symbols: &[Symbol],
-                    left: i32,
-                    right: i32| {
+                symbols: &[Symbol],
+                left: i32,
+                right: i32| {
         if left == -1 || right == -1 {
             return;
         }

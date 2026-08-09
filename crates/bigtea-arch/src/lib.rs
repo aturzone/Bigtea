@@ -18,6 +18,7 @@ mod deepseek4_forward;
 mod expert_cache;
 mod kv;
 mod qwen3;
+pub mod sample;
 pub mod spectrum;
 mod stream;
 
@@ -29,6 +30,7 @@ pub use deepseek4_forward::{
 pub use expert_cache::{CacheStats, ExpertCache};
 pub use kv::{KvCache, KvError};
 pub use qwen3::{Qwen3Config, Qwen3Model};
+pub use sample::{Sampler, SamplerConfig};
 pub use stream::{StreamStats, StreamingRunner};
 
 use std::fmt;

@@ -7,7 +7,7 @@
 
 use std::process::ExitCode;
 
-use bigtea_arch::{KvCache, Qwen3Config, Qwen3Model};
+use bigtea_arch::{KvCache, Qwen3Config, Qwen3Model, Sampler, SamplerConfig};
 use bigtea_ggml::{Context, WeightSet};
 use bigtea_model::{Model, ResidentSet};
 use bigtea_tokenizer::Tokenizer;
@@ -61,7 +61,20 @@ impl TokenWriter {
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: bigtea-run <model.gguf> \"prompt\" [-n tokens]");
+        eprintln!("usage: bigtea-run <model.gguf> \"prompt\" [options]");
+        eprintln!();
+        eprintln!("  -n N                tokens to generate");
+        eprintln!("  -f FILE             read the prompt from a file");
+        eprintln!("  -b N                prefill block size");
+        eprintln!("  --cache GIB         expert cache budget");
+        eprintln!("  --temp T            0 = greedy (default)");
+        eprintln!("  --top-k K           0 = off");
+        eprintln!("  --top-p P           1.0 = off");
+        eprintln!("  --min-p P           0.0 = off");
+        eprintln!("  --repeat-penalty R  1.0 = off");
+        eprintln!("  --repeat-last-n N   penalty window (default 64)");
+        eprintln!("  --seed S            reproducible sampling");
+        eprintln!("  --llamacpp-defaults temp 0.8, top-k 40, top-p 0.95, min-p 0.05, repeat 1.1");
         return ExitCode::from(2);
     };
     let mut prompt = String::new();
@@ -73,6 +86,8 @@ fn main() -> ExitCode {
     // raises it when there is RAM to spare.
     let mut prefill_block = 2048usize;
     let mut cache_budget: Option<u64> = None;
+    // Greedy by default, so existing behaviour is unchanged until asked.
+    let mut sampler = SamplerConfig::default();
     let rest: Vec<String> = args.collect();
     let mut i = 0;
     while i < rest.len() {
@@ -87,6 +102,41 @@ fn main() -> ExitCode {
                     .and_then(|v| v.parse::<f64>().ok())
                     .map(|g| (g * (1u64 << 30) as f64) as u64);
                 i += 2;
+            }
+            "--temp" | "--temperature" => {
+                sampler.temperature = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.8);
+                i += 2;
+            }
+            "--top-k" => {
+                sampler.top_k = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(40);
+                i += 2;
+            }
+            "--top-p" => {
+                sampler.top_p = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.95);
+                i += 2;
+            }
+            "--min-p" => {
+                sampler.min_p = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.05);
+                i += 2;
+            }
+            "--repeat-penalty" => {
+                sampler.repeat_penalty =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1.1);
+                i += 2;
+            }
+            "--repeat-last-n" => {
+                sampler.repeat_last_n = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(64);
+                i += 2;
+            }
+            "--seed" => {
+                sampler.seed = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                i += 2;
+            }
+            // One flag for "sample the way llama.cpp does by default", so a
+            // quality comparison is not silently comparing sampler settings.
+            "--llamacpp-defaults" => {
+                sampler = SamplerConfig::llamacpp_defaults();
+                i += 1;
             }
             "-b" => {
                 prefill_block = rest
@@ -126,7 +176,14 @@ fn main() -> ExitCode {
     }
     let prompt = prompt;
 
-    match run(&path, &prompt, n_predict, prefill_block, cache_budget) {
+    match run(
+        &path,
+        &prompt,
+        n_predict,
+        prefill_block,
+        cache_budget,
+        sampler,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("bigtea-run: {e}");
@@ -151,6 +208,7 @@ fn run_streaming(
     n_predict: usize,
     prefill_block: usize,
     cache_budget: Option<u64>,
+    sampler_cfg: SamplerConfig,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -246,18 +304,14 @@ fn run_streaming(
     let gen_start = std::time::Instant::now();
 
     let mut writer = TokenWriter::new();
+    let mut sampler = Sampler::new(sampler_cfg);
     for step in 0..n_predict {
         if logits.len() < vocab {
             return Err(format!("logits too small: {} < {vocab}", logits.len()).into());
         }
+        // The last token's row: a prefill returns logits for every position.
         let last = &logits[logits.len() - vocab..];
-        let (best, _) = last
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .ok_or("empty logits")?;
-
-        let next = best as u32;
+        let next = sampler.sample(last, &tokens);
         if Some(next) == tokenizer.eos {
             break;
         }
@@ -295,6 +349,7 @@ fn run(
     n_predict: usize,
     prefill_block: usize,
     cache_budget: Option<u64>,
+    sampler: SamplerConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
 
@@ -313,6 +368,7 @@ fn run(
             n_predict,
             1024,
             cache_budget,
+            sampler,
             t0,
         )?;
         return Ok(());
@@ -376,6 +432,7 @@ fn run(
             n_predict,
             prefill_block,
             cache_budget,
+            sampler,
             t0,
         );
     }
@@ -421,6 +478,7 @@ fn run(
     let mut produced = String::new();
     let gen_start = std::time::Instant::now();
 
+    let mut sampler = Sampler::new(sampler);
     let mut writer = TokenWriter::new();
     for step in 0..n_predict {
         // A fresh compute arena per token: intermediates are dead once the
@@ -437,22 +495,16 @@ fn run(
         let logits = arch.build_graph(&ctx, &weights, &tok, &pos, n)?;
         ctx.compute(&logits, threads)?;
 
-        // Greedy: the highest-scoring token of the final position. Sampling
-        // strategies come later; determinism is what makes a wrong forward
-        // pass diagnosable.
+        // The final position's row. Greedy is still the default -- see
+        // `SamplerConfig::default` -- so a wrong forward pass stays diagnosable
+        // unless the caller opts into sampling.
         let all = logits.to_vec_f32();
         let vocab = config.vocab_size as usize;
         if all.len() < vocab {
             return Err(format!("logits too small: {} < vocab {}", all.len(), vocab).into());
         }
         let last = &all[all.len() - vocab..];
-        let (best, _) = last
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .ok_or("empty logits")?;
-
-        let next = best as u32;
+        let next = sampler.sample(last, &tokens);
         if Some(next) == tokenizer.eos {
             println!("\n[end of sequence at step {step}]");
             break;
@@ -556,9 +608,11 @@ fn run_deepseek4(
     n_predict: usize,
     arena_mib: usize,
     expert_cache_budget: Option<u64>,
+    sampler_cfg: SamplerConfig,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = bigtea_arch::Deepseek4Config::from_model(model)?;
+    let vocab = config.vocab_size as usize;
 
     let tokens: Vec<i32> = tokenizer.encode(prompt).iter().map(|t| *t as i32).collect();
     if tokens.is_empty() {
@@ -685,7 +739,8 @@ fn run_deepseek4(
         seq.len() as f64 / prefill_secs
     );
 
-    let mut next = argmax(&logits)?;
+    let mut sampler = Sampler::new(sampler_cfg);
+    let mut next = sample_next(&mut sampler, &logits, vocab, &seq);
     print!("output     {}", tokenizer.decode(&[next as u32]));
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -714,7 +769,7 @@ fn run_deepseek4(
         // token — and makes the per-pass difference a single token's routing.
         bigtea_arch::routing_next_pass();
         let logits = bigtea_arch::step(&fw, &mut kv, next, arena_mib << 20)?;
-        next = argmax(&logits)?;
+        next = sample_next(&mut sampler, &logits, vocab, &seq);
         generated += 1;
         writer.push(tokenizer, next as u32);
     }
@@ -757,11 +812,18 @@ fn run_deepseek4(
     Ok(())
 }
 
-fn argmax(logits: &[f32]) -> Result<i32, Box<dyn std::error::Error>> {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
-        .map(|(i, _)| i as i32)
-        .ok_or_else(|| "no logits".into())
+/// The last position's logits, and the token drawn from them.
+///
+/// A prefill returns a row per position; only the final one predicts the next
+/// token. Taking the whole buffer would sample from position 0 — which reads
+/// as the model ignoring the prompt.
+fn sample_next(sampler: &mut Sampler, logits: &[f32], vocab: usize, seq: &[i32]) -> i32 {
+    let row = if logits.len() >= vocab {
+        &logits[logits.len() - vocab..]
+    } else {
+        logits
+    };
+    // The repeat penalty indexes by token id; this path carries i32.
+    let history: Vec<u32> = seq.iter().map(|&t| t as u32).collect();
+    sampler.sample(row, &history) as i32
 }
