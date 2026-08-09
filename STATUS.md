@@ -24,15 +24,27 @@ llama.cpp on V4-Flash — on that model it leads on nothing.**
 ## The honest scoreboard
 
 Never quote a comparison without the model name and the phase.
+**All V4-Flash rows below were measured back to back on 2026-08-10** with 9.3 GiB
+free, which is the first time the whole 7.38 GiB always-read set fitted.
 
 | model | phase | Bigtea | llama.cpp | verdict |
 |---|---|---:|---:|---|
-| **V4-Flash** | load | ~10s | ~10.5s | parity |
-| **V4-Flash** | prefill | 2440 ms/tok | **1503 ms/tok** | **1.62x behind** |
-| **V4-Flash** | generation | 0.064 tok/s | **0.21–0.31** | **3–4x behind** |
+| **V4-Flash** | prefill | 2060 ms/tok | **1644 ms/tok** | **1.25x behind** |
+| **V4-Flash** | generation, 9 tok | 0.344 tok/s | **0.39** | 1.13x behind |
+| **V4-Flash** | generation, 23 tok | 0.363 tok/s | — | cache still warming |
+| **V4-Flash** | generation, 47 tok | **0.374 tok/s** | **0.39** | **96% — parity** |
 | Qwen3-30B-A3B | prefill @565 | **27.6** | 23.6 | ahead |
 | Qwen3-30B-A3B | prefill @2206 | **36.6** | 33.6 | ahead |
 | Qwen3-30B-A3B | generation | 1.07 | **2.16** | ~2x behind |
+
+**V4-Flash generation went 0.064 → 0.374 tok/s in one day — 5.8x** — and the
+deficit against llama.cpp went from 3-4x to **4%**. It is parity, not a win, and
+must not be quoted as one.
+
+The trend is the interesting part: 0.344 at 9 tokens, 0.363 at 23, 0.374 at 47,
+with the expert cache's hit rate climbing 9.7% → 20.2% → 23.5% as it warms.
+llama.cpp is flat because it has nothing that warms. **Longer answers should
+favour Bigtea**, and that is measurable but not yet measured past 47 tokens.
 
 Sources, with both command lines and outputs:
 `docs/graph/research/v4flash-vs-llamacpp-2026-08-07.md` and
@@ -137,29 +149,27 @@ exactly).
 
 **Still open**: the 256-token ceiling (#46) needs the ring wraparound.
 
-## R1 re-measured (#47): the cache works, and it is still the wrong byte
+## R1 re-measured (#47): the cache pays, once residency is satisfied first
 
-With the KV cache in, a step reads 6 distinct experts per layer instead of ~123,
-so the expert cache finally has something to hold. Hit rate moved **1.9-4.1% →
-7.8% at 1 GiB → 12.6% at 2 GiB**. Generation barely moved: 0.127 → 0.131 → 0.134
-tok/s.
+With the always-read set fully resident, the expert cache stops competing and
+starts helping:
 
-The reason is not the cache. **It and the always-read weights compete for the
-same RAM, and residency wins by roughly 8x per byte:**
+| run | cache | hits | generation |
+|---|---:|---:|---:|
+| 9 tokens | off | — | 0.310 tok/s |
+| 9 tokens | 1.0 GiB | 9.7% | **0.344** |
+| 23 tokens | 1.5 GiB | 20.2% | **0.363** |
+| 47 tokens | 1.5 GiB | 23.5% | **0.374** |
 
-| a byte spent on | hit rate | what it buys |
-|---|---:|---|
-| always-read weights | **100%** | saves a read on *every* token, by definition |
-| expert cache (2 GiB) | 12.6% | saves 12.6% of a read |
+Earlier, under memory pressure, the same cache *hurt*: a byte given to it came
+out of residency, where it would have been read on every token. `bigtea-run`
+refuses a cache while the always-read set is still streaming, and that rule is
+now confirmed from both sides — it hurt at 2.43 GiB resident, it helps at 7.38.
 
-On that run only 2.43 of 7.38 GiB of always-read weights fitted, so the 2 GiB
-handed to the cache came straight out of residency. `bigtea-run` now **refuses**
-an expert cache while the always-read set is still streaming, and says by how
-much and why — the cache is not weak, it is the wrong place to spend the byte.
-
-The measurement that would settle its real value needs ~10.5 GiB free, so that
-residency is satisfied first and the cache is spending surplus rather than
-competing. Not yet taken.
+**R0.1's ~86% is not reached, and 23.5% is not evidence against it**: that
+figure is coverage of a prompt-warmed *set*, this is hit rate against a 1.5 GiB
+budget holding ~1% of the model's experts. The measurement that tests R0.1
+needs a much larger cache than this machine has spare.
 
 ## Known limitations
 
