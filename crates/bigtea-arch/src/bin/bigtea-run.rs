@@ -291,6 +291,26 @@ fn run(
     } else {
         println!("experts    none (dense)");
     }
+    println!(
+        "attention  {} rope, per-head QK norm {}",
+        if config.rope_type == 0 {
+            "NORM"
+        } else {
+            "NeoX"
+        },
+        if config.qk_norm { "yes" } else { "no" }
+    );
+    if !config.rope_type_is_known {
+        // Say it rather than let the user discover it in the output. Both RoPE
+        // conventions run without error on either layout, so a wrong guess is
+        // fluent nonsense and nothing downstream can detect it.
+        println!(
+            "           NOTE: {:?} is not an architecture this build has verified.",
+            model.architecture()
+        );
+        println!("           NeoX rope and the tensor layout are assumed. If the output");
+        println!("           is fluent but wrong, that assumption is the first suspect.");
+    }
 
     // Fail on a missing tensor now, not at layer 37.
     arch.verify(&model)?;

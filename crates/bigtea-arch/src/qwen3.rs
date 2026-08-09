@@ -21,6 +21,32 @@ use crate::{ArchError, Result};
 /// NeoX rotary convention — see the module note on why this matters.
 const ROPE_TYPE_NEOX: i32 = 2;
 
+/// The other RoPE convention, and the one Llama uses.
+///
+/// NORM rotates **adjacent** pairs `(x0,x1), (x2,x3), …`; NEOX rotates halves,
+/// `(x0, x[d/2]), (x1, x[d/2+1]), …`. Both are "rotary position embedding" and
+/// both run without error on either layout — **the wrong one produces fluent
+/// nonsense**, which is this project's most expensive failure mode.
+///
+/// llama.cpp splits them by architecture: `llama`, `baichuan` and `deci` are
+/// NORM; `qwen2`, `qwen3`, `phi3`, `gemma` and most others are NEOX.
+const ROPE_TYPE_NORM: i32 = 0;
+
+/// Which convention an architecture uses, by name.
+///
+/// Defaulting to NEOX rather than NORM is deliberate: NEOX is the majority, and
+/// an architecture this list has never seen is more likely to be one of them.
+/// It is still a guess, which is why [`Qwen3Config::rope_type_is_known`] exists
+/// and the runner says so out loud.
+fn rope_type_for(arch: &str) -> (i32, bool) {
+    match arch {
+        "llama" | "llama4" | "baichuan" | "deci" | "mistral" => (ROPE_TYPE_NORM, true),
+        "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "phi3" | "gemma" | "gemma2" | "gemma3"
+        | "stablelm" | "olmo" | "starcoder2" => (ROPE_TYPE_NEOX, true),
+        _ => (ROPE_TYPE_NEOX, false),
+    }
+}
+
 /// Shape and hyper-parameters, read from the container rather than assumed.
 #[derive(Debug, Clone)]
 pub struct Qwen3Config {
@@ -37,6 +63,25 @@ pub struct Qwen3Config {
     pub n_expert: u32,
     pub n_expert_used: u32,
     pub n_ff_expert: u32,
+    /// Whether each block carries `attn_q_norm` / `attn_k_norm`.
+    ///
+    /// Qwen3 normalises every attention head separately, with a weight of
+    /// `head_dim` rather than `n_embd`. **Llama, Mistral, Qwen2, Gemma and Phi
+    /// do not have these tensors at all** — and requiring them is what refused
+    /// the entire Llama family before a byte was read, since the container check
+    /// runs against `required_tensors` up front.
+    ///
+    /// Detected from the container rather than from the architecture name: the
+    /// tensor either exists or it does not, and that is a fact about this file
+    /// rather than about what the file claims to be. A finetune that drops or
+    /// adds QK-norm is then handled without a new arch name.
+    pub qk_norm: bool,
+    /// `ROPE_TYPE_NORM` or `ROPE_TYPE_NEOX` — see [`rope_type_for`].
+    pub rope_type: i32,
+    /// False when the architecture was not in [`rope_type_for`]'s list and the
+    /// type is a default rather than a fact. Nothing can detect this from the
+    /// weights, so the only honest thing is to say so.
+    pub rope_type_is_known: bool,
 }
 
 impl Qwen3Config {
@@ -72,11 +117,17 @@ impl Qwen3Config {
                     model.location("token_embd.weight").map(|l| l.dims[1])
                 })
                 .unwrap_or(0) as u32,
-            rms_eps: 1e-6,
-            rope_freq_base: 1_000_000.0,
+            rms_eps: model
+                .arch_f32("attention.layer_norm_rms_epsilon")
+                .unwrap_or(1e-6),
+            rope_freq_base: model.arch_f32("rope.freq_base").unwrap_or(1_000_000.0),
             n_expert: model.arch_u64("expert_count").unwrap_or(0) as u32,
             n_expert_used: model.arch_u64("expert_used_count").unwrap_or(0) as u32,
             n_ff_expert: model.arch_u64("expert_feed_forward_length").unwrap_or(0) as u32,
+            // Asked of the container, not of the architecture name.
+            qk_norm: model.location("blk.0.attn_q_norm.weight").is_some(),
+            rope_type: rope_type_for(&arch).0,
+            rope_type_is_known: rope_type_for(&arch).1,
         })
     }
 
@@ -118,11 +169,16 @@ impl Qwen3Model {
                 "attn_k.weight",
                 "attn_v.weight",
                 "attn_output.weight",
-                "attn_q_norm.weight",
-                "attn_k_norm.weight",
                 "ffn_norm.weight",
             ] {
                 names.push(format!("blk.{il}.{suffix}"));
+            }
+            // Only Qwen3 carries these. Listing them unconditionally is what
+            // refused every Llama-family container up front.
+            if c.qk_norm {
+                for suffix in ["attn_q_norm.weight", "attn_k_norm.weight"] {
+                    names.push(format!("blk.{il}.{suffix}"));
+                }
             }
             if c.is_moe() {
                 for suffix in [
@@ -207,27 +263,19 @@ impl Qwen3Model {
             let q = ctx.reshape_3d(&q, c.head_dim as i64, c.n_head as i64, n_tokens)?;
             let k = ctx.reshape_3d(&k, c.head_dim as i64, c.n_head_kv as i64, n_tokens)?;
 
-            let q = self.rms_norm_mul(ctx, &q, get(&format!("blk.{il}.attn_q_norm.weight"))?)?;
-            let k = self.rms_norm_mul(ctx, &k, get(&format!("blk.{il}.attn_k_norm.weight"))?)?;
+            // Absent on Llama, Mistral, Qwen2, Gemma and Phi: those normalise
+            // once before the projections and not again per head.
+            let (q, k) = if c.qk_norm {
+                (
+                    self.rms_norm_mul(ctx, &q, get(&format!("blk.{il}.attn_q_norm.weight"))?)?,
+                    self.rms_norm_mul(ctx, &k, get(&format!("blk.{il}.attn_k_norm.weight"))?)?,
+                )
+            } else {
+                (q, k)
+            };
 
-            let q = ctx.rope_ext(
-                &q,
-                positions,
-                None,
-                c.head_dim as i32,
-                ROPE_TYPE_NEOX,
-                0,
-                rope,
-            )?;
-            let k = ctx.rope_ext(
-                &k,
-                positions,
-                None,
-                c.head_dim as i32,
-                ROPE_TYPE_NEOX,
-                0,
-                rope,
-            )?;
+            let q = ctx.rope_ext(&q, positions, None, c.head_dim as i32, c.rope_type, 0, rope)?;
+            let k = ctx.rope_ext(&k, positions, None, c.head_dim as i32, c.rope_type, 0, rope)?;
 
             let attn = self.attention(ctx, &q, &k, &v, n_tokens)?;
             let attn = ctx.mul_mat(get(&format!("blk.{il}.attn_output.weight"))?, &attn)?;
@@ -287,8 +335,14 @@ impl Qwen3Model {
         let q = ctx.reshape_3d(&q, c.head_dim as i64, c.n_head as i64, n_tokens)?;
         let k = ctx.reshape_3d(&k, c.head_dim as i64, c.n_head_kv as i64, n_tokens)?;
 
-        let q = self.rms_norm_mul(ctx, &q, get(format!("blk.{il}.attn_q_norm.weight"))?)?;
-        let k = self.rms_norm_mul(ctx, &k, get(format!("blk.{il}.attn_k_norm.weight"))?)?;
+        let (q, k) = if c.qk_norm {
+            (
+                self.rms_norm_mul(ctx, &q, get(format!("blk.{il}.attn_q_norm.weight"))?)?,
+                self.rms_norm_mul(ctx, &k, get(format!("blk.{il}.attn_k_norm.weight"))?)?,
+            )
+        } else {
+            (q, k)
+        };
 
         let q = ctx.rope_ext(&q, positions, None, c.head_dim as i32, rope_type, 0, rope)?;
         let k = ctx.rope_ext(&k, positions, None, c.head_dim as i32, rope_type, 0, rope)?;
@@ -538,6 +592,17 @@ mod tests {
             n_expert: 0,
             n_expert_used: 0,
             n_ff_expert: 0,
+            qk_norm: true,
+            rope_type: ROPE_TYPE_NEOX,
+            rope_type_is_known: true,
+        }
+    }
+
+    /// The same model without per-head QK norm — a Llama-family container.
+    fn dense_config_no_qk_norm() -> Qwen3Config {
+        Qwen3Config {
+            qk_norm: false,
+            ..dense_config()
         }
     }
 
@@ -564,6 +629,63 @@ mod tests {
             "got {}",
             c.attn_scale()
         );
+    }
+
+    #[test]
+    fn llama_gets_norm_rope_and_qwen_gets_neox() {
+        // The two conventions run without error on each other's layout and
+        // produce plausible text either way, so nothing downstream can catch a
+        // mix-up. It has to be right here.
+        assert_eq!(rope_type_for("llama"), (ROPE_TYPE_NORM, true));
+        assert_eq!(rope_type_for("mistral"), (ROPE_TYPE_NORM, true));
+        assert_eq!(rope_type_for("qwen3"), (ROPE_TYPE_NEOX, true));
+        assert_eq!(rope_type_for("qwen3moe"), (ROPE_TYPE_NEOX, true));
+        assert_eq!(rope_type_for("gemma2"), (ROPE_TYPE_NEOX, true));
+
+        // An architecture nobody has checked gets a default AND is flagged as a
+        // guess, so the runner can say so rather than quietly being wrong.
+        let (ty, known) = rope_type_for("some-model-invented-next-year");
+        assert_eq!(ty, ROPE_TYPE_NEOX);
+        assert!(!known, "an unknown architecture must not claim to be known");
+    }
+
+    #[test]
+    fn a_llama_family_container_is_not_asked_for_qk_norm() {
+        // Requiring `attn_q_norm` unconditionally is what refused Llama,
+        // Mistral, Qwen2, Gemma and Phi *before a byte was read*, because the
+        // container check runs against `required_tensors` up front. The tensors
+        // do not exist in those files, so asking for them is not a strictness
+        // choice — it is a false negative on every one of them.
+        let m = Qwen3Model::new(dense_config_no_qk_norm());
+        let names = m.required_tensors();
+        assert!(
+            !names.iter().any(|n| n.contains("attn_q_norm")),
+            "a model without QK norm must not be asked for it: {names:?}"
+        );
+        assert!(!names.iter().any(|n| n.contains("attn_k_norm")));
+        // Everything else is still required — this must not become a blanket
+        // relaxation that lets a genuinely incomplete container through.
+        for il in 0..2 {
+            for suffix in [
+                "attn_norm.weight",
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "ffn_norm.weight",
+            ] {
+                assert!(
+                    names.contains(&format!("blk.{il}.{suffix}")),
+                    "blk.{il}.{suffix} is still required"
+                );
+            }
+        }
+
+        // And Qwen3 itself must still demand them, or the detection is useless.
+        let qwen = Qwen3Model::new(dense_config());
+        assert!(qwen
+            .required_tensors()
+            .contains(&"blk.0.attn_q_norm.weight".to_string()));
     }
 
     #[test]

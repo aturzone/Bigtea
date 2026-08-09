@@ -1315,6 +1315,9 @@ mod tests {
             n_expert: 4,
             n_expert_used: 2,
             n_ff_expert: 16,
+            qk_norm: true,
+            rope_type: 2,
+            rope_type_is_known: true,
         }
     }
 
