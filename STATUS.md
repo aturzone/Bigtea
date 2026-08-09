@@ -132,8 +132,21 @@ on batch shape. If the cache were feeding attention the wrong keys those layers
 would diverge first. **None of them do.** The test therefore asserts argmax plus
 a stated routing budget, with the diagnostic named in the failure message.
 
-Still to do after that: the compressor input ring (HCA then CSA), then the ring
-wraparound that lifts the 256-token ceiling.
+**R3.2 in progress** (#45): the compressor's input ring now exists in the cache
+and `compressor` front-pads from it instead of from zeros. At position 0 the ring
+is empty, so that block of zeros is exactly what it always was and prefill stays
+bit-identical — all 19 container tests confirm it.
+
+Two pieces remain before the guard can be lifted:
+
+1. **The ring must slide on every pass, not only when a block completes.** It is
+   updated inside `compressor`, which only runs when `nt / ratio > 0`. A step
+   that completes no block would skip it and the ring would develop a hole.
+2. **New summaries must append at their absolute block index**, rather than
+   `attention` overwriting the compressed half with whatever the current batch
+   produced.
+
+Then the ring wraparound that lifts the 256-token ceiling (#46).
 
 ## Known limitations
 

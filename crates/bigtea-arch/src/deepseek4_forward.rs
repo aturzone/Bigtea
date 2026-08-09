@@ -367,6 +367,18 @@ pub struct Deepseek4Cache {
     /// Compressed summaries, F16, `kv_lora_rank * N_KV` per layer. Slot index is
     /// the **block** index, not the position.
     comp: Vec<Vec<u16>>,
+    /// The compressor's input ring, per layer: the last `state_rows` rows of the
+    /// `kv` and `score` projections, interleaved as `(kv, score)`.
+    ///
+    /// **This is the piece that is easy to miss.** On a prefill the previous
+    /// window's rows are inside the batch being processed, so [`compressor`] can
+    /// front-pad `state_rows` zeros and never read a ring — which is why the
+    /// zeros were correct until now. In incremental decode those rows are in the
+    /// past, and the zeros would summarise the wrong span **without failing**.
+    ///
+    /// Sized lazily: `state_rows * wide` depends on whether the layer's
+    /// compressor overlaps, which is a property of the layer.
+    ring: Vec<(Vec<f32>, Vec<f32>)>,
     /// Whether a layer's compressed half holds anything yet. The compressed
     /// builders are guarded on this, so the same layer takes a different path
     /// early in a sequence than later.
@@ -382,6 +394,7 @@ impl Deepseek4Cache {
         Deepseek4Cache {
             raw: vec![vec![0u16; per_layer]; n_layer as usize],
             comp: vec![vec![0u16; per_layer]; n_layer as usize],
+            ring: vec![(Vec::new(), Vec::new()); n_layer as usize],
             comp_len: vec![0; n_layer as usize],
             n_past: 0,
         }
@@ -396,6 +409,10 @@ impl Deepseek4Cache {
     pub fn clear(&mut self) {
         for layer in self.raw.iter_mut().chain(self.comp.iter_mut()) {
             layer.fill(0);
+        }
+        for (kv, sc) in self.ring.iter_mut() {
+            kv.clear();
+            sc.clear();
         }
         self.comp_len.fill(0);
         self.n_past = 0;
@@ -822,7 +839,9 @@ fn compressor<'c>(
     il: u32,
     attn_norm: &Tensor<'c>,
     nt: i64,
+    pos0: i64,
     overlap: bool,
+    cache: &mut Deepseek4Cache,
 ) -> Result<Tensor<'c>> {
     let config = &fw.config;
     let head = config.kv_lora_rank as i64;
@@ -846,8 +865,14 @@ fn compressor<'c>(
     )?;
     // The gate's position embedding is indexed by the token's offset *within its
     // block*, not by its absolute position.
+    // Absolute, then reduced: a token's offset *within its block* is
+    // `(pos0 + p) % ratio`, and only equals `p % ratio` when pos0 is zero.
     let pos_t = ctx.new_i32_1d(nt)?;
-    pos_t.set_i32(&(0..nt).map(|p| (p % ratio) as i32).collect::<Vec<i32>>())?;
+    pos_t.set_i32(
+        &(0..nt)
+            .map(|p| ((pos0 + p) % ratio) as i32)
+            .collect::<Vec<i32>>(),
+    )?;
     let ape = ctx.get_rows(
         weights
             .get(&format!("blk.{il}.attn_compressor_ape.weight"))
@@ -862,12 +887,19 @@ fn compressor<'c>(
     let total = state_rows + nt + pad;
     let kv_vals = kv.to_vec_f32();
     let score_vals = score.to_vec_f32();
-    let mut kv_buf = vec![0.0f32; (state_rows * wide) as usize];
+    // Front-pad from the ring. At pos0 == 0 the ring is empty and this is the
+    // block of zeros the verified prefill path has always used, so prefill stays
+    // bit-identical; past that, these are the real preceding rows.
+    let need = (state_rows * wide) as usize;
+    let (ring_kv, ring_sc) = &cache.ring[il as usize];
+    let mut kv_buf = vec![0.0f32; need.saturating_sub(ring_kv.len())];
+    kv_buf.extend_from_slice(ring_kv);
     kv_buf.extend_from_slice(&kv_vals);
     kv_buf.extend(std::iter::repeat_n(0.0f32, (pad * wide) as usize));
     let kv_state = ctx.new_f32_2d(wide, total)?;
     kv_state.set_f32(&kv_buf)?;
-    let mut sc_buf = vec![0.0f32; (state_rows * wide) as usize];
+    let mut sc_buf = vec![0.0f32; need.saturating_sub(ring_sc.len())];
+    sc_buf.extend_from_slice(ring_sc);
     sc_buf.extend_from_slice(&score_vals);
     // -inf so the softmax ignores the padding rather than averaging it in.
     sc_buf.extend(std::iter::repeat_n(
@@ -876,6 +908,22 @@ fn compressor<'c>(
     ));
     let score_state = ctx.new_f32_2d(wide, total)?;
     score_state.set_f32(&sc_buf)?;
+
+    // Slide the ring: append this batch's rows and keep the last `state_rows`.
+    // Done here, after `kv_buf`/`sc_buf` have already read the *previous*
+    // contents, so a batch never summarises itself.
+    {
+        let (ring_kv, ring_sc) = &mut cache.ring[il as usize];
+        ring_kv.extend_from_slice(&kv_vals);
+        ring_sc.extend_from_slice(&score_vals);
+        let keep = (state_rows * wide) as usize;
+        if ring_kv.len() > keep {
+            ring_kv.drain(..ring_kv.len() - keep);
+        }
+        if ring_sc.len() > keep {
+            ring_sc.drain(..ring_sc.len() - keep);
+        }
+    }
 
     let zero_row = (state_rows + nt) as i32;
     let mut idxs: Vec<i32> = Vec::new();
@@ -1680,12 +1728,28 @@ pub fn block(
     }
     let comp = match (kind, fired) {
         (AttentionKind::Raw, _) | (_, false) => None,
-        (AttentionKind::CompressedSparse, true) => {
-            Some(compressor(fw, &ctx, &weights, il, &e.attn_norm, nt, true)?)
-        }
-        (AttentionKind::HeavilyCompressed, true) => {
-            Some(compressor(fw, &ctx, &weights, il, &e.attn_norm, nt, false)?)
-        }
+        (AttentionKind::CompressedSparse, true) => Some(compressor(
+            fw,
+            &ctx,
+            &weights,
+            il,
+            &e.attn_norm,
+            nt,
+            pos0,
+            true,
+            cache,
+        )?),
+        (AttentionKind::HeavilyCompressed, true) => Some(compressor(
+            fw,
+            &ctx,
+            &weights,
+            il,
+            &e.attn_norm,
+            nt,
+            pos0,
+            false,
+            cache,
+        )?),
     };
     let t_phase = std::time::Instant::now();
     let attn_out = attention(
