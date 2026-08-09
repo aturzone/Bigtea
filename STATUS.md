@@ -139,12 +139,15 @@ bit-identical — all 19 container tests confirm it.
 
 Two pieces remain before the guard can be lifted:
 
-1. **The ring must slide on every pass, not only when a block completes.** It is
-   updated inside `compressor`, which only runs when `nt / ratio > 0`. A step
-   that completes no block would skip it and the ring would develop a hole.
+1. ~~The ring must slide on every pass~~ **done.** The projections are split into
+   `compressor_project`, which `block` calls on every pass through a compressed
+   layer whether or not a block completes. A step that completed no block would
+   otherwise have left a hole in the window a later block summarises.
 2. **New summaries must append at their absolute block index**, rather than
    `attention` overwriting the compressed half with whatever the current batch
-   produced.
+   produced. This is the last piece before the guard can be lifted, and it is the
+   intricate one: a block that completes on a step spans the ring boundary, so
+   its rows come partly from the ring and partly from the batch.
 
 Then the ring wraparound that lifts the 256-token ceiling (#46).
 

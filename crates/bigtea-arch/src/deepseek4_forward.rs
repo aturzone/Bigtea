@@ -815,6 +815,93 @@ fn q_and_kv<'c>(
     Ok((q_full, kv_full))
 }
 
+/// What one pass through a compressed layer produces:
+/// `(ring kv before this batch, ring score before, this batch's kv, its score)`.
+///
+/// The "before" halves are what the batch front-pads with; returning them rather
+/// than re-reading the cache is what stops a batch summarising itself.
+type CompressorRows = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// The `kv` and `score` projections a compressed layer needs, and the ring slide.
+///
+/// Split out of [`compressor`] because it must run on **every** pass through a
+/// compressed layer, while the summary itself is only built when a block
+/// completes. A step that completes no block still contributes its row to the
+/// window that the *next* completed block will summarise; skipping it would
+/// leave a hole in the ring, and a hole does not fail — it summarises the wrong
+/// span.
+///
+/// Returns the ring contents *as they were before this batch*, because that is
+/// what the batch must front-pad with. Sliding first and reading second would
+/// let a batch summarise itself.
+#[allow(clippy::too_many_arguments)]
+fn compressor_project<'c>(
+    fw: &Deepseek4Forward<'_>,
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    il: u32,
+    attn_norm: &Tensor<'c>,
+    nt: i64,
+    pos0: i64,
+    overlap: bool,
+    cache: &mut Deepseek4Cache,
+) -> Result<CompressorRows> {
+    let config = &fw.config;
+    let head = config.kv_lora_rank as i64;
+    let ratio = config.compress_block(il).expect("compressed layer");
+    let wide = if overlap { 2 * head } else { head };
+    let state_rows = if overlap { 8 } else { ratio };
+
+    let kv = ctx.mul_mat(
+        weights
+            .get(&format!("blk.{il}.attn_compressor_kv.weight"))
+            .expect("bound"),
+        attn_norm,
+    )?;
+    let score = ctx.mul_mat(
+        weights
+            .get(&format!("blk.{il}.attn_compressor_gate.weight"))
+            .expect("bound"),
+        attn_norm,
+    )?;
+    // The gate's position embedding is indexed by the token's offset *within its
+    // block*: `(pos0 + p) % ratio`, which equals `p % ratio` only at pos0 = 0.
+    let pos_t = ctx.new_i32_1d(nt)?;
+    pos_t.set_i32(
+        &(0..nt)
+            .map(|p| ((pos0 + p) % ratio) as i32)
+            .collect::<Vec<i32>>(),
+    )?;
+    let ape = ctx.get_rows(
+        weights
+            .get(&format!("blk.{il}.attn_compressor_ape.weight"))
+            .expect("bound"),
+        &pos_t,
+    )?;
+    let score = ctx.add(&score, &ape)?;
+    ctx.compute(&kv, threads())?;
+    ctx.compute(&score, threads())?;
+
+    let kv_vals = kv.to_vec_f32();
+    let score_vals = score.to_vec_f32();
+
+    let (ring_kv, ring_sc) = &mut cache.ring[il as usize];
+    let prev_kv = ring_kv.clone();
+    let prev_sc = ring_sc.clone();
+
+    ring_kv.extend_from_slice(&kv_vals);
+    ring_sc.extend_from_slice(&score_vals);
+    let keep = (state_rows * wide) as usize;
+    if ring_kv.len() > keep {
+        ring_kv.drain(..ring_kv.len() - keep);
+    }
+    if ring_sc.len() > keep {
+        ring_sc.drain(..ring_sc.len() - keep);
+    }
+
+    Ok((prev_kv, prev_sc, kv_vals, score_vals))
+}
+
 /// The overlap compressor (CSA) or the plain one (HCA), for a prefill.
 ///
 /// Both summarise completed blocks of raw KV into one entry each. They differ
@@ -851,55 +938,23 @@ fn compressor<'c>(
     let n_read = ratio * n_blocks;
     let state_rows = if overlap { 8 } else { ratio };
 
-    let kv = ctx.mul_mat(
-        weights
-            .get(&format!("blk.{il}.attn_compressor_kv.weight"))
-            .expect("bound"),
-        attn_norm,
-    )?;
-    let score = ctx.mul_mat(
-        weights
-            .get(&format!("blk.{il}.attn_compressor_gate.weight"))
-            .expect("bound"),
-        attn_norm,
-    )?;
-    // The gate's position embedding is indexed by the token's offset *within its
-    // block*, not by its absolute position.
-    // Absolute, then reduced: a token's offset *within its block* is
-    // `(pos0 + p) % ratio`, and only equals `p % ratio` when pos0 is zero.
-    let pos_t = ctx.new_i32_1d(nt)?;
-    pos_t.set_i32(
-        &(0..nt)
-            .map(|p| ((pos0 + p) % ratio) as i32)
-            .collect::<Vec<i32>>(),
-    )?;
-    let ape = ctx.get_rows(
-        weights
-            .get(&format!("blk.{il}.attn_compressor_ape.weight"))
-            .expect("bound"),
-        &pos_t,
-    )?;
-    let score = ctx.add(&score, &ape)?;
-    ctx.compute(&kv, threads())?;
-    ctx.compute(&score, threads())?;
+    let (prev_kv, prev_sc, kv_vals, score_vals) =
+        compressor_project(fw, ctx, weights, il, attn_norm, nt, pos0, overlap, cache)?;
 
     let pad = if overlap { 1 } else { 0 };
     let total = state_rows + nt + pad;
-    let kv_vals = kv.to_vec_f32();
-    let score_vals = score.to_vec_f32();
     // Front-pad from the ring. At pos0 == 0 the ring is empty and this is the
     // block of zeros the verified prefill path has always used, so prefill stays
     // bit-identical; past that, these are the real preceding rows.
     let need = (state_rows * wide) as usize;
-    let (ring_kv, ring_sc) = &cache.ring[il as usize];
-    let mut kv_buf = vec![0.0f32; need.saturating_sub(ring_kv.len())];
-    kv_buf.extend_from_slice(ring_kv);
+    let mut kv_buf = vec![0.0f32; need.saturating_sub(prev_kv.len())];
+    kv_buf.extend_from_slice(&prev_kv);
     kv_buf.extend_from_slice(&kv_vals);
     kv_buf.extend(std::iter::repeat_n(0.0f32, (pad * wide) as usize));
     let kv_state = ctx.new_f32_2d(wide, total)?;
     kv_state.set_f32(&kv_buf)?;
-    let mut sc_buf = vec![0.0f32; need.saturating_sub(ring_sc.len())];
-    sc_buf.extend_from_slice(ring_sc);
+    let mut sc_buf = vec![0.0f32; need.saturating_sub(prev_sc.len())];
+    sc_buf.extend_from_slice(&prev_sc);
     sc_buf.extend_from_slice(&score_vals);
     // -inf so the softmax ignores the padding rather than averaging it in.
     sc_buf.extend(std::iter::repeat_n(
@@ -908,22 +963,6 @@ fn compressor<'c>(
     ));
     let score_state = ctx.new_f32_2d(wide, total)?;
     score_state.set_f32(&sc_buf)?;
-
-    // Slide the ring: append this batch's rows and keep the last `state_rows`.
-    // Done here, after `kv_buf`/`sc_buf` have already read the *previous*
-    // contents, so a batch never summarises itself.
-    {
-        let (ring_kv, ring_sc) = &mut cache.ring[il as usize];
-        ring_kv.extend_from_slice(&kv_vals);
-        ring_sc.extend_from_slice(&score_vals);
-        let keep = (state_rows * wide) as usize;
-        if ring_kv.len() > keep {
-            ring_kv.drain(..ring_kv.len() - keep);
-        }
-        if ring_sc.len() > keep {
-            ring_sc.drain(..ring_sc.len() - keep);
-        }
-    }
 
     let zero_row = (state_rows + nt) as i32;
     let mut idxs: Vec<i32> = Vec::new();
@@ -1725,6 +1764,30 @@ pub fn block(
         return Err(crate::ArchError::Unimplemented(
             "incremental decode through a compressed attention layer needs the              compressor input ring (R3 step 2); only the raw path is cached so far",
         ));
+    }
+    // A compressed layer must project **every** pass, even one that completes no
+    // block: the row still belongs to the window a later block will summarise,
+    // and a gap in the ring summarises the wrong span without failing. When a
+    // block does complete, `compressor` projects as part of building the
+    // summary, so this only covers the case where it would not run at all.
+    if !fired {
+        if let Some(overlap) = match kind {
+            AttentionKind::CompressedSparse => Some(true),
+            AttentionKind::HeavilyCompressed => Some(false),
+            AttentionKind::Raw => None,
+        } {
+            compressor_project(
+                fw,
+                &ctx,
+                &weights,
+                il,
+                &e.attn_norm,
+                nt,
+                pos0,
+                overlap,
+                cache,
+            )?;
+        }
     }
     let comp = match (kind, fired) {
         (AttentionKind::Raw, _) | (_, false) => None,
