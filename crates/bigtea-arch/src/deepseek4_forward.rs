@@ -296,6 +296,45 @@ fn dump_routing(log: &[Vec<Vec<u32>>], path: &str) -> std::io::Result<()> {
     out.flush()
 }
 
+/// The experts the **last token of a batch** selected, per layer.
+///
+/// The routing histogram cannot answer R3's question. It aggregates over every
+/// token in the pass, so "did a cached step route the same way as a full
+/// prefill" gets lost in the tokens they share. This records only the final
+/// token's six-of-256, which is the one token both paths end on and therefore
+/// the only fair comparison.
+///
+/// Enabled by `BIGTEA_ROUTING_LAST` so it costs nothing in a normal run.
+static LAST_ROUTING: std::sync::OnceLock<std::sync::Mutex<Vec<Vec<i32>>>> =
+    std::sync::OnceLock::new();
+
+fn last_routing() -> &'static std::sync::Mutex<Vec<Vec<i32>>> {
+    LAST_ROUTING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn record_last_token(il: u32, n_used: usize, ids: &[i32]) {
+    // `ids` is `n_used` per token, token-major, so the final token's selections
+    // are the last `n_used` entries.
+    let Some(tail) = ids.len().checked_sub(n_used) else {
+        return;
+    };
+    let mut log = last_routing().lock().expect("last-token routing");
+    while log.len() <= il as usize {
+        log.push(Vec::new());
+    }
+    log[il as usize] = ids[tail..].to_vec();
+}
+
+/// Per-layer expert ids chosen by the last token of the most recent pass.
+pub fn routing_last_token() -> Vec<Vec<i32>> {
+    last_routing().lock().expect("last-token routing").clone()
+}
+
+/// Forget the recorded selections, so two passes can be compared cleanly.
+pub fn routing_last_token_reset() {
+    last_routing().lock().expect("last-token routing").clear();
+}
+
 /// Attention state that must survive from one forward pass to the next.
 ///
 /// # Why this exists
@@ -1179,6 +1218,9 @@ fn moe_routing<'c>(
     let ids = topk.to_vec_i32();
     if std::env::var("BIGTEA_ROUTING").is_ok() {
         record_routing(il, n_expert as usize, &ids);
+    }
+    if std::env::var("BIGTEA_ROUTING_LAST").is_ok() {
+        record_last_token(il, n_used as usize, &ids);
     }
 
     // Renormalised over the selected six only, then scaled. The divisor is

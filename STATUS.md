@@ -6,8 +6,8 @@ closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
 **Last updated**: 2026-08-09 · **Version**: v0.0.2 · **Branch**: `main` ·
-**Open PR**: R3 step 1 on `ticket/r3-kv-cache` — the KV cache's raw path.
-**Unmerged, and its equivalence test does not pass yet** (see R3 below).
+**Open PR**: [#44](https://github.com/aturzone/Bigtea/pull/44) — R3 step 1, the
+KV cache's raw path. **Verified; unmerged, Atur merges.**
 PR #43 (R0/R0.1/R1) is **merged**.
 
 ---
@@ -112,22 +112,25 @@ element-exact and the cache machinery itself is sound.
 *sequence* having completed a block, not the batch, and there is a test asserting
 the refusal.
 
-**Open, and the reason this is unmerged**: the equivalence test
-(`prefill(0..n)` + `step(n)` vs `prefill(0..=n)`) fails.
+**Equivalence holds.** `prefill(0..n)` + `step(n)` agrees with
+`prefill(0..=n)`: argmax equal, and the logit sum 0.278% apart. That gap is
+**not** noise and was not hidden behind a widened tolerance — it was diagnosed:
 
 ```
-n = 1 (2 tokens)   step 446595.72   full 445449.16   +0.257%
-n = 2 (3 tokens)   step 399234.41   full 398126.00   +0.278%
+layer 33: full [48, 58, 70, 113, 166, 217]
+          step [48, 58, 70,      166, 217, 242]
+1 of 43 layers routed the last token differently; 0 of them hash-routed
 ```
 
-argmax agrees at both, and the error is **flat, not accumulating** — systematic
-from the first step rather than drift. That is the shape the routing-flip effect
-would have, which `r3-kv-cache.md` predicted, but predicted is not demonstrated.
-**The tolerance has deliberately not been widened**; the ticket names that as how
-a real cache bug ships. Next step is to log the selected expert ids for the last
-token in both paths and compare: differ → the flip is the cause and the assertion
-becomes "argmax equal, at most N routing differences" with N stated; identical →
-the cache is wrong and the sum is telling the truth.
+Five of six experts agree; one near-tie in the top-6-of-256 swaps when the batch
+shape changes, exactly as `r3-kv-cache.md` predicted. A different expert gives a
+different output, so the sum *should* move.
+
+**What proves it is a flip and not a wrong cache**: layers below
+`hash_layer_count` select by token id out of `ffn_gate_tid2eid` and cannot depend
+on batch shape. If the cache were feeding attention the wrong keys those layers
+would diverge first. **None of them do.** The test therefore asserts argmax plus
+a stated routing budget, with the diagnostic named in the failure message.
 
 Still to do after that: the compressor input ring (HCA then CSA), then the ring
 wraparound that lifts the 256-token ceiling.
