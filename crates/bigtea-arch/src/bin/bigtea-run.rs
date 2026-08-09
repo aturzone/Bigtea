@@ -662,6 +662,9 @@ fn run_deepseek4(
     // 137 GiB of routed experts, if the router spreads evenly. If it does not,
     // the hot set is cacheable and every byte-per-token figure changes.
     bigtea_arch::routing_report(137.06, fw.config().hash_layer_count);
+    // 3.21 GiB is what one token's six-of-256 costs on this container; the
+    // report scales it by how many of the six would actually be read.
+    bigtea_arch::routing_weight_report(3.21);
 
     // Hit rate is reported **with** footprint and next to tok/s below, never
     // alone. This project has measured a 71%-hit cache being the slowest

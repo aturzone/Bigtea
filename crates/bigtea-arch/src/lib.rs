@@ -18,12 +18,13 @@ mod deepseek4_forward;
 mod expert_cache;
 mod kv;
 mod qwen3;
+pub mod spectrum;
 mod stream;
 
 pub use deepseek4::{AttentionKind, Deepseek4Config, Deepseek4Model};
 pub use deepseek4_forward::{
     forward, prefill, routing_last_token, routing_last_token_reset, routing_next_pass,
-    routing_report, step, Deepseek4Cache, Deepseek4Forward,
+    routing_report, routing_weight_report, step, Deepseek4Cache, Deepseek4Forward,
 };
 pub use expert_cache::{CacheStats, ExpertCache};
 pub use kv::{KvCache, KvError};

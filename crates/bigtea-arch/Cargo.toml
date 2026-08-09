@@ -28,3 +28,8 @@ test = true
 name = "bigtea-run"
 path = "src/bin/bigtea-run.rs"
 test = false
+
+[[bin]]
+name = "bigtea-spectrum"
+path = "src/bin/bigtea-spectrum.rs"
+test = false

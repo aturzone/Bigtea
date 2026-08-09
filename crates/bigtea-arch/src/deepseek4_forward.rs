@@ -335,6 +335,105 @@ pub fn routing_last_token_reset() {
     last_routing().lock().expect("last-token routing").clear();
 }
 
+/// How the renormalised router weight is spread across the six chosen experts.
+///
+/// # The question it answers
+///
+/// Every selected expert costs the same bytes to stream — 4.2 MiB — but they do
+/// not contribute equally: the output is `Σ w_i · expert_i(x)` with `w`
+/// renormalised over the six. If the top two carry most of the mass, the tail
+/// is being paid for in full and returned at a discount, and **dropping it is a
+/// byte reduction available at every batch size, cache state and RAM budget** —
+/// the only lever measured so far with that property.
+///
+/// Accumulated as `[layer][rank]` sums of the weights sorted descending, plus a
+/// count, so the report is a mean profile rather than one token's accident.
+/// Sorting here rather than trusting selection order is deliberate: `top_k` does
+/// not return indices in score order, and a profile built on that assumption
+/// would look flat for a reason that has nothing to do with the model.
+///
+/// Enabled by `BIGTEA_ROUTING_WEIGHTS`, because reading the weights needs a
+/// `compute()` that would otherwise re-evaluate the ancestor graph for nothing.
+type WeightProfile = (Vec<Vec<f64>>, u64);
+static ROUTING_WEIGHTS: std::sync::OnceLock<std::sync::Mutex<WeightProfile>> =
+    std::sync::OnceLock::new();
+
+fn routing_weights() -> &'static std::sync::Mutex<WeightProfile> {
+    ROUTING_WEIGHTS.get_or_init(|| std::sync::Mutex::new((Vec::new(), 0)))
+}
+
+fn record_routing_weights(il: u32, n_used: usize, weights: &[f32]) {
+    let mut log = routing_weights().lock().expect("routing weights");
+    while log.0.len() <= il as usize {
+        log.0.push(vec![0.0; n_used]);
+    }
+    let mut tokens = 0u64;
+    for row in weights.chunks_exact(n_used) {
+        let mut sorted: Vec<f32> = row.to_vec();
+        sorted.sort_by(|a, b| b.partial_cmp(a).expect("finite router weight"));
+        for (slot, v) in log.0[il as usize].iter_mut().zip(&sorted) {
+            *slot += *v as f64;
+        }
+        tokens += 1;
+    }
+    // Counted once, on the first layer, so the divisor is tokens and not
+    // tokens x layers.
+    if il == 0 {
+        log.1 += tokens;
+    }
+}
+
+/// Print the mean router-weight profile, and what dropping the tail would save.
+///
+/// Prints nothing unless `BIGTEA_ROUTING_WEIGHTS` is set.
+pub fn routing_weight_report(expert_gib_per_token: f64) {
+    if std::env::var("BIGTEA_ROUTING_WEIGHTS").is_err() {
+        return;
+    }
+    let log = routing_weights().lock().expect("routing weights");
+    let (profile, tokens) = (&log.0, log.1);
+    if profile.is_empty() || tokens == 0 {
+        return;
+    }
+    let n_used = profile[0].len();
+    // Mean over layers and tokens: one profile for the model, since the
+    // decision — how many experts to read — is made the same way in every layer.
+    let mut mean = vec![0.0f64; n_used];
+    for layer in profile.iter() {
+        for (m, v) in mean.iter_mut().zip(layer) {
+            *m += v / (tokens as f64 * profile.len() as f64);
+        }
+    }
+    let total: f64 = mean.iter().sum();
+
+    println!();
+    println!(
+        "router weight profile  ({tokens} tokens, {} layers)",
+        profile.len()
+    );
+    println!(
+        "{:>5}  {:>8}  {:>10}  {:>10}  {:>12}",
+        "KEEP", "WEIGHT", "CUMULATIVE", "GiB/token", "SPEEDUP"
+    );
+    let mut acc = 0.0;
+    for (i, w) in mean.iter().enumerate() {
+        acc += w;
+        let keep = i + 1;
+        let gib = expert_gib_per_token * keep as f64 / n_used as f64;
+        println!(
+            "{keep:>5}  {:>7.1}%  {:>9.1}%  {gib:>10.2}  {:>11.2}x",
+            w / total * 100.0,
+            acc / total * 100.0,
+            n_used as f64 / keep as f64
+        );
+    }
+    println!();
+    println!("CUMULATIVE is the share of router weight kept, NOT the share of");
+    println!("output preserved -- a dropped expert's contribution is its weight");
+    println!("times its output, and the outputs are not equal. This bounds the");
+    println!("idea; it does not decide it. Perplexity does.");
+}
+
 /// Attention state that must survive from one forward pass to the next.
 ///
 /// # Why this exists
@@ -1338,6 +1437,10 @@ fn moe_routing<'c>(
     let w2 = ctx.reshape_2d(&w, n_used, nt)?;
     let sum = ctx.clamp(&ctx.sum_rows(&w2)?, 6.103_515_6e-5, f32::INFINITY)?;
     let w_norm = ctx.div(&w2, &sum)?;
+    if std::env::var("BIGTEA_ROUTING_WEIGHTS").is_ok() {
+        ctx.compute(&w_norm, threads())?;
+        record_routing_weights(il, n_used as usize, &w_norm.to_vec_f32());
+    }
     let w3 = ctx.reshape_3d(&w_norm, 1, n_used, nt)?;
     let w_scaled = ctx.scale(&w3, config.expert_weights_scale)?;
     Ok((w_scaled, ids))

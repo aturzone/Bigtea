@@ -5,10 +5,11 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-09 · **Version**: v0.0.2 · **Branch**: `main` ·
-**Open PR**: [#44](https://github.com/aturzone/Bigtea/pull/44) — R3 step 1, the
-KV cache's raw path. **Verified; unmerged, Atur merges.**
-PR #43 (R0/R0.1/R1) is **merged**.
+**Last updated**: 2026-08-10 · **Version**: v0.0.2 · **Branch**: `main` ·
+**Open PRs**: [#44](https://github.com/aturzone/Bigtea/pull/44) — R3, the KV
+cache. `ticket/r5-product` (release workflow, `bigtea-pull`, `bigtea-serve`) and
+`ticket/r7-factored-experts` (this session's measurements). **All unmerged, Atur
+merges.** PR #43 (R0/R0.1/R1) is **merged**.
 
 ---
 
@@ -171,6 +172,58 @@ figure is coverage of a prompt-warmed *set*, this is hit rate against a 1.5 GiB
 budget holding ~1% of the model's experts. The measurement that tests R0.1
 needs a much larger cache than this machine has spare.
 
+## The byte budget, and why 20 tok/s is not a code problem (2026-08-10)
+
+Generation reads **3.21 GiB per token**. 20 tok/s at the measured 1.58 GiB/s
+direct-read rate allows **79 MB**. The gap is **42x**, and this session went
+looking for it in the two places nobody had measured.
+
+**Both were negative.** Full detail and controls:
+`docs/graph/research/v4flash-has-no-slack-2026-08-10.md`.
+
+| lever | worth | status |
+|---|---:|---|
+| expert-bank factorisation | 1.0x | **dead — measured, 1.2x from random noise** |
+| drop the router's tail | ~1.2x | **costs 8.8% of routing mass — measured** |
+| contextual sparsity | 1.1x | dead — experts are 9.1% negligible |
+| pinned hot set | 1.0x | dead — R0, 37.5% vs 25.0% random |
+| speculative decoding | 1.4x | real, but the docs' **2.2x does not transfer** |
+| 4.25 → 2.5-bit experts | 1.7x | unproven on an MoE this size, quality-risky |
+| warmed expert cache | 1.3x | measured at 23.5% hits with ~6 GiB spare |
+
+Everything still alive, multiplied, is **3.1x**.
+
+Three findings, all first measurements:
+
+1. **The expert bank is full-rank.** `bigtea-spectrum` (new) asked whether all
+   256 experts in a layer share a subspace — if they did, one resident basis plus
+   small per-expert coefficients would cut bytes by `4096/r` *and* cut flops. A
+   rank-512 basis holds **20.4%** of the bank's energy against **16.6%** for
+   matched random noise. 1.23x from nothing, confirmed on two layers and two
+   projections, and converged (10 power iterations move rank-256 from 11.4% to
+   11.5%).
+2. **The router's tail is not small.** Renormalised weights, sorted, mean over 43
+   layers: **33.5 / 20.6 / 15.0 / 12.1 / 10.1 / 8.8%**. Uniform would be 16.7%.
+   The standing assumption that "the 6th expert contributes little" is false —
+   reading three instead of six buys 2x and discards **31%** of the routing mass.
+3. **Speculative decoding is ~1.4x here, not 2.2x.** The literature's figure
+   assumes the verify pass costs what a single-token pass costs. Here it costs
+   more, because more tokens select more distinct experts (`U(n) ≈ 6·n^0.667`,
+   from this project's own dedup measurements). Below α≈0.75 it is a net *loss*.
+
+Together with the earlier 9.1%-negligible result that is four independent probes
+and four negatives, which says something about the model rather than the runner:
+**V4-Flash has no redundancy left to harvest.** Its experts are mutually
+distinct, internally dense, and its router spreads real weight across all six.
+The 6-of-256 is the whole of this architecture's sparsity and Bigtea already
+exploits it.
+
+**So 3.21 GiB/token is what this model costs, not an artefact.** 20 tok/s does
+not need a better runner; it needs the active weights to stop coming from disk.
+That makes the next question a measurable one nobody has published: **what is
+the tok/s-versus-RAM frontier for a 144 GB model?** Bigtea can sweep it because
+it owns residency; an `mmap` engine cannot be told to use exactly N GiB.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
@@ -231,6 +284,14 @@ cargo build --release
 Windows needs the **GNU** Rust toolchain and `C:\msys64\mingw64\bin` on PATH —
 Git Bash's own `/mingw64` is not MSYS2's and has no `gcc`, which shows up as
 `cannot find -lgomp` at link time.
+
+**Toolchain fix, 2026-08-10**: MSYS2 updated to gcc 16.1.0 and its `libmingwex`
+dropped `_gnu_exception_handler`, `__mingw_oldexcpt_handler` and the
+`__mingw_initlts*` symbols that rustup's bundled `crt2.o` still references. Every
+link began failing with "undefined reference" on code that compiles cleanly.
+`.cargo/config.toml` now sets `link-self-contained=no` for
+`x86_64-pc-windows-gnu`, so rustc uses MSYS2's startup files, which match MSYS2's
+libraries. Scoped to that target; MSVC, Linux and macOS are untouched.
 
 Models are at `C:\Projects\models\` (v4flash 144 GB / 5 shards, qwen3moe 17.28
 GiB, qwen3-4b 2.33 GB). **Do not download more without asking** — limited home

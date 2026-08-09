@@ -50,6 +50,9 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 - **`compute()` re-evaluates the whole ancestor graph.** Calling it per intermediate *re-does* the work each time, plus a graph build and threadpool cycle. 24 calls per block became 6 — **1.9x**. Invisible on prefill (big matmuls bury it), dominant at one token. Compute only before a `to_vec_*`/`set_*`.
 - **Threads are not the lever.** 4/12/20 threads all cost the same on a V4-Flash prefill; 1 thread is 4.7x *slower*. Threadpool-churn was the obvious explanation and was wrong.
 - **Every arena must scale with the prefill block.** Fixed-size arenas abort once the block grows; ggml asks and dies rather than returning an error.
+- **V4-Flash has no redundancy left to harvest — four probes, four negatives.** Experts are 9.1% internally negligible; the expert *bank* is full-rank (a rank-512 shared basis holds 20.4% of its energy against **16.6% for random noise**, `bigtea-spectrum`); the router's tail is not small (33.5/20.6/15.0/12.1/10.1/**8.8**%, so 3-of-6 discards 31% of the mass); and a pinned hot set scores 37.5% vs 25.0% random. **3.21 GiB/token is what the model costs, not an artefact.** Do not re-propose factorisation, contextual sparsity, or pinning.
+- **Speculative decoding is ~1.4x here, not 2.2x.** The literature assumes the verify pass costs what a single-token pass costs; here it costs more, because more tokens select more distinct experts (`U(n)≈6·n^0.667`). Below α≈0.75 it is a net *loss*, and the optimum draft is short.
+- **Windows: `.cargo/config.toml` sets `link-self-contained=no`.** MSYS2 gcc 16.1.0 dropped symbols rustup's bundled `crt2.o` still references, so every link fails with "undefined reference" on code that compiles. Do not delete it.
 
 ## Working rules
 
@@ -67,11 +70,14 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 
 **R0 done 2026-08-08** (`routing-skew-is-per-prompt-2026-08-08.md`): the router is genuinely skewed — top-8 takes 5-7x a uniform router — but **the hot set is per-prompt and must be warmed, not pinned.** Pinned from one prompt it covers 61.3% of another on the same subject, 37.5% across subjects, against 25.0% for a *random* cache. This corrected four v0.0.2 figures, killed the "prune the model to its hot set" plan, and reshaped R1.
 
-1. **R0.1 — does prompt routing predict *generated*-token routing?** Gates R1's worth: the answer sits between 1.60 and 7.76 tok/s.
-2. **R1 expert cache**, frequency-gated (the policy in `stream.rs`, never wired into the deepseek4 path). Size from the probe; the cache must own its memory.
-3. **KV cache** — a single-token pass costs 4.0s, which is what a cached step will cost; today each token re-runs the whole sequence. ~33 MB for 43 layers. A wrong cache gives fluent nonsense, so it needs an oracle at two consecutive positions.
-4. **Overlap reads with compute** — 2.3s I/O vs 1.0s compute, strictly serial. Layers 0-2 route by token id, so their experts are knowable before any compute runs.
-5. Then T1-T5 of `lts-0-0-0.md`: `bigtea pull`, quant selection, self-configuration, OpenAI-compatible server, prebuilt binaries.
+**R0.1, R1, R3 done. R5 started** — `bigtea-pull`, `bigtea-serve` (OpenAI-compatible, verified against the live model), release workflow.
+
+**2026-08-10** (`v4flash-has-no-slack-2026-08-10.md`): the byte-reduction roadmap is closed. 20 tok/s needs 79 MB/token; V4-Flash reads 3288. Everything still alive multiplies to **3.1x** against a **42x** gap, and the two ideas that could have closed it were measured and failed. **20 tok/s is not a code problem** — it needs the active weights to stop coming from disk.
+
+1. **The tok/s-versus-RAM frontier for a 144 GB model** — never published by anyone, and only an engine that owns residency can sweep it (`mmap` cannot be told to use exactly N GiB). Answers the product question honestly: *given your machine, the largest model at the speed you want.*
+2. **Overlap reads with compute** — ~53 ms read vs ~23 ms compute per block, ceiling ~1.4x.
+3. **Ring wraparound** to lift the 256-token context ceiling (#46).
+4. Finish R5/T1-T5 of `lts-0-0-0.md`: quant selection, self-configuration, prebuilt binaries.
 
 **No GPU code exists** — `bigtea-probe` detects the card, nothing uses it. A VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer.
 
