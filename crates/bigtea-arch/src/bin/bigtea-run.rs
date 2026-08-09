@@ -559,20 +559,46 @@ fn run_deepseek4(
     // And the cache owns its memory, because past ~6 GiB on Qwen3 a 71%-hit
     // cache backed by the page cache was the *slowest* configuration measured.
     let mut fw = bigtea_arch::Deepseek4Forward::new(model, config.clone()).with_resident(&resident);
-    let expert_budget = expert_cache_budget.unwrap_or(0);
+    // The expert cache and the always-read weights compete for the same RAM, and
+    // measurement says residency wins by a wide margin until it is satisfied.
+    //
+    // Measured 2026-08-09 with 5.7 GiB free, so 4.95 GiB of the always-read set
+    // was streaming: a 2 GiB expert cache reached 12.6% hits and moved generation
+    // 0.127 -> 0.134 tok/s. A resident byte is read every token by definition —
+    // a 100% hit rate — so it is worth roughly 8x an expert-cache byte here, and
+    // the 2 GiB spent on the cache came straight out of residency.
+    //
+    // So the cache is refused, with the arithmetic, until the always-read set
+    // fits. It is not a weak cache; it is the wrong place to spend the byte.
+    let shortfall = report.skipped_over_budget;
+    let expert_budget = match expert_cache_budget {
+        Some(b) if b > 0 && shortfall > 0 => {
+            println!(
+                "cache      refusing {:.2} GiB for experts: {:.2} GiB of always-read",
+                b as f64 / GIB,
+                shortfall as f64 / GIB
+            );
+            println!("cache      weights is still streaming, and a resident byte is read");
+            println!("cache      every token (100%) against ~13% for a cached expert.");
+            println!(
+                "cache      Free ~{:.1} GiB and it becomes worth having.",
+                shortfall as f64 / GIB
+            );
+            0
+        }
+        Some(b) => b,
+        None => 0,
+    };
     if expert_budget > 0 {
         fw = fw.with_expert_cache(expert_budget as usize);
         println!(
             "cache      {:.2} GiB for routed experts, warmed from the prompt (not pinned)",
             expert_budget as f64 / GIB
         );
-    } else {
-        println!(
-            "cache      off — a pass reads ~123 distinct experts per layer (~66 GiB);\n\
-             cache      measured 1.9-4.1% hits and a 17% slower prefill at the sizes\n\
-             cache      this machine can spare. Worth turning on once the KV cache\n\
-             cache      lands. --cache <GiB> forces it."
-        );
+    } else if shortfall == 0 && expert_cache_budget.is_none() {
+        println!("cache      off. The always-read set fits, so --cache <GiB> is now");
+        println!("cache      worth measuring: a cached step reads 6 experts per layer,");
+        println!("cache      not the ~123 a long prefill does.");
     }
     let fw = fw;
     if !fw.indexer_is_exact(tokens.len()) {
@@ -589,8 +615,7 @@ fn run_deepseek4(
     let mut seq = tokens.clone();
     // One cache for the whole session: the prompt fills it, and each generated
     // token appends a single row instead of re-running the sequence.
-    let mut kv =
-        bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
+    let mut kv = bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
     let logits = bigtea_arch::forward(&fw, &mut kv, &seq, arena_mib << 20)?;
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
     println!(

@@ -137,6 +137,30 @@ exactly).
 
 **Still open**: the 256-token ceiling (#46) needs the ring wraparound.
 
+## R1 re-measured (#47): the cache works, and it is still the wrong byte
+
+With the KV cache in, a step reads 6 distinct experts per layer instead of ~123,
+so the expert cache finally has something to hold. Hit rate moved **1.9-4.1% →
+7.8% at 1 GiB → 12.6% at 2 GiB**. Generation barely moved: 0.127 → 0.131 → 0.134
+tok/s.
+
+The reason is not the cache. **It and the always-read weights compete for the
+same RAM, and residency wins by roughly 8x per byte:**
+
+| a byte spent on | hit rate | what it buys |
+|---|---:|---|
+| always-read weights | **100%** | saves a read on *every* token, by definition |
+| expert cache (2 GiB) | 12.6% | saves 12.6% of a read |
+
+On that run only 2.43 of 7.38 GiB of always-read weights fitted, so the 2 GiB
+handed to the cache came straight out of residency. `bigtea-run` now **refuses**
+an expert cache while the always-read set is still streaming, and says by how
+much and why — the cache is not weak, it is the wrong place to spend the byte.
+
+The measurement that would settle its real value needs ~10.5 GiB free, so that
+residency is satisfied first and the cache is spending surplus rather than
+competing. Not yet taken.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
