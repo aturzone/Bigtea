@@ -933,7 +933,13 @@ fn compressor<'c>(
     let config = &fw.config;
     let head = config.kv_lora_rank as i64;
     let ratio = config.compress_block(il).expect("compressed layer");
-    let n_blocks = nt / ratio;
+    // Blocks are absolute. `b0` is the first block this batch completes and `b1`
+    // one past the last; at pos0 = 0 that is `0..nt / ratio`, exactly what this
+    // used to compute. A step summarises only the block it finishes, and the
+    // rows of that block come partly from the ring and partly from the batch.
+    let b0 = pos0 / ratio;
+    let b1 = (pos0 + nt) / ratio;
+    let n_blocks = b1 - b0;
     let wide = if overlap { 2 * head } else { head };
     let n_read = ratio * n_blocks;
     let state_rows = if overlap { 8 } else { ratio };
@@ -965,24 +971,33 @@ fn compressor<'c>(
     score_state.set_f32(&sc_buf)?;
 
     let zero_row = (state_rows + nt) as i32;
+    // The combined buffer is `state_rows` ring rows followed by this batch, so
+    // absolute position `q` sits at `state_rows + (q - pos0)`. That is only
+    // `state_rows + q` when pos0 is zero.
+    //
+    // The reach backwards is what fixes `state_rows`: the overlap half of block
+    // `b0` reads from `b0 * ratio - ratio`, and with `b0 * ratio >= pos0 - ratio
+    // + 1` that is at worst `pos0 - 2 * ratio + 1` — which is why 8 rows are kept
+    // for a ratio of 4, and why a smaller ring would read past the front.
+    let row_of = |q: i64| (state_rows + q - pos0) as i32;
     let mut idxs: Vec<i32> = Vec::new();
     if overlap {
-        for b in 0..n_blocks {
+        for b in b0..b1 {
             for j in 0..ratio {
                 let p = b * ratio - ratio + j;
-                idxs.push(if p < 0 {
-                    zero_row
-                } else {
-                    (state_rows + p) as i32
-                });
+                idxs.push(if p < 0 { zero_row } else { row_of(p) });
             }
         }
     }
-    for b in 0..n_blocks {
+    for b in b0..b1 {
         for j in 0..ratio {
-            idxs.push((state_rows + b * ratio + j) as i32);
+            idxs.push(row_of(b * ratio + j));
         }
     }
+    debug_assert!(
+        idxs.iter().all(|&i| i >= 0 && i <= zero_row),
+        "compressor gathered outside the ring+batch buffer: pos0 {pos0}, blocks          {b0}..{b1}, state_rows {state_rows}"
+    );
     let idx_t = ctx.new_i32_1d(idxs.len() as i64)?;
     idx_t.set_i32(&idxs)?;
 
@@ -1041,11 +1056,7 @@ fn compressor<'c>(
         n_nope as usize * f32_size,
     )?;
     let comp_pos = ctx.new_i32_1d(n_blocks)?;
-    comp_pos.set_i32(
-        &(0..n_blocks)
-            .map(|b| (b * ratio) as i32)
-            .collect::<Vec<i32>>(),
-    )?;
+    comp_pos.set_i32(&(b0..b1).map(|b| (b * ratio) as i32).collect::<Vec<i32>>())?;
     let (rope, rope_orig) = fw.rope(il);
     let pe = ctx.rope_ext(
         &pe_in,
@@ -1084,6 +1095,7 @@ fn attention<'c>(
     comp: Option<&Tensor<'c>>,
     nt: i64,
     pos0: i64,
+    comp_block0: i64,
     cache: &mut Deepseek4Cache,
 ) -> Result<Tensor<'c>> {
     let config = &fw.config;
@@ -1106,18 +1118,28 @@ fn attention<'c>(
     bigtea_ggml::f32_to_f16(&kv_vals, &mut raw[at..at + kv_vals.len()]);
 
     let mut packed: Vec<u16> = raw.clone();
-    let n_kv = match comp {
-        None => N_KV,
-        Some(c) => {
-            // The compressor returns every summary the sequence has so far, so
-            // its rows land at block 0 upward regardless of `pos0`.
-            let cv = c.to_vec_f32();
-            let store = &mut cache.comp[il as usize];
-            bigtea_ggml::f32_to_f16(&cv, &mut store[..cv.len()]);
-            cache.comp_len[il as usize] = cv.len() as i64 / head;
-            packed.extend_from_slice(store);
-            2 * N_KV
-        }
+    if let Some(c) = comp {
+        // The compressor returns only the blocks **this batch completed**, so
+        // they append at their absolute index. Writing them from block 0 —
+        // which was right while every pass started at position 0 — would make
+        // a step overwrite the sequence's history with its own single block.
+        let cv = c.to_vec_f32();
+        let store = &mut cache.comp[il as usize];
+        let at = (comp_block0 * head) as usize;
+        bigtea_ggml::f32_to_f16(&cv, &mut store[at..at + cv.len()]);
+        cache.comp_len[il as usize] = comp_block0 + cv.len() as i64 / head;
+    }
+
+    // The compressed half is present whenever the **sequence** has summaries, not
+    // only when this batch produced some. Three steps in four complete no block,
+    // and attending over the raw window alone on those would discard everything
+    // the sequence had already compressed — silently, and only on the cached path.
+    let has_comp = cache.comp_len[il as usize] > 0;
+    let n_kv = if has_comp {
+        packed.extend_from_slice(&cache.comp[il as usize]);
+        2 * N_KV
+    } else {
+        N_KV
     };
     let k = ctx.new_f16_3d(head, n_kv, 1)?;
     let bytes: Vec<u8> = packed.iter().flat_map(|h| h.to_le_bytes()).collect();
@@ -1137,7 +1159,7 @@ fn attention<'c>(
                 mask[at..at + 2].copy_from_slice(&F16_NEG_INF);
             }
         }
-        if comp.is_some() {
+        if has_comp {
             for blk in ((q_abs + 1) / ratio)..N_KV {
                 let at = row + (N_KV + blk) as usize * 2;
                 mask[at..at + 2].copy_from_slice(&F16_NEG_INF);
@@ -1745,50 +1767,17 @@ pub fn block(
     // whether a block has completed yet: below the first boundary a compressed
     // layer falls back to Raw, exactly as llama.cpp's guards do.
     let kind = config.attention_kind_from_ratio(il).expect("known ratio");
-    let fired = config.compress_block(il).is_some_and(|r| nt / r > 0);
+    // "Does this batch complete a block?" — absolute, not relative. `nt / r` is
+    // zero for any single-token step, so a step would never build a summary and,
+    // worse, would tell `attention` there was no compressed half at all.
+    let fired = config
+        .compress_block(il)
+        .is_some_and(|r| (pos0 + nt) / r > pos0 / r);
     // The compressor front-pads `state_rows` zeros in place of a persistent ring,
     // which is exact only while the previous window is inside this batch. On an
     // incremental step it is in the past, and those zeros would summarise the
     // wrong span **without failing**. Refuse rather than return fluent nonsense;
     // the ring is the next piece of R3.
-    // Keyed on the **sequence**, not this batch. At `nt = 1` a compressed layer's
-    // `fired` is `1 / ratio == 0`, so a step would quietly fall back to Raw and
-    // drop the compressed half of attention altogether — summaries the sequence
-    // has already built simply not consulted. That is the silent-wrong-answer
-    // shape this codebase keeps paying for, and it is why the condition asks
-    // whether the *sequence so far* has completed a block.
-    let seq_compressed = config
-        .compress_block(il)
-        .is_some_and(|r| (pos0 + nt) / r > 0);
-    if pos0 > 0 && seq_compressed {
-        return Err(crate::ArchError::Unimplemented(
-            "incremental decode through a compressed attention layer needs the              compressor input ring (R3 step 2); only the raw path is cached so far",
-        ));
-    }
-    // A compressed layer must project **every** pass, even one that completes no
-    // block: the row still belongs to the window a later block will summarise,
-    // and a gap in the ring summarises the wrong span without failing. When a
-    // block does complete, `compressor` projects as part of building the
-    // summary, so this only covers the case where it would not run at all.
-    if !fired {
-        if let Some(overlap) = match kind {
-            AttentionKind::CompressedSparse => Some(true),
-            AttentionKind::HeavilyCompressed => Some(false),
-            AttentionKind::Raw => None,
-        } {
-            compressor_project(
-                fw,
-                &ctx,
-                &weights,
-                il,
-                &e.attn_norm,
-                nt,
-                pos0,
-                overlap,
-                cache,
-            )?;
-        }
-    }
     let comp = match (kind, fired) {
         (AttentionKind::Raw, _) | (_, false) => None,
         (AttentionKind::CompressedSparse, true) => Some(compressor(
@@ -1825,6 +1814,7 @@ pub fn block(
         comp.as_ref(),
         nt,
         pos0,
+        pos0 / config.compress_block(il).unwrap_or(1),
         cache,
     )?;
     let attn_secs = t_phase.elapsed().as_secs_f64();

@@ -587,7 +587,11 @@ fn run_deepseek4(
 
     let t_prefill = std::time::Instant::now();
     let mut seq = tokens.clone();
-    let logits = bigtea_arch::prefill(&fw, &seq, arena_mib << 20)?;
+    // One cache for the whole session: the prompt fills it, and each generated
+    // token appends a single row instead of re-running the sequence.
+    let mut kv =
+        bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
+    let logits = bigtea_arch::forward(&fw, &mut kv, &seq, arena_mib << 20)?;
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
     println!(
         "prefill    {} tokens in {prefill_secs:.1}s ({:.2} tok/s)",
@@ -622,7 +626,7 @@ fn run_deepseek4(
         // routing histogram so keeps the prompt from being counted again per
         // token — and makes the per-pass difference a single token's routing.
         bigtea_arch::routing_next_pass();
-        let logits = bigtea_arch::prefill(&fw, &seq, arena_mib << 20)?;
+        let logits = bigtea_arch::step(&fw, &mut kv, next, arena_mib << 20)?;
         next = argmax(&logits)?;
         generated += 1;
         print!("{}", tokenizer.decode(&[next as u32]));

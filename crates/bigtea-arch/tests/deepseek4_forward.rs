@@ -3807,40 +3807,60 @@ fn a_cached_step_agrees_with_a_full_prefill() {
     );
 }
 
-/// **The compressed path must refuse an incremental step, not approximate it.**
+/// **A cached step must agree with a full prefill through the compressed path.**
 ///
-/// `compressor` front-pads `state_rows` zeros where llama.cpp keeps a ring,
-/// which is exact only while the previous window is inside the batch. On a step
-/// it is in the past. Summarising the wrong span does not fail — so the refusal
-/// is the safety property, and it is asserted rather than assumed.
+/// The raw-path version of this proves the KV cache; this proves the compressor
+/// ring, which is the harder half. At eight tokens two CSA blocks have completed,
+/// so the step's block spans the ring boundary — its rows come partly from the
+/// ring and partly from the batch, which is the case that front-padding zeros
+/// silently got wrong.
 #[test]
-#[ignore = "reads weights from a 144 GB container"]
-fn an_incremental_step_through_a_compressed_layer_is_refused() {
+#[ignore = "reads weights from a 144 GB container, two full passes"]
+fn a_cached_step_agrees_through_the_compressed_path() {
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
     let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());
     let arena = 1024 << 20;
 
-    // Eight tokens is two complete CSA blocks, so a compressed builder fires.
-    let tokens: Vec<i32> = TOKENS_165[..8].to_vec();
-    let mut cache = bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
-    bigtea_arch::forward(&fw, &mut cache, &tokens, arena).expect("prefill");
+    let tokens: Vec<i32> = TOKENS_165[..12].to_vec();
+    let n = 11usize;
+    assert!(
+        (n as i64 + 1) / Deepseek4Config::CSA_RATIO > 0,
+        "this length must actually run a compressor, or the test proves nothing"
+    );
 
-    let err = bigtea_arch::step(&fw, &mut cache, tokens[0], arena);
-    match err {
-        Err(bigtea_arch::ArchError::Unimplemented(msg)) => {
-            assert!(
-                msg.contains("ring"),
-                "the message must name what is missing"
-            );
-            eprintln!("  refused, as it must: {msg}");
-        }
-        Err(other) => panic!("wrong error: {other}"),
-        Ok(_) => panic!(
-            "an incremental step ran through a compressed layer without the \
-             compressor ring — it would have summarised the wrong span silently"
-        ),
-    }
+    let full = bigtea_arch::prefill(&fw, &tokens[..=n], arena).expect("full prefill");
+
+    let mut cache = bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
+    bigtea_arch::forward(&fw, &mut cache, &tokens[..n], arena).expect("partial prefill");
+    let stepwise = bigtea_arch::step(&fw, &mut cache, tokens[n], arena).expect("cached step");
+
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+            .expect("logits")
+            .0
+    };
+    let sum_full: f32 = full.iter().sum();
+    let sum_step: f32 = stepwise.iter().sum();
+    let drift = (sum_step - sum_full).abs() / sum_full.abs().max(1.0);
+    eprintln!(
+        "  compressed path: argmax {} vs {}, sums {sum_full:.2} vs {sum_step:.2}          ({:.3}% apart)",
+        argmax(&full),
+        argmax(&stepwise),
+        drift * 100.0
+    );
+    assert_eq!(
+        argmax(&full),
+        argmax(&stepwise),
+        "a cached step through a compressed layer chose a different token — the          compressor ring is summarising the wrong span, which on this          architecture reads as fluent nonsense rather than an error"
+    );
+    assert!(
+        drift < 0.02,
+        "logit sum moved {:.3}%, too much for a near-tie re-route",
+        drift * 100.0
+    );
 }
 
 /// **Is the cached step's disagreement a routing flip, or a wrong cache?**

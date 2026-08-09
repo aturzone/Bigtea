@@ -71,7 +71,7 @@ policy** is.
 
 | id | work | state | why it is next |
 |---|---|---|---|
-| **R3** | KV cache | **step 1 built, NOT yet verified** — `ticket/r3-kv-cache`, fully scoped in `backlog/r3-kv-cache.md` | the unlock for everything else, not just a speed win. ~24 MB of state across **three** structures (the compressor ring is the one that is easy to miss). Verified without a new oracle: `prefill(0..n) then step(n)` must match `prefill(0..=n)` — argmax and a tolerance, **not** bit-identical, since routing already flips ~3% on near ties at a ggml blocking boundary. Test at 2, 5 and 165 tokens because each runs a different attention builder. Worth **~0.33 tok/s** from the measured 3.0s single-token pass alone, against llama.cpp's 0.21–0.31, and it is what makes R1 pay |
+| **R3** | KV cache | **working, verified** — `ticket/r3-kv-cache`, fully scoped in `backlog/r3-kv-cache.md` | the unlock for everything else, not just a speed win. ~24 MB of state across **three** structures (the compressor ring is the one that is easy to miss). Verified without a new oracle: `prefill(0..n) then step(n)` must match `prefill(0..=n)` — argmax and a tolerance, **not** bit-identical, since routing already flips ~3% on near ties at a ggml blocking boundary. Test at 2, 5 and 165 tokens because each runs a different attention builder. Worth **~0.33 tok/s** from the measured 3.0s single-token pass alone, against llama.cpp's 0.21–0.31, and it is what makes R1 pay |
 | **R1** | frequency-gated expert cache on the deepseek4 path | **built 2026-08-08, inert until R3** | implemented, tested against the oracle, sized from the probe, `--cache <GiB>` now works on this path. Warms on the prompt, never pinned. Cannot pay while a pass still reads ~123 distinct experts per layer |
 | **R2** | overlap I/O with compute | ready, but smaller than it looks | per block it is ~53 ms read against ~23 ms compute, so the ceiling is ~1.4x — and all three expert tensors already read in one batched call, with everything after depending on them. Scoped against the code in the handoff |
 | **R4** | fit the always-read set | user-side | 7.38 GiB; needs ~10.5 GiB free. Worth 0.7s/token. The runner already names the processes to close |
@@ -95,61 +95,47 @@ So **R3 → R1 → R2**.
 Detail for each: `docs/graph/backlog/next-session-handoff.md`.
 Strategy and the bets beyond R6: `docs/graph/backlog/the-big-bang.md`.
 
-## R3 in progress — what is built and what is open
+## R3 — the KV cache works
 
-**Built** (`ticket/r3-kv-cache`): `Deepseek4Cache` (raw latents + compressed
-summaries, slot = absolute position), absolute positions threaded through all
-four hardcoded sites, and `forward`/`step` as **one** code path — a prefill is a
-step against an empty cache, so every existing test exercises the new machinery
-rather than leaving the `pos0 != 0` branch unrun.
-
-**All 14 llama.cpp oracle tests still pass through it**, so prefill is still
-element-exact and the cache machinery itself is sound.
-
-**One real bug caught before it shipped**: at `nt = 1` a compressed layer's
-`fired` is `1 / ratio == 0`, so an incremental step fell back to Raw and
-**silently dropped the compressed half of attention**. The guard now keys on the
-*sequence* having completed a block, not the batch, and there is a test asserting
-the refusal.
-
-**Equivalence holds.** `prefill(0..n)` + `step(n)` agrees with
-`prefill(0..=n)`: argmax equal, and the logit sum 0.278% apart. That gap is
-**not** noise and was not hidden behind a widened tolerance — it was diagnosed:
+**Generation no longer re-runs the sequence.** `bigtea-run` keeps one cache for
+the session: the prompt fills it, each token appends a single row.
 
 ```
-layer 33: full [48, 58, 70, 113, 166, 217]
-          step [48, 58, 70,      166, 217, 242]
-1 of 43 layers routed the last token differently; 0 of them hash-routed
+generate 5 tokens   0.145 tok/s   (6.9 s/token)     was 0.064
 ```
 
-Five of six experts agree; one near-tie in the top-6-of-256 swaps when the batch
-shape changes, exactly as `r3-kv-cache.md` predicted. A different expert gives a
-different output, so the sum *should* move.
+**2.3x, and measured under memory pressure** — 5.7 GiB free at the time, so only
+3.42 of the 7.38 GiB always-read set was resident and 3.95 GiB was re-read on
+every token. A single-token pass with the whole set resident measured **3.0s**
+(2026-08-08), which is ~0.33 tok/s; that figure has **not** been re-measured
+since the cache landed and should not be quoted as achieved.
 
-**What proves it is a flip and not a wrong cache**: layers below
-`hash_layer_count` select by token id out of `ffn_gate_tid2eid` and cannot depend
-on batch shape. If the cache were feeding attention the wrong keys those layers
-would diverge first. **None of them do.** The test therefore asserts argmax plus
-a stated routing budget, with the diagnostic named in the failure message.
+llama.cpp on the same model is 0.21–0.31 tok/s. **We are not yet past it on a
+measurement taken under equal conditions.** The next honest comparison needs
+~10.5 GiB free on both sides.
 
-**R3.2 in progress** (#45): the compressor's input ring now exists in the cache
-and `compressor` front-pads from it instead of from zeros. At position 0 the ring
-is empty, so that block of zeros is exactly what it always was and prefill stays
-bit-identical — all 19 container tests confirm it.
+### What it took, and two bugs that would have shipped silently
 
-Two pieces remain before the guard can be lifted:
+Both were caught by the equivalence harness (`prefill(0..n)` + `step(n)` must
+match `prefill(0..=n)`), not by reading the code:
 
-1. ~~The ring must slide on every pass~~ **done.** The projections are split into
-   `compressor_project`, which `block` calls on every pass through a compressed
-   layer whether or not a block completes. A step that completed no block would
-   otherwise have left a hole in the window a later block summarises.
-2. **New summaries must append at their absolute block index**, rather than
-   `attention` overwriting the compressed half with whatever the current batch
-   produced. This is the last piece before the guard can be lifted, and it is the
-   intricate one: a block that completes on a step spans the ring boundary, so
-   its rows come partly from the ring and partly from the batch.
+1. **The compressor ring.** `compressor` front-padded `state_rows` zeros where
+   llama.cpp keeps a ring — exact on a prefill, where the previous window is in
+   the batch, and a lie on a step. It now slides on *every* pass through a
+   compressed layer, including the three in four that complete no block.
+2. **`fired` was relative.** It asked `nt / ratio > 0`, which is zero for any
+   single-token step, so a step built no summary *and* told `attention` there was
+   no compressed half at all — discarding everything the sequence had compressed.
+   Now absolute: `(pos0 + nt) / r > pos0 / r`. **This one measured 15.05% wrong
+   with the argmax still agreeing**, which is exactly the failure mode that reads
+   as fluent nonsense. After the fix: 0.090%.
 
-Then the ring wraparound that lifts the 256-token ceiling (#46).
+Equivalence now holds on both paths — raw 0.278% apart, compressed 0.090%, argmax
+equal on both, with the residual proven to be a near-tie re-route rather than a
+cache fault (hash-routed layers, which cannot depend on batch shape, agree
+exactly).
+
+**Still open**: the 256-token ceiling (#46) needs the ring wraparound.
 
 ## Known limitations
 
