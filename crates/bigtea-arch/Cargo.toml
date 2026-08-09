@@ -17,6 +17,14 @@ bigtea-probe = { path = "../bigtea-probe" }
 bigtea-tokenizer = { path = "../bigtea-tokenizer" }
 
 [[bin]]
+name = "bigtea-serve"
+path = "src/bin/bigtea-serve.rs"
+# Unlike the other binaries this one has real unit tests -- request parsing and
+# JSON escaping, where a mistake corrupts a response rather than failing -- so
+# its harness is not empty and must run.
+test = true
+
+[[bin]]
 name = "bigtea-run"
 path = "src/bin/bigtea-run.rs"
 test = false

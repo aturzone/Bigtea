@@ -107,7 +107,7 @@ not built yet.
 | ⚠️ **Generation is slow** | see above — no KV cache yet on the V4-Flash path |
 | ⚠️ **V4-Flash is limited to 256 prompt tokens** | it builds its attention cache for the whole sequence at once; longer prompts are refused with a message. Lifting this is part of the KV-cache work |
 | ⚠️ **Model downloader** | `bigtea-pull <name>` resolves, resumes and reports the fit before downloading. Two models in the catalogue so far |
-| ❌ No server / API | no OpenAI-compatible endpoint yet |
+| ⚠️ **OpenAI-compatible server** | `bigtea-serve` answers `POST /v1/chat/completions`. Localhost only, one request at a time, no streaming yet |
 | ⚠️ **Linux and macOS build and pass tests in CI** | but no model has been *run* there yet, and macOS falls back to buffered I/O (`F_NOCACHE` is not wired up) |
 | ⚠️ **Prebuilt binaries** | the release workflow is written and asserts the binaries start; not yet fired against a tag |
 
@@ -200,6 +200,16 @@ bigtea-model-info model.gguf --budget 8
 
 # Run it
 bigtea-run model.gguf "your prompt" -n 32
+
+# Or serve it to a coding agent
+bigtea-serve model.gguf --port 8080
+```
+
+```console
+$ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json'     -d '{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":6}'
+{"id":"bigtea","object":"chat.completion","model":"deepseek-v4-flash",
+ "choices":[{"index":0,"message":{"role":"assistant","content":" Paris."},
+ "finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":6,"total_tokens":11}}
 ```
 
 For a split model, pass **any one shard**; the rest are discovered automatically.
