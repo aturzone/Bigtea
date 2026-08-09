@@ -8,3 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+
+[[bin]]
+name = "bigtea-iobench"
+path = "src/bin/bigtea-iobench.rs"
+test = false

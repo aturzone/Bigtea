@@ -33,3 +33,8 @@ test = false
 name = "bigtea-spectrum"
 path = "src/bin/bigtea-spectrum.rs"
 test = false
+
+[[bin]]
+name = "bigtea-kernelbench"
+path = "src/bin/bigtea-kernelbench.rs"
+test = false

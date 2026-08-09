@@ -224,6 +224,59 @@ That makes the next question a measurable one nobody has published: **what is
 the tok/s-versus-RAM frontier for a 144 GB model?** Bigtea can sweep it because
 it owns residency; an `mmap` engine cannot be told to use exactly N GiB.
 
+## The plateau was ours, not the drive's (2026-08-10) — 1.32x on expert reads
+
+Two written-down "facts" were ceilings we had built. Full detail and both new
+tools: `docs/graph/research/the-plateau-was-ours-2026-08-10.md`.
+
+**Where a token actually goes**, measured with `BIGTEA_BLOCK_TIMING=1`:
+
+| phase | before | share |
+|---|---:|---:|
+| dense always-read re-reads (disk) | 2.15 s | 39% |
+| expert slice reads (disk) | 2.03 s | 37% |
+| tail + graph overhead | 1.10 s | 20% |
+| **expert matmul** | **0.18 s** | **3%** |
+
+**76% of a token is disk; the arithmetic is 3%.** `bigtea-kernelbench` (new)
+times the expert FFN with weights already in RAM: 3.02 ms per block at **24.7
+GiB/s**, which is *above* single-threaded memcpy on this machine. The kernel is
+at DRAM speed and there is nothing to win in it.
+
+**All four readers shared one file handle.** A Windows handle without
+`FILE_FLAG_OVERLAPPED` is synchronous and the OS serialises reads on it, so the
+drive never left queue depth 1. `bigtea-iobench` (new), identical reads, one
+variable:
+
+| threads | shared handle | one handle each |
+|---:|---:|---:|
+| 4 | 2.01 GiB/s | **2.65** |
+| 8 | 2.05 | **2.69** |
+
+2.69 GiB/s is also above the 2.37 recorded as the drive's sequential ceiling.
+Implemented: an 8-handle pool per shard, `READERS` 4 → 8, and `prefetch_dense`
+reading a block's non-resident always-read tensors across the pool.
+
+| | before | after | gain |
+|---|---:|---:|---:|
+| **expert slice reads** | 2.03 s | **1.54 s** | **1.32x** |
+| dense re-reads, per GiB missing | 0.691 s | **0.496 s** | **1.39x** |
+
+**1.32x on expert reads is the clean number** — independent of residency, and it
+matches the bench's 1.31x prediction. The end-to-end rows (5.46 → 4.33 s/step,
+0.182 → 0.227 tok/s) are **not** a clean A/B: the runs had 3.11 and 2.66 GiB
+missing respectively. Normalised, the step gain is **1.19x**, and that is the
+figure to quote. A clean end-to-end A/B needs stable free RAM and is not done.
+
+This also corrects the speculative-decoding pessimism above: measured compute
+scales as ~`n^0.49` in the batch, not linearly, so the byte table is a fair
+estimate of total speedup rather than an optimistic one.
+
+**Revised ceiling on this machine**: with residency satisfied and reads overlapped
+with compute (R2, not done), a token is about `max(1.54, 0.6)` s ≈ **0.65 tok/s**
+against llama.cpp's 0.39 — a real 1.7x lead rather than parity. Not 20 tok/s.
+The remaining gap is entirely disk bandwidth against 3.21 GiB per token.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

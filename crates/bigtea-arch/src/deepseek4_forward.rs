@@ -526,9 +526,20 @@ type ExpertStack = (SkewedBuf, Vec<u64>);
 
 /// Concurrent readers for a layer's expert slices.
 ///
-/// Four, measured: 1.59 GiB/s with one reader, 1.99 with four, and no further
-/// gain at eight. The drive does 2.37 GiB/s sequential.
-const READERS: usize = 4;
+/// Was four, because "no further gain at eight" — which was true, and was an
+/// artefact of all four sharing one **synchronous** file handle, where the OS
+/// serialises reads and the drive never leaves queue depth 1. With a handle per
+/// reader ([`bigtea_model`]'s pool) the curve keeps climbing to eight:
+///
+/// ```text
+/// threads      one shared handle      one handle each
+///       4           2.01 GiB/s             2.65 GiB/s
+///       8           2.05                   2.69
+/// ```
+///
+/// Eight is where the per-handle curve flattens, and it must not exceed the
+/// pool size or two readers would collide on one handle again.
+const READERS: usize = 8;
 
 /// The padded key window each half of the cache occupies.
 const N_KV: i64 = 256;
@@ -1554,8 +1565,10 @@ fn read_expert_slices(
         }
     }
 
-    // Hand each reader disjoint destination spans. Positioned reads carry their
-    // own offset, so concurrent reads through one handle need no locking.
+    // Hand each reader disjoint destination spans *and its own file handle*.
+    // Positioned reads need no locking in this code, but a synchronous handle is
+    // serialised by the OS, so sharing one would leave the drive at queue depth
+    // 1 no matter how many threads are spawned.
     let mut slots: Vec<Vec<(&Job, &mut [u8])>> = (0..READERS).map(|_| Vec::new()).collect();
     let mut cursors: Vec<&mut [u8]> = buffers.iter_mut().map(|(b, _)| &mut b[..]).collect();
     for (j, job) in jobs.iter().enumerate() {
@@ -1568,13 +1581,19 @@ fn read_expert_slices(
     let copied: usize = std::thread::scope(|scope| {
         let handles: Vec<_> = slots
             .into_iter()
-            .map(|work| {
+            .enumerate()
+            .map(|(slot, work)| {
                 scope.spawn(move || {
                     let mut copied = 0usize;
                     for (job, dst) in work {
                         match &job.src {
                             Src::Disk { offset } => {
-                                copied += model.read_range_into(&names[job.name], *offset, dst)?;
+                                copied += model.read_range_into_via(
+                                    &names[job.name],
+                                    *offset,
+                                    dst,
+                                    slot,
+                                )?;
                             }
                             Src::Memory(bytes) => dst.copy_from_slice(bytes),
                         }
@@ -1802,20 +1821,89 @@ fn bind_dense<'c>(
     wctx: &'c Context,
     weights: &mut WeightSet<'c>,
     name: &str,
+    prefetched: &std::collections::HashMap<String, std::sync::Arc<SkewedBuf>>,
 ) -> Result<u64> {
     let loc = fw.model.location(name).expect("present").clone();
-    match fw.resident.and_then(|r| r.get_shared(name)) {
-        Some(shared) => {
-            weights.bind_shared(wctx, name, loc.ty, &loc.dims, shared)?;
-            Ok(0)
-        }
-        None => {
-            let data = fw.model.read_tensor_shared(name)?;
-            let n = data.len() as u64;
-            weights.bind_shared(wctx, name, loc.ty, &loc.dims, data)?;
-            Ok(n)
-        }
+    if let Some(shared) = fw.resident.and_then(|r| r.get_shared(name)) {
+        weights.bind_shared(wctx, name, loc.ty, &loc.dims, shared)?;
+        return Ok(0);
     }
+    // Read by `prefetch_dense` on several handles at once; falling back here
+    // keeps the function correct if the prefetch was skipped or failed.
+    let data = match prefetched.get(name) {
+        Some(d) => d.clone(),
+        None => fw.model.read_tensor_shared(name)?,
+    };
+    let n = data.len() as u64;
+    weights.bind_shared(wctx, name, loc.ty, &loc.dims, data)?;
+    Ok(n)
+}
+
+/// Read a block's non-resident always-read tensors in parallel, before binding.
+///
+/// # Why this is separate from binding
+///
+/// When the always-read set does not fit, every one of these is re-read on every
+/// token — 147 MiB per block, **2.1 s per token** measured on a machine 3.1 GiB
+/// short. That path read one tensor at a time through one file handle, which is
+/// the worst case for an NVMe: serialised by the OS *and* at queue depth 1.
+///
+/// Binding cannot be parallelised — `ggml` contexts are not thread-safe and the
+/// graph must be built in order — but reading can. So the reads are hoisted out,
+/// spread across the shard's handle pool, and the bind loop that follows finds
+/// its bytes already in memory.
+///
+/// Resident tensors are skipped entirely: `get_shared` is a refcount bump, and
+/// prefetching them would read what is already in RAM.
+fn prefetch_dense(
+    fw: &Deepseek4Forward<'_>,
+    names: &[String],
+) -> Result<std::collections::HashMap<String, std::sync::Arc<SkewedBuf>>> {
+    let missing: Vec<&String> = names
+        .iter()
+        .filter(|n| fw.resident.and_then(|r| r.get_shared(n)).is_none())
+        .collect();
+    if missing.len() < 2 {
+        // One tensor has nothing to overlap with, and the common case — a fully
+        // resident set — has none at all.
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let model = fw.model;
+    let chunks: Vec<Vec<&String>> = (0..READERS)
+        .map(|s| {
+            missing
+                .iter()
+                .skip(s)
+                .step_by(READERS)
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let out = std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .enumerate()
+            .map(|(slot, work)| {
+                scope.spawn(move || {
+                    let mut got = Vec::with_capacity(work.len());
+                    for name in work {
+                        let loc = model.location(name).expect("present");
+                        let mut buf =
+                            SkewedBuf::new(loc.size as usize, SkewedBuf::skew_for(loc.file_offset));
+                        model.read_range_into_via(name, 0, &mut buf[..], slot)?;
+                        got.push((name.clone(), std::sync::Arc::new(buf)));
+                    }
+                    Ok::<_, crate::ArchError>(got)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("dense prefetch thread did not panic"))
+            .collect::<Result<Vec<_>>>()
+    })?;
+    Ok(out.into_iter().flatten().collect())
 }
 
 /// One whole block, in its own arena, streams in and streams out as floats.
@@ -1846,9 +1934,10 @@ pub fn block(
         names.push("token_embd.weight".to_string());
     }
     let t_bind = std::time::Instant::now();
+    let prefetched = prefetch_dense(fw, &names)?;
     let mut dense_bytes = 0u64;
     for name in &names {
-        dense_bytes += bind_dense(fw, &wctx, &mut weights, name)?;
+        dense_bytes += bind_dense(fw, &wctx, &mut weights, name, &prefetched)?;
     }
     let dense_secs = t_bind.elapsed().as_secs_f64();
 
@@ -1964,14 +2053,21 @@ pub fn head(fw: &Deepseek4Forward<'_>, streams: &[f32], arena: usize) -> Result<
     let ctx = Context::new(arena)?;
     let wctx = Context::new_no_alloc(8 << 20)?;
     let mut weights = WeightSet::new();
-    for name in [
+    let names: Vec<String> = [
         "output_hc_fn.weight",
         "output_hc_scale.weight",
         "output_hc_base.weight",
         "output_norm.weight",
         "output.weight",
-    ] {
-        bind_dense(fw, &wctx, &mut weights, name)?;
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    // The head runs once per pass, but `output.weight` alone is large enough
+    // that reading it beside the others is worth the same parallelism.
+    let prefetched = prefetch_dense(fw, &names)?;
+    for name in &names {
+        bind_dense(fw, &wctx, &mut weights, name, &prefetched)?;
     }
 
     let hc = config.hc_mult as i64;
