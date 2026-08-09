@@ -14,9 +14,24 @@
 
 mod bytes;
 mod pretok;
+pub mod spm;
 
 pub use bytes::{decode as bytes_decode, encode as bytes_encode};
 pub use pretok::pre_tokenize;
+
+/// Which tokenization rule a container asks for.
+///
+/// GGUF names these in `tokenizer.ggml.model`. They are not variants of one
+/// algorithm — see [`spm`] for why the merge decision itself differs — so the
+/// choice is made once, at load, and never re-examined per call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// `"gpt2"` — byte-level BPE over an explicit ranked merge table.
+    Bpe,
+    /// `"llama"` — SentencePiece: merge by vocabulary score, `▁` for space,
+    /// `<0xXX>` byte fallback.
+    Spm,
+}
 
 use std::collections::HashMap;
 use std::fmt;
@@ -31,6 +46,8 @@ pub enum TokenizerError {
     UnsupportedModel(String),
     /// A merge rule was not two space-separated pieces.
     BadMerge(String),
+    /// SentencePiece needs one score per token and the container disagrees.
+    MissingScores { have: usize, want: usize },
 }
 
 impl fmt::Display for TokenizerError {
@@ -42,10 +59,17 @@ impl fmt::Display for TokenizerError {
             TokenizerError::UnsupportedModel(m) => {
                 write!(
                     f,
-                    "unsupported tokenizer model {m:?} (only byte-level BPE is implemented)"
+                    "unsupported tokenizer model {m:?} \
+                     (implemented: \"gpt2\" byte-level BPE, \"llama\" SentencePiece)"
                 )
             }
             TokenizerError::BadMerge(m) => write!(f, "malformed merge rule {m:?}"),
+            TokenizerError::MissingScores { have, want } => write!(
+                f,
+                "SentencePiece needs one score per token, but the container has \
+                 {have} scores for {want} tokens; without them every merge would \
+                 score equally and tokenize wrongly without failing"
+            ),
         }
     }
 }
@@ -55,8 +79,12 @@ impl std::error::Error for TokenizerError {}
 pub struct Tokenizer {
     tokens: Vec<String>,
     ids: HashMap<String, u32>,
-    /// Merge pair -> rank. Lower rank merges first.
+    /// Merge pair -> rank. Lower rank merges first. Empty for SentencePiece.
     merges: HashMap<(String, String), u32>,
+    kind: Kind,
+    /// Per-token score, indexed by id. Empty for byte-level BPE.
+    scores: Vec<f32>,
+    add_dummy_prefix: bool,
     pub bos: Option<u32>,
     pub eos: Option<u32>,
     pub add_bos: bool,
@@ -72,9 +100,11 @@ impl Tokenizer {
             .get("tokenizer.ggml.model")
             .and_then(Value::as_str)
             .unwrap_or("gpt2");
-        if model != "gpt2" {
-            return Err(TokenizerError::UnsupportedModel(model.to_string()));
-        }
+        let kind = match model {
+            "gpt2" => Kind::Bpe,
+            "llama" => Kind::Spm,
+            other => return Err(TokenizerError::UnsupportedModel(other.to_string())),
+        };
 
         let tokens: Vec<String> = meta
             .get("tokenizer.ggml.tokens")
@@ -109,13 +139,44 @@ impl Tokenizer {
         let id_of = |key: &str| meta.get(key).and_then(Value::as_u64).map(|v| v as u32);
         let flag = |key: &str| matches!(meta.get(key), Some(Value::Bool(true)));
 
+        // SentencePiece merges by score, so the array is not optional there —
+        // an absent one would make every merge score 0.0 and reduce the
+        // algorithm to "merge whatever is leftmost", which tokenizes without
+        // complaint and produces the wrong stream.
+        let scores: Vec<f32> = meta
+            .get("tokenizer.ggml.scores")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_f32).collect())
+            .unwrap_or_default();
+        if kind == Kind::Spm && scores.len() != tokens.len() {
+            return Err(TokenizerError::MissingScores {
+                have: scores.len(),
+                want: tokens.len(),
+            });
+        }
+
         Ok(Tokenizer {
             tokens,
             ids,
             merges,
+            kind,
+            scores,
+            // SentencePiece prepends a space so the first word tokenizes as it
+            // would mid-sentence. Containers may say otherwise; the default is
+            // on, which is what every Llama-family model uses.
+            add_dummy_prefix: match meta.get("tokenizer.ggml.add_space_prefix") {
+                Some(Value::Bool(v)) => *v,
+                _ => kind == Kind::Spm,
+            },
             bos: id_of("tokenizer.ggml.bos_token_id"),
             eos: id_of("tokenizer.ggml.eos_token_id"),
-            add_bos: flag("tokenizer.ggml.add_bos_token"),
+            // Llama-family containers frequently omit the flag and still expect
+            // BOS. Defaulting it on for SPM matches llama.cpp; for BPE the
+            // absent flag genuinely means "no".
+            add_bos: match meta.get("tokenizer.ggml.add_bos_token") {
+                Some(Value::Bool(v)) => *v,
+                _ => kind == Kind::Spm,
+            },
             add_eos: flag("tokenizer.ggml.add_eos_token"),
         })
     }
@@ -132,11 +193,30 @@ impl Tokenizer {
         self.ids.get(token).copied()
     }
 
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
     /// Encode text to token ids, honouring the container's add_bos/add_eos.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
         if self.add_bos {
             out.extend(self.bos);
+        }
+        if self.kind == Kind::Spm {
+            // No pre-tokenizer: SentencePiece works on the whole string, and
+            // splitting it first would prevent merges across the boundaries the
+            // splitter chose.
+            out.extend(spm::encode(
+                text,
+                &self.ids,
+                &self.scores,
+                self.add_dummy_prefix,
+            ));
+            if self.add_eos {
+                out.extend(self.eos);
+            }
+            return out;
         }
         for piece in pre_tokenize(text) {
             let encoded = bytes::encode(piece.as_bytes());
@@ -165,7 +245,63 @@ impl Tokenizer {
     ///
     /// Lossy on invalid UTF-8, because a partial multi-byte character is
     /// normal when streaming one token at a time.
+    /// Decode to **bytes**, without deciding they are valid UTF-8.
+    ///
+    /// # Why a streaming caller must use this
+    ///
+    /// One character is often several tokens. `😀` is four byte-fallback tokens,
+    /// and a Persian or Chinese character is typically two or three; decoding
+    /// each to a `String` on its own converts every incomplete fragment to `�`,
+    /// permanently. The text is then unrecoverable no matter what the caller
+    /// does downstream.
+    ///
+    /// So generation appends these bytes to a buffer and converts only at a
+    /// valid UTF-8 boundary. [`Self::decode`] is for whole sequences, where the
+    /// bytes are all present and the conversion is safe.
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        if self.kind == Kind::Spm {
+            let mut bytes = Vec::new();
+            for &id in ids {
+                if Some(id) == self.bos || Some(id) == self.eos {
+                    continue;
+                }
+                if let Some(text) = self.token_text(id) {
+                    bytes.extend(spm::piece_bytes(text));
+                }
+            }
+            return bytes;
+        }
+        let joined: String = ids.iter().filter_map(|&id| self.token_text(id)).collect();
+        bytes::decode(&joined)
+    }
+
     pub fn decode(&self, ids: &[u32]) -> String {
+        if self.kind == Kind::Spm {
+            let mut bytes = Vec::new();
+            for &id in ids {
+                // BOS/EOS have no text of their own; emitting their spelling
+                // ("<s>") would put markup in the user's output.
+                if Some(id) == self.bos || Some(id) == self.eos {
+                    continue;
+                }
+                if let Some(text) = self.token_text(id) {
+                    bytes.extend(spm::piece_bytes(text));
+                }
+            }
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            // Undo the dummy prefix `encode` added — but **only** when this is a
+            // whole sequence, which BOS in first position is the evidence for.
+            //
+            // Generation decodes one token at a time, and `▁The` must stay
+            // " The" there. Stripping unconditionally ran every word together
+            // ("Thecapital") — output that looks like a broken forward pass and
+            // is really a detokenizer applying a whole-sequence rule per piece.
+            let whole_sequence = self.bos.is_some() && ids.first().copied() == self.bos;
+            return match whole_sequence && self.add_dummy_prefix {
+                true => text.strip_prefix(' ').unwrap_or(&text).to_string(),
+                false => text,
+            };
+        }
         let joined: String = ids.iter().filter_map(|&id| self.token_text(id)).collect();
         String::from_utf8_lossy(&bytes::decode(&joined)).into_owned()
     }

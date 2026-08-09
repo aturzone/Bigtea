@@ -14,6 +14,50 @@ use bigtea_tokenizer::Tokenizer;
 
 const GIB: f64 = (1u64 << 30) as f64;
 
+/// Emit generated tokens as text, holding back incomplete UTF-8.
+///
+/// One character is often several tokens - an emoji is four byte-fallback
+/// tokens under SentencePiece, and a Persian or Chinese character is two or
+/// three. Converting each token to a `String` on its own turns every incomplete
+/// fragment into a replacement character permanently, so the bytes are buffered
+/// and flushed only at a valid UTF-8 boundary.
+struct TokenWriter {
+    pending: Vec<u8>,
+}
+
+impl TokenWriter {
+    fn new() -> Self {
+        TokenWriter {
+            pending: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, tokenizer: &Tokenizer, id: u32) {
+        use std::io::Write;
+        self.pending.extend(tokenizer.decode_bytes(&[id]));
+        // Longest valid prefix: everything up to a trailing partial character.
+        let good = match std::str::from_utf8(&self.pending) {
+            Ok(_) => self.pending.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if good > 0 {
+            let text = String::from_utf8_lossy(&self.pending[..good]).into_owned();
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+            self.pending.drain(..good);
+        }
+    }
+
+    /// Anything still buffered at the end was genuinely malformed, so it is
+    /// shown lossily rather than silently dropped.
+    fn finish(&mut self) {
+        if !self.pending.is_empty() {
+            print!("{}", String::from_utf8_lossy(&self.pending));
+            self.pending.clear();
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
@@ -201,6 +245,7 @@ fn run_streaming(
     println!("\n{}", tokenizer.decode(&tokens));
     let gen_start = std::time::Instant::now();
 
+    let mut writer = TokenWriter::new();
     for step in 0..n_predict {
         if logits.len() < vocab {
             return Err(format!("logits too small: {} < {vocab}", logits.len()).into());
@@ -216,9 +261,7 @@ fn run_streaming(
         if Some(next) == tokenizer.eos {
             break;
         }
-        print!("{}", tokenizer.decode(&[next]));
-        use std::io::Write;
-        std::io::stdout().flush().ok();
+        writer.push(tokenizer, next);
         tokens.push(next);
 
         // Only the new token needs computing; history lives in the cache.
@@ -378,6 +421,7 @@ fn run(
     let mut produced = String::new();
     let gen_start = std::time::Instant::now();
 
+    let mut writer = TokenWriter::new();
     for step in 0..n_predict {
         // A fresh compute arena per token: intermediates are dead once the
         // token is chosen, and reclaiming them keeps peak memory flat rather
@@ -413,11 +457,8 @@ fn run(
             println!("\n[end of sequence at step {step}]");
             break;
         }
-        let piece = tokenizer.decode(&[next]);
-        print!("{piece}");
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-        produced.push_str(&piece);
+        writer.push(&tokenizer, next);
+        produced.push_str(&tokenizer.decode(std::slice::from_ref(&next)));
         tokens.push(next);
     }
 
@@ -665,6 +706,7 @@ fn run_deepseek4(
     // fluent nonsense rather than an error.
     let t_gen = std::time::Instant::now();
     let mut generated = 0usize;
+    let mut writer = TokenWriter::new();
     while generated + 1 < n_predict {
         seq.push(next);
         // Each iteration is a fresh pass over the whole sequence. Telling the
@@ -674,9 +716,9 @@ fn run_deepseek4(
         let logits = bigtea_arch::step(&fw, &mut kv, next, arena_mib << 20)?;
         next = argmax(&logits)?;
         generated += 1;
-        print!("{}", tokenizer.decode(&[next as u32]));
-        let _ = std::io::stdout().flush();
+        writer.push(tokenizer, next as u32);
     }
+    writer.finish();
     println!();
 
     // 137 GiB of routed experts, if the router spreads evenly. If it does not,

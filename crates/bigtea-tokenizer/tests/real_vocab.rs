@@ -125,3 +125,51 @@ fn special_tokens_are_present_and_addressable() {
         "bos token text looks wrong: {text:?}"
     );
 }
+
+/// SentencePiece round trip against the real TinyLlama vocabulary.
+///
+/// A wrong tokenizer never crashes, so the only useful check is that text
+/// survives a round trip and that streaming decode matches whole-sequence
+/// decode. Ignored by default: it needs a container on disk.
+#[test]
+#[ignore = "needs models/tinyllama"]
+fn spm_round_trips_real_text_and_streams_the_same() {
+    let path =
+        std::path::Path::new("C:/Projects/models/tinyllama/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf");
+    if !path.exists() {
+        eprintln!("skipping: {} not present", path.display());
+        return;
+    }
+    let model = bigtea_model::Model::open_split(path).expect("open");
+    let tk = bigtea_tokenizer::Tokenizer::from_metadata(model.metadata()).expect("tokenizer");
+    assert_eq!(tk.kind(), bigtea_tokenizer::Kind::Spm);
+
+    for text in [
+        "The capital of France is Paris.",
+        "hello world",
+        "a b  c",
+        "def fib(n):\n    return n",
+        "Ünïcödé and emoji \u{1F600}",
+    ] {
+        let ids = tk.encode(text);
+        assert!(!ids.is_empty(), "{text:?} encoded to nothing");
+        let back = tk.decode(&ids);
+        assert_eq!(back, text, "round trip failed for {text:?} -> {ids:?}");
+
+        // Decoding one token at a time -- what generation does -- must
+        // concatenate to the same text. The invariant is on BYTES, not on
+        // Strings: one character is often several tokens, so a per-token
+        // String conversion would replace every incomplete fragment with a
+        // replacement character and lose it permanently.
+        let mut streamed = Vec::new();
+        for &id in &ids {
+            streamed.extend(tk.decode_bytes(std::slice::from_ref(&id)));
+        }
+        let streamed = String::from_utf8(streamed).expect("streamed bytes are valid UTF-8");
+        assert_eq!(
+            streamed.strip_prefix(' ').unwrap_or(&streamed),
+            text,
+            "streaming decode disagreed with whole-sequence decode for {text:?}"
+        );
+    }
+}

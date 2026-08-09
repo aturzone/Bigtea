@@ -277,6 +277,51 @@ with compute (R2, not done), a token is about `max(1.54, 0.6)` s ≈ **0.65 tok/
 against llama.cpp's 0.39 — a real 1.7x lead rather than parity. Not 20 tok/s.
 The remaining gap is entirely disk bandwidth against 3.21 GiB per token.
 
+## Coverage: the Llama family now opens (2026-08-10)
+
+Atur reset the goal: **standards-compliant, opens any model, matches or beats
+llama.cpp on the criteria, all its options — then tag v0.0.X LTS, then 20 tok/s.**
+The checklist that decides when LTS ships is
+`docs/graph/backlog/lts-parity-criteria.md`; every row is done / gap / won't.
+
+Coverage was the larger gap and had never been written down:
+
+| | was | now | llama.cpp |
+|---|---:|---:|---:|
+| architectures | 3 | **5 families** | ~100 |
+| tokenizers | 1 (`gpt2`) | **2 (`gpt2`, `llama`)** | 6 |
+| chat templates | 0 | 0 | ~40 |
+| samplers | greedy only | greedy only | ~10 |
+
+**Verified on real containers, not fixtures:**
+
+| model | architecture | tokenizer | output |
+|---|---|---|---|
+| TinyLlama-1.1B | `llama` | SPM | "The capital of France is **Paris.**" |
+| Llama-3.2-1B-Instruct | `llama` | BPE | "**Paris.** The capital of Germany is Berlin." |
+| Qwen3-4B | `qwen3` | BPE | unchanged — no regression |
+
+Three things were refusing the Llama family, and two would have shipped silently:
+
+1. **QK norm was mandatory.** `required_tensors` listed `attn_q_norm`/
+   `attn_k_norm` on every block; llama, mistral, qwen2, gemma and phi do not
+   have them, so the up-front check was a false negative on all of them. Now
+   detected from the container.
+2. **RoPE type was hardcoded to NeoX.** llama.cpp uses NORM for llama/mistral
+   and NeoX for qwen/phi/gemma. Both run without error on either layout — the
+   wrong one is fluent nonsense. Now chosen by architecture, and an
+   architecture *not* on the list is **flagged as a guess** in the runner's
+   output rather than silently defaulted.
+3. **SentencePiece did not exist.** It merges by vocabulary *score*, not by
+   merge rank; space is `▁`; unknown text falls back to `<0xXX>` byte tokens.
+
+**One real bug the round-trip test caught**: decoding tokens one at a time is
+unsound for any multi-byte character — an emoji is four byte-fallback tokens,
+and Persian or Chinese characters are two or three, so each fragment became `�`
+permanently. `decode_bytes` returns bytes and generation now buffers to a valid
+UTF-8 boundary. **This affected the BPE path too**, so it was breaking non-ASCII
+output on every model, not just the new ones.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
