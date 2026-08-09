@@ -30,6 +30,7 @@ use std::sync::Arc;
 use bigtea_gguf::{GgmlType, Gguf};
 use bigtea_io::{DirectFile, IoMode, SkewedBuf};
 
+pub mod catalogue;
 mod discover;
 mod resident;
 

@@ -37,6 +37,7 @@ dependencies = [
  "bigtea-gguf",
  "bigtea-io",
  "bigtea-plan",
+ "bigtea-probe",
 ]
 
 [[package]]

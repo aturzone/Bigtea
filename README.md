@@ -106,10 +106,10 @@ not built yet.
 | ✅ Honest reporting of residency, throughput and shortfalls | |
 | ⚠️ **Generation is slow** | see above — no KV cache yet on the V4-Flash path |
 | ⚠️ **V4-Flash is limited to 256 prompt tokens** | it builds its attention cache for the whole sequence at once; longer prompts are refused with a message. Lifting this is part of the KV-cache work |
-| ❌ No model downloader | you bring your own `.gguf` |
+| ⚠️ **Model downloader** | `bigtea-pull <name>` resolves, resumes and reports the fit before downloading. Two models in the catalogue so far |
 | ❌ No server / API | no OpenAI-compatible endpoint yet |
 | ⚠️ **Linux and macOS build and pass tests in CI** | but no model has been *run* there yet, and macOS falls back to buffered I/O (`F_NOCACHE` is not wired up) |
-| ❌ No prebuilt binaries | you build from source, and you need ggml |
+| ⚠️ **Prebuilt binaries** | the release workflow is written and asserts the binaries start; not yet fired against a tag |
 
 Architectures implemented: **Qwen3 / Qwen3-MoE** and **DeepSeek-V4-Flash**
 (`deepseek4`). Others will load as containers but will not run.
@@ -186,6 +186,12 @@ that would be blocked for no reason.
 ## Using it
 
 ```bash
+# What Bigtea can fetch, and what each needs resident
+bigtea-pull --list
+
+# Says what it costs and whether it will run here, before downloading
+bigtea-pull v4flash --dry-run
+
 # What can this machine run, and what should you close?
 bigtea-probe
 
