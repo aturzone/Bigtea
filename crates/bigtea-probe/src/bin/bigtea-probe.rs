@@ -1,8 +1,11 @@
 //! Measure this machine.
 //!
-//! Usage: `bigtea-probe [path] [--quick]`
+//! Usage: `bigtea-probe [path] [--bandwidth]`
 //!
-//! `--quick` skips the read-bandwidth benchmark, which is the only slow step
+//! The read-bandwidth benchmark is **off by default**: it writes a temporary
+//! file larger than RAM, and this is the first command a new user runs — often
+//! to check whether they have disk space at all. `--bandwidth` opts in;
+//! `--quick` is still accepted and is now the default behaviour.
 //! (it writes and reads a file larger than available RAM, deliberately, so the
 //! page cache cannot hide the disk).
 
@@ -12,16 +15,28 @@ use bigtea_probe::{processes, Machine};
 
 fn main() -> ExitCode {
     let mut path = String::from(".");
-    let mut quick = false;
+    // **Quick by default.** The bandwidth benchmark writes a temporary file
+    // larger than RAM, and this is the first command anyone runs — often to
+    // decide whether they have the disk space for a model at all. Filling that
+    // disk uninvited, with no confirmation, is the wrong first impression, and
+    // it made an unarguable `bigtea-probe` in CI a multi-minute disk hammer.
+    // Opt in with `--bandwidth`; `--quick` stays accepted so existing scripts
+    // and every doc that mentions it keep working.
+    let mut quick = true;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--quick" | "-q" => quick = true,
+            "--bandwidth" | "-b" => quick = false,
             "--processes" | "-p" => {
                 dump_processes();
                 return ExitCode::SUCCESS;
             }
             "-h" | "--help" => {
-                println!("usage: bigtea-probe [path] [--quick] [--processes]");
+                println!("usage: bigtea-probe [path] [--bandwidth] [--processes]");
+                println!();
+                println!("  --bandwidth  measure read speed. Writes a temporary file larger");
+                println!("               than RAM, so it is off unless you ask for it.");
+                println!("  --processes  what is holding RAM, and what closing it would free.");
                 return ExitCode::SUCCESS;
             }
             other => path = other.to_string(),
@@ -31,8 +46,17 @@ fn main() -> ExitCode {
     if !quick {
         eprintln!("measuring read bandwidth (writes a temporary file larger than RAM)...");
     }
+    let machine_note = if quick {
+        "
+read       pass --bandwidth to measure it (writes a temp file > RAM)"
+    } else {
+        ""
+    };
     let machine = Machine::probe(&path, !quick);
     println!("{machine}");
+    if !machine_note.is_empty() {
+        println!("{machine_note}");
+    }
 
     // The number every plan hangs off, made explicit.
     let usable = machine.usable_ram_for_weights(OVERHEAD);

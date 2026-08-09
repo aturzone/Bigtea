@@ -184,7 +184,11 @@ competing. Not yet taken.
   **Windows binaries are now redistributable** (2026-08-08) — the GNU C++ and
   OpenMP runtimes link statically, so the `.exe` needs only system DLLs. Before
   that it died with `0xC0000135` before `main` on any machine without MSYS2,
-  silently. The CI release job is still to write.
+  silently. **The release workflow is written** (2026-08-09, `release.yml`): it
+  builds on a tag for all three platforms, **asserts every binary actually
+  starts** — a missing runtime kills the process before `main`, so silence is the
+  symptom — reports what each links against, and attaches the archives. Not yet
+  fired against a real tag.
 
 ## Things that are true and cost time to rediscover
 
@@ -211,7 +215,7 @@ doc, run in the same session as the number it is compared against.**
 export GGML_LIB_DIR=C:/Projects/llamacpp-unsloth/build/ggml/src
 cargo test --release          # 168 tests (+16 container-backed, --ignored)
 cargo build --release
-./target/release/bigtea-probe --quick        # RAM/disk/GPU + what to close
+./target/release/bigtea-probe        # RAM/disk/GPU + what to close
 ```
 
 Windows needs the **GNU** Rust toolchain and `C:\msys64\mingw64\bin` on PATH —

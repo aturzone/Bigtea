@@ -187,7 +187,7 @@ that would be blocked for no reason.
 
 ```bash
 # What can this machine run, and what should you close?
-bigtea-probe --quick
+bigtea-probe
 
 # Will this model fit, and how fast will it be — before downloading 144 GB
 bigtea-model-info model.gguf --budget 8

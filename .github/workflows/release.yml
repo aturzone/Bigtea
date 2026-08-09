@@ -1,0 +1,183 @@
+name: Release
+
+# Build redistributable binaries on a tag and attach them to the GitHub Release.
+#
+# Today the only way to try Bigtea is to install the GNU Rust toolchain, install
+# MSYS2, build ggml by hand and set an environment variable. That is a wall in
+# front of every potential user, and it is the largest single thing standing
+# between the project and anyone actually running it.
+#
+# **Redistributable is the hard part, not building.** A binary that starts on the
+# machine that compiled it is easy; one that starts on a machine with no
+# toolchain is the point. Windows died with `0xC0000135` before `main` on any
+# machine without MSYS2 — silently, with no message — until the GNU C++ and
+# OpenMP runtimes were linked statically. So every artefact here is checked for
+# the thing that would make it useless: that it runs at all.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (for a dry run without publishing)'
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  name: linux-x86_64,   ext: '',     archive: tar.gz }
+          - { os: macos-latest,   name: macos-arm64,    ext: '',     archive: tar.gz }
+          - { os: windows-latest, name: windows-x86_64, ext: '.exe', archive: zip }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Use the GNU toolchain on Windows
+        if: runner.os == 'Windows'
+        run: rustup default stable-x86_64-pc-windows-gnu
+
+      - name: MSYS2 toolchain (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            git
+
+      - name: Put mingw64 on PATH (Windows)
+        if: runner.os == 'Windows'
+        run: echo "D:/a/_temp/msys64/mingw64/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build ggml (Windows, MinGW)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp
+          cmake -S llama.cpp -B llama.cpp/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF -DGGML_NATIVE=OFF
+          cmake --build llama.cpp/build --target ggml ggml-base ggml-cpu -j
+          mkdir -p ggml-libs
+          find llama.cpp/build \( -name 'libggml*.a' -o -name 'ggml*.a' \) -print | while read -r f; do
+            cp "$f" "ggml-libs/$(basename "$f" | sed 's/^lib//')"
+          done
+          for lib in ggml-base ggml-cpu ggml; do
+            test -f "ggml-libs/$lib.a" || { echo "::error::ggml-libs/$lib.a missing"; exit 1; }
+          done
+
+      - name: Build ggml (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp
+          cmake -S llama.cpp -B llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF -DGGML_NATIVE=OFF
+          cmake --build llama.cpp/build --config Release --target ggml ggml-base ggml-cpu -j
+          mkdir -p ggml-libs
+          find llama.cpp/build \( -name 'libggml*.a' -o -name 'ggml*.a' \) -print | while read -r f; do
+            cp "$f" "ggml-libs/$(basename "$f" | sed 's/^lib//')"
+          done
+          for lib in ggml-base ggml-cpu ggml; do
+            test -f "ggml-libs/$lib.a" || { echo "::error::ggml-libs/$lib.a missing"; exit 1; }
+          done
+
+      - name: Build release binaries
+        shell: bash
+        env:
+          GGML_LIB_DIR: ${{ github.workspace }}/ggml-libs
+        run: cargo build --release --workspace --bins
+
+      # The whole point of shipping a binary is that it runs somewhere the
+      # toolchain does not. `--help`-style smoke tests catch the failure mode
+      # that matters — a missing runtime DLL kills the process before `main`,
+      # so there is no error message to read, only an exit code.
+      - name: The binaries actually start
+        shell: bash
+        run: |
+          cd target/release
+          fail=0
+          for b in bigtea-run bigtea-probe bigtea-model-info bigtea-meta gguf-info bigtea-loadbench; do
+            exe="./$b${{ matrix.ext }}"
+            test -f "$exe" || { echo "::error::$b was not built"; fail=1; continue; }
+            # No arguments: every one of these prints usage and exits non-zero,
+            # which is fine. A load-time failure exits without printing at all.
+            # bigtea-probe with no flags would measure disk bandwidth, so give
+            # it the cheap path; everything else prints usage and exits.
+            if [ "$b" = "bigtea-probe" ]; then args=(--help); else args=(); fi
+            out=$("$exe" "${args[@]}" 2>&1 || true)
+            if [ -z "$out" ]; then
+              echo "::error::$b produced no output — it probably failed before main (missing runtime?)"
+              fail=1
+            else
+              echo "$b starts: $(echo "$out" | head -1)"
+            fi
+          done
+          exit $fail
+
+      - name: Report what the binaries link against
+        shell: bash
+        run: |
+          cd target/release
+          echo "### Dynamic dependencies of \`bigtea-run\` (${{ matrix.name }})" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          if [ "${{ runner.os }}" = "Linux" ]; then ldd bigtea-run >> $GITHUB_STEP_SUMMARY || true
+          elif [ "${{ runner.os }}" = "macOS" ]; then otool -L bigtea-run >> $GITHUB_STEP_SUMMARY || true
+          else objdump -p bigtea-run.exe | grep 'DLL Name' >> $GITHUB_STEP_SUMMARY || true
+          fi
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Package
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME:-dev}"
+          DIR="bigtea-${VER}-${{ matrix.name }}"
+          mkdir -p "$DIR"
+          for b in bigtea-run bigtea-probe bigtea-model-info bigtea-meta gguf-info bigtea-loadbench; do
+            cp "target/release/$b${{ matrix.ext }}" "$DIR/"
+          done
+          cp README.md LICENSE NOTICE CHANGELOG.md STATUS.md "$DIR/"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "$DIR.zip" "$DIR" >/dev/null
+          else
+            tar czf "$DIR.tar.gz" "$DIR"
+          fi
+          ls -la bigtea-*.${{ matrix.archive }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bigtea-${{ matrix.name }}
+          path: bigtea-*.${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: attach to the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - run: ls -la dist
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
