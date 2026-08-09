@@ -3691,3 +3691,144 @@ fn a_prompt_longer_than_the_window_is_refused_not_a_panic() {
         Ok(_) => panic!("400 tokens should not have been accepted"),
     }
 }
+
+/// **A cached step must agree with a full prefill.**
+///
+/// This is R3's entire correctness argument, and it needs no new llama.cpp
+/// capture: `prefill` is already verified against llama.cpp's element sums for
+/// all 43 blocks, so it is a trustworthy reference for itself.
+///
+/// ```text
+/// full     = prefill(tokens[0..=n])            <- already oracle-verified
+/// stepwise = prefill(tokens[0..n]) then step(tokens[n])
+/// ```
+///
+/// **Deliberately not bit-identical.** Measured 2026-08-08: at the 63 → 64 token
+/// boundary the *existing* engine re-routes ~3% of selections that earlier tokens
+/// had already made — the net stays at exactly +6 per layer, so no token is lost,
+/// but near-ties in the top-6-of-256 flip when the batch shape changes. A cached
+/// step attends with a different batch shape than a full prefill *by
+/// construction*, so it meets the same effect on purpose. A test demanding
+/// equality would fail on correct code, and the natural reaction — loosening it
+/// until it passes — is exactly how a real cache bug gets shipped.
+///
+/// So: argmax must agree, and the logit sum must land inside the same tolerance
+/// every other check in this file uses.
+#[test]
+///
+/// # STATUS: FAILING, and deliberately not loosened
+///
+/// The raw path is implemented and this test does not yet pass:
+///
+/// ```text
+/// n = 1 (2 tokens)   step 446595.72   full 445449.16   +0.257%
+/// n = 2 (3 tokens)   step 399234.41   full 398126.00   +0.278%
+/// ```
+///
+/// argmax agrees at both lengths, and the error is **flat rather than
+/// accumulating**, so it is systematic from the first step rather than drift in
+/// the cached values. That is the shape a routing flip would have — the
+/// behaviour `r3-kv-cache.md` predicted, since a step attends with a different
+/// batch shape than a full prefill by construction — but *predicted* is not
+/// *demonstrated*, and 0.26% is well outside the tolerance every other check
+/// here uses.
+///
+/// **Do not widen the tolerance to make this green.** The ticket names that as
+/// the exact route by which a real cache bug gets shipped. Prove which it is
+/// first: log the selected expert ids for the last token in both paths and
+/// compare. If they differ, the flip is the cause and the assertion should
+/// become "argmax equal, and at most N routing differences" with N stated. If
+/// they are identical, the cache is wrong and the sum is telling the truth.
+#[ignore = "reads weights from a 144 GB container, two full passes per length"]
+fn a_cached_step_agrees_with_a_full_prefill() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+    let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());
+    let arena = 1024 << 20;
+
+    // Only the raw attention path is cached so far, and a compressed builder
+    // fires once a block completes (`nt / ratio > 0`, ratio 4). Below that every
+    // one of the 43 blocks falls back to Raw, which is what this step covers.
+    // The compressed lengths — 5 and 165 — are asserted to *refuse*, so the
+    // untested path cannot be reached silently.
+    let tokens: Vec<i32> = TOKENS_5.to_vec();
+    // The length that decides which builders run is the **whole** sequence, not
+    // the step: `tokens[..=n]` is `n + 1` long, and at `n + 1 == 4` a CSA block
+    // completes, so the full pass runs a compressor the stepwise path must
+    // refuse. Getting this wrong made the cache look broken when the test was.
+    let n = 2usize;
+    assert!(
+        (n as i64 + 1) / Deepseek4Config::CSA_RATIO == 0,
+        "this length must stay on the raw path, or the test is checking a path \
+         the cache does not implement yet"
+    );
+
+    let full = bigtea_arch::prefill(&fw, &tokens[..=n], arena).expect("full prefill");
+
+    let mut cache = bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
+    let _ = bigtea_arch::forward(&fw, &mut cache, &tokens[..n], arena).expect("partial prefill");
+    assert_eq!(cache.n_past(), n, "the cache must know where it is");
+    let stepwise = bigtea_arch::step(&fw, &mut cache, tokens[n], arena).expect("cached step");
+    assert_eq!(cache.n_past(), n + 1);
+
+    assert_eq!(full.len(), stepwise.len(), "logit count");
+
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+            .expect("logits")
+            .0
+    };
+    assert_eq!(
+        argmax(&full),
+        argmax(&stepwise),
+        "a cached step chose a different token than the full prefill — the cache \
+         is wrong, and on this architecture that reads as fluent nonsense rather \
+         than an error"
+    );
+
+    let sum_full: f32 = full.iter().sum();
+    let sum_step: f32 = stepwise.iter().sum();
+    assert_sum("cached step vs full prefill", sum_step, sum_full);
+    eprintln!(
+        "  argmax {} agrees; sums {sum_full:.3} vs {sum_step:.3}",
+        argmax(&full)
+    );
+}
+
+/// **The compressed path must refuse an incremental step, not approximate it.**
+///
+/// `compressor` front-pads `state_rows` zeros where llama.cpp keeps a ring,
+/// which is exact only while the previous window is inside the batch. On a step
+/// it is in the past. Summarising the wrong span does not fail — so the refusal
+/// is the safety property, and it is asserted rather than assumed.
+#[test]
+#[ignore = "reads weights from a 144 GB container"]
+fn an_incremental_step_through_a_compressed_layer_is_refused() {
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+    let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());
+    let arena = 1024 << 20;
+
+    // Eight tokens is two complete CSA blocks, so a compressed builder fires.
+    let tokens: Vec<i32> = TOKENS_165[..8].to_vec();
+    let mut cache = bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
+    bigtea_arch::forward(&fw, &mut cache, &tokens, arena).expect("prefill");
+
+    let err = bigtea_arch::step(&fw, &mut cache, tokens[0], arena);
+    match err {
+        Err(bigtea_arch::ArchError::Unimplemented(msg)) => {
+            assert!(
+                msg.contains("ring"),
+                "the message must name what is missing"
+            );
+            eprintln!("  refused, as it must: {msg}");
+        }
+        Err(other) => panic!("wrong error: {other}"),
+        Ok(_) => panic!(
+            "an incremental step ran through a compressed layer without the \
+             compressor ring — it would have summarised the wrong span silently"
+        ),
+    }
+}

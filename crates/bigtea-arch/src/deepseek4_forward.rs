@@ -296,6 +296,73 @@ fn dump_routing(log: &[Vec<Vec<u32>>], path: &str) -> std::io::Result<()> {
     out.flush()
 }
 
+/// Attention state that must survive from one forward pass to the next.
+///
+/// # Why this exists
+///
+/// Without it, generating token *n* re-runs the whole prompt: every published
+/// V4-Flash generation figure so far is the cost of re-prefilling the sequence,
+/// not the cost of a token. It is also what makes the expert cache pay — a pass
+/// over 166 tokens reads **122.8 distinct experts per layer (~66 GiB)**, and a
+/// single-token step reads **6 (3.21 GiB)**. Nothing of that size is cacheable
+/// until a step stops re-reading the sequence.
+///
+/// # Three structures, not two
+///
+/// The compressor's input ring is the one that is easy to miss, and missing it
+/// does not fail — it summarises the wrong span, fluently. On a *prefill* the
+/// previous window's rows are inside the batch being processed, so
+/// [`compressor`] can front-pad with `state_rows` zeros and never read a ring.
+/// In incremental decode those rows are in the past, and the zeros would be a
+/// lie.
+///
+/// Roughly 24 MB across 43 layers. Memory is not the constraint here;
+/// correctness is.
+pub struct Deepseek4Cache {
+    /// Raw KV latents, F16, `kv_lora_rank * N_KV` per layer.
+    ///
+    /// **Slot index is the absolute position**, which is what lets the mask stay
+    /// simple arithmetic — and what a ring with wraparound would break, so the
+    /// mask and any future ring must be rewritten together.
+    raw: Vec<Vec<u16>>,
+    /// Compressed summaries, F16, `kv_lora_rank * N_KV` per layer. Slot index is
+    /// the **block** index, not the position.
+    comp: Vec<Vec<u16>>,
+    /// Whether a layer's compressed half holds anything yet. The compressed
+    /// builders are guarded on this, so the same layer takes a different path
+    /// early in a sequence than later.
+    comp_len: Vec<i64>,
+    /// How many tokens this cache already describes: the absolute position the
+    /// next step occupies.
+    n_past: usize,
+}
+
+impl Deepseek4Cache {
+    pub fn new(n_layer: u32, kv_lora_rank: u32) -> Self {
+        let per_layer = kv_lora_rank as usize * N_KV as usize;
+        Deepseek4Cache {
+            raw: vec![vec![0u16; per_layer]; n_layer as usize],
+            comp: vec![vec![0u16; per_layer]; n_layer as usize],
+            comp_len: vec![0; n_layer as usize],
+            n_past: 0,
+        }
+    }
+
+    /// Absolute position the next token will occupy.
+    pub fn n_past(&self) -> usize {
+        self.n_past
+    }
+
+    /// Forget everything, so the same cache can start a new sequence.
+    pub fn clear(&mut self) {
+        for layer in self.raw.iter_mut().chain(self.comp.iter_mut()) {
+            layer.fill(0);
+        }
+        self.comp_len.fill(0);
+        self.n_past = 0;
+    }
+}
+
 /// One expert tensor's selected slices, packed, with the shape to bind them as.
 ///
 /// The dims are not the tensor's: the last is the number of slices actually
@@ -602,6 +669,7 @@ fn q_and_kv<'c>(
     il: u32,
     attn_norm: &Tensor<'c>,
     nt: i64,
+    pos0: i64,
 ) -> Result<(Tensor<'c>, Tensor<'c>)> {
     let config = &fw.config;
     let head = config.kv_lora_rank as i64;
@@ -612,8 +680,11 @@ fn q_and_kv<'c>(
     let hs = head as usize * f32_size;
     let (rope, rope_orig) = fw.rope(il);
 
+    // Absolute positions. RoPE is applied *before* a value enters the cache, so
+    // a cached entry must never be rotated again — which is why this is the
+    // token's real position and not its index within the batch.
     let pos = ctx.new_i32_1d(nt)?;
-    pos.set_i32(&(0..nt as i32).collect::<Vec<i32>>())?;
+    pos.set_i32(&(pos0 as i32..(pos0 + nt) as i32).collect::<Vec<i32>>())?;
 
     let qr = ctx.mul_mat(
         weights
@@ -886,6 +957,8 @@ fn attention<'c>(
     kv_full: &Tensor<'c>,
     comp: Option<&Tensor<'c>>,
     nt: i64,
+    pos0: i64,
+    cache: &mut Deepseek4Cache,
 ) -> Result<Tensor<'c>> {
     let config = &fw.config;
     let head = config.kv_lora_rank as i64;
@@ -895,36 +968,51 @@ fn attention<'c>(
     let n_nope = config.n_rot_none() as i64;
     let f32_size = std::mem::size_of::<f32>();
 
+    // Write this batch's latents into the persistent cache at their absolute
+    // slots, then attend over the whole of it. A prefill starts at slot 0 and
+    // fills 0..nt; a step at position p writes one row at p and reads 0..=p.
+    // **There is deliberately no separate uncached path**: a `pos0 == 0` branch
+    // that every existing test took would leave the incremental one unexercised,
+    // and a wrong cache here returns fluent nonsense rather than an error.
     let kv_vals = kv_full.to_vec_f32();
-    let mut cache = vec![0u16; (head * N_KV) as usize];
-    bigtea_ggml::f32_to_f16(&kv_vals, &mut cache[..kv_vals.len()]);
+    let raw = &mut cache.raw[il as usize];
+    let at = (pos0 * head) as usize;
+    bigtea_ggml::f32_to_f16(&kv_vals, &mut raw[at..at + kv_vals.len()]);
+
+    let mut packed: Vec<u16> = raw.clone();
     let n_kv = match comp {
         None => N_KV,
         Some(c) => {
+            // The compressor returns every summary the sequence has so far, so
+            // its rows land at block 0 upward regardless of `pos0`.
             let cv = c.to_vec_f32();
-            let mut ch = vec![0u16; (head * N_KV) as usize];
-            bigtea_ggml::f32_to_f16(&cv, &mut ch[..cv.len()]);
-            cache.extend_from_slice(&ch);
+            let store = &mut cache.comp[il as usize];
+            bigtea_ggml::f32_to_f16(&cv, &mut store[..cv.len()]);
+            cache.comp_len[il as usize] = cv.len() as i64 / head;
+            packed.extend_from_slice(store);
             2 * N_KV
         }
     };
     let k = ctx.new_f16_3d(head, n_kv, 1)?;
-    let bytes: Vec<u8> = cache.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let bytes: Vec<u8> = packed.iter().flat_map(|h| h.to_le_bytes()).collect();
     k.set_bytes(&bytes)?;
 
     let ratio = config.compress_block(il).unwrap_or(1);
     let window = config.sliding_window as i64;
     let mut mask = vec![0u8; (n_kv * nt) as usize * 2];
     for query in 0..nt {
+        // The key axis is indexed by absolute position, so the query must be too
+        // — otherwise a step at position 40 would mask everything before it.
+        let q_abs = pos0 + query;
         let row = (query * n_kv) as usize * 2;
         for key in 0..N_KV {
-            if key > query || (window > 0 && query - key >= window) {
+            if key > q_abs || (window > 0 && q_abs - key >= window) {
                 let at = row + key as usize * 2;
                 mask[at..at + 2].copy_from_slice(&F16_NEG_INF);
             }
         }
         if comp.is_some() {
-            for blk in ((query + 1) / ratio)..N_KV {
+            for blk in ((q_abs + 1) / ratio)..N_KV {
                 let at = row + (N_KV + blk) as usize * 2;
                 mask[at..at + 2].copy_from_slice(&F16_NEG_INF);
             }
@@ -955,7 +1043,7 @@ fn attention<'c>(
         n_nope as usize * f32_size,
     )?;
     let pos = ctx.new_i32_1d(nt)?;
-    pos.set_i32(&(0..nt as i32).collect::<Vec<i32>>())?;
+    pos.set_i32(&(pos0 as i32..(pos0 + nt) as i32).collect::<Vec<i32>>())?;
     let (rope, rope_orig) = fw.rope(il);
     let o_pe = ctx.rope_ext_back(
         &o_pe_in,
@@ -1484,8 +1572,10 @@ fn bind_dense<'c>(
 /// through its sources, so a dropped buffer reads freed memory successfully.
 pub fn block(
     fw: &Deepseek4Forward<'_>,
+    cache: &mut Deepseek4Cache,
     il: u32,
     tokens: &[i32],
+    pos0: i64,
     streams_in: Option<&[f32]>,
     arena: usize,
 ) -> Result<Streams> {
@@ -1519,7 +1609,7 @@ pub fn block(
 
     let t_phase = std::time::Instant::now();
     let e = entry(fw, &ctx, &weights, il, streams, nt)?;
-    let (q, kv) = q_and_kv(fw, &ctx, &weights, il, &e.attn_norm, nt)?;
+    let (q, kv) = q_and_kv(fw, &ctx, &weights, il, &e.attn_norm, nt, pos0)?;
     let qkv_secs = t_phase.elapsed().as_secs_f64();
 
     // Which attention runs is decided by the block's compression ratio *and*
@@ -1527,6 +1617,25 @@ pub fn block(
     // layer falls back to Raw, exactly as llama.cpp's guards do.
     let kind = config.attention_kind_from_ratio(il).expect("known ratio");
     let fired = config.compress_block(il).is_some_and(|r| nt / r > 0);
+    // The compressor front-pads `state_rows` zeros in place of a persistent ring,
+    // which is exact only while the previous window is inside this batch. On an
+    // incremental step it is in the past, and those zeros would summarise the
+    // wrong span **without failing**. Refuse rather than return fluent nonsense;
+    // the ring is the next piece of R3.
+    // Keyed on the **sequence**, not this batch. At `nt = 1` a compressed layer's
+    // `fired` is `1 / ratio == 0`, so a step would quietly fall back to Raw and
+    // drop the compressed half of attention altogether — summaries the sequence
+    // has already built simply not consulted. That is the silent-wrong-answer
+    // shape this codebase keeps paying for, and it is why the condition asks
+    // whether the *sequence so far* has completed a block.
+    let seq_compressed = config
+        .compress_block(il)
+        .is_some_and(|r| (pos0 + nt) / r > 0);
+    if pos0 > 0 && seq_compressed {
+        return Err(crate::ArchError::Unimplemented(
+            "incremental decode through a compressed attention layer needs the              compressor input ring (R3 step 2); only the raw path is cached so far",
+        ));
+    }
     let comp = match (kind, fired) {
         (AttentionKind::Raw, _) | (_, false) => None,
         (AttentionKind::CompressedSparse, true) => {
@@ -1537,7 +1646,18 @@ pub fn block(
         }
     };
     let t_phase = std::time::Instant::now();
-    let attn_out = attention(fw, &ctx, &weights, il, &q, &kv, comp.as_ref(), nt)?;
+    let attn_out = attention(
+        fw,
+        &ctx,
+        &weights,
+        il,
+        &q,
+        &kv,
+        comp.as_ref(),
+        nt,
+        pos0,
+        cache,
+    )?;
     let attn_secs = t_phase.elapsed().as_secs_f64();
 
     let t_phase = std::time::Instant::now();
@@ -1630,11 +1750,50 @@ pub fn prefill(fw: &Deepseek4Forward<'_>, tokens: &[i32], arena: usize) -> Resul
             limit: N_KV as usize,
         });
     }
-    let mut streams = block(fw, 0, tokens, None, arena)?;
-    for il in 1..fw.config.n_layer {
-        streams = block(fw, il, tokens, Some(&streams), arena)?;
+    let mut cache = Deepseek4Cache::new(fw.config.n_layer, fw.config.kv_lora_rank);
+    forward(fw, &mut cache, tokens, arena)
+}
+
+/// One forward pass over `tokens`, appended to whatever `cache` already holds.
+///
+/// This is the single implementation behind both [`prefill`] and [`step`]: a
+/// prefill is this against an empty cache, and a step is this with one token
+/// against a full one. Keeping them one path is deliberate — a separate
+/// uncached route would be the one every existing test took, leaving the
+/// incremental one unexercised until a user found it.
+pub fn forward(
+    fw: &Deepseek4Forward<'_>,
+    cache: &mut Deepseek4Cache,
+    tokens: &[i32],
+    arena: usize,
+) -> Result<Vec<f32>> {
+    let pos0 = cache.n_past as i64;
+    if pos0 as usize + tokens.len() > N_KV as usize {
+        return Err(crate::ArchError::ContextTooLong {
+            tokens: pos0 as usize + tokens.len(),
+            limit: N_KV as usize,
+        });
     }
+    let mut streams = block(fw, cache, 0, tokens, pos0, None, arena)?;
+    for il in 1..fw.config.n_layer {
+        streams = block(fw, cache, il, tokens, pos0, Some(&streams), arena)?;
+    }
+    cache.n_past += tokens.len();
     head(fw, &streams, arena)
+}
+
+/// Advance one token, reusing everything the cache already holds.
+///
+/// Costs one forward pass over a **single** token instead of over the whole
+/// sequence. Both the arithmetic and the disk traffic collapse: a step selects
+/// 6 distinct experts per layer where a 166-token pass selects 122.8.
+pub fn step(
+    fw: &Deepseek4Forward<'_>,
+    cache: &mut Deepseek4Cache,
+    token: i32,
+    arena: usize,
+) -> Result<Vec<f32>> {
+    forward(fw, cache, &[token], arena)
 }
 
 #[cfg(test)]

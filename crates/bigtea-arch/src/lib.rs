@@ -21,7 +21,9 @@ mod qwen3;
 mod stream;
 
 pub use deepseek4::{AttentionKind, Deepseek4Config, Deepseek4Model};
-pub use deepseek4_forward::{prefill, routing_next_pass, routing_report, Deepseek4Forward};
+pub use deepseek4_forward::{
+    forward, prefill, routing_next_pass, routing_report, step, Deepseek4Cache, Deepseek4Forward,
+};
 pub use expert_cache::{CacheStats, ExpertCache};
 pub use kv::{KvCache, KvError};
 pub use qwen3::{Qwen3Config, Qwen3Model};
@@ -46,6 +48,8 @@ pub enum ArchError {
         tokens: usize,
         limit: usize,
     },
+    /// A path that is deliberately refused rather than silently approximated.
+    Unimplemented(&'static str),
 }
 
 impl fmt::Display for ArchError {
@@ -60,6 +64,7 @@ impl fmt::Display for ArchError {
             ArchError::Model(e) => write!(f, "{e}"),
             ArchError::Ggml(e) => write!(f, "{e}"),
             ArchError::Kv(e) => write!(f, "{e}"),
+            ArchError::Unimplemented(what) => write!(f, "not implemented: {what}"),
             ArchError::ContextTooLong { tokens, limit } => write!(
                 f,
                 "prompt is {tokens} tokens; this path holds {limit}. \

@@ -35,3 +35,6 @@ tools/routing/captures/
 # Junk
 *.log
 .DS_Store
+
+# Worktrees created by agent sessions — never part of the tree
+.claude/worktrees/

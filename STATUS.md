@@ -5,9 +5,10 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-08 · **Version**: v0.0.2 · **Branch**: `main` ·
-**Open PR**: [#43](https://github.com/aturzone/Bigtea/pull/43) — R0, R0.1, R1,
-the 256-token fix, and the R3 plan. **Unmerged; Atur merges.**
+**Last updated**: 2026-08-09 · **Version**: v0.0.2 · **Branch**: `main` ·
+**Open PR**: R3 step 1 on `ticket/r3-kv-cache` — the KV cache's raw path.
+**Unmerged, and its equivalence test does not pass yet** (see R3 below).
+PR #43 (R0/R0.1/R1) is **merged**.
 
 ---
 
@@ -70,7 +71,7 @@ policy** is.
 
 | id | work | state | why it is next |
 |---|---|---|---|
-| **R3** | KV cache | **ready — DO THIS NEXT**, fully scoped in `backlog/r3-kv-cache.md` | the unlock for everything else, not just a speed win. ~24 MB of state across **three** structures (the compressor ring is the one that is easy to miss). Verified without a new oracle: `prefill(0..n) then step(n)` must match `prefill(0..=n)` — argmax and a tolerance, **not** bit-identical, since routing already flips ~3% on near ties at a ggml blocking boundary. Test at 2, 5 and 165 tokens because each runs a different attention builder. Worth **~0.33 tok/s** from the measured 3.0s single-token pass alone, against llama.cpp's 0.21–0.31, and it is what makes R1 pay |
+| **R3** | KV cache | **step 1 built, NOT yet verified** — `ticket/r3-kv-cache`, fully scoped in `backlog/r3-kv-cache.md` | the unlock for everything else, not just a speed win. ~24 MB of state across **three** structures (the compressor ring is the one that is easy to miss). Verified without a new oracle: `prefill(0..n) then step(n)` must match `prefill(0..=n)` — argmax and a tolerance, **not** bit-identical, since routing already flips ~3% on near ties at a ggml blocking boundary. Test at 2, 5 and 165 tokens because each runs a different attention builder. Worth **~0.33 tok/s** from the measured 3.0s single-token pass alone, against llama.cpp's 0.21–0.31, and it is what makes R1 pay |
 | **R1** | frequency-gated expert cache on the deepseek4 path | **built 2026-08-08, inert until R3** | implemented, tested against the oracle, sized from the probe, `--cache <GiB>` now works on this path. Warms on the prompt, never pinned. Cannot pay while a pass still reads ~123 distinct experts per layer |
 | **R2** | overlap I/O with compute | ready, but smaller than it looks | per block it is ~53 ms read against ~23 ms compute, so the ceiling is ~1.4x — and all three expert tensors already read in one batched call, with everything after depending on them. Scoped against the code in the handoff |
 | **R4** | fit the always-read set | user-side | 7.38 GiB; needs ~10.5 GiB free. Worth 0.7s/token. The runner already names the processes to close |
@@ -93,6 +94,43 @@ So **R3 → R1 → R2**.
 
 Detail for each: `docs/graph/backlog/next-session-handoff.md`.
 Strategy and the bets beyond R6: `docs/graph/backlog/the-big-bang.md`.
+
+## R3 in progress — what is built and what is open
+
+**Built** (`ticket/r3-kv-cache`): `Deepseek4Cache` (raw latents + compressed
+summaries, slot = absolute position), absolute positions threaded through all
+four hardcoded sites, and `forward`/`step` as **one** code path — a prefill is a
+step against an empty cache, so every existing test exercises the new machinery
+rather than leaving the `pos0 != 0` branch unrun.
+
+**All 14 llama.cpp oracle tests still pass through it**, so prefill is still
+element-exact and the cache machinery itself is sound.
+
+**One real bug caught before it shipped**: at `nt = 1` a compressed layer's
+`fired` is `1 / ratio == 0`, so an incremental step fell back to Raw and
+**silently dropped the compressed half of attention**. The guard now keys on the
+*sequence* having completed a block, not the batch, and there is a test asserting
+the refusal.
+
+**Open, and the reason this is unmerged**: the equivalence test
+(`prefill(0..n)` + `step(n)` vs `prefill(0..=n)`) fails.
+
+```
+n = 1 (2 tokens)   step 446595.72   full 445449.16   +0.257%
+n = 2 (3 tokens)   step 399234.41   full 398126.00   +0.278%
+```
+
+argmax agrees at both, and the error is **flat, not accumulating** — systematic
+from the first step rather than drift. That is the shape the routing-flip effect
+would have, which `r3-kv-cache.md` predicted, but predicted is not demonstrated.
+**The tolerance has deliberately not been widened**; the ticket names that as how
+a real cache bug ships. Next step is to log the selected expert ids for the last
+token in both paths and compare: differ → the flip is the cause and the assertion
+becomes "argmax equal, at most N routing differences" with N stated; identical →
+the cache is wrong and the sum is telling the truth.
+
+Still to do after that: the compressor input ring (HCA then CSA), then the ring
+wraparound that lifts the 256-token ceiling.
 
 ## Known limitations
 
