@@ -751,9 +751,13 @@ them, and splitting each across 20 threads leaves ~38 rows per thread per
 barrier. The threads cost more than the work.
 
 llama.cpp peaks at **4 threads** on the same model where we peak at 1, which
-says its expert path parallelises and ours does not. **That is the concrete lead
-for the remaining 1.60x** — batch the expert matmuls so there is real work per
-barrier, rather than 24 tiny nodes per layer.
+says its expert path parallelises and ours does not. **That is the lead for the
+remaining 1.60x**, now scoped with its arithmetic in
+`docs/graph/backlog/batch-the-expert-matmuls.md`: the expert path runs at
+**3.7 GB/s** where the dense FFN runs at ~13, so the headroom is per-node
+overhead (1,152 tensor binds and ~2,300 graph nodes per token), not bandwidth.
+Batching is worth ~1.45x *if* a batched matmul reaches DRAM speed — and the
+ticket names the one-afternoon experiment that decides it, rather than assuming.
 
 `llama-bench -m Qwen3-30B-A3B-Q4_K_M.gguf -n 32 -p 0 -r 2 -t 1,4,10`:
 1.95 ± 0.64 / **4.21 ± 0.28** / 3.64 ± 0.22.
