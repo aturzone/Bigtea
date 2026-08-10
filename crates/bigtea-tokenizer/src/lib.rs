@@ -16,6 +16,7 @@ mod bytes;
 pub mod chat;
 mod pretok;
 pub mod spm;
+pub mod wpm;
 
 pub use bytes::{decode as bytes_decode, encode as bytes_encode};
 pub use chat::{ChatFormat, Message};
@@ -33,6 +34,9 @@ pub enum Kind {
     /// `"llama"` — SentencePiece: merge by vocabulary score, `▁` for space,
     /// `<0xXX>` byte fallback.
     Spm,
+    /// `"bert"` — WordPiece: longest-prefix match, `##` continuations, and one
+    /// `[UNK]` for any word the vocabulary cannot cover. No byte fallback.
+    Wpm,
 }
 
 use std::collections::HashMap;
@@ -62,7 +66,7 @@ impl fmt::Display for TokenizerError {
                 write!(
                     f,
                     "unsupported tokenizer model {m:?} \
-                     (implemented: \"gpt2\" byte-level BPE, \"llama\" SentencePiece)"
+                     (implemented: \"gpt2\" byte-level BPE, \"llama\" SentencePiece,                       \"bert\" WordPiece)"
                 )
             }
             TokenizerError::BadMerge(m) => write!(f, "malformed merge rule {m:?}"),
@@ -94,6 +98,13 @@ pub struct Tokenizer {
     /// The raw Jinja template, kept so the chat format can be identified and
     /// so a caller can print it when the format is not recognised.
     chat_template: Option<String>,
+    /// The id for text the vocabulary cannot represent. WordPiece has no byte
+    /// fallback, so without this an unknown word would silently disappear.
+    unk: Option<u32>,
+    /// Which continuation spelling this WordPiece vocabulary uses. Read off
+    /// the vocabulary rather than assumed -- see [`wpm`], where guessing it
+    /// costs every ordinary word without producing an error.
+    wpm_spelling: wpm::Spelling,
     /// Control tokens, longest first, with their ids.
     ///
     /// These must be matched **literally in the text and mapped to one id**.
@@ -119,6 +130,7 @@ impl Tokenizer {
         let kind = match model {
             "gpt2" => Kind::Bpe,
             "llama" => Kind::Spm,
+            "bert" => Kind::Wpm,
             other => return Err(TokenizerError::UnsupportedModel(other.to_string())),
         };
 
@@ -176,7 +188,6 @@ impl Tokenizer {
         specials.sort_by_key(|(text, _)| std::cmp::Reverse(text.len()));
 
         let id_of = |key: &str| meta.get(key).and_then(Value::as_u64).map(|v| v as u32);
-        let flag = |key: &str| matches!(meta.get(key), Some(Value::Bool(true)));
 
         // SentencePiece merges by score, so the array is not optional there —
         // an absent one would make every merge score 0.0 and reduce the
@@ -194,6 +205,9 @@ impl Tokenizer {
             });
         }
 
+        // Before the struct takes ownership of `tokens`.
+        let wpm_spelling = wpm::detect_spelling(&tokens);
+
         Ok(Tokenizer {
             tokens,
             ids,
@@ -207,6 +221,8 @@ impl Tokenizer {
                 Some(Value::Bool(v)) => *v,
                 _ => kind == Kind::Spm,
             },
+            unk: id_of("tokenizer.ggml.unknown_token_id"),
+            wpm_spelling,
             bos: id_of("tokenizer.ggml.bos_token_id"),
             eos: id_of("tokenizer.ggml.eos_token_id"),
             // Llama-family containers frequently omit the flag and still expect
@@ -214,9 +230,16 @@ impl Tokenizer {
             // absent flag genuinely means "no".
             add_bos: match meta.get("tokenizer.ggml.add_bos_token") {
                 Some(Value::Bool(v)) => *v,
-                _ => kind == Kind::Spm,
+                // BERT containers declare neither flag and still expect the
+                // sequence wrapped in [CLS] .. [SEP] -- llama.cpp adds both
+                // unconditionally for WordPiece, and a missing [CLS] shifts
+                // every position by one.
+                _ => matches!(kind, Kind::Spm | Kind::Wpm),
             },
-            add_eos: flag("tokenizer.ggml.add_eos_token"),
+            add_eos: match meta.get("tokenizer.ggml.add_eos_token") {
+                Some(Value::Bool(v)) => *v,
+                _ => kind == Kind::Wpm,
+            },
             chat_template: meta
                 .get("tokenizer.chat_template")
                 .and_then(Value::as_str)
@@ -327,6 +350,12 @@ impl Tokenizer {
         if text.is_empty() {
             return;
         }
+        if self.kind == Kind::Wpm {
+            // No pre-tokenizer and no byte fallback: WordPiece does its own
+            // splitting, and anything it cannot cover becomes one [UNK].
+            out.extend(wpm::encode(text, &self.ids, self.unk, self.wpm_spelling));
+            return;
+        }
         if self.kind == Kind::Spm {
             // No pre-tokenizer: SentencePiece works on the whole string, and
             // splitting it first would prevent merges across the boundaries the
@@ -376,6 +405,9 @@ impl Tokenizer {
     /// valid UTF-8 boundary. [`Self::decode`] is for whole sequences, where the
     /// bytes are all present and the conversion is safe.
     pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        if self.kind == Kind::Wpm {
+            return self.decode(ids).into_bytes();
+        }
         if self.kind == Kind::Spm {
             let mut bytes = Vec::new();
             for &id in ids {
@@ -393,6 +425,16 @@ impl Tokenizer {
     }
 
     pub fn decode(&self, ids: &[u32]) -> String {
+        if self.kind == Kind::Wpm {
+            // [CLS]/[SEP] carry no text; printing their spelling would put
+            // markup in the user's output.
+            let pieces: Vec<&str> = ids
+                .iter()
+                .filter(|id| Some(**id) != self.bos && Some(**id) != self.eos)
+                .filter_map(|&id| self.token_text(id))
+                .collect();
+            return wpm::decode(&pieces, self.wpm_spelling);
+        }
         if self.kind == Kind::Spm {
             let mut bytes = Vec::new();
             for &id in ids {
