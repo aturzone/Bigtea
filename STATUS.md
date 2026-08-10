@@ -418,7 +418,7 @@ compute path on its own.** Both command lines and outputs:
 | Qwen3-4B dense, CPU, 20 threads | Bigtea | llama.cpp | verdict |
 |---|---:|---:|---|
 | prefill (matched, 519 vs 512) | **83.4 tok/s** | **88.3** | **1.06x behind** |
-| generation | **3.96–4.27 tok/s** | **5.90** (tg128) | ~1.4x behind |
+| generation | **5.13 tok/s** | **5.90** (tg128) | **1.15x behind** |
 
 *(The original 38.5 / 0.67 figures were taken on the uncached path with a
 broken arena; both are superseded.)*
@@ -583,6 +583,32 @@ process. It surfaced as `error: test failed ... process didn't exit
 successfully` rather than as a failing test, and every result after the abort
 was lost — so in practice they had stopped being run. They now share a `heavy()`
 lock, and the plain command above works without `--test-threads=1`.
+
+## Generation: q, k and v now share one graph — 1.30x
+
+`compute()` re-evaluates the **whole ancestor graph** of its output. The Q/K/V
+phase called it three times, once per tensor, so the normalisation they share
+ran three times and it paid three graph builds and three threadpool cycles per
+layer per token. At one token those fixed costs dominate: the matmuls are
+matrix-*vector* products and tiny.
+
+The comment above the code already said *"one compute materialises all three;
+they share a graph"*. The code did not.
+
+`Context::compute_many` expands one graph with several roots. Measured on
+Qwen3-4B, 96 tokens:
+
+| | before | after |
+|---|---:|---:|
+| generation | 3.94 tok/s | **5.13** |
+| Q/K/V phase | 8.3 s | **5.3 s** |
+
+**1.30x, and the deficit against llama.cpp goes ~1.4x → 1.15x.** Output is
+unchanged on all five architectures.
+
+This is the third time this exact fact has cost time — it is already in
+`CLAUDE.md` as *"24 calls per block became 6 — 1.9x"*. Worth grepping for
+`compute(` in any hot loop before assuming the arithmetic is the cost.
 
 ## Known limitations
 

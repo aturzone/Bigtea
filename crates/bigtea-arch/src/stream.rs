@@ -1138,11 +1138,15 @@ impl<'m> StreamingRunner<'m> {
                 let q = ctx.rope_ext(&q, &pos, None, head_dim as i32, rope_type, 0, rp)?;
                 let k = ctx.rope_ext(&k, &pos, None, head_dim as i32, rope_type, 0, rp)?;
 
-                // One compute materialises all three; they share a graph.
+                // One compute materialises all three, which is what the comment
+                // here claimed while the code called `compute` once per tensor.
+                // `compute` re-evaluates the whole ancestor graph, so that ran
+                // the shared normalisation three times and paid three graph
+                // builds and three threadpool cycles — and at one token those
+                // fixed costs dominate, because the matmuls are matrix-vector
+                // products and tiny.
                 let t = std::time::Instant::now();
-                ctx.compute(&q, threads)?;
-                ctx.compute(&k, threads)?;
-                ctx.compute(&v, threads)?;
+                ctx.compute_many(&[&q, &k, &v], threads)?;
                 self.stats.qkv_seconds += t.elapsed().as_secs_f64();
                 (q.to_vec_f32(), k.to_vec_f32(), v.to_vec_f32(), x.clone())
             };
