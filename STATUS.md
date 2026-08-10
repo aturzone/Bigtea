@@ -756,8 +756,12 @@ remaining 1.60x**, now scoped with its arithmetic in
 `docs/graph/backlog/batch-the-expert-matmuls.md`: the expert path runs at
 **3.7 GB/s** where the dense FFN runs at ~13, so the headroom is per-node
 overhead (1,152 tensor binds and ~2,300 graph nodes per token), not bandwidth.
-Batching is worth ~1.45x *if* a batched matmul reaches DRAM speed — and the
-ticket names the one-afternoon experiment that decides it, rather than assuming.
+**The deciding experiment is done** — `bigtea-kernelbench` on the stacked expert
+tensor reaches **11.17 GiB/s** against a 16.8 GiB/s memcpy ceiling and
+parallelises to 4 threads (2.86x), where our per-expert path manages 3.7 GB/s on
+one. Node count is the bottleneck, the kernel is not. Per layer per token that
+is **5.7 ms → 0.59 ms**; across 48 layers, ~275 ms → ~28 ms, or ~106 ms once the
+copy is paid. **Build it** — the ticket carries the reference code.
 
 `llama-bench -m Qwen3-30B-A3B-Q4_K_M.gguf -n 32 -p 0 -r 2 -t 1,4,10`:
 1.95 ± 0.64 / **4.21 ± 0.28** / 3.64 ± 0.22.

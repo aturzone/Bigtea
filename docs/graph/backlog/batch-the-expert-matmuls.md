@@ -71,27 +71,68 @@ per-layer buffer at no extra cost. At the measured 69% hit rate that still
 leaves ~700 MB/token of copying (~54 ms), so the estimate above is the
 conservative one.
 
-## The measurement that would kill this ticket
+## The measurement that would have killed it — DONE, and it says build
 
-**Do this first; it is one afternoon and it decides the rest.** Take one layer's
-8 experts, copy them into a contiguous buffer by hand, and time a single
-`mul_mat` of `2048 x 6144` against a column versus the 8 separate `2048 x 768`
-matmuls it replaces, at 1, 4 and 8 threads.
+`bigtea-kernelbench` already does exactly this experiment: it binds the
+**stacked** expert tensor and runs `mul_mat_id`, which is the batched form.
 
-- If the batched form reaches ~13 GB/s, the ticket is worth ~1.45x — build it.
-- If it stalls at 3-4 GB/s too, the bottleneck is not node count and **this
-  whole ticket is void**. Say so and close it.
+```
+$ bigtea-kernelbench Qwen3-30B-A3B-Q4_K_M.gguf --reps 3 --threads
+layer 20, 6 experts, 2048 x 768 per matrix, 17.5 MiB resident
 
-`bigtea-kernelbench` already times the expert FFN with weights resident and is
-the right place to put this.
+TOKENS    MS/PASS    MS/TOKEN    GFLOP/s      GiB/s
+     1      1.53       1.53         37.0      11.17
+
+ THREADS    MS/PASS   SPEEDUP
+       1      1.69      1.00x
+       2      0.69      2.44x
+       4      0.59      2.86x
+       8      1.15      1.47x
+      20      1.39      1.22x
+
+reference  single-threaded memcpy: 16.8 GiB/s (read+write)
+```
+
+**The batched form reaches 11.17 GiB/s against a 16.8 GiB/s memcpy ceiling, and
+it parallelises to 4 threads (2.86x).** Our streaming path runs the same
+arithmetic at **3.7 GB/s on one thread**. So node count *is* the bottleneck, the
+kernel is not, and the ticket is worth building.
+
+| per layer, one token | |
+|---|---:|
+| streaming path today (8 experts, 24 nodes) | ~5.7 ms |
+| batched `mul_mat_id`, 4 threads | **0.59 ms** |
+
+Across 48 layers that is **~275 ms/token → ~28 ms**, and even paying the full
+78 ms copy the expert phase lands near **106 ms** — a saving of ~170 ms on a
+~380 ms token.
+
+**Do not read this as 3.6x on generation.** Disk is ~228 ms/token of that same
+token and is untouched by any of it; see the note at the bottom.
 
 ## What must not be assumed
 
 - **That llama.cpp's 4-thread peak means our path can reach one.** It uses
   `ggml_mul_mat_id` over the *whole stacked* expert tensor with an index tensor,
   which it can do because it mmaps the entire model. Bigtea streams a subset and
-  cannot bind the stacked tensor. The comparison motivates the ticket; it does
-  not size it.
+  cannot bind the stacked tensor — **it has to build a stack of the 8 selected
+  experts and pass ids `0..8`.** That is the copy above, and it is why our
+  version is worth ~1.45x where llama.cpp's costs nothing.
+
+## How to build it
+
+`bigtea-kernelbench` lines ~265-275 are working reference code for the batched
+form, including `Context::mul_mat_id`, which already exists in the wrapper. The
+change in `expert_ffn_single` is:
+
+1. one contiguous buffer per matrix kind, 8 experts wide, filled from the
+   `Arc<[u8]>` slices (misses can be read straight into it — see above);
+2. bind each as a 3D `[n_embd, n_ff, 8]` tensor instead of 8 separate 2D ones;
+3. `mul_mat_id(gate, x, ids)`, `silu`, `mul`, `mul_mat_id(down, act, ids)` with
+   `ids = 0..8`;
+4. the routing weights still have to be applied per expert and summed — that
+   part does not change, and getting it wrong is fluent nonsense rather than an
+   error, so check the output text before the timing.
 - **That the 1.60x is all here.** Disk is 7.3 s of a 12.2 s 32-token run — 60%.
   Even a perfect expert path leaves that untouched, and R2 (overlap) is the
   ticket that addresses it.
