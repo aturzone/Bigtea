@@ -857,6 +857,30 @@ At `-t 4` on both sides it reads 114.99 against 76.76 — 1.50x ahead — becaus
 prefill wants every core and llama.cpp was being handicapped. Run the opposing
 command at the setting its own author would choose.
 
+## Quality is measured now — perplexity, and it agrees with llama.cpp (2026-08-10)
+
+Every correctness check in this project had been *"does it say Paris"*, which
+catches a broken forward pass and nothing subtler. `bigtea-run --ppl-chunk N`
+reports perplexity with llama.cpp's exact windowing:
+
+| perplexity, 128-token chunks | Bigtea | llama.cpp | difference |
+|---|---:|---:|---:|
+| Llama-3.2-1B-Instruct Q4_K_M | **29.0909** | 29.2456 ± 6.49 | **0.53%** |
+| Qwen3-4B Q4_K_M | **33.6434** | 34.0293 ± 9.64 | **1.13%** |
+
+Two architectures, two tokenizer families. It exercises the tokenizer, RoPE, the
+causal mask, the KV cache, fused attention, repacking and the output projection
+against an independent implementation, on a number that would move if any were
+wrong. **Both sit inside llama.cpp's own error bar — this is agreement, not a
+claim to be more accurate.**
+
+**The windowing is the measurement**, and both details were wrong first time:
+including one 98-token remainder alongside three full chunks took the answer
+from 29.25 to **33.65**, and scoring from position 1 instead of the second half
+gave **1.9232**, which looks spectacular and means nothing. Match the chunk size
+and the corpus or you are comparing windowings.
+`docs/graph/research/perplexity-2026-08-10.md`.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

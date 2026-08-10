@@ -226,6 +226,32 @@ impl Sampler {
     }
 }
 
+/// `-log softmax(logits)[target]`, in nats, without ever forming the softmax.
+///
+/// This is the per-token quantity perplexity averages, so its accuracy is the
+/// accuracy of the whole measurement.
+///
+/// Two things it must get right, both of which fail silently:
+///
+/// - **Subtract the max first.** Logits reach ±30 and `exp(30)` overflows an
+///   `f32` to `inf`, which turns the sum into `inf`, the log into `inf`, and
+///   the reported perplexity into `NaN` — after the run, with nothing to
+///   indicate which token did it.
+/// - **Accumulate in `f64`.** The sum runs over a vocabulary of up to 256,000
+///   terms and is then averaged across thousands of tokens; `f32` loses real
+///   precision at that length, and the error is one-directional rather than
+///   noise.
+pub fn neg_log_prob(logits: &[f32], target: usize) -> f64 {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    if !max.is_finite() {
+        return f64::INFINITY;
+    }
+    let sum: f64 = logits.iter().map(|&l| (l as f64 - max).exp()).sum();
+    let target_logit = logits.get(target).copied().unwrap_or(f32::NEG_INFINITY) as f64;
+    // log P = (x_t - max) - log(sum exp(x - max))
+    -((target_logit - max) - sum.ln())
+}
+
 pub fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
@@ -482,6 +508,51 @@ mod tests {
             c[1].1, -8.0,
             "negative logit must be multiplied, not raised"
         );
+    }
+
+    #[test]
+    fn neg_log_prob_matches_a_hand_computed_softmax() {
+        // Two equal logits: each has probability 1/2, so -log p = ln 2.
+        let nll = neg_log_prob(&[1.0, 1.0], 0);
+        assert!((nll - std::f64::consts::LN_2).abs() < 1e-9, "got {nll}");
+        // Uniform over four: -log(1/4) = ln 4.
+        let nll = neg_log_prob(&[3.0, 3.0, 3.0, 3.0], 2);
+        assert!((nll - 4f64.ln()).abs() < 1e-9, "got {nll}");
+    }
+
+    #[test]
+    fn a_large_logit_does_not_overflow_to_nan() {
+        // exp(400) is inf in f64, let alone f32. Subtracting the max is the
+        // only reason this is finite, and getting it wrong poisons the whole
+        // average with no indication of which token did it.
+        let nll = neg_log_prob(&[400.0, 399.0, -400.0], 0);
+        assert!(nll.is_finite(), "got {nll}");
+        assert!(
+            nll > 0.0 && nll < 1.0,
+            "the max logit should be likely: {nll}"
+        );
+    }
+
+    #[test]
+    fn shifting_every_logit_leaves_the_answer_alone() {
+        // Softmax is invariant under adding a constant, so this is a free
+        // check that the max subtraction has not changed the maths.
+        let base = [2.5f32, -1.0, 0.75, 4.0];
+        let shifted: Vec<f32> = base.iter().map(|l| l + 17.0).collect();
+        for t in 0..base.len() {
+            let a = neg_log_prob(&base, t);
+            let b = neg_log_prob(&shifted, t);
+            assert!((a - b).abs() < 1e-6, "target {t}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn probabilities_over_every_target_sum_to_one() {
+        let logits = [1.5f32, -2.0, 0.25, 3.0, -0.5];
+        let total: f64 = (0..logits.len())
+            .map(|t| (-neg_log_prob(&logits, t)).exp())
+            .sum();
+        assert!((total - 1.0).abs() < 1e-9, "got {total}");
     }
 
     #[test]

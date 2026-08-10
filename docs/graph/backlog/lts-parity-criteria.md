@@ -70,6 +70,17 @@ measured back to back in one session with both command lines recorded.
 | generation tok/s | 0.37 vs 0.39 | 1.07 vs 2.16 | **4.27 vs 5.90 — 1.38x behind** (Llama-3.2-1B: 10.12 vs 12.91, 1.28x) |
 | memory footprint at equal speed | **ours, by design** | ours | — |
 | long-context generation | untested | untested | untested |
+| **quality (perplexity)** | untested | untested | **33.6434 vs 34.0293 — 1.13%** |
+
+**Quality is measured now, and it was the largest untested claim in this
+document.** `bigtea-run --ppl-chunk N` reports perplexity using llama.cpp's
+windowing (whole chunks only, second half scored, `n_ctx - 1 - n_ctx/2` tokens
+each). Llama-3.2-1B: **29.0909 against 29.2456 ± 6.49**; Qwen3-4B: **33.6434
+against 34.0293 ± 9.64**. Two architectures, two tokenizer families, both within
+~1% — which exercises the tokenizer, RoPE, the causal mask, the KV cache, fused
+attention, repacking and the output projection against an independent
+implementation. Both sit inside llama.cpp's own error bar, so this is agreement,
+**not** a claim to be more accurate: `../research/perplexity-2026-08-10.md`.
 
 **Weight repacking does not transfer to V4-Flash, and the row above does not
 move** (2026-08-10). Every always-read tensor in that container with a

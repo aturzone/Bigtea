@@ -8,8 +8,8 @@
 use std::process::ExitCode;
 
 use bigtea_arch::{
-    architecture_is_verified, KvCache, Qwen3Config, Qwen3Model, Sampler, SamplerConfig,
-    VERIFIED_ARCHITECTURES,
+    architecture_is_verified, neg_log_prob, KvCache, Qwen3Config, Qwen3Model, Sampler,
+    SamplerConfig, VERIFIED_ARCHITECTURES,
 };
 use bigtea_ggml::{Context, WeightSet};
 use bigtea_model::{Model, ResidentSet};
@@ -81,6 +81,119 @@ fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool) -> String {
         println!("           the model may not respond as an assistant.");
     }
     tokenizer.apply_chat_template(&[Message::new("user", prompt)], true)
+}
+
+/// Perplexity over a corpus: the standard way to say a model still works.
+///
+/// # Why this exists
+///
+/// Every correctness check in this project so far has been "does it say Paris".
+/// That catches a broken forward pass and nothing subtler — a slightly wrong
+/// RoPE base, a rounding difference in the KV cache, or a repacked kernel that
+/// is *almost* right all answer Paris. Perplexity is a number over thousands of
+/// tokens, so it moves when any of those are wrong, and it is what llama.cpp's
+/// `llama-perplexity` reports, so the two can be compared directly.
+///
+/// # The method, stated because it decides the number
+///
+/// The corpus is cut into chunks of `chunk_size` tokens. Each chunk starts with
+/// an **empty KV cache**, and only positions in the **second half** contribute
+/// `-log P(token | everything before it in this chunk)`. The result is
+/// `exp(total / count)`.
+///
+/// Scoring the second half only is llama.cpp's rule, and it is not arbitrary:
+/// token 1 of a chunk is predicted from a single token of context and token 400
+/// from 400, so including the early ones measures mostly how short the context
+/// was. Every scored token here has at least `chunk_size / 2` of history.
+/// Scoring from position 1 instead gave 1.9232 where this gives a different
+/// number on the same file — the windowing *is* the measurement.
+///
+/// Tokens are fed **one at a time**, which is slow and deliberate: the forward
+/// pass projects only the final position through the output matrix (that was a
+/// 253 GFLOP saving on prefill), so per-position logits are only available a
+/// step at a time. Correct and slow beats fast and approximate for a number
+/// whose whole purpose is to be compared.
+///
+/// **This is not bit-comparable to `llama-perplexity`** unless the chunking
+/// matches: it defaults to 512 and different windowing gives a different number
+/// on the same file and the same model. Compare the two only with the same
+/// `--ppl-chunk` and the same corpus, and say so when quoting.
+fn perplexity_run(
+    runner: &mut bigtea_arch::StreamingRunner<'_>,
+    weights: &WeightSet<'_>,
+    config: &Qwen3Config,
+    tokens: &[u32],
+    chunk_size: usize,
+    t0: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vocab = config.vocab_size as usize;
+    if tokens.len() < 2 {
+        return Err("perplexity needs at least 2 tokens; use -f with a real corpus".into());
+    }
+    let mut total_nll = 0f64;
+    let mut counted = 0usize;
+    let mut chunks = 0usize;
+    let start = std::time::Instant::now();
+
+    for chunk in tokens.chunks(chunk_size) {
+        // **Whole chunks only**, which is llama.cpp's rule. A trailing fragment
+        // gives its scored tokens far less context than a full chunk does, and
+        // including one took 29.25 to 33.65 on the same corpus — a 15% error
+        // from a single short chunk out of four.
+        if chunk.len() < chunk_size {
+            break;
+        }
+        let mut cache = KvCache::new(
+            config.n_layer as usize,
+            config.n_head_kv as usize,
+            config.head_dim as usize,
+        );
+        // Every position is still *evaluated* — the context has to be built —
+        // but only the second half is scored.
+        //
+        // `+ 1` matches llama.cpp exactly: it scores `n_ctx - 1 - n_ctx/2`
+        // tokens per chunk, which is 63 at a context of 128, not 64. An
+        // off-by-one here is invisible in the output and shifts the number.
+        let first_scored = chunk.len() / 2 + 1;
+        let mut logits = runner.forward_cached(weights, &mut cache, &chunk[..1], 0)?;
+        for i in 1..chunk.len() {
+            if logits.len() < vocab {
+                return Err(format!("logits too small: {} < {vocab}", logits.len()).into());
+            }
+            if i >= first_scored {
+                let row = &logits[logits.len() - vocab..];
+                total_nll += neg_log_prob(row, chunk[i] as usize);
+                counted += 1;
+            }
+            // The last position predicts nothing further, so do not pay for it.
+            if i + 1 < chunk.len() {
+                logits = runner.forward_cached(weights, &mut cache, &chunk[i..i + 1], i)?;
+            }
+        }
+        chunks += 1;
+        let ppl = (total_nll / counted as f64).exp();
+        println!(
+            "chunk {chunks:>4}   {counted:>7} tokens   ppl {ppl:.4}   ({:.1}s)",
+            start.elapsed().as_secs_f64()
+        );
+    }
+
+    if counted == 0 {
+        return Err(format!(
+            "no chunk reached 2 tokens: the corpus is {} tokens and --ppl-chunk is {chunk_size}",
+            tokens.len()
+        )
+        .into());
+    }
+    let ppl = (total_nll / counted as f64).exp();
+    println!();
+    println!("perplexity {ppl:.4} over {counted} tokens in {chunks} chunks of {chunk_size}");
+    println!(
+        "           mean NLL {:.4} nats/token",
+        total_nll / counted as f64
+    );
+    println!("total      {:.1}s", t0.elapsed().as_secs_f64());
+    Ok(())
 }
 
 /// Bytes of `ggml` arena a dense forward pass over `n` tokens needs.
@@ -185,6 +298,7 @@ fn main() -> ExitCode {
     let mut chat = false;
     let mut threads: Option<usize> = None;
     let mut threads_batch: Option<usize> = None;
+    let mut perplexity: Option<usize> = None;
     let mut ctx_size: Option<usize> = None;
     let mut stop: Vec<String> = Vec::new();
     let mut force = false;
@@ -274,6 +388,18 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // Quality, not speed: the one thing this project has never measured.
+            "--perplexity" | "--ppl" => {
+                perplexity = Some(perplexity.unwrap_or(512));
+                i += 1;
+            }
+            "--ppl-chunk" => {
+                perplexity = rest
+                    .get(i + 1)
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&c: &usize| c >= 2);
+                i += 2;
+            }
             "-tb" | "--threads-batch" => {
                 threads_batch = rest
                     .get(i + 1)
@@ -348,6 +474,7 @@ fn main() -> ExitCode {
         chat,
         threads,
         threads_batch,
+        perplexity,
         ctx_size,
         stop,
         force,
@@ -379,6 +506,7 @@ fn run_streaming(
     sampler_cfg: SamplerConfig,
     ctx_size: Option<usize>,
     stop: Vec<String>,
+    perplexity: Option<usize>,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -489,6 +617,10 @@ fn run_streaming(
     );
     let vocab = config.vocab_size as usize;
 
+    if let Some(chunk_size) = perplexity {
+        return perplexity_run(&mut runner, &weights, &config, &tokens, chunk_size, t0);
+    }
+
     // Prefill in blocks. Attention holds n_total * n_new * n_head floats for
     // scores and again for their softmax, so prefilling a long prompt in one
     // pass needs an arena quadratic in prompt length. Blocks bound it, and the
@@ -590,6 +722,7 @@ fn run(
     chat: bool,
     threads_flag: Option<usize>,
     threads_batch_flag: Option<usize>,
+    perplexity: Option<usize>,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -744,6 +877,7 @@ fn run(
             sampler,
             ctx_size,
             stop,
+            perplexity,
             t0,
         );
     }
