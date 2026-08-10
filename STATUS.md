@@ -417,8 +417,11 @@ compute path on its own.** Both command lines and outputs:
 
 | Qwen3-4B dense, CPU, 20 threads | Bigtea | llama.cpp | verdict |
 |---|---:|---:|---|
-| prefill | 38.5 tok/s (651 tok) | **111.2** (pp512) | **2.9x behind** |
-| generation | 0.67 tok/s (128 tok) | **5.90** (tg128) | **8.8x behind** |
+| prefill (matched, 519 vs 512) | **56.3 tok/s** | **111.2** (pp512) | **1.98x behind** |
+| generation | **4.27 tok/s** | **5.90** (tg128) | **1.38x behind** |
+
+*(The original 38.5 / 0.67 figures were taken on the uncached path with a
+broken arena; both are superseded.)*
 
 **FIXED the same day.** The cause was one branch condition: `forward_cached`
 already had a working KV cache but was only reached `if config.is_moe()`, so

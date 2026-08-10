@@ -1168,16 +1168,32 @@ impl<'m> StreamingRunner<'m> {
             }
 
             let (normed_v, probs_v) = {
-                let ctx = Context::new(arena_for(
-                    &[
-                        (n_embd, n_new),            // ffn input
-                        (n_embd, n_new),            // normalised
-                        (n_embd, n_new),            // rms intermediate
-                        (c.n_expert as i64, n_new), // router logits
-                        (c.n_expert as i64, n_new), // router probabilities
-                    ],
-                    24,
-                ))?;
+                // The dense branch below runs the whole feed-forward in this
+                // arena -- gate, up, the SwiGLU product and down -- and those
+                // are `n_ff` wide, four times `n_embd` here. Budgeting only for
+                // the router's tensors aborted at 519 tokens: ggml asked for
+                // 56 MB and had 48. It is only the MoE path where the experts
+                // are computed elsewhere.
+                let mut shapes = vec![
+                    (n_embd, n_new),            // ffn input
+                    (n_embd, n_new),            // normalised
+                    (n_embd, n_new),            // rms intermediate
+                    (c.n_expert as i64, n_new), // router logits
+                    (c.n_expert as i64, n_new), // router probabilities
+                ];
+                if !c.is_moe() {
+                    let n_ff = c.n_ff as i64;
+                    // gate, up, silu(gate), the product, and the down output.
+                    shapes.extend([
+                        (n_ff, n_new),
+                        (n_ff, n_new),
+                        (n_ff, n_new),
+                        (n_ff, n_new),
+                        (n_embd, n_new),
+                        (n_embd, n_new),
+                    ]);
+                }
+                let ctx = Context::new(arena_for(&shapes, 24))?;
                 let xt = ctx.new_f32_2d(n_embd, n_new)?;
                 xt.set_f32(&ffn_input)?;
                 let normed = self.arch.norm_scaled(
