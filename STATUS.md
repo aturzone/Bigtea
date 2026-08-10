@@ -389,9 +389,24 @@ Two details that would have been wrong quietly:
 - Streaming re-uses the UTF-8 buffering rule: a chunk is emitted only at a
   character boundary, so a multi-byte character never becomes `�` mid-stream.
 
-Still a gap: **`bigtea-serve` refuses anything that is not V4-Flash.** The
-server is the part an agent talks to, so serving only the 144 GB model makes it
-useless for the models people actually run. Next item.
+**The server now serves any supported architecture.** It refused everything
+except V4-Flash, which made the one component an agent actually talks to
+useless for the models people actually run. Verified end to end:
+
+| model | template | result |
+|---|---|---|
+| Llama-3.2-1B | llama3 | `"Pacific Ocean"`, `finish_reason: "stop"` |
+| TinyLlama-1.1B | zephyr | answers, SPM tokenizer, same binary |
+
+`/v1/models` reports the container's own name (`Llama-3.2-1B-Instruct`), not a
+constant. A stop sequence truncates correctly: asking it to repeat
+"alpha beta gamma delta" with `stop: ["gamma"]` returns `"alpha beta "` and
+`finish_reason: "stop"`.
+
+One wire-format bug caught by looking at the raw bytes rather than trusting the
+code: the SSE headers were being emitted with **leading whitespace**, because a
+multi-line string literal in the source kept its indentation. `curl` tolerated
+it; a stricter client would not.
 
 ## Known limitations
 

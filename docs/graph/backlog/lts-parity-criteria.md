@@ -47,7 +47,7 @@ deep:
 | A4 | `gemma`/`gemma2` (post-norm, logit soft-cap, tied embeddings) | Gemma family | gap |
 | A5 | `phi3`, `qwen2` explicit | Phi, Qwen2 | gap |
 | A6 | WPM + UGM tokenizers | BERT-family, T5-family | gap |
-| A7 | tied embeddings (`output.weight` absent → reuse `token_embd`) | many small models | gap |
+| A7 | tied embeddings (`output.weight` absent → reuse `token_embd`) | many small models | **DONE** — Llama-3.2-1B is tied and loads |
 | A8 | a clear error naming the *architecture* and what is missing | every unsupported model | **partial** — an unverified architecture now says its RoPE layout is a guess |
 
 **A8 is not cosmetic and should land first.** "Open any model" fails safely only
@@ -106,7 +106,7 @@ without samplers, and it is a day of work.
 | D2 | GGUF v2 and v3 | v3 done; v2 untested |
 | D3 | split containers (`-00001-of-0000N`) | **done** |
 | D4 | every ggml quant type ggml can decode | **done — delegated to ggml** |
-| D5 | OpenAI API surface: `/v1/chat/completions`, `/v1/models`, `/v1/completions`, `/v1/embeddings` | 2 of 4 |
+| D5 | OpenAI API surface: `/v1/chat/completions`, `/v1/models`, `/v1/completions`, `/v1/embeddings` | 2 of 4; chat now **streams** and serves **any** supported architecture |
 | D6 | refuse an unsupported container clearly rather than producing nonsense | partial — **the most important safety property this runner has** |
 
 ## The order

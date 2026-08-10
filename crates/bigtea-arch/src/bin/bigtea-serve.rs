@@ -34,7 +34,11 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
 
-use bigtea_arch::{Deepseek4Cache, Deepseek4Config, Deepseek4Forward, Sampler, SamplerConfig};
+use bigtea_arch::{
+    Deepseek4Cache, Deepseek4Config, Deepseek4Forward, Qwen3Config, Qwen3Model, Sampler,
+    SamplerConfig,
+};
+use bigtea_ggml::{Context, WeightSet};
 use bigtea_model::{Model, ResidentSet};
 use bigtea_tokenizer::{Message, Tokenizer};
 
@@ -97,46 +101,133 @@ fn usage() {
 fn serve(path: &str, port: u16, cache_gib: f64) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     let model = Model::open_split(path)?;
-    if model.architecture() != "deepseek4" {
-        return Err(format!(
-            "bigtea-serve currently serves deepseek4 only; this container is {}",
-            model.architecture()
-        )
-        .into());
-    }
-    let config = Deepseek4Config::from_model(&model)?;
     let tokenizer = Tokenizer::from_metadata(model.metadata())?;
-
-    let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
-    let reserve = (1u64 << 30) + (512 << 20) + (768 << 20);
-    let (resident, report) = ResidentSet::load(&model, machine.usable_ram_for_weights(reserve))?;
-    println!("resident   {report}");
-
-    let mut fw = Deepseek4Forward::new(&model, config.clone()).with_resident(&resident);
-    // Same rule the runner enforces: a byte given to the expert cache while the
-    // always-read set is still streaming comes out of residency, where it would
-    // have been read on every token. Measured both ways.
-    if cache_gib > 0.0 && report.skipped_over_budget == 0 {
-        fw = fw.with_expert_cache((cache_gib * GIB) as usize);
-        println!("cache      {cache_gib:.2} GiB for routed experts");
-    } else if cache_gib > 0.0 {
-        println!(
-            "cache      refused: {:.2} GiB of always-read weights is still streaming",
-            report.skipped_over_budget as f64 / GIB
-        );
+    println!("model      {} ({})", model.architecture(), model.io_mode());
+    let format = tokenizer.chat_format();
+    if format.is_known() {
+        println!("chat       {} template", format.name());
+    } else {
+        println!("chat       template not recognised -- using a plain framing;");
+        println!("           the model may not respond as an assistant.");
     }
-    let fw = fw;
 
+    // Two engines, chosen by architecture, because V4-Flash shares almost none
+    // of its graph with the dense path. Both are set up here so the borrowed
+    // state outlives the request loop.
+    if model.architecture() == "deepseek4" {
+        let config = Deepseek4Config::from_model(&model)?;
+        let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
+        let reserve = (1u64 << 30) + (512 << 20) + (768 << 20);
+        let (resident, report) =
+            ResidentSet::load(&model, machine.usable_ram_for_weights(reserve))?;
+        println!("resident   {report}");
+
+        let mut fw = Deepseek4Forward::new(&model, config.clone()).with_resident(&resident);
+        // Same rule the runner enforces: a byte given to the expert cache while
+        // the always-read set is still streaming comes out of residency, where
+        // it would have been read on every token. Measured both ways.
+        if cache_gib > 0.0 && report.skipped_over_budget == 0 {
+            fw = fw.with_expert_cache((cache_gib * GIB) as usize);
+            println!("cache      {cache_gib:.2} GiB for routed experts");
+        } else if cache_gib > 0.0 {
+            println!(
+                "cache      refused: {:.2} GiB of always-read weights is still streaming",
+                report.skipped_over_budget as f64 / GIB
+            );
+        }
+        let fw = fw;
+        let engine = Engine::Deepseek4 {
+            fw: &fw,
+            config: &config,
+        };
+        return run_loop(engine, &tokenizer, port, t0);
+    }
+
+    // Dense: Llama, Mistral, Qwen and everything else the qwen3 path covers.
+    let config = Qwen3Config::from_model(&model)?;
+    let arch = Qwen3Model::new(config.clone());
+    arch.verify(&model)?;
+    println!(
+        "shape      {} layers, {} embd, {} heads ({} kv)",
+        config.n_layer, config.n_embd, config.n_head, config.n_head_kv
+    );
+    if !config.rope_type_is_known {
+        println!(
+            "           NOTE: {:?} is not an architecture this build has verified;",
+            model.architecture()
+        );
+        println!("           its RoPE layout is assumed. Fluent-but-wrong output points here.");
+    }
+
+    let weight_ctx = Context::new_no_alloc(64 << 20)?;
+    let mut weights = WeightSet::new();
+    let mut bound = 0u64;
+    for name in arch.required_tensors() {
+        let loc = model
+            .location(&name)
+            .ok_or_else(|| format!("missing tensor {name}"))?
+            .clone();
+        let data = model.read_tensor(&name)?;
+        bound += data.len() as u64;
+        weights.bind(&weight_ctx, &name, loc.ty, &loc.dims, data)?;
+    }
+    // Tied embeddings: many small models ship no separate output projection and
+    // reuse the embedding table. Binding it only when present is what lets
+    // those containers load at all.
+    if model.location("output.weight").is_some() && weights.get("output.weight").is_none() {
+        let loc = model.location("output.weight").expect("checked").clone();
+        let data = model.read_tensor("output.weight")?;
+        bound += data.len() as u64;
+        weights.bind(&weight_ctx, "output.weight", loc.ty, &loc.dims, data)?;
+    }
+    println!(
+        "weights    {} tensors, {:.2} GiB bound in {:.1}s (zero-copy)",
+        weights.len(),
+        bound as f64 / GIB,
+        t0.elapsed().as_secs_f64()
+    );
+
+    // `general.name` if the container carries one, else the file stem -- a
+    // client's model id should mean something.
+    let name = model
+        .metadata()
+        .get("general.name")
+        .and_then(bigtea_gguf::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            std::path::Path::new(path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "bigtea-model".to_string())
+        });
+    let engine = Engine::Dense {
+        arch: &arch,
+        weights: &weights,
+        name: &name,
+    };
+    run_loop(engine, &tokenizer, port, t0)
+}
+
+/// Accept and answer requests, one at a time.
+fn run_loop(
+    engine: Engine<'_>,
+    tokenizer: &Tokenizer,
+    port: u16,
+    t0: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr)?;
     println!("ready      {addr} in {:.1}s", t0.elapsed().as_secs_f64());
     println!("           POST /v1/chat/completions");
-    println!("           one request at a time — the KV cache is not shareable");
+    println!(
+        "           context {} tokens, one request at a time",
+        engine.context_limit()
+    );
 
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                if let Err(e) = handle(s, &fw, &tokenizer, &config) {
+                if let Err(e) = handle(s, &engine, tokenizer) {
                     eprintln!("request failed: {e}");
                 }
             }
@@ -191,9 +282,8 @@ fn read_request(stream: &TcpStream) -> Result<Request, Box<dyn std::error::Error
 
 fn handle(
     mut stream: TcpStream,
-    fw: &Deepseek4Forward<'_>,
+    engine: &Engine<'_>,
     tokenizer: &Tokenizer,
-    config: &Deepseek4Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let req = read_request(&stream)?;
     let started = std::time::Instant::now();
@@ -202,14 +292,17 @@ fn handle(
         ("GET", "/health") | ("GET", "/") => (
             200,
             format!(
-                r#"{{"status":"ok","architecture":"{}","context_limit":{}}}"#,
-                "deepseek4", 256
+                r#"{{"status":"ok","model":"{}","context_limit":{}}}"#,
+                engine.model_name(),
+                engine.context_limit()
             ),
         ),
         ("GET", "/v1/models") => (
             200,
-            r#"{"object":"list","data":[{"id":"deepseek-v4-flash","object":"model","owned_by":"bigtea"}]}"#
-                .to_string(),
+            format!(
+                r#"{{"object":"list","data":[{{"id":"{}","object":"model","owned_by":"bigtea"}}]}}"#,
+                engine.model_name()
+            ),
         ),
         ("POST", "/v1/chat/completions") => {
             let params = Params::from_body(&req.body);
@@ -218,12 +311,12 @@ fn handle(
                 // event per token, so a client sees words appear instead of
                 // waiting for the whole answer. Nothing more may be written
                 // afterwards, so this returns early.
-                return stream_completion(stream, &req, fw, tokenizer, config, &params, started);
+                return stream_completion(stream, &req, engine, tokenizer, &params, started);
             }
-            match generate(&req.body, fw, tokenizer, config, &params, &mut |_| Ok(())) {
+            match generate(&req.body, engine, tokenizer, &params, &mut |_| Ok(())) {
                 Ok((text, prompt_tokens, produced, finish)) => (
                     200,
-                    completion_json(&text, prompt_tokens, produced, finish),
+                    completion_json(engine.model_name(), &text, prompt_tokens, produced, finish),
                 ),
                 Err(e) => (400, error_json(&e.to_string())),
             }
@@ -268,38 +361,38 @@ fn handle(
 fn stream_completion(
     mut stream: TcpStream,
     req: &Request,
-    fw: &Deepseek4Forward<'_>,
+    engine: &Engine<'_>,
     tokenizer: &Tokenizer,
-    config: &Deepseek4Config,
     params: &Params,
     started: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    stream.write_all(
-        b"HTTP/1.1 200 OK
-
-          Content-Type: text/event-stream
-
-          Cache-Control: no-cache
-
-          Access-Control-Allow-Origin: *
-
-          Connection: close
-
-
-
-",
-    )?;
+    // Built by concatenation rather than as one multi-line literal: HTTP header
+    // lines are CRLF-separated with no leading whitespace, and a literal that
+    // wraps in the source is an easy way to ship indented headers that stricter
+    // clients reject.
+    let headers = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Type: text/event-stream\r\n",
+        "Cache-Control: no-cache\r\n",
+        "Access-Control-Allow-Origin: *\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+    );
+    stream.write_all(headers.as_bytes())?;
     // The role arrives in its own first chunk, before any content, which is
     // what the OpenAI streaming schema specifies.
     stream.write_all(
-        b"data: {\"id\":\"bigtea\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}
-
-",
+        concat!(
+            r#"data: {"id":"bigtea","object":"chat.completion.chunk","#,
+            r#""choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            "\n\n",
+        )
+        .as_bytes(),
     )?;
     stream.flush()?;
 
     let mut sink = stream.try_clone()?;
-    let result = generate(&req.body, fw, tokenizer, config, params, &mut |text| {
+    let result = generate(&req.body, engine, tokenizer, params, &mut |text| {
         sink.write_all(sse_chunk(text, None).as_bytes())?;
         // Flush per token or the OS buffers the whole answer and "streaming"
         // arrives all at once at the end.
@@ -323,11 +416,7 @@ fn stream_completion(
             )?;
         }
     }
-    stream.write_all(
-        b"data: [DONE]
-
-",
-    )?;
+    stream.write_all(b"data: [DONE]\n\n")?;
     stream.flush()?;
     eprintln!(
         "{} {} -> 200 (stream) in {:.1}s",
@@ -343,6 +432,61 @@ fn error_json(message: &str) -> String {
         r#"{{"error":{{"message":"{}","type":"invalid_request_error"}}}}"#,
         escape(message)
     )
+}
+
+/// Which model this server is driving.
+///
+/// V4-Flash shares almost none of its graph with the dense architectures, so
+/// they are separate variants rather than one configurable path — the same
+/// split `bigtea-run` makes. Serving only V4-Flash was a real limitation: the
+/// server is the part an editor or agent talks to, and refusing every Llama and
+/// Qwen container made it useless for the models people actually run.
+enum Engine<'a> {
+    Deepseek4 {
+        fw: &'a Deepseek4Forward<'a>,
+        config: &'a Deepseek4Config,
+    },
+    /// Dense Llama/Qwen. Regenerates over the whole sequence per token, exactly
+    /// as `bigtea-run` does on this path: every pass is stateless and identical
+    /// to a prefill, so there is no cache to get subtly wrong. These models are
+    /// small enough that the quadratic term is not what limits them.
+    Dense {
+        arch: &'a Qwen3Model,
+        weights: &'a WeightSet<'a>,
+        /// What to report as the model id. Clients key off this, so it comes
+        /// from the container rather than being a constant.
+        name: &'a str,
+    },
+}
+
+impl Engine<'_> {
+    fn model_name(&self) -> &str {
+        match self {
+            Engine::Deepseek4 { .. } => "deepseek-v4-flash",
+            Engine::Dense { name, .. } => name,
+        }
+    }
+
+    /// Tokens this path can hold in total, prompt plus generation.
+    fn context_limit(&self) -> usize {
+        match self {
+            // Attention builds one cache for the whole sequence, 512 x 256.
+            Engine::Deepseek4 { .. } => 256,
+            // Bounded by the arena rather than by a cache. Kept modest because
+            // every pass rebuilds the graph over the whole sequence.
+            Engine::Dense { .. } => 2048,
+        }
+    }
+}
+
+/// One generation, driven by whichever engine is loaded.
+///
+/// Returns the logits for the next token. The two paths differ in what they
+/// carry between calls, so the state lives here rather than in `generate`.
+enum State {
+    Deepseek4(Deepseek4Cache),
+    /// The dense path keeps nothing: each call rebuilds over the full sequence.
+    Dense,
 }
 
 /// Everything a request asks for beyond the messages themselves.
@@ -423,9 +567,8 @@ impl Finish {
 /// disconnecting mid-stream stops the work rather than finishing it for nobody.
 fn generate(
     body: &str,
-    fw: &Deepseek4Forward<'_>,
+    engine: &Engine<'_>,
     tokenizer: &Tokenizer,
-    config: &Deepseek4Config,
     params: &Params,
     emit: &mut dyn FnMut(&str) -> std::io::Result<()>,
 ) -> Result<(String, usize, usize, Finish), Box<dyn std::error::Error>> {
@@ -446,18 +589,24 @@ fn generate(
     // The context limit is a real property of this path, not a policy: attention
     // builds its cache for the whole sequence at once. Say so before spending
     // ten seconds discovering it.
-    if tokens.len() + params.max_tokens > 256 {
+    let limit = engine.context_limit();
+    if tokens.len() + params.max_tokens > limit {
         return Err(format!(
-            "prompt is {} tokens and max_tokens is {}; this path holds 256 in total",
+            "prompt is {} tokens and max_tokens is {}; this path holds {limit} in total",
             tokens.len(),
             params.max_tokens
         )
         .into());
     }
 
-    let arena = 1024usize << 20;
-    let mut kv = Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
-    let logits = bigtea_arch::forward(fw, &mut kv, &tokens, arena)?;
+    let mut seq = tokens.clone();
+    let mut state = match engine {
+        Engine::Deepseek4 { config, .. } => {
+            State::Deepseek4(Deepseek4Cache::new(config.n_layer, config.kv_lora_rank))
+        }
+        Engine::Dense { .. } => State::Dense,
+    };
+    let logits = advance(engine, &mut state, &seq, true)?;
 
     let mut sampler = Sampler::new(params.sampler.clone());
     let mut history: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
@@ -506,7 +655,8 @@ fn generate(
         if produced >= params.max_tokens {
             break;
         }
-        let logits = bigtea_arch::step(fw, &mut kv, next, arena)?;
+        seq.push(next);
+        let logits = advance(engine, &mut state, &seq, false)?;
         next = sampler.sample(&logits, &history) as i32;
     }
 
@@ -519,10 +669,72 @@ fn generate(
     Ok((out, tokens.len(), produced, finish))
 }
 
+/// Run the model forward and return the next token's logits.
+///
+/// `first` distinguishes the prompt pass from a continuation. The deepseek4
+/// path is incremental — its KV cache means a step feeds one token — while the
+/// dense path rebuilds over the whole sequence every time, so it needs `seq`
+/// rather than the last token.
+fn advance(
+    engine: &Engine<'_>,
+    state: &mut State,
+    seq: &[i32],
+    first: bool,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    match (engine, state) {
+        (Engine::Deepseek4 { fw, .. }, State::Deepseek4(kv)) => {
+            let arena = 1024usize << 20;
+            if first {
+                Ok(bigtea_arch::forward(fw, kv, seq, arena)?)
+            } else {
+                // The cache already holds everything before it, so a step feeds
+                // exactly the token just chosen.
+                let last = *seq.last().expect("non-empty sequence");
+                Ok(bigtea_arch::step(fw, kv, last, arena)?)
+            }
+        }
+        (Engine::Dense { arch, weights, .. }, _) => {
+            let n = seq.len() as i64;
+            let c = &arch.config;
+            // Arena scales with the sequence: attention holds n x n scores per
+            // head, and ggml aborts rather than erroring when it runs short.
+            let arena = bigtea_ggml::arena_for(
+                &[(c.n_embd as i64, n), (c.vocab_size as i64, n)],
+                64 + (n as usize / 8),
+            )
+            .max(256 << 20);
+            let ctx = Context::new(arena)?;
+            let tok = ctx.new_i32_1d(n)?;
+            tok.set_i32(seq)?;
+            let pos = ctx.new_i32_1d(n)?;
+            pos.set_i32(&(0..n as i32).collect::<Vec<_>>())?;
+            let logits = arch.build_graph(&ctx, weights, &tok, &pos, n)?;
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1);
+            ctx.compute(&logits, threads)?;
+            let all = logits.to_vec_f32();
+            // Only the final position predicts the next token.
+            let vocab = c.vocab_size as usize;
+            Ok(match all.len() >= vocab {
+                true => all[all.len() - vocab..].to_vec(),
+                false => all,
+            })
+        }
+        _ => Err("engine and state disagree -- this is a bug".into()),
+    }
+}
+
 /// The non-streaming response body.
-fn completion_json(text: &str, prompt_tokens: usize, produced: usize, finish: Finish) -> String {
+fn completion_json(
+    model: &str,
+    text: &str,
+    prompt_tokens: usize,
+    produced: usize,
+    finish: Finish,
+) -> String {
     format!(
-        r#"{{"id":"bigtea","object":"chat.completion","model":"deepseek-v4-flash","choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"{}"}}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{produced},"total_tokens":{}}}}}"#,
+        r#"{{"id":"bigtea","object":"chat.completion","model":"{model}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"{}"}}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{produced},"total_tokens":{}}}}}"#,
         escape(text),
         finish.as_str(),
         prompt_tokens + produced
@@ -541,7 +753,7 @@ fn sse_chunk(delta: &str, finish: Option<Finish>) -> String {
         format!(r#"{{"content":"{}"}}"#, escape(delta))
     };
     format!(
-        "data: {{\"id\":\"bigtea\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-flash\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}\n\n"
+        "data: {{\"id\":\"bigtea\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}\n\n"
     )
 }
 
@@ -900,7 +1112,8 @@ mod tests {
     fn finish_reason_distinguishes_running_out_from_stopping() {
         assert_eq!(Finish::Length.as_str(), "length");
         assert_eq!(Finish::Stop.as_str(), "stop");
-        let j = completion_json("hi", 5, 2, Finish::Stop);
+        let j = completion_json("test-model", "hi", 5, 2, Finish::Stop);
+        assert!(j.contains(r#""model":"test-model""#));
         assert!(j.contains(r#""finish_reason":"stop""#));
         assert!(j.contains(r#""total_tokens":7"#));
     }
