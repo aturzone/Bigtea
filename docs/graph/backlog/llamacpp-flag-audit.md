@@ -14,8 +14,8 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 
 | bucket | flags | state |
 |---|---:|---|
-| **have** | **69** | done |
-| **samplers** | 22 | **13 done 2026-08-10**, DRY (5) + `--samplers` ordering (3) left |
+| **have** | **71** | done |
+| **samplers** | 22 | **18 done**; `--samplers` ordering (3) + `--backend-sampling` left |
 | interaction / prompt handling | 22 | **done 2026-08-11** — including a real REPL |
 | runtime / threading / memory | 31 | mostly gap; several are meaningless here |
 | RoPE, YaRN, context shift | 15 | **9 done 2026-08-11**; the other 6 refused, see below |
@@ -161,11 +161,40 @@ Two of the thirteen are refused: `--log-colors` (status goes to a stream that
 may be a file; llama.cpp's colour applies to a level marker we render as one
 character) and `--no-host`, which is not a logging flag at all.
 
+## Done 2026-08-11 — DRY, the sampler that actually breaks a loop
+
+`--dry-multiplier`, `--dry-base`, `--dry-allowed-length`,
+`--dry-penalty-last-n`, `--dry-sequence-breaker`.
+
+DRY asks a narrower question than a repeat penalty. A repeat penalty punishes a
+token for having appeared, which also suppresses the ordinary reuse prose is
+made of. DRY looks for a *sequence* replaying and penalises only the token that
+would continue it, growing the penalty geometrically with how long the run
+already is.
+
+```
+$ bigtea-run <llama-3.2-1b> "The sea is blue. The sea is blue. The sea is blue. The sea is" -n 14
+ blue. The sea is blue. The sea is blue. The sea      <- stuck
+
+$ ... --dry-multiplier 1.5
+ ... blue. (Repeat ad infinitum)  This is a classic example
+```
+
+**Sequence breakers are what stop it penalising structure.** A match may not
+cross a newline, quote, colon or asterisk, or a list is punished for having the
+shape of a list. They arrive as text and the sampler works in token ids, so they
+are resolved once the vocabulary exists; a breaker that is not a single token in
+this vocabulary is **skipped rather than approximated**.
+
+One test caught the author, not the code: a fixture written as
+`[9,1,2,3,4,9,1,2,3]` has `9 1 2 3` repeating, so the match is four long and the
+penalty is `base^2`, not `base^1`. The assertion was wrong and the
+implementation was right — both cases are pinned now.
+
 ## Next batches, in order
 
-1. **DRY + `--samplers` ordering (8)** — finishes the sampler bucket. DRY needs
-   n-gram suffix matching and sequence breakers; the ordering flag needs the
-   chain to become data rather than a fixed sequence of calls.
+1. **`--samplers` ordering (3)** — finishes the sampler bucket. Needs the chain
+   to become data rather than a fixed sequence of calls.
 2. **RoPE / context (15)** — `--rope-freq-base`, `--rope-freq-scale`,
    `--rope-scaling`, YaRN. Cheap, and needed for any model whose container
    disagrees with its training context.

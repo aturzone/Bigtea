@@ -24,6 +24,8 @@
 //! all of them, so `Sampler::default()` is exactly the old greedy behaviour and
 //! nothing changes for a caller that does not opt in.
 
+use std::collections::HashMap;
+
 /// Which filters run, and how hard.
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
@@ -51,6 +53,27 @@ pub struct SamplerConfig {
     pub presence_penalty: f32,
     /// How far back all three penalties look.
     pub repeat_last_n: usize,
+    /// DRY ("don't repeat yourself") strength. `0.0` disables.
+    ///
+    /// Unlike the three penalties above, DRY is about *sequences*: it looks for
+    /// the text about to repeat an earlier run of tokens and penalises only the
+    /// token that would continue it. A repeat penalty cannot express that — it
+    /// punishes a word for having been used, which also suppresses the ordinary
+    /// reuse that normal prose is made of.
+    pub dry_multiplier: f32,
+    /// Growth per token beyond `dry_allowed_length`. Penalty is
+    /// `multiplier * base^(match_len - allowed_len)`, so this decides how
+    /// sharply a longer repeat is punished.
+    pub dry_base: f32,
+    /// Repeats shorter than this are not penalised at all. Every language
+    /// repeats short spans constantly ("of the", "it is"), so a low value
+    /// suppresses grammar rather than repetition.
+    pub dry_allowed_length: usize,
+    /// How far back DRY looks. `0` means the whole history.
+    pub dry_penalty_last_n: usize,
+    /// Token ids a match may not cross — newline, quote, colon. Held as ids
+    /// rather than strings because the sampler never sees the tokenizer.
+    pub dry_sequence_breakers: Vec<u32>,
     /// Locally typical sampling: keep the smallest set whose surprise is
     /// closest to the distribution's entropy. `1.0` disables.
     pub typical_p: f32,
@@ -94,6 +117,11 @@ impl Default for SamplerConfig {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             repeat_last_n: 64,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: 0,
+            dry_sequence_breakers: Vec::new(),
             typical_p: 1.0,
             top_n_sigma: 0.0,
             dynatemp_range: 0.0,
@@ -127,6 +155,11 @@ impl SamplerConfig {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             repeat_last_n: 64,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: 0,
+            dry_sequence_breakers: Vec::new(),
             typical_p: 1.0,
             top_n_sigma: 0.0,
             dynatemp_range: 0.0,
@@ -163,12 +196,16 @@ impl SamplerConfig {
             && self.logit_bias.is_empty()
             && !self.ignore_eos
             && self.mirostat == 0
+            && self.dry_multiplier == 0.0
     }
 
     /// Whether any penalty is active, so a greedy-with-penalties path can
     /// still be taken without running the full sampling pipeline.
     pub fn has_penalties(&self) -> bool {
-        self.repeat_penalty != 1.0 || self.frequency_penalty != 0.0 || self.presence_penalty != 0.0
+        self.repeat_penalty != 1.0
+            || self.frequency_penalty != 0.0
+            || self.presence_penalty != 0.0
+            || self.dry_multiplier != 0.0
     }
 }
 
@@ -304,6 +341,15 @@ impl Sampler {
             self.config.presence_penalty,
             self.config.repeat_last_n,
         );
+        apply_dry(
+            &mut self.candidates,
+            history,
+            self.config.dry_multiplier,
+            self.config.dry_base,
+            self.config.dry_allowed_length,
+            self.config.dry_penalty_last_n,
+            &self.config.dry_sequence_breakers,
+        );
 
         // Temperature 0 with a penalty active is a normal request — an OpenAI
         // client sending `temperature: 0, frequency_penalty: 1.0` means "argmax
@@ -386,6 +432,101 @@ impl Sampler {
         // Floating point can leave `acc` a hair under `r`; the last candidate is
         // the correct answer rather than a failure.
         self.candidates.last().map(|c| c.0).unwrap_or(0)
+    }
+}
+
+/// DRY — penalise the token that would *continue* an earlier sequence.
+///
+/// # What it does that a repeat penalty cannot
+///
+/// A repeat penalty punishes a token for having appeared. That also suppresses
+/// the ordinary reuse prose is made of — "the", "and", a character's name. DRY
+/// asks a narrower question: *is the text about to replay a run of tokens it
+/// has already produced?* Only the token that would extend that run is
+/// penalised, and the penalty grows with how long the run already is.
+///
+/// # The algorithm
+///
+/// Let the window end with token `L`. For every earlier position `i` holding
+/// `L`, measure how far the text agrees backwards from `i` and from the end.
+/// That common length is how much of a repeat is already in progress, and the
+/// token at `i + 1` is what would continue it. Penalty:
+///
+/// ```text
+/// multiplier * base^(match_len - allowed_len)      when match_len >= allowed_len
+/// ```
+///
+/// The **largest** penalty wins where several positions nominate the same
+/// token: two separate repeats of the same continuation are not twice as bad as
+/// one, but the longer of them is what matters.
+///
+/// `sequence_breakers` are ids a match may not cross — newline, quote, colon.
+/// Without them a repeat is happily detected across a paragraph boundary, and
+/// structured output (a list, a table) is penalised for having structure.
+fn apply_dry(
+    candidates: &mut [(u32, f32)],
+    history: &[u32],
+    multiplier: f32,
+    base: f32,
+    allowed_length: usize,
+    penalty_last_n: usize,
+    breakers: &[u32],
+) {
+    if multiplier <= 0.0 || history.len() < 2 {
+        return;
+    }
+    // `0` means the whole history, which is llama.cpp's convention and the
+    // opposite of what `0` means for `repeat_last_n`.
+    let window = if penalty_last_n == 0 || penalty_last_n >= history.len() {
+        history
+    } else {
+        &history[history.len() - penalty_last_n..]
+    };
+    let n = window.len();
+    if n < 2 {
+        return;
+    }
+    let is_breaker = |t: u32| breakers.contains(&t);
+    let last = window[n - 1];
+    // A breaker as the most recent token means no repeat is in progress at all.
+    if is_breaker(last) {
+        return;
+    }
+
+    let mut penalties: HashMap<u32, f32> = HashMap::new();
+    for i in 0..n - 1 {
+        if window[i] != last {
+            continue;
+        }
+        // Walk backwards from both ends while they agree, stopping at a
+        // breaker so a "repeat" cannot span a paragraph boundary.
+        let mut len = 1usize;
+        while len <= i
+            && len < n
+            && window[i - len] == window[n - 1 - len]
+            && !is_breaker(window[i - len])
+        {
+            len += 1;
+        }
+        if len < allowed_length {
+            continue;
+        }
+        let next = window[i + 1];
+        // `saturating_sub` for the boundary case: at exactly `allowed_length`
+        // the exponent is 0 and the penalty is the bare multiplier.
+        let penalty = multiplier * base.powi((len - allowed_length) as i32);
+        let slot = penalties.entry(next).or_insert(0.0);
+        if penalty > *slot {
+            *slot = penalty;
+        }
+    }
+    if penalties.is_empty() {
+        return;
+    }
+    for c in candidates.iter_mut() {
+        if let Some(p) = penalties.get(&c.0) {
+            c.1 -= p;
+        }
     }
 }
 
@@ -829,6 +970,74 @@ mod tests {
         assert_eq!(
             c[1].1, -8.0,
             "negative logit must be multiplied, not raised"
+        );
+    }
+
+    #[test]
+    fn dry_penalises_the_token_that_continues_a_repeat() {
+        // History "a b c a b" — the run "a b" is in progress, and `c` is what
+        // followed it last time. Only `c` should be penalised.
+        let history = [1u32, 2, 3, 1, 2];
+        let mut c = vec![(1u32, 0.0f32), (2, 0.0), (3, 0.0), (4, 0.0)];
+        apply_dry(&mut c, &history, 1.0, 2.0, 2, 0, &[]);
+        assert_eq!(c[2].1, -1.0, "token 3 continues the repeat: {c:?}");
+        assert_eq!(c[0].1, 0.0, "token 1 does not");
+        assert_eq!(c[3].1, 0.0, "an unseen token certainly does not");
+    }
+
+    #[test]
+    fn dry_grows_with_the_length_of_the_repeat() {
+        // Match length 2 with allowed 2 -> exponent 0 -> bare multiplier.
+        let mut c = vec![(3u32, 0.0f32)];
+        apply_dry(&mut c, &[1, 2, 3, 1, 2], 1.0, 3.0, 2, 0, &[]);
+        assert_eq!(c[0].1, -1.0);
+        // Match length 3 with allowed 2 -> exponent 1 -> multiplier * base.
+        // The leading tokens differ (8 vs 9) so the agreement stops at three;
+        // making them equal gives a match of four and a penalty of nine, which
+        // is what the first draft of this test asserted against by accident.
+        let mut c = vec![(4u32, 0.0f32)];
+        apply_dry(&mut c, &[8, 1, 2, 3, 4, 9, 1, 2, 3], 1.0, 3.0, 2, 0, &[]);
+        assert_eq!(c[0].1, -3.0, "a longer repeat costs more: {c:?}");
+
+        // ...and one token longer again is base^2, not base*2.
+        let mut c = vec![(4u32, 0.0f32)];
+        apply_dry(&mut c, &[9, 1, 2, 3, 4, 9, 1, 2, 3], 1.0, 3.0, 2, 0, &[]);
+        assert_eq!(c[0].1, -9.0, "growth must be geometric: {c:?}");
+    }
+
+    #[test]
+    fn dry_respects_allowed_length_and_being_off() {
+        // The repeat is length 2; allowing 3 means nothing is penalised.
+        let mut c = vec![(3u32, 0.0f32)];
+        apply_dry(&mut c, &[1, 2, 3, 1, 2], 1.0, 2.0, 3, 0, &[]);
+        assert_eq!(c[0].1, 0.0);
+        // Multiplier 0 is off.
+        let mut c = vec![(3u32, 0.0f32)];
+        apply_dry(&mut c, &[1, 2, 3, 1, 2], 0.0, 2.0, 2, 0, &[]);
+        assert_eq!(c[0].1, 0.0);
+    }
+
+    #[test]
+    fn a_sequence_breaker_stops_a_match_spanning_it() {
+        // Same history, but token 2 is a breaker. The backward walk must stop
+        // there, leaving a match too short to penalise. Without this, a list
+        // is penalised for having the shape of a list.
+        let mut c = vec![(3u32, 0.0f32)];
+        apply_dry(&mut c, &[1, 2, 3, 1, 2], 1.0, 2.0, 2, 0, &[2]);
+        assert_eq!(c[0].1, 0.0, "the match crossed a breaker: {c:?}");
+    }
+
+    #[test]
+    fn dry_takes_the_largest_penalty_not_the_sum() {
+        // Two separate repeats both nominate token 3. Two occurrences of the
+        // same continuation are not twice as bad as one; the longer run is
+        // what matters, so the penalties must not accumulate.
+        let history = [1u32, 2, 3, 1, 2, 3, 1, 2];
+        let mut c = vec![(3u32, 0.0f32)];
+        apply_dry(&mut c, &history, 1.0, 2.0, 2, 0, &[]);
+        assert!(
+            c[0].1 >= -8.0,
+            "penalties summed instead of taking the max: {c:?}"
         );
     }
 

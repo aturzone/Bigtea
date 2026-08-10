@@ -24,7 +24,7 @@ the real distance to "any model", and it is far larger than the performance gap.
 | architectures | **6** (`deepseek4`, `gemma2`, `llama`, `phi3`, `qwen3`, `qwen3moe`) | ~100 |
 | tokenizer families | **2** (`gpt2` BPE, `llama` SPM) | 6 (spm, bpe, wpm, ugm, rwkv, plamo2) |
 | quant types | all ggml can decode | same |
-| CLI flags | **69** | **182** (counted, not estimated: `llamacpp-flag-audit.md`) |
+| CLI flags | **71** | **182** (counted, not estimated: `llamacpp-flag-audit.md`) |
 | chat templates | **9 families** | ~40 |
 | backends | CPU | CPU, CUDA, Metal, Vulkan, ROCm, SYCL |
 

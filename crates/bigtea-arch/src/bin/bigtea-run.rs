@@ -523,6 +523,11 @@ fn main() -> ExitCode {
         eprintln!("  --mirostat-lr ETA   mirostat learning rate (default 0.1)");
         eprintln!("  --logit-bias ID+B   nudge one token, repeatable (e.g. 42-100)");
         eprintln!("  --ignore-eos        never stop at end-of-sequence");
+        eprintln!("  --dry-multiplier M  DRY repetition penalty. 0 = off");
+        eprintln!("  --dry-base B        DRY growth per extra repeated token (1.75)");
+        eprintln!("  --dry-allowed-length N  repeats shorter than this are free (2)");
+        eprintln!("  --dry-penalty-last-n N  how far DRY looks back. 0 = all");
+        eprintln!("  --dry-sequence-breaker S  a match may not cross this, repeatable");
         eprintln!("  -i, --interactive   keep the session open and take turns");
         eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
         eprintln!("  -st, --single-turn  one exchange, then exit");
@@ -597,6 +602,8 @@ fn main() -> ExitCode {
     let mut escape = true;
     let mut rope = RopeOverrides::default();
     let mut logcfg = bigtea_arch::log::LogConfig::default();
+    // Held as text until a tokenizer exists to turn them into ids.
+    let mut dry_breakers: Vec<String> = Vec::new();
     let mut show_perf = true;
     let mut system_prompt: Option<String> = None;
     let mut ctx_size: Option<usize> = None;
@@ -745,6 +752,32 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // --- DRY: penalise continuing a repeat, not reusing a word -----
+            "--dry-multiplier" => {
+                sampler.dry_multiplier =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                i += 2;
+            }
+            "--dry-base" => {
+                sampler.dry_base = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1.75);
+                i += 2;
+            }
+            "--dry-allowed-length" => {
+                sampler.dry_allowed_length =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(2);
+                i += 2;
+            }
+            "--dry-penalty-last-n" => {
+                sampler.dry_penalty_last_n =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                i += 2;
+            }
+            "--dry-sequence-breaker" => {
+                if let Some(v) = rest.get(i + 1) {
+                    dry_breakers.push(v.clone());
+                }
+                i += 2;
+            }
             // --- logging: status is diagnostics, the text is output --------
             "--log-disable" => {
                 logcfg.verbosity = 0;
@@ -1023,6 +1056,7 @@ fn main() -> ExitCode {
         system_prompt,
         rope,
         show_perf,
+        dry_breakers,
         ctx_size,
         stop,
         force,
@@ -1331,6 +1365,7 @@ fn run(
     system_prompt: Option<String>,
     rope: RopeOverrides,
     show_perf: bool,
+    dry_breakers: Vec<String>,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -1466,6 +1501,46 @@ fn run(
 
     // --- tokenizer ---------------------------------------------------------
     let tokenizer = Tokenizer::from_metadata(model.metadata())?;
+
+    // DRY's sequence breakers arrive as text and the sampler works in ids, so
+    // they can only be resolved once a vocabulary exists. Defaults are
+    // llama.cpp's: a newline, a quote, a colon and an asterisk — the marks that
+    // separate one structural unit from the next, and across which a "repeat"
+    // is usually just a list having a shape.
+    let mut sampler = sampler;
+    if sampler.dry_multiplier > 0.0 {
+        let wanted: Vec<String> = if dry_breakers.is_empty() {
+            ["\n", ":", "\"", "*"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            dry_breakers
+        };
+        for text in &wanted {
+            // BOS is dropped: `encode` prepends it for models that ask for one,
+            // and a breaker is a piece of text, not the start of a sequence.
+            // A breaker that is still not a single token cannot act as a
+            // barrier, so it is skipped rather than silently matching
+            // something else — "*" is one token in some vocabularies and part
+            // of a merge in others.
+            let ids: Vec<u32> = tokenizer
+                .encode(text)
+                .into_iter()
+                .filter(|id| Some(*id) != tokenizer.bos)
+                .collect();
+            if let [only] = ids[..] {
+                sampler.dry_sequence_breakers.push(only);
+            }
+        }
+        bigtea_arch::detail!(
+            "dry        {} sequence breakers resolved of {} asked for",
+            sampler.dry_sequence_breakers.len(),
+            wanted.len()
+        );
+    }
+    let sampler = sampler;
+
     let prompt = &framed(
         &tokenizer,
         prompt,
