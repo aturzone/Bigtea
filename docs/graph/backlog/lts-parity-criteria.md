@@ -91,7 +91,7 @@ reads + ~0.6 s of everything else, so with R2 overlap it is **~0.65 tok/s agains
 | C5 | stop sequences, `max_tokens`, `n_predict` | **DONE** — `--stop` (repeatable) on the CLI, string-or-array on the server; both match accumulated text, not tokens |
 | C6 | grammar / JSON-schema constrained output | **won't for LTS** — large, and not what an agent needs first |
 | C7 | LoRA adapters | **won't for LTS** — no user asking |
-| C8 | embeddings endpoint | gap, small |
+| C8 | embeddings endpoint | **won't for LTS** — the graph returns logits, not hidden states. Faking it is worse than a 501, and doing it properly means a second output path |
 | C9 | quantise/convert tooling | **won't** — llama.cpp owns this and does it well |
 
 **C1 is required, not optional.** Greedy decoding makes every answer
@@ -106,7 +106,7 @@ without samplers, and it is a day of work.
 | D2 | GGUF v2 and v3 | v3 done; v2 untested |
 | D3 | split containers (`-00001-of-0000N`) | **done** |
 | D4 | every ggml quant type ggml can decode | **done — delegated to ggml** |
-| D5 | OpenAI API surface: `/v1/chat/completions`, `/v1/models`, `/v1/completions`, `/v1/embeddings` | 2 of 4; chat now **streams** and serves **any** supported architecture |
+| D5 | OpenAI API surface: `/v1/chat/completions`, `/v1/models`, `/v1/completions`, `/v1/embeddings` | **3 of 4 + an honest 501.** Chat streams and serves any supported architecture; `/v1/completions` runs the prompt verbatim; **embeddings refuse with 501** rather than returning a logit-derived vector that would look right and behave like noise |
 | D6 | refuse an unsupported container clearly rather than producing nonsense | partial — **the most important safety property this runner has** |
 
 ## The order

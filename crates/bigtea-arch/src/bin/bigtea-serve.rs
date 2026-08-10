@@ -321,12 +321,43 @@ fn handle(
                 Err(e) => (400, error_json(&e.to_string())),
             }
         }
+        // The legacy completions endpoint: same engine, no chat framing. Some
+        // clients and most autocomplete integrations still speak only this.
+        ("POST", "/v1/completions") => {
+            let params = Params::from_body(&req.body);
+            match generate_raw(&req.body, engine, tokenizer, &params, &mut |_| Ok(())) {
+                Ok((text, prompt_tokens, produced, finish)) => (
+                    200,
+                    format!(
+                        r#"{{"id":"bigtea","object":"text_completion","model":"{}","choices":[{{"index":0,"text":"{}","finish_reason":"{}"}}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{produced},"total_tokens":{}}}}}"#,
+                        engine.model_name(),
+                        escape(&text),
+                        finish.as_str(),
+                        prompt_tokens + produced
+                    ),
+                ),
+                Err(e) => (400, error_json(&e.to_string())),
+            }
+        }
+        // Embeddings are a different computation, not a cheaper completion:
+        // they need the model's hidden state rather than its logits, and this
+        // runner's graph returns only logits. Saying so is better than
+        // returning a plausible vector that is not an embedding.
+        ("POST", "/v1/embeddings") => (
+            501,
+            error_json(concat!(
+                "embeddings are not implemented: this runner's graph returns logits, ",
+                "not hidden states. A vector derived from logits would look like an ",
+                "embedding and behave like noise, so it is refused rather than faked."
+            )),
+        ),
         _ => (404, error_json("no such endpoint")),
     };
 
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        501 => "Not Implemented",
         _ => "Not Found",
     };
     let response = format!(
@@ -577,12 +608,35 @@ fn generate(
     // this did before -- makes an instruct model continue the conversation
     // rather than answer it.
     let prompt = tokenizer.apply_chat_template(&messages, true);
+    run_prompt(&prompt, engine, tokenizer, params, emit)
+}
 
-    let tokens: Vec<i32> = tokenizer
-        .encode(&prompt)
-        .iter()
-        .map(|t| *t as i32)
-        .collect();
+/// `/v1/completions`: the caller's text verbatim, with no chat framing.
+///
+/// A base model or an autocomplete client wants exactly what it sent. Applying
+/// a chat template here would be the mirror of the bug that made instruct
+/// models answer the wrong question.
+fn generate_raw(
+    body: &str,
+    engine: &Engine<'_>,
+    tokenizer: &Tokenizer,
+    params: &Params,
+    emit: &mut dyn FnMut(&str) -> std::io::Result<()>,
+) -> Result<(String, usize, usize, Finish), Box<dyn std::error::Error>> {
+    let prompt =
+        extract_json_string(body, "prompt").ok_or("no `prompt` string in the request body")?;
+    run_prompt(&prompt, engine, tokenizer, params, emit)
+}
+
+/// The shared body of both completion endpoints.
+fn run_prompt(
+    prompt: &str,
+    engine: &Engine<'_>,
+    tokenizer: &Tokenizer,
+    params: &Params,
+    emit: &mut dyn FnMut(&str) -> std::io::Result<()>,
+) -> Result<(String, usize, usize, Finish), Box<dyn std::error::Error>> {
+    let tokens: Vec<i32> = tokenizer.encode(prompt).iter().map(|t| *t as i32).collect();
     if tokens.is_empty() {
         return Err("empty prompt".into());
     }
@@ -858,7 +912,16 @@ fn extract_int(body: &str, key: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-/// Escape for embedding in a JSON string.
+/// Read a top-level JSON string field, e.g. `"prompt"`.
+fn extract_json_string(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let at = body.find(&needle)?;
+    let after = body[at + needle.len()..].trim_start();
+    let rest = after.strip_prefix(':')?.trim_start();
+    let body = rest.strip_prefix('"')?;
+    read_json_string(body).ok().map(|(s, _)| s)
+}
+
 /// Read a JSON number as `f64`. Accepts integers too, since `temperature: 1`
 /// is legal JSON and common from hand-written clients.
 fn extract_float(body: &str, key: &str) -> Option<f64> {
@@ -1116,5 +1179,30 @@ mod tests {
         assert!(j.contains(r#""model":"test-model""#));
         assert!(j.contains(r#""finish_reason":"stop""#));
         assert!(j.contains(r#""total_tokens":7"#));
+    }
+
+    #[test]
+    fn a_raw_prompt_is_read_for_the_completions_endpoint() {
+        let body = r#"{"model":"x","prompt":"once upon a","max_tokens":8}"#;
+        assert_eq!(
+            extract_json_string(body, "prompt").as_deref(),
+            Some("once upon a")
+        );
+        // Absent is None rather than an empty string, so the endpoint can
+        // refuse instead of generating from nothing.
+        assert_eq!(extract_json_string(r#"{"model":"x"}"#, "prompt"), None);
+    }
+
+    #[test]
+    fn escapes_survive_a_raw_prompt() {
+        let body = r#"{"prompt":"say \"hi\"
+then stop"}"#;
+        assert_eq!(
+            extract_json_string(body, "prompt").as_deref(),
+            Some(
+                "say \"hi\"
+then stop"
+            )
+        );
     }
 }
