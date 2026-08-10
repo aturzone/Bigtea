@@ -178,6 +178,18 @@ impl Gguf {
             return Err(Error::BadMagic { found: magic });
         }
         let version = cur.u32("version")?;
+        // A version whose low half is zero is a small number byte-swapped:
+        // v3 written big-endian reads as 0x03000000 here. Saying so beats
+        // reporting "unsupported version 50331648", which reads like corruption
+        // and sends the reader looking at the wrong thing. llama.cpp makes the
+        // same check for the same reason.
+        if version != 0 && (version & 0x0000_FFFF) == 0 {
+            return Err(Error::ByteOrderMismatch { found: version });
+        }
+        // **v2 and v3 have the same layout.** The u32-to-u64 change to string
+        // and array lengths was v1 to v2, not v2 to v3 -- v3 added big-endian
+        // support and left the field widths alone. llama.cpp reads both with one
+        // code path and refuses v1 outright; so does this.
         if !(2..=3).contains(&version) {
             return Err(Error::UnsupportedVersion(version));
         }

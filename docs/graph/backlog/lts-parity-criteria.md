@@ -103,7 +103,7 @@ without samplers, and it is a day of work.
 | ticket | what | state |
 |---|---|---|
 | D1 | read every GGUF metadata type incl. arrays and nested | likely done, **untested against a fuzz corpus** |
-| D2 | GGUF v2 and v3 | v3 done; v2 untested |
+| D2 | GGUF v2 and v3 | **DONE 2026-08-10** — v2 and v3 proved to parse identically from in-memory headers, v1 and future versions refused, alignment honoured only when a power of two. **The ticket's premise was wrong**: the `u32`→`u64` length change was v1→v2, not v2→v3, and implementing it as written would have mis-read every real v2 container — llama.cpp has no width branch and refuses v1 outright. Also added: a byte-swapped version is now named as an endianness mismatch instead of "unsupported version 50331648". See `../research/gguf-v2-premise-was-wrong-2026-08-10.md` |
 | D3 | split containers (`-00001-of-0000N`) | **done** |
 | D4 | every ggml quant type ggml can decode | **done — delegated to ggml** |
 | D5 | OpenAI API surface: `/v1/chat/completions`, `/v1/models`, `/v1/completions`, `/v1/embeddings` | **3 of 4 + an honest 501.** Chat streams and serves any supported architecture; `/v1/completions` runs the prompt verbatim; **embeddings refuse with 501** rather than returning a logit-derived vector that would look right and behave like noise |

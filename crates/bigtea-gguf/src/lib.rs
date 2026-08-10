@@ -35,6 +35,9 @@ pub enum Error {
     BadMagic { found: u32 },
     /// A GGUF version this parser does not implement.
     UnsupportedVersion(u32),
+    /// The version field looks byte-swapped, which means the file was written
+    /// on a machine of the opposite endianness.
+    ByteOrderMismatch { found: u32 },
     /// The file ended in the middle of a field.
     Truncated {
         needed: usize,
@@ -59,7 +62,18 @@ impl fmt::Display for Error {
                 f,
                 "not a GGUF file (magic was {found:#010x}, expected {MAGIC:#010x})"
             ),
-            Error::UnsupportedVersion(v) => write!(f, "unsupported GGUF version {v}"),
+            Error::UnsupportedVersion(v) => write!(
+                f,
+                "unsupported GGUF version {v} (this reader implements 2 and 3; \
+                 GGUFv1 was withdrawn and llama.cpp refuses it too)"
+            ),
+            Error::ByteOrderMismatch { found } => write!(
+                f,
+                "GGUF version reads as {found}, which is a small version number \
+                 with its bytes reversed -- the file was written big-endian and \
+                 this machine is little-endian (or the reverse). The container is \
+                 not corrupt; it is the wrong byte order for this host."
+            ),
             Error::Truncated {
                 needed,
                 available,
