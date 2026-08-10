@@ -168,14 +168,60 @@ is unchanged from what was recorded before any of this — 1.23x — which is wh
 gives confidence the ratio is real rather than an artefact of the operating
 point.
 
+## MoE wanted ONE thread, and it is worth 2.4x
+
+The prediction below — "MoE generation is disk-dominated, so threads should
+matter far less" — was **wrong**, and the tuner is what caught it.
+
+On Qwen3-30B-A3B the tuner chose 1 thread. That looked like a failure: on a
+streaming model most of a token is disk, and how much varies per token with
+cache hits and warming, so the signal could easily be swamped. The tuner now
+subtracts read time and times only what the thread count can affect. **It still
+chose 1, three runs in a row**, and a direct sweep says it is right:
+
+| threads | Qwen3-30B gen | expert compute |
+|---:|---:|---:|
+| **1** | **2.88 tok/s** | 2.2 s |
+| 2 | 2.54 | 2.5 s |
+| 4 | 2.23 | 2.9 s |
+| 8 | 1.80 | 3.6 s |
+| 20 — *the old default* | 1.21 | 5.2 s |
+
+Disk was flat at ~3.0 s throughout, so this is entirely compute. Each expert
+matmul at one token is a 768x2048 matrix-vector, a layer's graph holds 24 of
+them, and splitting each across 20 threads leaves ~38 rows per thread per
+barrier. **The threads cost more than the work they do.**
+
+End to end this took Qwen3-30B generation from **1.07 to 2.63 tok/s (2.46x)**.
+
+### And it re-opened a competitive number in our disfavour
+
+```
+$ llama-bench -m Qwen3-30B-A3B-Q4_K_M.gguf -n 32 -p 0 -r 2 -t 1,4,10
+|       1 | tg32 | 1.95 ± 0.64 |
+|       4 | tg32 | 4.21 ± 0.28 |
+|      10 | tg32 | 3.64 ± 0.22 |
+```
+
+The recorded reference was **2.16**; llama.cpp's own best is **4.21**. So
+Qwen3-30B generation is **1.60x behind**, not the ~2x on record and nowhere near
+the win that 2.63-against-2.16 would have been. Third stale competitor number
+found this week by re-running the opposing command.
+
+**llama.cpp peaks at 4 threads where we peak at 1**, which says its expert path
+parallelises and ours does not. That is the concrete lead for the remaining
+1.60x: give each barrier real work — batch the expert matmuls — instead of 24
+tiny nodes per layer.
+
 ## What this does not measure
 
 - **Any other machine.** Every number here is one laptop with one hybrid CPU and
   two memory channels. The *mechanism* (generation saturates DRAM, prefill
   scales with cores) is general; the optimum is not, which is precisely why the
   shipped answer is measured at run time rather than hardcoded.
-- **MoE models.** V4-Flash and Qwen3-30B generation is dominated by expert reads
-  from disk, so the thread count should matter far less. Untested.
+- **V4-Flash**, whose forward pass is a separate file and reads `BIGTEA_THREADS`
+  directly rather than going through the tuner. Given the Qwen3-30B result it
+  should be swept too.
 - **Long context**, where attention grows and the balance may shift.
 
 ## Correctness

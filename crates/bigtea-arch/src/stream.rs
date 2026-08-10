@@ -1195,11 +1195,18 @@ impl<'m> StreamingRunner<'m> {
             self.threads = t.candidate();
         }
         let start = std::time::Instant::now();
+        let disk_before = self.stats.read_seconds;
         let out = self.forward_cached_inner(weights, cache, tokens, pos_start);
-        let elapsed = start.elapsed().as_secs_f64();
+        // Time the thread count can actually affect. On a streaming MoE model
+        // most of a token is disk, and how much varies per token with cache
+        // hits and warming — on Qwen3-30B that noise swamped the signal
+        // entirely and the tuner chose **one thread**, which is close to the
+        // worst answer available for the expert matmuls. Subtracting the reads
+        // measures the knob rather than the weather.
+        let elapsed = start.elapsed().as_secs_f64() - (self.stats.read_seconds - disk_before);
         // A step that failed took no meaningful time; do not let it win.
         if out.is_ok() {
-            if let Some(best) = self.tuner.as_mut().and_then(|t| t.record(elapsed)) {
+            if let Some(best) = self.tuner.as_mut().and_then(|t| t.record(elapsed.max(0.0))) {
                 self.threads = best;
                 self.tuner = None;
             }

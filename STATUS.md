@@ -36,7 +36,13 @@ free, which is the first time the whole 7.38 GiB always-read set fitted.
 | **V4-Flash** | generation, 47 tok | **0.374 tok/s** | **0.39** | **96% — parity** |
 | Qwen3-30B-A3B | prefill @565 | **27.6** | 23.6 | ahead |
 | Qwen3-30B-A3B | prefill @2206 | **36.6** | 33.6 | ahead |
-| Qwen3-30B-A3B | generation | 1.07 | **2.16** | ~2x behind |
+| Qwen3-30B-A3B | generation | **2.63** | **4.21 ± 0.28** | **1.60x behind** |
+
+**The Qwen3-30B generation row moved twice on 2026-08-10 and both corrections
+matter.** Bigtea went 1.07 → **2.63** (2.46x) purely from the thread tuner
+choosing **one** thread for the expert matmuls. And the llama.cpp reference is
+**4.21 ± 0.28** at its own best (`-t 4`), not the 2.16 previously recorded — so
+this is still a **deficit**, and a re-measured one, not a win.
 
 **V4-Flash generation went 0.064 → 0.374 tok/s in one day — 5.8x** — and the
 deficit against llama.cpp went from 3-4x to **4%**. It is parity, not a win, and
@@ -681,7 +687,34 @@ this work (1.23x), which is what says the ratio is real rather than an artefact
 of where on the curve each engine was sitting.
 
 Output is byte-identical at 2 and 20 threads on all five verified dense
-architectures. 229 tests pass.
+architectures. 235 tests pass.
+
+### The MoE path wanted ONE thread, and nobody had checked
+
+The tuner picked 1 thread for Qwen3-30B-A3B. That looked like a bug — its signal
+is disk-dominated on a streaming model — so the tuner now subtracts read time and
+measures only what the knob affects. It still picked 1, three runs in a row, and
+a direct sweep says it is right:
+
+| threads | Qwen3-30B gen | expert compute |
+|---:|---:|---:|
+| **1** | **2.88 tok/s** | 2.2 s |
+| 4 | 2.23 | 2.9 s |
+| 8 | 1.80 | 3.6 s |
+| 20 — *the old default* | 1.21 | 5.2 s |
+
+**2.4x, and expert compute more than doubles as threads are added.** Each expert
+matmul at one token is a 768x2048 matrix-vector; a layer's graph holds 24 of
+them, and splitting each across 20 threads leaves ~38 rows per thread per
+barrier. The threads cost more than the work.
+
+llama.cpp peaks at **4 threads** on the same model where we peak at 1, which
+says its expert path parallelises and ours does not. **That is the concrete lead
+for the remaining 1.60x** — batch the expert matmuls so there is real work per
+barrier, rather than 24 tiny nodes per layer.
+
+`llama-bench -m Qwen3-30B-A3B-Q4_K_M.gguf -n 32 -p 0 -r 2 -t 1,4,10`:
+1.95 ± 0.64 / **4.21 ± 0.28** / 3.64 ± 0.22.
 
 ## Gemma-2 sliding-window attention (2026-08-10) — the 4096 refusal is gone
 
