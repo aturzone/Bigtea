@@ -573,16 +573,13 @@ impl Params {
     /// `bigtea-run`, where greedy is right because it keeps a wrong forward
     /// pass diagnosable.
     fn from_body(body: &str) -> Self {
+        // OpenAI's default temperature is 1.0, not 0.0, so the rest is taken
+        // from `default()` and only that overridden — a struct literal here
+        // would need updating every time a sampler is added, and forgetting
+        // would silently reset one to zero rather than failing to compile.
         let mut sampler = SamplerConfig {
             temperature: 1.0,
-            top_k: 0,
-            top_p: 1.0,
-            min_p: 0.0,
-            repeat_penalty: 1.0,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
-            repeat_last_n: 64,
-            seed: 0,
+            ..SamplerConfig::default()
         };
         if let Some(v) = extract_float(body, "temperature") {
             sampler.temperature = v as f32;

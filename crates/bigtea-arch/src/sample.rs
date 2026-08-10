@@ -51,6 +51,34 @@ pub struct SamplerConfig {
     pub presence_penalty: f32,
     /// How far back all three penalties look.
     pub repeat_last_n: usize,
+    /// Locally typical sampling: keep the smallest set whose surprise is
+    /// closest to the distribution's entropy. `1.0` disables.
+    pub typical_p: f32,
+    /// Keep tokens whose **logit** is within `n` standard deviations of the
+    /// maximum. `0.0` disables. Operates on logits, not probabilities, which is
+    /// what makes it insensitive to temperature.
+    pub top_n_sigma: f32,
+    /// Dynamic temperature: the spread either side of `temperature`. `0.0`
+    /// disables and the fixed temperature is used.
+    pub dynatemp_range: f32,
+    /// How sharply dynamic temperature reacts to entropy. `1.0` is linear.
+    pub dynatemp_exponent: f32,
+    /// Chance of applying XTC to a given token. `0.0` disables.
+    pub xtc_probability: f32,
+    /// XTC only considers tokens at or above this probability.
+    pub xtc_threshold: f32,
+    /// Mirostat version: `0` off, `1` v1, `2` v2.
+    pub mirostat: u32,
+    /// Mirostat's target surprise, in bits.
+    pub mirostat_tau: f32,
+    /// Mirostat's learning rate.
+    pub mirostat_eta: f32,
+    /// Added to a token's logit before anything else. `(id, bias)`.
+    pub logit_bias: Vec<(u32, f32)>,
+    /// Never emit the end-of-sequence token.
+    pub ignore_eos: bool,
+    /// The EOS id, needed by `ignore_eos`. `None` means the model declared none.
+    pub eos: Option<u32>,
     pub seed: u64,
 }
 
@@ -66,6 +94,18 @@ impl Default for SamplerConfig {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             repeat_last_n: 64,
+            typical_p: 1.0,
+            top_n_sigma: 0.0,
+            dynatemp_range: 0.0,
+            dynatemp_exponent: 1.0,
+            xtc_probability: 0.0,
+            xtc_threshold: 0.1,
+            mirostat: 0,
+            mirostat_tau: 5.0,
+            mirostat_eta: 0.1,
+            logit_bias: Vec::new(),
+            ignore_eos: false,
+            eos: None,
             seed: 0,
         }
     }
@@ -87,6 +127,18 @@ impl SamplerConfig {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             repeat_last_n: 64,
+            typical_p: 1.0,
+            top_n_sigma: 0.0,
+            dynatemp_range: 0.0,
+            dynatemp_exponent: 1.0,
+            xtc_probability: 0.0,
+            xtc_threshold: 0.1,
+            mirostat: 0,
+            mirostat_tau: 5.0,
+            mirostat_eta: 0.1,
+            logit_bias: Vec::new(),
+            ignore_eos: false,
+            eos: None,
             seed: 0,
         }
     }
@@ -98,11 +150,19 @@ impl SamplerConfig {
     /// wants the penalised argmax, not the raw one. An OpenAI client sending
     /// `temperature: 0, frequency_penalty: 1.0` is a normal request and would
     /// otherwise be silently ignored.
+    /// `logit_bias` and `ignore_eos` are here for the same reason as the
+    /// penalties: they change *which* token is the argmax. Leaving them out
+    /// meant `--logit-bias 2+100` and `--ignore-eos` were accepted, echoed and
+    /// then silently ignored at temperature 0 — the default. Two tests caught
+    /// it; nothing in the output would have.
     pub fn is_greedy(&self) -> bool {
         self.temperature <= 0.0
             && self.repeat_penalty == 1.0
             && self.frequency_penalty == 0.0
             && self.presence_penalty == 0.0
+            && self.logit_bias.is_empty()
+            && !self.ignore_eos
+            && self.mirostat == 0
     }
 
     /// Whether any penalty is active, so a greedy-with-penalties path can
@@ -119,6 +179,11 @@ pub struct Sampler {
     /// Scratch, reused across tokens to keep sampling allocation-free on the
     /// hot path — a 150k-entry vocabulary allocated per token is real work.
     candidates: Vec<(u32, f32)>,
+    /// Mirostat's running estimate of the surprise budget. **The only state
+    /// that survives between tokens**, which is what makes mirostat a feedback
+    /// controller rather than a filter: it observes how surprising the token it
+    /// just picked was and moves the target for the next one.
+    mu: f32,
 }
 
 impl Sampler {
@@ -128,10 +193,61 @@ impl Sampler {
         // means a caller passing 0 still gets a usable stream.
         let state = config.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         Sampler {
+            mu: 2.0 * config.mirostat_tau,
             config,
             state,
             candidates: Vec::new(),
         }
+    }
+
+    /// Mirostat: sample to a target *surprise* instead of a probability mass.
+    ///
+    /// `tau` is the surprise wanted per token in bits; `mu` is the running
+    /// budget. Candidates more surprising than `mu` are discarded, one is
+    /// drawn, and `mu` moves by `eta * (observed - tau)` — so a stretch of
+    /// predictable text loosens the filter and a surprising one tightens it.
+    /// That is what keeps perplexity roughly constant over a long generation,
+    /// which neither `top_p` nor `top_k` attempts.
+    ///
+    /// v1 and v2 differ only in how the cut is chosen; llama.cpp's v1 also
+    /// estimates a Zipf exponent to pick a `k`, and v2's plain surprise
+    /// threshold is both simpler and what almost everyone runs. v1 here is
+    /// v2's rule with v1's `m`-independent truncation, and it is documented as
+    /// such rather than being claimed as an exact reimplementation.
+    fn sample_mirostat(&mut self) -> u32 {
+        // Surprise in **bits**, matching tau's units. Using nats here is a
+        // silent factor of ln(2) on every generation.
+        let cut = 2f32.powf(-self.mu);
+        let kept = self.candidates.iter().filter(|c| c.1 >= cut).count().max(1);
+        self.candidates.truncate(kept);
+        // Mirostat is a stochastic sampler by construction, and Bigtea's
+        // default temperature is 0 (greedy) where llama.cpp's is 0.8. Passing
+        // only `--mirostat 2` therefore used to mean "greedy", which is not
+        // what anyone means by it. A temperature the user did not set becomes
+        // 1.0 here rather than collapsing the controller.
+        let temp = if self.config.temperature <= 0.0 {
+            1.0
+        } else {
+            self.config.temperature
+        };
+        apply_temperature(&mut self.candidates, temp);
+
+        let r = self.next_f32();
+        let mut acc = 0.0;
+        let mut chosen = self.candidates.last().copied().unwrap_or((0, 1.0));
+        for &(id, p) in &self.candidates {
+            acc += p;
+            if r < acc {
+                chosen = (id, p);
+                break;
+            }
+        }
+        let observed = -chosen.1.max(1e-30).log2();
+        self.mu -= self.config.mirostat_eta * (observed - self.config.mirostat_tau);
+        // Unbounded mu becomes inf and then the cut is NaN, which silently
+        // keeps everything for the rest of the run.
+        self.mu = self.mu.clamp(0.0, 100.0);
+        chosen.0
     }
 
     pub fn config(&self) -> &SamplerConfig {
@@ -163,6 +279,23 @@ impl Sampler {
         self.candidates
             .extend(logits.iter().enumerate().map(|(i, &l)| (i as u32, l)));
 
+        // Before everything: a bias is a statement about the model's output,
+        // not about the sampling, so it belongs on the raw logits.
+        for &(id, bias) in &self.config.logit_bias {
+            if let Some(c) = self.candidates.get_mut(id as usize) {
+                c.1 += bias;
+            }
+        }
+        // `-inf` rather than removal: the entry has to stay put because
+        // everything up to the sort still indexes candidates by token id.
+        if self.config.ignore_eos {
+            if let Some(eos) = self.config.eos {
+                if let Some(c) = self.candidates.get_mut(eos as usize) {
+                    c.1 = f32::NEG_INFINITY;
+                }
+            }
+        }
+
         apply_penalties(
             &mut self.candidates,
             history,
@@ -177,7 +310,11 @@ impl Sampler {
         // of the penalised logits". It must NOT fall through to the pipeline
         // below: temperature 0 there becomes `powf(1e6)`, which drives every
         // probability to zero or one and picks nonsense.
-        if self.config.temperature <= 0.0 {
+        // `&& mirostat == 0`: mirostat supplies its own temperature below and
+        // must not be short-circuited here. Without this it fell through to the
+        // penalised argmax and `--mirostat 2` produced byte-identical output to
+        // greedy — accepted, echoed, and doing nothing.
+        if self.config.temperature <= 0.0 && self.config.mirostat == 0 {
             return self
                 .candidates
                 .iter()
@@ -190,27 +327,53 @@ impl Sampler {
         // is why they compose in any order without re-sorting.
         self.candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
+        // On **logits**, before the softmax, and that is the point: a standard
+        // deviation of a probability distribution moves with temperature, so
+        // doing this after would make the flag mean something different at
+        // every temperature.
+        apply_top_n_sigma(&mut self.candidates, self.config.top_n_sigma);
+
         if self.config.top_k > 0 {
             self.candidates.truncate(self.config.top_k);
         }
 
         softmax(&mut self.candidates);
+
+        // Mirostat replaces the whole truncate-then-temperature tail: it
+        // targets a *surprise* rather than a probability mass, and mixing it
+        // with top_p would mean neither controls the result.
+        if self.config.mirostat > 0 {
+            return self.sample_mirostat();
+        }
+
+        apply_typical_p(&mut self.candidates, self.config.typical_p);
         apply_top_p(&mut self.candidates, self.config.top_p);
         apply_min_p(&mut self.candidates, self.config.min_p);
+        // Only drawn when XTC is on. Drawing unconditionally would consume a
+        // value from the seeded stream and change the output of every existing
+        // `--seed` run that never asked for XTC.
+        if self.config.xtc_probability > 0.0 {
+            let roll = self.next_f32();
+            apply_xtc(
+                &mut self.candidates,
+                self.config.xtc_probability,
+                self.config.xtc_threshold,
+                roll,
+            );
+        }
 
         // Temperature last, on the surviving set, so top_p meant what it says.
-        if (self.config.temperature - 1.0).abs() > f32::EPSILON {
-            let inv = 1.0 / self.config.temperature.max(1e-6);
-            for c in self.candidates.iter_mut() {
-                c.1 = c.1.powf(inv);
-            }
-            let total: f32 = self.candidates.iter().map(|c| c.1).sum();
-            if total > 0.0 {
-                for c in self.candidates.iter_mut() {
-                    c.1 /= total;
-                }
-            }
-        }
+        let temp = if self.config.dynatemp_range > 0.0 {
+            dynamic_temperature(
+                &self.candidates,
+                self.config.temperature,
+                self.config.dynatemp_range,
+                self.config.dynatemp_exponent,
+            )
+        } else {
+            self.config.temperature
+        };
+        apply_temperature(&mut self.candidates, temp);
 
         let r = self.next_f32();
         let mut acc = 0.0;
@@ -224,6 +387,159 @@ impl Sampler {
         // the correct answer rather than a failure.
         self.candidates.last().map(|c| c.0).unwrap_or(0)
     }
+}
+
+/// Rescale probabilities by temperature and renormalise.
+///
+/// `1.0` is the identity, and anything at or below zero would be a division by
+/// zero, so it is clamped — the greedy path is decided earlier, by
+/// `is_greedy`, and reaching here with a zero temperature means dynamic
+/// temperature produced one.
+fn apply_temperature(candidates: &mut [(u32, f32)], temperature: f32) {
+    if (temperature - 1.0).abs() <= f32::EPSILON {
+        return;
+    }
+    let inv = 1.0 / temperature.max(1e-6);
+    for c in candidates.iter_mut() {
+        c.1 = c.1.powf(inv);
+    }
+    let total: f32 = candidates.iter().map(|c| c.1).sum();
+    if total > 0.0 {
+        for c in candidates.iter_mut() {
+            c.1 /= total;
+        }
+    }
+}
+
+/// Locally typical sampling — llama.cpp's `--typical`.
+///
+/// Keeps the tokens whose surprise `-log p` is *closest to the distribution's
+/// own entropy*, rather than the most probable ones. The difference matters
+/// where `top_p` behaves worst: when the model is confident, the single obvious
+/// token is atypically *unsurprising*, and typical sampling will pass over it
+/// in favour of the ones carrying about the expected amount of information.
+///
+/// Expects `candidates` already softmaxed and sorted descending; it re-sorts
+/// into probability order before returning so the rest of the chain still sees
+/// a descending prefix.
+fn apply_typical_p(candidates: &mut Vec<(u32, f32)>, typical_p: f32) {
+    if typical_p >= 1.0 || candidates.len() < 2 {
+        return;
+    }
+    let entropy: f32 = -candidates
+        .iter()
+        .filter(|c| c.1 > 0.0)
+        .map(|c| c.1 * c.1.ln())
+        .sum::<f32>();
+    // Distance of each token's surprise from the entropy.
+    let mut scored: Vec<(usize, f32)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, (-c.1.max(1e-30).ln() - entropy).abs()))
+        .collect();
+    scored.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+
+    let mut cum = 0.0f32;
+    let mut keep = 0usize;
+    for &(i, _) in &scored {
+        cum += candidates[i].1;
+        keep += 1;
+        if cum >= typical_p {
+            break;
+        }
+    }
+    let mut kept: Vec<(u32, f32)> = scored[..keep].iter().map(|&(i, _)| candidates[i]).collect();
+    kept.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+    *candidates = kept;
+}
+
+/// Top-n-sigma — llama.cpp's `--top-nsigma`.
+///
+/// Keeps tokens whose **logit** is within `n` standard deviations of the
+/// maximum. Runs on logits before the softmax on purpose: the spread of a
+/// probability distribution changes with temperature, so applying this
+/// afterwards would silently make `-n 1.0` mean a different cut at every
+/// temperature setting.
+fn apply_top_n_sigma(candidates: &mut Vec<(u32, f32)>, n: f32) {
+    if n <= 0.0 || candidates.len() < 2 {
+        return;
+    }
+    let max = candidates
+        .iter()
+        .map(|c| c.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return;
+    }
+    let finite: Vec<f32> = candidates
+        .iter()
+        .map(|c| c.1)
+        .filter(|l| l.is_finite())
+        .collect();
+    if finite.len() < 2 {
+        return;
+    }
+    let mean = finite.iter().sum::<f32>() / finite.len() as f32;
+    let var = finite.iter().map(|l| (l - mean) * (l - mean)).sum::<f32>() / finite.len() as f32;
+    let sigma = var.sqrt();
+    if sigma <= 0.0 {
+        return;
+    }
+    let floor = max - n * sigma;
+    candidates.retain(|c| c.1 >= floor);
+}
+
+/// Exclude Top Choices — llama.cpp's `--xtc-probability` / `--xtc-threshold`.
+///
+/// With probability `p`, **removes** the most likely tokens and keeps the least
+/// likely of those above `threshold`. That is backwards from every other
+/// sampler here, and deliberate: it is used to stop a model reaching for the
+/// same obvious phrasing, while the threshold guarantees a *plausible* token is
+/// still available to fall back on.
+///
+/// `roll` is supplied by the caller so the decision draws from the sampler's
+/// seeded stream and a run stays reproducible.
+fn apply_xtc(candidates: &mut Vec<(u32, f32)>, probability: f32, threshold: f32, roll: f32) {
+    if probability <= 0.0 || roll >= probability || candidates.len() < 2 {
+        return;
+    }
+    // Sorted descending, so this is a prefix.
+    let above = candidates.iter().take_while(|c| c.1 >= threshold).count();
+    // Fewer than two and there is nothing to exclude *to*: removing the only
+    // plausible token would leave the tail, which is the opposite of the point.
+    if above < 2 {
+        return;
+    }
+    candidates.drain(..above - 1);
+}
+
+/// Entropy-driven temperature — llama.cpp's `--dynatemp-range`.
+///
+/// A flat distribution (the model is unsure) gets the high end of the range and
+/// a peaked one gets the low end, so the temperature is high exactly where
+/// variety is cheap and low where it would introduce errors.
+fn dynamic_temperature(
+    candidates: &[(u32, f32)],
+    temperature: f32,
+    range: f32,
+    exponent: f32,
+) -> f32 {
+    let lo = (temperature - range).max(0.0);
+    let hi = temperature + range;
+    if candidates.len() < 2 {
+        return temperature;
+    }
+    let entropy: f32 = -candidates
+        .iter()
+        .filter(|c| c.1 > 0.0)
+        .map(|c| c.1 * c.1.ln())
+        .sum::<f32>();
+    let max_entropy = (candidates.len() as f32).ln();
+    if max_entropy <= 0.0 {
+        return temperature;
+    }
+    let normalised = (entropy / max_entropy).clamp(0.0, 1.0);
+    lo + (hi - lo) * normalised.powf(exponent.max(1e-6))
 }
 
 /// `-log softmax(logits)[target]`, in nats, without ever forming the softmax.
@@ -429,7 +745,13 @@ mod tests {
         };
         assert_eq!(run(), run());
 
-        let other = SamplerConfig { seed: 43, ..cfg };
+        // `.clone()` because `logit_bias` is a `Vec`: struct-update syntax used
+        // to only copy this struct's fields and now moves it, which collides
+        // with the closure above still borrowing `cfg`.
+        let other = SamplerConfig {
+            seed: 43,
+            ..cfg.clone()
+        };
         let mut s = Sampler::new(other);
         let different: Vec<u32> = (0..32).map(|_| s.sample(&logits(), &[])).collect();
         assert_ne!(run(), different, "a different seed must differ");
@@ -507,6 +829,168 @@ mod tests {
         assert_eq!(
             c[1].1, -8.0,
             "negative logit must be multiplied, not raised"
+        );
+    }
+
+    #[test]
+    fn top_n_sigma_cuts_by_logit_spread() {
+        // Four tight logits and one far below: 1 sigma must drop the outlier
+        // and keep the cluster.
+        let mut c = vec![(0u32, 10.0f32), (1, 9.8), (2, 9.6), (3, 9.4), (4, -5.0)];
+        apply_top_n_sigma(&mut c, 1.0);
+        assert!(c.iter().all(|x| x.0 != 4), "the outlier must go: {c:?}");
+        assert_eq!(c.len(), 4);
+        // Disabled leaves everything.
+        let mut c = vec![(0u32, 10.0f32), (4, -5.0)];
+        apply_top_n_sigma(&mut c, 0.0);
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn xtc_removes_the_likely_tokens_not_the_unlikely_ones() {
+        // The direction is the whole point and is the opposite of every other
+        // sampler here: XTC drops the *top* choices.
+        let mut c = vec![(0u32, 0.5f32), (1, 0.3), (2, 0.15), (3, 0.05)];
+        apply_xtc(&mut c, 1.0, 0.1, 0.0);
+        assert_eq!(c[0].0, 2, "the least likely above threshold survives");
+        assert_eq!(c.len(), 2, "and everything below threshold stays");
+    }
+
+    #[test]
+    fn xtc_does_nothing_when_the_roll_fails_or_only_one_token_qualifies() {
+        let before = vec![(0u32, 0.9f32), (1, 0.05), (2, 0.05)];
+        // Roll above the probability: untouched.
+        let mut c = before.clone();
+        apply_xtc(&mut c, 0.5, 0.1, 0.9);
+        assert_eq!(c, before);
+        // Only one token above threshold: removing it would leave only the
+        // tail, which is the opposite of the intent.
+        let mut c = before.clone();
+        apply_xtc(&mut c, 1.0, 0.1, 0.0);
+        assert_eq!(c, before);
+    }
+
+    #[test]
+    fn dynamic_temperature_is_high_when_the_model_is_unsure() {
+        let flat = vec![(0u32, 0.25f32), (1, 0.25), (2, 0.25), (3, 0.25)];
+        let peaked = vec![(0u32, 0.97f32), (1, 0.01), (2, 0.01), (3, 0.01)];
+        let hot = dynamic_temperature(&flat, 1.0, 0.5, 1.0);
+        let cold = dynamic_temperature(&peaked, 1.0, 0.5, 1.0);
+        assert!(hot > cold, "flat {hot} should exceed peaked {cold}");
+        assert!(
+            (hot - 1.5).abs() < 1e-3,
+            "a uniform set is maximum entropy: {hot}"
+        );
+        assert!(cold < 0.8, "a confident set should cool: {cold}");
+    }
+
+    #[test]
+    fn typical_p_keeps_a_normalised_prefix_and_stays_sorted() {
+        let mut c = vec![(0u32, 0.6f32), (1, 0.2), (2, 0.15), (3, 0.05)];
+        apply_typical_p(&mut c, 0.5);
+        assert!(!c.is_empty() && c.len() < 4, "it must actually cut: {c:?}");
+        // The rest of the chain assumes descending order.
+        for w in c.windows(2) {
+            assert!(w[0].1 >= w[1].1, "not sorted: {c:?}");
+        }
+        // Disabled is the identity.
+        let mut c = vec![(0u32, 0.6f32), (1, 0.4)];
+        apply_typical_p(&mut c, 1.0);
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn a_logit_bias_can_force_and_forbid_a_token() {
+        // Token 2 loses on raw logits; a large bias must make it the argmax.
+        let mut s = Sampler::new(SamplerConfig {
+            logit_bias: vec![(2, 100.0)],
+            ..SamplerConfig::default()
+        });
+        assert_eq!(s.sample(&[5.0, 4.0, 1.0], &[]), 2);
+        // And a large negative bias must rule it out.
+        let mut s = Sampler::new(SamplerConfig {
+            logit_bias: vec![(0, -100.0)],
+            ..SamplerConfig::default()
+        });
+        assert_ne!(s.sample(&[5.0, 4.0, 1.0], &[]), 0);
+    }
+
+    #[test]
+    fn ignore_eos_never_returns_the_eos_token() {
+        let mut s = Sampler::new(SamplerConfig {
+            eos: Some(0),
+            ignore_eos: true,
+            ..SamplerConfig::default()
+        });
+        // Token 0 wins by a mile on the raw logits.
+        assert_ne!(s.sample(&[50.0, 1.0, 0.5], &[]), 0);
+    }
+
+    #[test]
+    fn mirostat_alone_is_not_greedy() {
+        // `--mirostat 2` with no `--temp` is the normal way to ask for it, and
+        // Bigtea's default temperature is 0 where llama.cpp's is 0.8. Twice
+        // this fell through to an argmax: once via `is_greedy`, once via the
+        // temperature-0 early return. Both produced byte-identical output to
+        // greedy, with the flag accepted and echoed.
+        let cfg = SamplerConfig {
+            mirostat: 2,
+            seed: 11,
+            ..SamplerConfig::default()
+        };
+        assert!(!cfg.is_greedy(), "mirostat must not be treated as greedy");
+        // A distribution with a clear winner but real mass elsewhere: over many
+        // draws a stochastic sampler must sometimes pick something else.
+        let logits = [2.0f32, 1.9, 1.8, 1.7];
+        let mut s = Sampler::new(cfg);
+        let drawn: std::collections::HashSet<u32> =
+            (0..64).map(|_| s.sample(&logits, &[])).collect();
+        assert!(drawn.len() > 1, "mirostat returned one token every time");
+    }
+
+    #[test]
+    fn mirostat_moves_its_budget_toward_the_target_surprise() {
+        let mut s = Sampler::new(SamplerConfig {
+            mirostat: 2,
+            temperature: 1.0,
+            mirostat_tau: 3.0,
+            mirostat_eta: 0.5,
+            ..SamplerConfig::default()
+        });
+        let start = s.mu;
+        assert_eq!(start, 6.0, "mu starts at 2 * tau");
+        // A very peaked distribution: the drawn token carries almost no
+        // surprise, which is *below* tau, so the budget RISES to admit more
+        // surprising choices. The sign is the whole controller and is easy to
+        // assume backwards — `mu -= eta * (observed - tau)`.
+        for _ in 0..12 {
+            s.sample(&[20.0, 0.0, -5.0, -8.0], &[]);
+        }
+        assert!(
+            s.mu > start,
+            "unsurprising text should loosen the budget: {}",
+            s.mu
+        );
+        assert!(s.mu.is_finite() && s.mu <= 100.0, "mu must stay bounded");
+
+        // And the other direction: a flat distribution is maximally
+        // surprising, so the budget tightens back down.
+        let mut s2 = Sampler::new(SamplerConfig {
+            mirostat: 2,
+            temperature: 1.0,
+            mirostat_tau: 1.0,
+            mirostat_eta: 0.5,
+            ..SamplerConfig::default()
+        });
+        let flat: Vec<f32> = vec![0.0; 64];
+        let before = s2.mu;
+        for _ in 0..12 {
+            s2.sample(&flat, &[]);
+        }
+        assert!(
+            s2.mu < before,
+            "surprising text should tighten the budget: {}",
+            s2.mu
         );
     }
 

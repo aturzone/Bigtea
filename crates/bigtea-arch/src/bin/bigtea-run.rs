@@ -271,6 +271,17 @@ fn main() -> ExitCode {
         eprintln!("  --frequency-penalty F  subtract F x count. 0 = off");
         eprintln!("  --presence-penalty P   subtract P if used at all. 0 = off");
         eprintln!("  --repeat-last-n N   penalty window (default 64)");
+        eprintln!("  --typical P         locally typical sampling. 1.0 = off");
+        eprintln!("  --top-nsigma N      keep logits within N sigma of the max. 0 = off");
+        eprintln!("  --dynatemp-range R  entropy-driven temperature spread. 0 = off");
+        eprintln!("  --dynatemp-exp E    how sharply it reacts (default 1.0)");
+        eprintln!("  --xtc-probability P exclude top choices, chance per token. 0 = off");
+        eprintln!("  --xtc-threshold T   XTC only considers tokens above this (default 0.1)");
+        eprintln!("  --mirostat N        0 off, 1 v1, 2 v2 -- targets a surprise, not a mass");
+        eprintln!("  --mirostat-ent TAU  target surprise in bits (default 5.0)");
+        eprintln!("  --mirostat-lr ETA   mirostat learning rate (default 0.1)");
+        eprintln!("  --logit-bias ID+B   nudge one token, repeatable (e.g. 42-100)");
+        eprintln!("  --ignore-eos        never stop at end-of-sequence");
         eprintln!("  --seed S            reproducible sampling");
         eprintln!("  --llamacpp-defaults temp 0.8, top-k 40, top-p 0.95, min-p 0.05, repeat 1.1");
         eprintln!("  --chat              apply the model's chat template to the prompt");
@@ -348,6 +359,63 @@ fn main() -> ExitCode {
             "--presence-penalty" => {
                 sampler.presence_penalty =
                     rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                i += 2;
+            }
+            // llama.cpp's sampler flags, its spellings, its defaults.
+            "--typical" | "--typical-p" => {
+                sampler.typical_p = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1.0);
+                i += 2;
+            }
+            "--top-nsigma" | "--top-n-sigma" => {
+                sampler.top_n_sigma = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                i += 2;
+            }
+            "--dynatemp-range" => {
+                sampler.dynatemp_range =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                i += 2;
+            }
+            "--dynatemp-exp" => {
+                sampler.dynatemp_exponent =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1.0);
+                i += 2;
+            }
+            "--xtc-probability" => {
+                sampler.xtc_probability =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                i += 2;
+            }
+            "--xtc-threshold" => {
+                sampler.xtc_threshold = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.1);
+                i += 2;
+            }
+            "--mirostat" => {
+                sampler.mirostat = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                i += 2;
+            }
+            "--mirostat-ent" => {
+                sampler.mirostat_tau = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(5.0);
+                i += 2;
+            }
+            "--mirostat-lr" => {
+                sampler.mirostat_eta = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.1);
+                i += 2;
+            }
+            "--ignore-eos" => {
+                sampler.ignore_eos = true;
+                i += 1;
+            }
+            // `ID+BIAS` or `ID-BIAS`, repeatable, which is llama.cpp's spelling.
+            "--logit-bias" => {
+                if let Some(spec) = rest.get(i + 1) {
+                    if let Some(cut) = spec.find(['+', '-']) {
+                        if let (Ok(id), Ok(bias)) =
+                            (spec[..cut].parse::<u32>(), spec[cut..].parse::<f32>())
+                        {
+                            sampler.logit_bias.push((id, bias));
+                        }
+                    }
+                }
                 i += 2;
             }
             "--repeat-last-n" => {
