@@ -86,9 +86,9 @@ reads + ~0.6 s of everything else, so with R2 overlap it is **~0.65 tok/s agains
 |---|---|---|
 | C1 | sampling: temperature, top-k, top-p, min-p, repeat penalty, seed | **DONE 2026-08-10** — 10 unit tests, `--llamacpp-defaults` for like-for-like comparison |
 | C2 | chat templates from `tokenizer.chat_template` | **DONE 2026-08-10** — 9 families, detected from the real templates; control tokens encode to single ids |
-| C3 | streaming responses (SSE) in `bigtea-serve` | gap |
+| C3 | streaming responses (SSE) in `bigtea-serve` | **DONE 2026-08-10** — plus temperature/top_p/top_k/min_p/seed/stop from the request, EOS and stop sequences give `finish_reason: stop` |
 | C4 | `-c` context size, `-b` batch, `-t` threads as flags | partial |
-| C5 | stop sequences, `max_tokens`, `n_predict` | partial |
+| C5 | stop sequences, `max_tokens`, `n_predict` | **server DONE** — stop accepted as string or array; CLI still partial |
 | C6 | grammar / JSON-schema constrained output | **won't for LTS** — large, and not what an agent needs first |
 | C7 | LoRA adapters | **won't for LTS** — no user asking |
 | C8 | embeddings endpoint | gap, small |

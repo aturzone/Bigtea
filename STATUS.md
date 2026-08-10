@@ -363,6 +363,36 @@ the framed prompt above is **17 tokens**, not 40-odd.
 `bigtea-serve` now parses `messages[]` with roles in order and applies the
 template, instead of concatenating the contents.
 
+## C3 the server streams, samples and stops (2026-08-10)
+
+`bigtea-serve` answered one way: greedy, no sampling controls, and
+`finish_reason` was **always** `"length"` because nothing checked for
+end-of-sequence. It also buffered the whole answer before sending a byte.
+
+Now:
+
+| | |
+|---|---|
+| `stream: true` | server-sent events, one per token, flushed each time |
+| sampling | `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `repetition_penalty` |
+| stopping | EOS **and** `stop` sequences → `finish_reason: "stop"` |
+| `stop` | accepted as a string *or* an array, both spellings clients send |
+
+Two details that would have been wrong quietly:
+
+- **The default temperature is 1.0, not 0.0.** OpenAI's default is sampling;
+  a client that sends no `temperature` does not expect greedy. `bigtea-run`
+  keeps greedy as its default for the opposite reason — it keeps a wrong
+  forward pass diagnosable.
+- **Stop sequences are matched against the accumulated text, not the token**,
+  because a stop string can straddle a token boundary.
+- Streaming re-uses the UTF-8 buffering rule: a chunk is emitted only at a
+  character boundary, so a multi-byte character never becomes `�` mid-stream.
+
+Still a gap: **`bigtea-serve` refuses anything that is not V4-Flash.** The
+server is the part an agent talks to, so serving only the 144 GB model makes it
+useless for the models people actually run. Next item.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

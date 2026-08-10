@@ -34,7 +34,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
 
-use bigtea_arch::{Deepseek4Cache, Deepseek4Config, Deepseek4Forward};
+use bigtea_arch::{Deepseek4Cache, Deepseek4Config, Deepseek4Forward, Sampler, SamplerConfig};
 use bigtea_model::{Model, ResidentSet};
 use bigtea_tokenizer::{Message, Tokenizer};
 
@@ -211,10 +211,23 @@ fn handle(
             r#"{"object":"list","data":[{"id":"deepseek-v4-flash","object":"model","owned_by":"bigtea"}]}"#
                 .to_string(),
         ),
-        ("POST", "/v1/chat/completions") => match complete(&req.body, fw, tokenizer, config) {
-            Ok(b) => (200, b),
-            Err(e) => (400, error_json(&e.to_string())),
-        },
+        ("POST", "/v1/chat/completions") => {
+            let params = Params::from_body(&req.body);
+            if params.stream {
+                // Streaming owns the socket: headers go out first, then one
+                // event per token, so a client sees words appear instead of
+                // waiting for the whole answer. Nothing more may be written
+                // afterwards, so this returns early.
+                return stream_completion(stream, &req, fw, tokenizer, config, &params, started);
+            }
+            match generate(&req.body, fw, tokenizer, config, &params, &mut |_| Ok(())) {
+                Ok((text, prompt_tokens, produced, finish)) => (
+                    200,
+                    completion_json(&text, prompt_tokens, produced, finish),
+                ),
+                Err(e) => (400, error_json(&e.to_string())),
+            }
+        }
         _ => (404, error_json("no such endpoint")),
     };
 
@@ -242,6 +255,89 @@ fn handle(
     Ok(())
 }
 
+/// Answer a `stream: true` request as server-sent events.
+///
+/// The status line and headers are written **before** generation starts, which
+/// is the entire point: a client that waits for `Content-Length` cannot show
+/// anything until the last token. There is no length to send, so the response
+/// ends by closing the connection after `data: [DONE]`.
+///
+/// An error after the headers are out cannot become a 400 — the status is
+/// already committed — so it is delivered as a final chunk carrying the message
+/// and then `[DONE]`, which is what the OpenAI clients expect.
+fn stream_completion(
+    mut stream: TcpStream,
+    req: &Request,
+    fw: &Deepseek4Forward<'_>,
+    tokenizer: &Tokenizer,
+    config: &Deepseek4Config,
+    params: &Params,
+    started: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    stream.write_all(
+        b"HTTP/1.1 200 OK
+
+          Content-Type: text/event-stream
+
+          Cache-Control: no-cache
+
+          Access-Control-Allow-Origin: *
+
+          Connection: close
+
+
+
+",
+    )?;
+    // The role arrives in its own first chunk, before any content, which is
+    // what the OpenAI streaming schema specifies.
+    stream.write_all(
+        b"data: {\"id\":\"bigtea\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}
+
+",
+    )?;
+    stream.flush()?;
+
+    let mut sink = stream.try_clone()?;
+    let result = generate(&req.body, fw, tokenizer, config, params, &mut |text| {
+        sink.write_all(sse_chunk(text, None).as_bytes())?;
+        // Flush per token or the OS buffers the whole answer and "streaming"
+        // arrives all at once at the end.
+        sink.flush()
+    });
+
+    match result {
+        Ok((_, _, _, finish)) => {
+            stream.write_all(sse_chunk("", Some(finish)).as_bytes())?;
+        }
+        Err(e) => {
+            stream.write_all(
+                sse_chunk(
+                    &format!(
+                        "
+[error: {e}]"
+                    ),
+                    Some(Finish::Stop),
+                )
+                .as_bytes(),
+            )?;
+        }
+    }
+    stream.write_all(
+        b"data: [DONE]
+
+",
+    )?;
+    stream.flush()?;
+    eprintln!(
+        "{} {} -> 200 (stream) in {:.1}s",
+        req.method,
+        req.target,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 fn error_json(message: &str) -> String {
     format!(
         r#"{{"error":{{"message":"{}","type":"invalid_request_error"}}}}"#,
@@ -249,19 +345,95 @@ fn error_json(message: &str) -> String {
     )
 }
 
-/// Run one completion.
-fn complete(
+/// Everything a request asks for beyond the messages themselves.
+struct Params {
+    max_tokens: usize,
+    sampler: SamplerConfig,
+    stop: Vec<String>,
+    stream: bool,
+}
+
+impl Params {
+    /// Read the OpenAI sampling fields, defaulting the way that API does.
+    ///
+    /// OpenAI's default temperature is 1.0, not 0.0 — a client that sends no
+    /// `temperature` expects sampling, not greedy. That differs from
+    /// `bigtea-run`, where greedy is right because it keeps a wrong forward
+    /// pass diagnosable.
+    fn from_body(body: &str) -> Self {
+        let mut sampler = SamplerConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repeat_penalty: 1.0,
+            repeat_last_n: 64,
+            seed: 0,
+        };
+        if let Some(v) = extract_float(body, "temperature") {
+            sampler.temperature = v as f32;
+        }
+        if let Some(v) = extract_float(body, "top_p") {
+            sampler.top_p = v as f32;
+        }
+        if let Some(v) = extract_float(body, "min_p") {
+            sampler.min_p = v as f32;
+        }
+        if let Some(v) = extract_int(body, "top_k") {
+            sampler.top_k = v.max(0) as usize;
+        }
+        if let Some(v) =
+            extract_float(body, "repetition_penalty").or(extract_float(body, "repeat_penalty"))
+        {
+            sampler.repeat_penalty = v as f32;
+        }
+        if let Some(v) = extract_int(body, "seed") {
+            sampler.seed = v as u64;
+        }
+        Params {
+            max_tokens: extract_int(body, "max_tokens").unwrap_or(64).clamp(1, 4096) as usize,
+            sampler,
+            stop: extract_string_array(body, "stop"),
+            stream: extract_bool(body, "stream").unwrap_or(false),
+        }
+    }
+}
+
+/// Why generation ended, in the vocabulary the OpenAI API uses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Finish {
+    /// Hit the token budget.
+    Length,
+    /// The model emitted end-of-sequence, or a stop sequence was produced.
+    Stop,
+}
+
+impl Finish {
+    fn as_str(self) -> &'static str {
+        match self {
+            Finish::Length => "length",
+            Finish::Stop => "stop",
+        }
+    }
+}
+
+/// Run one completion, handing each newly decoded piece of text to `emit`.
+///
+/// `emit` returning an error aborts generation — that is how a client
+/// disconnecting mid-stream stops the work rather than finishing it for nobody.
+fn generate(
     body: &str,
     fw: &Deepseek4Forward<'_>,
     tokenizer: &Tokenizer,
     config: &Deepseek4Config,
-) -> Result<String, Box<dyn std::error::Error>> {
+    params: &Params,
+    emit: &mut dyn FnMut(&str) -> std::io::Result<()>,
+) -> Result<(String, usize, usize, Finish), Box<dyn std::error::Error>> {
     let messages = extract_messages(body)?;
     // The framing the model was trained on. Concatenating the contents -- what
     // this did before -- makes an instruct model continue the conversation
     // rather than answer it.
     let prompt = tokenizer.apply_chat_template(&messages, true);
-    let max_tokens = extract_int(body, "max_tokens").unwrap_or(64).clamp(1, 4096) as usize;
 
     let tokens: Vec<i32> = tokenizer
         .encode(&prompt)
@@ -274,10 +446,11 @@ fn complete(
     // The context limit is a real property of this path, not a policy: attention
     // builds its cache for the whole sequence at once. Say so before spending
     // ten seconds discovering it.
-    if tokens.len() + max_tokens > 256 {
+    if tokens.len() + params.max_tokens > 256 {
         return Err(format!(
-            "prompt is {} tokens and max_tokens is {max_tokens}; this path holds 256 in total",
-            tokens.len()
+            "prompt is {} tokens and max_tokens is {}; this path holds 256 in total",
+            tokens.len(),
+            params.max_tokens
         )
         .into());
     }
@@ -285,43 +458,91 @@ fn complete(
     let arena = 1024usize << 20;
     let mut kv = Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
     let logits = bigtea_arch::forward(fw, &mut kv, &tokens, arena)?;
-    let mut next = argmax(&logits);
+
+    let mut sampler = Sampler::new(params.sampler.clone());
+    let mut history: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+    let mut next = sampler.sample(&logits, &history) as i32;
 
     let mut out = String::new();
+    // Bytes not yet forming a whole character. One character is often several
+    // tokens, so converting each token to text on its own would emit
+    // replacement characters into the stream permanently.
+    let mut pending: Vec<u8> = Vec::new();
     let mut produced = 0usize;
+    let mut finish = Finish::Length;
     let started = std::time::Instant::now();
+
     loop {
-        out.push_str(&tokenizer.decode(&[next as u32]));
+        if Some(next as u32) == tokenizer.eos {
+            finish = Finish::Stop;
+            break;
+        }
+        history.push(next as u32);
+        pending.extend(tokenizer.decode_bytes(&[next as u32]));
+        let good = match std::str::from_utf8(&pending) {
+            Ok(_) => pending.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if good > 0 {
+            let text = String::from_utf8_lossy(&pending[..good]).into_owned();
+            pending.drain(..good);
+            out.push_str(&text);
+            emit(&text)?;
+        }
         produced += 1;
-        if produced >= max_tokens {
+
+        // A stop sequence is checked against the accumulated text, not the
+        // token, because it can straddle a token boundary.
+        if let Some(cut) = params
+            .stop
+            .iter()
+            .filter(|s| !s.is_empty())
+            .find_map(|s| out.find(s.as_str()))
+        {
+            out.truncate(cut);
+            finish = Finish::Stop;
+            break;
+        }
+        if produced >= params.max_tokens {
             break;
         }
         let logits = bigtea_arch::step(fw, &mut kv, next, arena)?;
-        next = argmax(&logits);
+        next = sampler.sample(&logits, &history) as i32;
     }
+
     let secs = started.elapsed().as_secs_f64();
     eprintln!(
-        "  {produced} tokens in {secs:.1}s ({:.3} tok/s)",
-        produced as f64 / secs.max(1e-9)
+        "  {produced} tokens in {secs:.1}s ({:.3} tok/s), finish={}",
+        produced as f64 / secs.max(1e-9),
+        finish.as_str()
     );
-
-    Ok(format!(
-        r#"{{"id":"bigtea","object":"chat.completion","model":"deepseek-v4-flash",{}"#,
-        format_args!(
-            r#""choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"length"}}],"usage":{{"prompt_tokens":{},"completion_tokens":{produced},"total_tokens":{}}}}}"#,
-            escape(&out),
-            tokens.len(),
-            tokens.len() + produced
-        )
-    ))
+    Ok((out, tokens.len(), produced, finish))
 }
 
-fn argmax(v: &[f32]) -> i32 {
-    v.iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
-        .map(|(i, _)| i as i32)
-        .unwrap_or(0)
+/// The non-streaming response body.
+fn completion_json(text: &str, prompt_tokens: usize, produced: usize, finish: Finish) -> String {
+    format!(
+        r#"{{"id":"bigtea","object":"chat.completion","model":"deepseek-v4-flash","choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"{}"}}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{produced},"total_tokens":{}}}}}"#,
+        escape(text),
+        finish.as_str(),
+        prompt_tokens + produced
+    )
+}
+
+/// One server-sent-event chunk carrying a delta.
+fn sse_chunk(delta: &str, finish: Option<Finish>) -> String {
+    let finish_field = match finish {
+        Some(f) => format!(r#""{}""#, f.as_str()),
+        None => "null".to_string(),
+    };
+    let delta_field = if delta.is_empty() {
+        "{}".to_string()
+    } else {
+        format!(r#"{{"content":"{}"}}"#, escape(delta))
+    };
+    format!(
+        "data: {{\"id\":\"bigtea\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-flash\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}\n\n"
+    )
 }
 
 /// Pull the conversation out of an OpenAI request body.
@@ -426,6 +647,79 @@ fn extract_int(body: &str, key: &str) -> Option<i64> {
 }
 
 /// Escape for embedding in a JSON string.
+/// Read a JSON number as `f64`. Accepts integers too, since `temperature: 1`
+/// is legal JSON and common from hand-written clients.
+fn extract_float(body: &str, key: &str) -> Option<f64> {
+    let needle = format!("\"{key}\"");
+    let at = body.find(&needle)?;
+    let after = body[at + needle.len()..].trim_start();
+    let rest = after.strip_prefix(':')?.trim_start();
+    let end = rest
+        .find(|c: char| {
+            !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')
+        })
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// Read a JSON boolean. Absent and malformed are both `None`, so the caller
+/// picks the default rather than this guessing one.
+fn extract_bool(body: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{key}\"");
+    let at = body.find(&needle)?;
+    let after = body[at + needle.len()..].trim_start();
+    let rest = after.strip_prefix(':')?.trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Read `"stop"`, which the OpenAI API allows as a string **or** an array of
+/// strings. Both spellings are common in the wild, so both are accepted.
+fn extract_string_array(body: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\"");
+    let Some(at) = body.find(&needle) else {
+        return Vec::new();
+    };
+    let after = body[at + needle.len()..].trim_start();
+    let Some(rest) = after.strip_prefix(':') else {
+        return Vec::new();
+    };
+    let rest = rest.trim_start();
+    if let Some(one) = rest.strip_prefix('"') {
+        return read_json_string(one)
+            .map(|(s, _)| vec![s])
+            .unwrap_or_default();
+    }
+    let Some(mut list) = rest.strip_prefix('[') else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    loop {
+        list = list.trim_start();
+        match list.strip_prefix('"') {
+            Some(body) => match read_json_string(body) {
+                Ok((s, consumed)) => {
+                    out.push(s);
+                    list = &body[consumed..];
+                }
+                Err(_) => break,
+            },
+            None => break,
+        }
+        list = list.trim_start();
+        match list.strip_prefix(',') {
+            Some(next) => list = next,
+            None => break,
+        }
+    }
+    out
+}
+
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 16);
     for c in s.chars() {
@@ -496,5 +790,118 @@ mod tests {
     fn control_characters_cannot_break_the_response() {
         let e = escape("a\u{1}b");
         assert!(e.contains("\\u0001"), "{e}");
+    }
+
+    #[test]
+    fn sampling_params_are_read_from_the_request() {
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],
+                       "temperature":0.7,"top_p":0.9,"top_k":40,"seed":123,
+                       "max_tokens":32,"stream":true}"#;
+        let p = Params::from_body(body);
+        assert!((p.sampler.temperature - 0.7).abs() < 1e-6);
+        assert!((p.sampler.top_p - 0.9).abs() < 1e-6);
+        assert_eq!(p.sampler.top_k, 40);
+        assert_eq!(p.sampler.seed, 123);
+        assert_eq!(p.max_tokens, 32);
+        assert!(p.stream);
+    }
+
+    #[test]
+    fn an_absent_temperature_defaults_to_the_openai_value_not_greedy() {
+        // OpenAI's default is 1.0. Defaulting to 0.0 here would make every
+        // answer from every client deterministic and flat, which is a
+        // behaviour difference no caller asked for.
+        let p = Params::from_body(r#"{"messages":[{"role":"user","content":"hi"}]}"#);
+        assert!((p.sampler.temperature - 1.0).abs() < 1e-6);
+        assert!(!p.stream, "stream must default to false");
+        assert!(p.stop.is_empty());
+    }
+
+    #[test]
+    fn stop_is_accepted_as_a_string_or_an_array() {
+        // The OpenAI schema allows both and clients send both.
+        let one = Params::from_body(r#"{"stop":"END","messages":[]}"#);
+        assert_eq!(one.stop, vec!["END".to_string()]);
+        let many = Params::from_body(
+            r#"{"stop":["
+
+","<|eot|>"],"messages":[]}"#,
+        );
+        assert_eq!(
+            many.stop,
+            vec![
+                "
+
+"
+                .to_string(),
+                "<|eot|>".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn floats_parse_whether_written_as_int_or_decimal() {
+        assert_eq!(
+            extract_float(r#"{"temperature":1}"#, "temperature"),
+            Some(1.0)
+        );
+        assert_eq!(
+            extract_float(r#"{"temperature":0.25}"#, "temperature"),
+            Some(0.25)
+        );
+        assert_eq!(extract_float(r#"{"a":1}"#, "temperature"), None);
+        assert_eq!(extract_bool(r#"{"stream":true}"#, "stream"), Some(true));
+        assert_eq!(extract_bool(r#"{"stream":false}"#, "stream"), Some(false));
+        assert_eq!(extract_bool(r#"{"x":1}"#, "stream"), None);
+    }
+
+    #[test]
+    fn an_sse_chunk_is_one_event_with_a_blank_line_after_it() {
+        // Two newlines terminate an event. One, and every client hangs waiting
+        // for the rest of it.
+        let c = sse_chunk("hi", None);
+        assert!(c.starts_with("data: {"));
+        assert!(
+            c.ends_with(
+                "
+
+"
+            ),
+            "event must end with a blank line: {c:?}"
+        );
+        assert!(c.contains(r#""content":"hi""#));
+        assert!(c.contains(r#""finish_reason":null"#));
+
+        let last = sse_chunk("", Some(Finish::Stop));
+        assert!(
+            last.contains(r#""delta":{}"#),
+            "the final chunk carries no content"
+        );
+        assert!(last.contains(r#""finish_reason":"stop""#));
+    }
+
+    #[test]
+    fn a_chunk_escapes_content_that_would_break_the_event() {
+        // A raw newline inside the JSON would terminate the event early and
+        // the client would see a truncated object.
+        let c = sse_chunk("line1\nline2\"quoted\"", None);
+        let payload = c.trim_start_matches("data: ").trim_end();
+        assert!(
+            !payload.contains('\n'),
+            "raw newline breaks the event: {payload:?}"
+        );
+        assert!(
+            payload.contains("\\n"),
+            "newline must be escaped: {payload:?}"
+        );
+    }
+
+    #[test]
+    fn finish_reason_distinguishes_running_out_from_stopping() {
+        assert_eq!(Finish::Length.as_str(), "length");
+        assert_eq!(Finish::Stop.as_str(), "stop");
+        let j = completion_json("hi", 5, 2, Finish::Stop);
+        assert!(j.contains(r#""finish_reason":"stop""#));
+        assert!(j.contains(r#""total_tokens":7"#));
     }
 }
