@@ -155,6 +155,8 @@ fn main() -> ExitCode {
         eprintln!("  --top-p P           1.0 = off");
         eprintln!("  --min-p P           0.0 = off");
         eprintln!("  --repeat-penalty R  1.0 = off");
+        eprintln!("  --frequency-penalty F  subtract F x count. 0 = off");
+        eprintln!("  --presence-penalty P   subtract P if used at all. 0 = off");
         eprintln!("  --repeat-last-n N   penalty window (default 64)");
         eprintln!("  --seed S            reproducible sampling");
         eprintln!("  --llamacpp-defaults temp 0.8, top-k 40, top-p 0.95, min-p 0.05, repeat 1.1");
@@ -220,6 +222,18 @@ fn main() -> ExitCode {
             "--repeat-penalty" => {
                 sampler.repeat_penalty =
                     rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1.1);
+                i += 2;
+            }
+            // llama.cpp's spellings, and OpenAI's semantics: frequency scales
+            // with how often a token was used, presence is flat.
+            "--frequency-penalty" => {
+                sampler.frequency_penalty =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                i += 2;
+            }
+            "--presence-penalty" => {
+                sampler.presence_penalty =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
                 i += 2;
             }
             "--repeat-last-n" => {

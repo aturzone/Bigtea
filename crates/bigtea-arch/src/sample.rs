@@ -41,7 +41,15 @@ pub struct SamplerConfig {
     pub min_p: f32,
     /// Divide the logit of a recently used token by this. `1.0` disables.
     pub repeat_penalty: f32,
-    /// How far back the penalty looks.
+    /// Subtract `frequency_penalty * count` from a token's logit. `0.0`
+    /// disables. OpenAI's `frequency_penalty`, and llama.cpp's
+    /// `--frequency-penalty`: proportional to how often the token was used.
+    pub frequency_penalty: f32,
+    /// Subtract `presence_penalty` from any token used at all in the window.
+    /// `0.0` disables. OpenAI's `presence_penalty`: flat, so it discourages
+    /// returning to a subject rather than repeating a word within one.
+    pub presence_penalty: f32,
+    /// How far back all three penalties look.
     pub repeat_last_n: usize,
     pub seed: u64,
 }
@@ -55,6 +63,8 @@ impl Default for SamplerConfig {
             top_p: 1.0,
             min_p: 0.0,
             repeat_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             repeat_last_n: 64,
             seed: 0,
         }
@@ -73,13 +83,32 @@ impl SamplerConfig {
             top_p: 0.95,
             min_p: 0.05,
             repeat_penalty: 1.1,
+            // llama.cpp's own defaults for these two are 0.0 — off.
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             repeat_last_n: 64,
             seed: 0,
         }
     }
 
+    /// Greedy decoding takes the argmax and skips every filter.
+    ///
+    /// The penalties are the exception worth stating: they change *which* token
+    /// is the argmax, so a caller asking for `temperature 0` plus a penalty
+    /// wants the penalised argmax, not the raw one. An OpenAI client sending
+    /// `temperature: 0, frequency_penalty: 1.0` is a normal request and would
+    /// otherwise be silently ignored.
     pub fn is_greedy(&self) -> bool {
         self.temperature <= 0.0
+            && self.repeat_penalty == 1.0
+            && self.frequency_penalty == 0.0
+            && self.presence_penalty == 0.0
+    }
+
+    /// Whether any penalty is active, so a greedy-with-penalties path can
+    /// still be taken without running the full sampling pipeline.
+    pub fn has_penalties(&self) -> bool {
+        self.repeat_penalty != 1.0 || self.frequency_penalty != 0.0 || self.presence_penalty != 0.0
     }
 }
 
@@ -134,12 +163,28 @@ impl Sampler {
         self.candidates
             .extend(logits.iter().enumerate().map(|(i, &l)| (i as u32, l)));
 
-        apply_repeat_penalty(
+        apply_penalties(
             &mut self.candidates,
             history,
             self.config.repeat_penalty,
+            self.config.frequency_penalty,
+            self.config.presence_penalty,
             self.config.repeat_last_n,
         );
+
+        // Temperature 0 with a penalty active is a normal request — an OpenAI
+        // client sending `temperature: 0, frequency_penalty: 1.0` means "argmax
+        // of the penalised logits". It must NOT fall through to the pipeline
+        // below: temperature 0 there becomes `powf(1e6)`, which drives every
+        // probability to zero or one and picks nonsense.
+        if self.config.temperature <= 0.0 {
+            return self
+                .candidates
+                .iter()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|c| c.0)
+                .unwrap_or(0);
+        }
 
         // Sort once, descending. Every truncation below is then a prefix, which
         // is why they compose in any order without re-sorting.
@@ -190,30 +235,75 @@ pub fn argmax(logits: &[f32]) -> u32 {
         .unwrap_or(0)
 }
 
-/// Divide (or multiply) the logits of recently seen tokens.
-///
-/// A negative logit must be *multiplied* by the penalty and a positive one
-/// divided; using one operation for both makes the penalty **reward** tokens
-/// whose logit is negative, which is the opposite of the intent and is a real
-/// bug in more than one implementation.
+#[cfg(test)]
 fn apply_repeat_penalty(
     candidates: &mut [(u32, f32)],
     history: &[u32],
     penalty: f32,
     last_n: usize,
 ) {
-    if penalty == 1.0 || last_n == 0 || history.is_empty() {
+    apply_penalties(candidates, history, penalty, 0.0, 0.0, last_n)
+}
+
+/// Repetition, frequency and presence penalties, in llama.cpp's order.
+///
+/// A negative logit must be *multiplied* by the repeat penalty and a positive
+/// one divided; using one operation for both makes the penalty **reward**
+/// tokens whose logit is negative, which is the opposite of the intent and is a
+/// real bug in more than one implementation.
+///
+/// Three different ideas that share one window:
+///
+/// - **repeat** is *multiplicative* — divide a positive logit, multiply a
+///   negative one — and does not care how often the token appeared.
+/// - **frequency** is *subtractive* and scales with the count, so a token used
+///   five times is pushed down five times as far as one used once.
+/// - **presence** is *subtractive* and flat: it costs the same to reuse a token
+///   once as ten times, which discourages returning to a topic rather than
+///   discouraging repetition within it.
+///
+/// The last two are what the OpenAI API means by `frequency_penalty` and
+/// `presence_penalty`, and a client that sends them expects these semantics
+/// exactly. llama.cpp applies the multiplicative one first; so do we.
+fn apply_penalties(
+    candidates: &mut [(u32, f32)],
+    history: &[u32],
+    repeat: f32,
+    frequency: f32,
+    presence: f32,
+    last_n: usize,
+) {
+    if last_n == 0 || history.is_empty() {
+        return;
+    }
+    if repeat == 1.0 && frequency == 0.0 && presence == 0.0 {
         return;
     }
     let window = &history[history.len().saturating_sub(last_n)..];
+    // Count the window once. The previous shape swept the whole candidate list
+    // calling `contains` on each — 151,936 x 64 comparisons per token, to act
+    // on at most 64 distinct tokens.
+    let mut counts: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::with_capacity(window.len());
+    for &t in window {
+        *counts.entry(t).or_insert(0) += 1;
+    }
+    // Looked up by token id rather than by index: this runs before the sort
+    // today, but a caller that sorted first would otherwise penalise whichever
+    // tokens happened to land in those slots — silently, and only visibly as
+    // slightly odd text.
     for c in candidates.iter_mut() {
-        if window.contains(&c.0) {
+        let Some(&count) = counts.get(&c.0) else {
+            continue;
+        };
+        if repeat != 1.0 {
             c.1 = if c.1 > 0.0 {
-                c.1 / penalty
+                c.1 / repeat
             } else {
-                c.1 * penalty
+                c.1 * repeat
             };
         }
+        c.1 -= count as f32 * frequency + presence;
     }
 }
 
@@ -392,6 +482,58 @@ mod tests {
             c[1].1, -8.0,
             "negative logit must be multiplied, not raised"
         );
+    }
+
+    #[test]
+    fn frequency_scales_with_the_count_and_presence_does_not() {
+        // Token 0 appears three times, token 1 once. Frequency must punish 0
+        // three times as hard; presence must punish them identically. Getting
+        // these two the same way round is the whole difference between the
+        // OpenAI fields, and neither errors when swapped.
+        let mut c = vec![(0u32, 10.0f32), (1, 10.0)];
+        apply_penalties(&mut c, &[0, 0, 0, 1], 1.0, 1.0, 0.0, 64);
+        assert_eq!(c[0].1, 7.0, "used 3 times, so -3");
+        assert_eq!(c[1].1, 9.0, "used once, so -1");
+
+        let mut c = vec![(0u32, 10.0f32), (1, 10.0)];
+        apply_penalties(&mut c, &[0, 0, 0, 1], 1.0, 0.0, 2.0, 64);
+        assert_eq!(c[0].1, 8.0, "presence is flat");
+        assert_eq!(c[1].1, 8.0, "...for both");
+    }
+
+    #[test]
+    fn an_unused_token_is_untouched_by_any_penalty() {
+        let mut c = vec![(7u32, 3.0f32)];
+        apply_penalties(&mut c, &[0, 1, 2], 2.0, 5.0, 5.0, 64);
+        assert_eq!(c[0].1, 3.0);
+    }
+
+    #[test]
+    fn the_three_penalties_compose_in_llamacpp_s_order() {
+        // Multiplicative first, then the two subtractive ones: 8/2 - 1*1 - 3.
+        let mut c = vec![(0u32, 8.0f32)];
+        apply_penalties(&mut c, &[0], 2.0, 1.0, 3.0, 64);
+        assert_eq!(c[0].1, 0.0);
+    }
+
+    #[test]
+    fn temperature_zero_with_a_penalty_is_the_penalised_argmax() {
+        // An OpenAI client sending `temperature: 0, frequency_penalty: N` is
+        // normal. Falling through to the sampling pipeline would raise every
+        // probability to the power of 1e6; returning the raw argmax would
+        // ignore the penalty. Neither is right.
+        let mut s = Sampler::new(SamplerConfig {
+            temperature: 0.0,
+            frequency_penalty: 5.0,
+            ..SamplerConfig::default()
+        });
+        // Token 0 wins on raw logits, but it has been used and 1 has not.
+        let chosen = s.sample(&[3.0, 1.0, 0.5], &[0, 0]);
+        assert_eq!(chosen, 1, "the penalty must decide it");
+
+        // ...and with no penalty at all, greedy is still greedy.
+        let mut s = Sampler::new(SamplerConfig::default());
+        assert_eq!(s.sample(&[3.0, 1.0, 0.5], &[0, 0]), 0);
     }
 
     #[test]

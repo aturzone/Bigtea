@@ -70,6 +70,12 @@ fn main() -> ExitCode {
                 }
                 i += 2;
             }
+            "-tb" | "--threads-batch" => {
+                if let Some(t) = args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                    std::env::set_var("BIGTEA_THREADS_BATCH", t.to_string());
+                }
+                i += 2;
+            }
             "-h" | "--help" => {
                 usage();
                 return ExitCode::SUCCESS;
@@ -97,7 +103,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() {
-    println!("usage: bigtea-serve <model.gguf> [--port 8080] [--cache GiB] [-t N]");
+    println!("usage: bigtea-serve <model.gguf> [--port 8080] [--cache GiB] [-t N] [-tb N]");
     println!();
     println!("Serves an OpenAI-compatible endpoint on 127.0.0.1:");
     println!("  POST /v1/chat/completions   the one an agent calls");
@@ -561,6 +567,8 @@ impl Params {
             top_p: 1.0,
             min_p: 0.0,
             repeat_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             repeat_last_n: 64,
             seed: 0,
         };
@@ -580,6 +588,15 @@ impl Params {
             extract_float(body, "repetition_penalty").or(extract_float(body, "repeat_penalty"))
         {
             sampler.repeat_penalty = v as f32;
+        }
+        // Both are standard OpenAI fields. A client that sends them and is
+        // silently ignored gets output that looks like the model repeating
+        // itself, with nothing to point at.
+        if let Some(v) = extract_float(body, "frequency_penalty") {
+            sampler.frequency_penalty = v as f32;
+        }
+        if let Some(v) = extract_float(body, "presence_penalty") {
+            sampler.presence_penalty = v as f32;
         }
         if let Some(v) = extract_int(body, "seed") {
             sampler.seed = v as u64;

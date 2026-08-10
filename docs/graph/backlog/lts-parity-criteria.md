@@ -84,7 +84,7 @@ reads + ~0.6 s of everything else, so with R2 overlap it is **~0.65 tok/s agains
 
 | ticket | what | state |
 |---|---|---|
-| C1 | sampling: temperature, top-k, top-p, min-p, repeat penalty, seed | **DONE 2026-08-10** — 10 unit tests, `--llamacpp-defaults` for like-for-like comparison |
+| C1 | sampling: temperature, top-k, top-p, min-p, repeat penalty, seed | **DONE 2026-08-10** — 10 unit tests, `--llamacpp-defaults` for like-for-like comparison. **Extended same day** with `--frequency-penalty` and `--presence-penalty` (OpenAI's fields and llama.cpp's flags), including `temperature: 0` + a penalty, which is the penalised argmax and would otherwise have run `powf(1e6)` |
 | C2 | chat templates from `tokenizer.chat_template` | **DONE 2026-08-10** — 9 families, detected from the real templates; control tokens encode to single ids |
 | C3 | streaming responses (SSE) in `bigtea-serve` | **DONE 2026-08-10** — plus temperature/top_p/top_k/min_p/seed/stop from the request, EOS and stop sequences give `finish_reason: stop` |
 | C4 | `-c` context size, `-b` batch, `-t` threads as flags | **DONE 2026-08-10, then found broken and re-done the same day.** `-t` reached only `deepseek4`; every other architecture ignored it. Now plumbed, plus llama.cpp's `-tb`/`--threads-batch`, because generation and prefill want opposite counts. The generation default is **tuned on real tokens** — 1.66x/1.69x over "all cores". See `../research/threads-were-never-plumbed-2026-08-10.md` |
