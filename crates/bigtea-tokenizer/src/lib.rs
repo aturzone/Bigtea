@@ -316,6 +316,26 @@ impl Tokenizer {
         self.ids.get(token).copied()
     }
 
+    /// Whether `id` is a control token — `<|im_end|>`, `<s>`, `[CLS]`.
+    ///
+    /// These are framing, not output. `decode` deliberately drops most of them,
+    /// so a caller that wants to *show* them (llama.cpp's `--special`) has to
+    /// ask which ones they are rather than inferring it from the text.
+    pub fn is_control(&self, id: u32) -> bool {
+        if Some(id) == self.bos || Some(id) == self.eos {
+            return true;
+        }
+        self.specials.iter().any(|(_, sid)| *sid == id)
+    }
+
+    /// A control token's literal spelling, for `--special`.
+    ///
+    /// Returns the raw vocabulary entry rather than routing through `decode`,
+    /// which is exactly the code that hides these.
+    pub fn control_text(&self, id: u32) -> String {
+        self.token_text(id).unwrap_or_default().to_string()
+    }
+
     pub fn kind(&self) -> Kind {
         self.kind
     }

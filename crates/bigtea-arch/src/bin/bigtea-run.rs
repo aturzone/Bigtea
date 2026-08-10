@@ -26,12 +26,14 @@ const GIB: f64 = (1u64 << 30) as f64;
 /// and flushed only at a valid UTF-8 boundary.
 struct TokenWriter {
     pending: Vec<u8>,
+    colored: bool,
 }
 
 impl TokenWriter {
     fn new() -> Self {
         TokenWriter {
             pending: Vec::new(),
+            colored: false,
         }
     }
 
@@ -51,6 +53,32 @@ impl TokenWriter {
         }
     }
 
+    /// `push`, with `--color` and `--special` applied.
+    ///
+    /// Control tokens are hidden by default because a chat template's
+    /// `<|im_end|>` is framing, not output, and printing it makes every answer
+    /// look broken. `--special` shows them, which is what you want when the
+    /// question is *why* an answer ended where it did.
+    fn push_visible(&mut self, tokenizer: &Tokenizer, id: u32, ui: &Ui) {
+        use std::io::Write;
+        if ui.special && tokenizer.is_control(id) {
+            if ui.color {
+                print!("{COLOR_OFF}");
+            }
+            print!("{}", tokenizer.control_text(id));
+            if ui.color {
+                print!("{COLOR_GEN}");
+            }
+            let _ = std::io::stdout().flush();
+            return;
+        }
+        if ui.color && !self.colored {
+            print!("{COLOR_GEN}");
+            self.colored = true;
+        }
+        self.push(tokenizer, id);
+    }
+
     /// Anything still buffered at the end was genuinely malformed, so it is
     /// shown lossily rather than silently dropped.
     fn finish(&mut self) {
@@ -61,14 +89,130 @@ impl TokenWriter {
     }
 }
 
+/// How the terminal side behaves — llama.cpp's interaction flags.
+///
+/// Grouped rather than passed individually because they are all "how it talks
+/// to a person", they travel together, and a function taking twenty `bool`s
+/// invites the argument-order bug that no test catches.
+#[derive(Clone, Default)]
+struct Ui {
+    interactive: bool,
+    conversation: bool,
+    single_turn: bool,
+    multiline: bool,
+    display_prompt: bool,
+    color: bool,
+    /// Render control tokens like `<|im_end|>` instead of hiding them.
+    special: bool,
+    print_token_count: bool,
+    verbose_prompt: bool,
+    in_prefix: String,
+    in_suffix: String,
+    in_prefix_bos: bool,
+}
+
+/// ANSI, and only when asked for and not writing to a pipe.
+const COLOR_GEN: &str = "\x1b[32m";
+const COLOR_OFF: &str = "\x1b[0m";
+
+/// Read one turn from the user.
+///
+/// `Ok(None)` means end of input — Ctrl-D, or a pipe that has run out — which
+/// ends the session rather than being an error.
+///
+/// With `--multiline-input`, a line ending in a single backslash continues onto
+/// the next, because a shell prompt is the wrong place to be unable to paste a
+/// paragraph.
+fn read_user_turn(ui: &Ui) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Write};
+    let mut out = String::new();
+    let stdin = std::io::stdin();
+    loop {
+        if ui.color {
+            print!("{COLOR_OFF}");
+        }
+        print!("\n> ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if ui.multiline {
+            if let Some(head) = trimmed.strip_suffix('\\') {
+                out.push_str(head);
+                out.push('\n');
+                continue;
+            }
+        }
+        out.push_str(trimmed);
+        // A blank first line is a request for a prompt, not a turn to send.
+        if out.trim().is_empty() {
+            out.clear();
+            continue;
+        }
+        return Ok(Some(out));
+    }
+}
+
+/// Interpret the backslash escapes llama.cpp's `-e` accepts.
+///
+/// `-p "Line one\nLine two"` is the ordinary way to write a two-line prompt on
+/// a command line, and without this the model is asked about a literal
+/// backslash-n. Unknown escapes are left exactly as written rather than
+/// swallowed, so a Windows path in a prompt survives.
+fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('x') => {
+                // Exactly two hex digits, and only if both are there.
+                let hex: String = chars.clone().take(2).collect();
+                match u8::from_str_radix(&hex, 16) {
+                    Ok(byte) if hex.len() == 2 => {
+                        out.push(byte as char);
+                        chars.next();
+                        chars.next();
+                    }
+                    _ => {
+                        out.push('\\');
+                        out.push('x');
+                    }
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 /// Apply the model's chat template when asked, and say which one was used.
 ///
 /// An instruct model trained on `<|im_start|>user` does not fail on raw text —
 /// it continues it. Asked to "Write one sentence about the sea", Llama-3.2
 /// answered "The sentence should be concise and evocative", because it was
 /// completing an instruction rather than following one.
-fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool) -> String {
-    if !chat {
+fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool, system: Option<&str>) -> String {
+    // A system prompt is only meaningful inside a template — there is nowhere
+    // to put it in raw completion — so asking for one implies chat framing
+    // rather than being silently dropped.
+    if !chat && system.is_none() {
         return prompt.to_string();
     }
     let format = tokenizer.chat_format();
@@ -80,7 +224,12 @@ fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool) -> String {
         println!("chat       template not recognised -- using a plain framing;");
         println!("           the model may not respond as an assistant.");
     }
-    tokenizer.apply_chat_template(&[Message::new("user", prompt)], true)
+    let mut messages = Vec::new();
+    if let Some(sys) = system {
+        messages.push(Message::new("system", sys));
+    }
+    messages.push(Message::new("user", prompt));
+    tokenizer.apply_chat_template(&messages, true)
 }
 
 /// Perplexity over a corpus: the standard way to say a model still works.
@@ -282,6 +431,26 @@ fn main() -> ExitCode {
         eprintln!("  --mirostat-lr ETA   mirostat learning rate (default 0.1)");
         eprintln!("  --logit-bias ID+B   nudge one token, repeatable (e.g. 42-100)");
         eprintln!("  --ignore-eos        never stop at end-of-sequence");
+        eprintln!("  -i, --interactive   keep the session open and take turns");
+        eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
+        eprintln!("  -st, --single-turn  one exchange, then exit");
+        eprintln!("  --multiline-input   a trailing backslash continues the line");
+        eprintln!("  --in-prefix S       wrap user input (non-conversation mode)");
+        eprintln!("  --in-suffix S       ...and after it");
+        eprintln!("  --in-prefix-bos     prepend BOS to each user turn");
+        eprintln!("  -sys, --system-prompt S   system message (implies a template)");
+        eprintln!("  --system-prompt-file F    ...read from a file");
+        eprintln!("  -co, --color        colour the generated text");
+        eprintln!("  --simple-io         no ANSI, for pipes and logs");
+        eprintln!("  --no-display-prompt do not echo the prompt back");
+        eprintln!("  -sp, --special      show control tokens instead of hiding them");
+        eprintln!("  --print-token-count report prompt and generated counts");
+        eprintln!("  --verbose-prompt    print the tokenised prompt and its ids");
+        eprintln!("  -e, --escape        process backslash escapes in -p (default on)");
+        eprintln!("  --no-escape         take -p literally");
+        eprintln!("  -r, --reverse-prompt S    llama.cpp's name for --stop");
+        eprintln!("  --perplexity        score a corpus instead of generating");
+        eprintln!("  --ppl-chunk N       perplexity chunk size (default 512)");
         eprintln!("  --seed S            reproducible sampling");
         eprintln!("  --llamacpp-defaults temp 0.8, top-k 40, top-p 0.95, min-p 0.05, repeat 1.1");
         eprintln!("  --chat              apply the model's chat template to the prompt");
@@ -310,6 +479,14 @@ fn main() -> ExitCode {
     let mut threads: Option<usize> = None;
     let mut threads_batch: Option<usize> = None;
     let mut perplexity: Option<usize> = None;
+    let mut ui = Ui {
+        // llama.cpp echoes the prompt by default and processes backslash
+        // escapes in -p by default; both match here.
+        display_prompt: true,
+        ..Ui::default()
+    };
+    let mut escape = true;
+    let mut system_prompt: Option<String> = None;
     let mut ctx_size: Option<usize> = None;
     let mut stop: Vec<String> = Vec::new();
     let mut force = false;
@@ -456,6 +633,96 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // --- interaction, llama.cpp's spellings ---------------------
+            "-i" | "--interactive" => {
+                ui.interactive = true;
+                i += 1;
+            }
+            "-cnv" | "--conversation" => {
+                ui.interactive = true;
+                ui.conversation = true;
+                i += 1;
+            }
+            "--no-conversation" => {
+                ui.conversation = false;
+                i += 1;
+            }
+            "-st" | "--single-turn" => {
+                ui.interactive = true;
+                ui.single_turn = true;
+                i += 1;
+            }
+            "--multiline-input" => {
+                ui.multiline = true;
+                i += 1;
+            }
+            "--in-prefix" => {
+                ui.in_prefix = rest.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+            }
+            "--in-suffix" => {
+                ui.in_suffix = rest.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+            }
+            "--in-prefix-bos" => {
+                ui.in_prefix_bos = true;
+                i += 1;
+            }
+            "--color" | "-co" => {
+                ui.color = true;
+                i += 1;
+            }
+            // A pipe is not a terminal: colour codes in a redirected file are
+            // noise, and llama.cpp's --simple-io means exactly "no ANSI".
+            "--simple-io" => {
+                ui.color = false;
+                i += 1;
+            }
+            "--display-prompt" => {
+                ui.display_prompt = true;
+                i += 1;
+            }
+            "--no-display-prompt" => {
+                ui.display_prompt = false;
+                i += 1;
+            }
+            "--special" | "-sp" => {
+                ui.special = true;
+                i += 1;
+            }
+            "--print-token-count" => {
+                ui.print_token_count = true;
+                i += 1;
+            }
+            "--verbose-prompt" => {
+                ui.verbose_prompt = true;
+                i += 1;
+            }
+            "-e" | "--escape" => {
+                escape = true;
+                i += 1;
+            }
+            "--no-escape" => {
+                escape = false;
+                i += 1;
+            }
+            "-sys" | "--system-prompt" => {
+                system_prompt = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--system-prompt-file" => {
+                if let Some(f) = rest.get(i + 1) {
+                    system_prompt = std::fs::read_to_string(f).ok();
+                }
+                i += 2;
+            }
+            // llama.cpp's name for what we already spell --stop.
+            "-r" | "--reverse-prompt" => {
+                if let Some(v) = rest.get(i + 1) {
+                    stop.push(v.clone());
+                }
+                i += 2;
+            }
             // Quality, not speed: the one thing this project has never measured.
             "--perplexity" | "--ppl" => {
                 perplexity = Some(perplexity.unwrap_or(512));
@@ -530,6 +797,13 @@ fn main() -> ExitCode {
     if prompt.is_empty() {
         prompt = "The capital of France is".into();
     }
+    // llama.cpp processes backslash escapes in `-p` by default, so a prompt
+    // written with a backslash-n is two lines rather than a question about a
+    // backslash. `--no-escape` turns it off for prompts that contain literal
+    // ones, such as a Windows path.
+    if escape {
+        prompt = unescape(&prompt);
+    }
     let prompt = prompt;
 
     match run(
@@ -543,6 +817,8 @@ fn main() -> ExitCode {
         threads,
         threads_batch,
         perplexity,
+        ui,
+        system_prompt,
         ctx_size,
         stop,
         force,
@@ -575,6 +851,7 @@ fn run_streaming(
     ctx_size: Option<usize>,
     stop: Vec<String>,
     perplexity: Option<usize>,
+    ui: Ui,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -713,47 +990,99 @@ fn run_streaming(
         prompt_len as f64 / prefill_secs.max(1e-9)
     );
 
-    println!("\n{}", tokenizer.decode(&tokens));
+    if ui.verbose_prompt {
+        eprintln!("prompt     {} tokens: {:?}", tokens.len(), tokens);
+    }
+    if ui.display_prompt {
+        println!("\n{}", tokenizer.decode(&tokens));
+    }
     let gen_start = std::time::Instant::now();
 
     let mut writer = TokenWriter::new();
     let mut sampler = Sampler::new(sampler_cfg);
-    // Stop sequences are matched against the accumulated text, not the token:
-    // a stop string can straddle a token boundary and per-token matching would
-    // miss most of them.
-    let mut generated_text = String::new();
-    for step in 0..n_predict {
-        if logits.len() < vocab {
-            return Err(format!("logits too small: {} < {vocab}", logits.len()).into());
-        }
-        // The last token's row: a prefill returns logits for every position.
-        let last = &logits[logits.len() - vocab..];
-        let next = sampler.sample(last, &tokens);
-        if Some(next) == tokenizer.eos {
-            break;
-        }
-        writer.push(tokenizer, next);
-        tokens.push(next);
-        if !stop.is_empty() {
-            generated_text.push_str(&tokenizer.decode(std::slice::from_ref(&next)));
-            if stop
-                .iter()
-                .any(|s| !s.is_empty() && generated_text.contains(s.as_str()))
-            {
+    let mut turns = 0usize;
+
+    // One iteration per exchange. A non-interactive run takes the `break` at
+    // the bottom on its first pass, so its behaviour is exactly what it was.
+    loop {
+        // Stop sequences are matched against the accumulated text, not the
+        // token: a stop string can straddle a token boundary and per-token
+        // matching would miss most of them. Reset per turn, or a stop string
+        // from an earlier answer would end this one immediately.
+        let mut generated_text = String::new();
+        for step in 0..n_predict {
+            if logits.len() < vocab {
+                return Err(format!("logits too small: {} < {vocab}", logits.len()).into());
+            }
+            // The last token's row: a prefill returns logits for every position.
+            let last = &logits[logits.len() - vocab..];
+            let next = sampler.sample(last, &tokens);
+            if Some(next) == tokenizer.eos {
+                tokens.push(next);
                 break;
             }
-        }
+            writer.push_visible(tokenizer, next, &ui);
+            tokens.push(next);
+            if !stop.is_empty() {
+                generated_text.push_str(&tokenizer.decode(std::slice::from_ref(&next)));
+                if stop
+                    .iter()
+                    .any(|s| !s.is_empty() && generated_text.contains(s.as_str()))
+                {
+                    break;
+                }
+            }
 
-        // Only the new token needs computing; history lives in the cache.
-        // Skipped on the last step — nothing would read those logits.
-        if step + 1 < n_predict {
-            logits = runner.forward_cached(&weights, &mut cache, &[next], pos)?;
-            pos += 1;
+            // Only the new token needs computing; history lives in the cache.
+            // Skipped on the last step — nothing would read those logits.
+            if step + 1 < n_predict {
+                logits = runner.forward_cached(&weights, &mut cache, &[next], pos)?;
+                pos += 1;
+            }
         }
+        writer.finish();
+
+        if !ui.interactive {
+            break;
+        }
+        turns += 1;
+        if ui.single_turn {
+            break;
+        }
+        // The KV cache already holds everything said so far, so a turn costs
+        // only the new tokens — which is the whole reason a REPL is worth
+        // having over re-invoking the binary.
+        let Some(line) = read_user_turn(&ui)? else {
+            break; // EOF: Ctrl-D, or a pipe running out
+        };
+        let framed_turn = if ui.conversation {
+            tokenizer.apply_chat_template(&[Message::new("user", &line)], true)
+        } else {
+            format!("{}{}{}", ui.in_prefix, line, ui.in_suffix)
+        };
+        let mut next_tokens = tokenizer.encode(&framed_turn);
+        if ui.in_prefix_bos {
+            if let Some(bos) = tokenizer.bos {
+                next_tokens.insert(0, bos);
+            }
+        }
+        if next_tokens.is_empty() {
+            continue;
+        }
+        if ui.verbose_prompt {
+            eprintln!("turn       {} tokens: {:?}", next_tokens.len(), next_tokens);
+        }
+        tokens.extend_from_slice(&next_tokens);
+        logits = runner.forward_cached(&weights, &mut cache, &next_tokens, pos)?;
+        pos += next_tokens.len();
     }
 
     let secs = gen_start.elapsed().as_secs_f64();
-    let produced = tokens.len() - prompt_len;
+    let produced = tokens.len().saturating_sub(prompt_len);
+    if ui.print_token_count {
+        println!("\ntokens     {} prompt + {produced} generated", prompt_len);
+    }
+    let _ = turns;
     println!("\n");
     println!(
         "generated  {produced} tokens in {secs:.1}s ({:.2} tok/s)",
@@ -791,6 +1120,8 @@ fn run(
     threads_flag: Option<usize>,
     threads_batch_flag: Option<usize>,
     perplexity: Option<usize>,
+    ui: Ui,
+    system_prompt: Option<String>,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -858,7 +1189,12 @@ fn run(
     if model.architecture() == "deepseek4" {
         println!("model      {} ({})", model.architecture(), model.io_mode());
         let tokenizer = Tokenizer::from_metadata(model.metadata())?;
-        let prompt = &framed(&tokenizer, prompt, chat);
+        let prompt = &framed(
+            &tokenizer,
+            prompt,
+            chat || ui.conversation,
+            system_prompt.as_deref(),
+        );
         run_deepseek4(
             &model,
             &tokenizer,
@@ -914,7 +1250,12 @@ fn run(
 
     // --- tokenizer ---------------------------------------------------------
     let tokenizer = Tokenizer::from_metadata(model.metadata())?;
-    let prompt = &framed(&tokenizer, prompt, chat);
+    let prompt = &framed(
+        &tokenizer,
+        prompt,
+        chat || ui.conversation,
+        system_prompt.as_deref(),
+    );
     let mut tokens: Vec<u32> = tokenizer.encode(prompt);
     println!("prompt     {prompt:?} -> {} tokens", tokens.len());
     if tokens.is_empty() {
@@ -946,6 +1287,7 @@ fn run(
             ctx_size,
             stop,
             perplexity,
+            ui,
             t0,
         );
     }

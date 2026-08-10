@@ -14,9 +14,9 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 
 | bucket | flags | state |
 |---|---:|---|
-| **have** | 21 | done |
+| **have** | **49** | done |
 | **samplers** | 22 | **13 done 2026-08-10**, DRY (5) + `--samplers` ordering (3) left |
-| interaction / prompt handling | 22 | gap — the next batch |
+| interaction / prompt handling | 22 | **done 2026-08-11** — including a real REPL |
 | runtime / threading / memory | 31 | mostly gap; several are meaningless here |
 | RoPE, YaRN, context shift | 15 | gap; `--rope-freq-base`/`--rope-scale` are cheap and real |
 | logging | 13 | gap, cheap |
@@ -62,16 +62,47 @@ Caught by tests and by running the flags against a real model and reading the
 output. **Two of the three are invisible in any test that only checks the
 process exits zero**, which is what makes this category worth the care.
 
+## Done 2026-08-11 — interaction, and Bigtea has a REPL
+
+`-i`/`--interactive`, `-cnv`/`--conversation`, `-st`/`--single-turn`,
+`--multiline-input`, `--in-prefix`, `--in-suffix`, `--in-prefix-bos`,
+`-sys`/`--system-prompt`, `--system-prompt-file`, `-co`/`--color`,
+`--simple-io`, `--display-prompt`/`--no-display-prompt`, `-sp`/`--special`,
+`--print-token-count`, `--verbose-prompt`, `-e`/`--escape`/`--no-escape`,
+`-r`/`--reverse-prompt`.
+
+**The KV cache is what makes this worth having**: a turn costs only its new
+tokens, because everything said so far is already in the cache. Verified as a
+real conversation rather than a mechanism:
+
+```
+$ bigtea-run <llama-3.2-1b> "Name the capital of France in one word." \
+    -n 24 -cnv -sys "You are terse. Answer with one word only."
+chat       llama3 template
+Paris.
+> What is the capital of Japan?
+Tokyo.
+```
+
+Two things that would otherwise be silent:
+
+- **`--escape` is on by default**, matching llama.cpp, so a prompt containing a
+  backslash-n is two lines. Checked by token id rather than by eye: `198` (a
+  real newline) with it, `1734` (a literal two-character sequence) with
+  `--no-escape`.
+- **Stop sequences reset per turn.** Carried over, a stop string from an earlier
+  answer ends the next one instantly, and the session looks hung.
+
+`--keep` is deliberately **not** accepted. It controls what survives a context
+shift, and Bigtea has no context shift — accepting it would be a flag that does
+nothing, which is the exact failure this audit exists to prevent.
+
 ## Next batches, in order
 
-1. **Interaction (22)** — `--interactive`, `--conversation`, `--in-prefix`,
-   `--in-suffix`, `--system-prompt`, `--color`, `--escape`, `--special`,
-   `--print-token-count`, `--verbose-prompt`, `--keep`. This is what makes a
-   local model usable from a terminal rather than benchmarkable.
-2. **DRY + `--samplers` ordering (8)** — finishes the sampler bucket. DRY needs
+1. **DRY + `--samplers` ordering (8)** — finishes the sampler bucket. DRY needs
    n-gram suffix matching and sequence breakers; the ordering flag needs the
    chain to become data rather than a fixed sequence of calls.
-3. **RoPE / context (15)** — `--rope-freq-base`, `--rope-freq-scale`,
+2. **RoPE / context (15)** — `--rope-freq-base`, `--rope-freq-scale`,
    `--rope-scaling`, YaRN. Cheap, and needed for any model whose container
    disagrees with its training context.
 4. **Logging (13)** — `--log-file`, `--log-disable`, `--verbose`, timestamps.
