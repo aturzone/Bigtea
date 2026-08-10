@@ -69,7 +69,7 @@ fn rope_type_for(arch: &str) -> (i32, bool) {
 /// So the default is to refuse an architecture nobody has checked. `--force`
 /// runs it anyway, which is the right escape hatch for someone testing a new
 /// architecture — but it has to be asked for.
-pub const VERIFIED_ARCHITECTURES: &[&str] = &["deepseek4", "llama", "qwen3", "qwen3moe"];
+pub const VERIFIED_ARCHITECTURES: &[&str] = &["deepseek4", "llama", "phi3", "qwen3", "qwen3moe"];
 
 /// Whether this build has been run against `arch` and had its output checked.
 pub fn architecture_is_verified(arch: &str) -> bool {
@@ -111,6 +111,17 @@ pub struct Qwen3Config {
     /// type is a default rather than a fact. Nothing can detect this from the
     /// weights, so the only honest thing is to say so.
     pub rope_type_is_known: bool,
+    /// Q, K and V share one `attn_qkv` tensor rather than three.
+    ///
+    /// Phi-3 ships them fused. The split is along the output dimension and the
+    /// rows are whole quantisation blocks, so three views cost nothing — but
+    /// asking for `attn_q.weight` on such a container fails outright, which is
+    /// what refused Phi-3 before this existed.
+    pub fused_qkv: bool,
+    /// The FFN gate and up projections share one `ffn_up` tensor.
+    ///
+    /// Also Phi-3. `ffn_up` is `2 * n_ff` rows: gate first, then up.
+    pub fused_gate_up: bool,
 }
 
 impl Qwen3Config {
@@ -149,7 +160,11 @@ impl Qwen3Config {
             rms_eps: model
                 .arch_f32("attention.layer_norm_rms_epsilon")
                 .unwrap_or(1e-6),
-            rope_freq_base: model.arch_f32("rope.freq_base").unwrap_or(1_000_000.0),
+            // 10000 is llama.cpp's default and what every container that omits
+            // the key was trained with. The previous default of 1e6 was Qwen3's
+            // *declared* value generalised into a fallback, which silently gave
+            // Phi-3 the wrong rotation.
+            rope_freq_base: model.arch_f32("rope.freq_base").unwrap_or(10_000.0),
             n_expert: model.arch_u64("expert_count").unwrap_or(0) as u32,
             n_expert_used: model.arch_u64("expert_used_count").unwrap_or(0) as u32,
             n_ff_expert: model.arch_u64("expert_feed_forward_length").unwrap_or(0) as u32,
@@ -157,6 +172,11 @@ impl Qwen3Config {
             qk_norm: model.location("blk.0.attn_q_norm.weight").is_some(),
             rope_type: rope_type_for(&arch).0,
             rope_type_is_known: rope_type_for(&arch).1,
+            // Asked of the container, like `qk_norm`: a fusion is a fact about
+            // this file, not about what it calls itself.
+            fused_qkv: model.location("blk.0.attn_qkv.weight").is_some(),
+            fused_gate_up: model.location("blk.0.ffn_gate.weight").is_none()
+                && model.location("blk.0.ffn_up.weight").is_some(),
         })
     }
 
@@ -181,6 +201,71 @@ impl Qwen3Model {
         Qwen3Model { config }
     }
 
+    /// Q, K and V for one block, whether the container fuses them or not.
+    ///
+    /// A fused `attn_qkv` is `n_q + n_k + n_v` rows in that order. The split is
+    /// along the output dimension, so each part is a contiguous run of whole
+    /// rows — and since `ne0` is a multiple of the quantisation block, the
+    /// views land on block boundaries and no dequantisation is needed.
+    pub(crate) fn qkv_weights<'a>(
+        &self,
+        ctx: &'a Context,
+        weights: &WeightSet<'a>,
+        il: u32,
+    ) -> Result<(Tensor<'a>, Tensor<'a>, Tensor<'a>)> {
+        let c = &self.config;
+        let get = |name: String| -> Result<&Tensor<'a>> {
+            weights.get(&name).ok_or(ArchError::MissingTensor(name))
+        };
+        if !c.fused_qkv {
+            return Ok((
+                *get(format!("blk.{il}.attn_q.weight"))?,
+                *get(format!("blk.{il}.attn_k.weight"))?,
+                *get(format!("blk.{il}.attn_v.weight"))?,
+            ));
+        }
+        let w = get(format!("blk.{il}.attn_qkv.weight"))?;
+        let (dims, strides) = w.dims_and_strides();
+        let ne0 = dims[0];
+        let row = strides[1];
+        let n_q = (c.n_head * c.head_dim) as i64;
+        let n_kv = (c.n_head_kv * c.head_dim) as i64;
+        Ok((
+            ctx.view_2d(w, ne0, n_q, row, 0)?,
+            ctx.view_2d(w, ne0, n_kv, row, n_q as usize * row)?,
+            ctx.view_2d(w, ne0, n_kv, row, (n_q + n_kv) as usize * row)?,
+        ))
+    }
+
+    /// The FFN gate and up projections, fused or separate.
+    ///
+    /// When fused, `ffn_up` is `2 * n_ff` rows with gate first.
+    pub(crate) fn gate_up_weights<'a>(
+        &self,
+        ctx: &'a Context,
+        weights: &WeightSet<'a>,
+        il: u32,
+    ) -> Result<(Tensor<'a>, Tensor<'a>)> {
+        let c = &self.config;
+        let get = |name: String| -> Result<&Tensor<'a>> {
+            weights.get(&name).ok_or(ArchError::MissingTensor(name))
+        };
+        if !c.fused_gate_up {
+            return Ok((
+                *get(format!("blk.{il}.ffn_gate.weight"))?,
+                *get(format!("blk.{il}.ffn_up.weight"))?,
+            ));
+        }
+        let w = get(format!("blk.{il}.ffn_up.weight"))?;
+        let (dims, strides) = w.dims_and_strides();
+        let (ne0, half) = (dims[0], dims[1] / 2);
+        let row = strides[1];
+        Ok((
+            ctx.view_2d(w, ne0, half, row, 0)?,
+            ctx.view_2d(w, ne0, half, row, half as usize * row)?,
+        ))
+    }
+
     /// Every tensor this architecture reads, in load order.
     ///
     /// Used both to bind weights and to check a container up front — finding
@@ -192,15 +277,15 @@ impl Qwen3Model {
             "output_norm.weight".to_string(),
         ];
         for il in 0..c.n_layer {
-            for suffix in [
-                "attn_norm.weight",
-                "attn_q.weight",
-                "attn_k.weight",
-                "attn_v.weight",
-                "attn_output.weight",
-                "ffn_norm.weight",
-            ] {
+            for suffix in ["attn_norm.weight", "attn_output.weight", "ffn_norm.weight"] {
                 names.push(format!("blk.{il}.{suffix}"));
+            }
+            if c.fused_qkv {
+                names.push(format!("blk.{il}.attn_qkv.weight"));
+            } else {
+                for suffix in ["attn_q.weight", "attn_k.weight", "attn_v.weight"] {
+                    names.push(format!("blk.{il}.{suffix}"));
+                }
             }
             // Only Qwen3 carries these. Listing them unconditionally is what
             // refused every Llama-family container up front.
@@ -216,6 +301,10 @@ impl Qwen3Model {
                     "ffn_up_exps.weight",
                     "ffn_down_exps.weight",
                 ] {
+                    names.push(format!("blk.{il}.{suffix}"));
+                }
+            } else if c.fused_gate_up {
+                for suffix in ["ffn_up.weight", "ffn_down.weight"] {
                     names.push(format!("blk.{il}.{suffix}"));
                 }
             } else {
@@ -283,9 +372,10 @@ impl Qwen3Model {
             let normed =
                 self.rms_norm_mul(ctx, &cur, get(&format!("blk.{il}.attn_norm.weight"))?)?;
 
-            let q = ctx.mul_mat(get(&format!("blk.{il}.attn_q.weight"))?, &normed)?;
-            let k = ctx.mul_mat(get(&format!("blk.{il}.attn_k.weight"))?, &normed)?;
-            let v = ctx.mul_mat(get(&format!("blk.{il}.attn_v.weight"))?, &normed)?;
+            let (qw, kw, vw) = self.qkv_weights(ctx, weights, il)?;
+            let q = ctx.mul_mat(&qw, &normed)?;
+            let k = ctx.mul_mat(&kw, &normed)?;
+            let v = ctx.mul_mat(&vw, &normed)?;
 
             // Split into heads before normalising: Qwen3 normalises each head
             // separately, with a weight of head_dim rather than n_embd.
@@ -373,9 +463,10 @@ impl Qwen3Model {
 
         let normed = self.rms_norm_mul(ctx, x, get(format!("blk.{il}.attn_norm.weight"))?)?;
 
-        let q = ctx.mul_mat(get(format!("blk.{il}.attn_q.weight"))?, &normed)?;
-        let k = ctx.mul_mat(get(format!("blk.{il}.attn_k.weight"))?, &normed)?;
-        let v = ctx.mul_mat(get(format!("blk.{il}.attn_v.weight"))?, &normed)?;
+        let (qw, kw, vw) = self.qkv_weights(ctx, weights, il)?;
+        let q = ctx.mul_mat(&qw, &normed)?;
+        let k = ctx.mul_mat(&kw, &normed)?;
+        let v = ctx.mul_mat(&vw, &normed)?;
 
         let q = ctx.reshape_3d(&q, c.head_dim as i64, c.n_head as i64, n_tokens)?;
         let k = ctx.reshape_3d(&k, c.head_dim as i64, c.n_head_kv as i64, n_tokens)?;
@@ -565,8 +656,9 @@ impl Qwen3Model {
         let get = |name: String| -> Result<&Tensor<'a>> {
             weights.get(&name).ok_or(ArchError::MissingTensor(name))
         };
-        let gate = ctx.mul_mat(get(format!("blk.{il}.ffn_gate.weight"))?, x)?;
-        let up = ctx.mul_mat(get(format!("blk.{il}.ffn_up.weight"))?, x)?;
+        let (gate_w, up_w) = self.gate_up_weights(ctx, weights, il)?;
+        let gate = ctx.mul_mat(&gate_w, x)?;
+        let up = ctx.mul_mat(&up_w, x)?;
         let activated = ctx.mul(&ctx.silu(&gate)?, &up)?;
         Ok(ctx.mul_mat(get(format!("blk.{il}.ffn_down.weight"))?, &activated)?)
     }
@@ -640,6 +732,8 @@ mod tests {
             qk_norm: true,
             rope_type: ROPE_TYPE_NEOX,
             rope_type_is_known: true,
+            fused_qkv: false,
+            fused_gate_up: false,
         }
     }
 
@@ -774,17 +868,10 @@ mod tests {
         // "The capital of France is" with "himselff"; Phi-3 fails cleanly on a
         // fused attn_qkv. Only the first kind is dangerous, and only refusing
         // by default catches it.
-        for arch in ["deepseek4", "llama", "qwen3", "qwen3moe"] {
+        for arch in ["deepseek4", "llama", "phi3", "qwen3", "qwen3moe"] {
             assert!(architecture_is_verified(arch), "{arch} should be verified");
         }
-        for arch in [
-            "gemma2",
-            "gemma",
-            "phi3",
-            "falcon",
-            "mamba",
-            "something-new",
-        ] {
+        for arch in ["gemma2", "gemma", "falcon", "mamba", "something-new"] {
             assert!(
                 !architecture_is_verified(arch),
                 "{arch} has not been checked and must not claim to be"

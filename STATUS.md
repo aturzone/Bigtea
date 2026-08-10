@@ -469,8 +469,20 @@ run and read — `deepseek4, llama, qwen3, qwen3moe` — and anything else is
 does not offer that escape hatch at all**, because an API client has no way to
 see that an answer is unsound.
 
-Gemma and Phi-3 support stay open as A4/A5. What changed is that not having
-them is now visible instead of silent.
+**Phi-3 is now supported and verified** (same day): it fuses *both* Q/K/V into
+one `attn_qkv` and the FFN gate/up into one `ffn_up`, and both split into views
+along whole quantisation blocks, so the fix is free at runtime. It answers "The
+capital of France is" with "Paris." and "2 + 2 =" with "4", matching llama.cpp's
+own output on the same container. `VERIFIED_ARCHITECTURES` is now
+**deepseek4, llama, phi3, qwen3, qwen3moe**.
+
+A silent bug found alongside it: **the RoPE frequency base defaulted to 1e6**,
+which was Qwen3's *declared* value generalised into a fallback. Phi-3 declares
+none, so it was being rotated at 100x the right frequency. llama.cpp's default
+is 10000 and that is now ours. Qwen3 (1e6) and Llama-3.2 (5e5) declare theirs,
+so nothing regressed — checked on all four.
+
+Gemma stays open as A4, with what it needs recorded from measurement.
 
 ## Known limitations
 

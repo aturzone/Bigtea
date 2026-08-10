@@ -1003,9 +1003,10 @@ impl<'m> StreamingRunner<'m> {
                     &xt,
                     &get(weights, format!("blk.{il}.attn_norm.weight"))?,
                 )?;
-                let q = ctx.mul_mat(&get(weights, format!("blk.{il}.attn_q.weight"))?, &normed)?;
-                let k = ctx.mul_mat(&get(weights, format!("blk.{il}.attn_k.weight"))?, &normed)?;
-                let v = ctx.mul_mat(&get(weights, format!("blk.{il}.attn_v.weight"))?, &normed)?;
+                let (qw, kw, vw) = self.arch.qkv_weights(&ctx, weights, il)?;
+                let q = ctx.mul_mat(&qw, &normed)?;
+                let k = ctx.mul_mat(&kw, &normed)?;
+                let v = ctx.mul_mat(&vw, &normed)?;
 
                 let q = ctx.reshape_3d(&q, head_dim, c.n_head as i64, n_new)?;
                 let k = ctx.reshape_3d(&k, head_dim, n_kv, n_new)?;
@@ -1343,6 +1344,8 @@ mod tests {
             qk_norm: true,
             rope_type: 2,
             rope_type_is_known: true,
+            fused_qkv: false,
+            fused_gate_up: false,
         }
     }
 
