@@ -128,11 +128,23 @@ fn serve(path: &str, port: u16, cache_gib: f64) -> Result<(), Box<dyn std::error
         let config = Deepseek4Config::from_model(&model)?;
         let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
         let reserve = (1u64 << 30) + (512 << 20) + (768 << 20);
-        let (resident, report) =
+        let (mut resident, report) =
             ResidentSet::load(&model, machine.usable_ram_for_weights(reserve))?;
         println!("resident   {report}");
 
-        let mut fw = Deepseek4Forward::new(&model, config.clone()).with_resident(&resident);
+        // Rearranged once, at load, and re-bound per block — see `RepackedDense`.
+        let repacked = bigtea_arch::RepackedDense::build(&mut resident, &model)?;
+        let (n_repacked, repacked_bytes, _) = repacked.stats();
+        if n_repacked > 0 {
+            println!(
+                "repacked   {n_repacked} tensors, {:.2} GiB in the CPU kernels' layout",
+                repacked_bytes as f64 / GIB
+            );
+        }
+
+        let mut fw = Deepseek4Forward::new(&model, config.clone())
+            .with_resident(&resident)
+            .with_repacked(&repacked);
         // Same rule the runner enforces: a byte given to the expert cache while
         // the always-read set is still streaming comes out of residency, where
         // it would have been read on every token. Measured both ways.

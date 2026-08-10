@@ -937,9 +937,33 @@ fn run_deepseek4(
     // A flat constant here is either wasteful or wrong depending on the block.
     let reserve = ((arena_mib as u64) << 20) + (512 << 20) + (768 << 20);
     let budget = machine.usable_ram_for_weights(reserve);
-    let (resident, report) = ResidentSet::load(model, budget)?;
+    let (mut resident, report) = ResidentSet::load(model, budget)?;
     println!("resident   {report}");
     report_residency_shortfall(&report, &machine);
+
+    // Rearrange the always-read weights into the layout the CPU kernels want,
+    // once, before any block runs.
+    //
+    // It has to happen here rather than inside the block loop: V4-Flash owns an
+    // arena per block and rebuilds its `WeightSet` 43 times a token, so
+    // rearranging there would re-do the whole set on every one of them.
+    //
+    // Each tensor is taken out of the resident set as it is converted, so the
+    // footprint does not double — which on a 15.7 GiB machine holding a 7.38
+    // GiB always-read set is the difference between this working and swapping.
+    let repack_start = std::time::Instant::now();
+    let repacked = bigtea_arch::RepackedDense::build(&mut resident, model)?;
+    let (n_repacked, repacked_bytes, declined) = repacked.stats();
+    if n_repacked > 0 {
+        println!(
+            "repacked   {n_repacked} tensors, {:.2} GiB in the CPU kernels' layout, {:.1}s",
+            repacked_bytes as f64 / GIB,
+            repack_start.elapsed().as_secs_f64()
+        );
+        if declined > 0 {
+            println!("repacked   {declined} declined by ggml and left in their stored layout");
+        }
+    }
 
     // The expert cache is **off unless asked for**, and that default is measured
     // rather than cautious.
@@ -967,7 +991,9 @@ fn run_deepseek4(
     // covering 37.5% of an unseen subject against 25% for caching at random.
     // And the cache owns its memory, because past ~6 GiB on Qwen3 a 71%-hit
     // cache backed by the page cache was the *slowest* configuration measured.
-    let mut fw = bigtea_arch::Deepseek4Forward::new(model, config.clone()).with_resident(&resident);
+    let mut fw = bigtea_arch::Deepseek4Forward::new(model, config.clone())
+        .with_resident(&resident)
+        .with_repacked(&repacked);
     // The expert cache and the always-read weights compete for the same RAM, and
     // measurement says residency wins by a wide margin until it is satisfied.
     //

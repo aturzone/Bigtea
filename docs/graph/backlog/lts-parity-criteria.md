@@ -71,6 +71,15 @@ measured back to back in one session with both command lines recorded.
 | memory footprint at equal speed | **ours, by design** | ours | — |
 | long-context generation | untested | untested | untested |
 
+**Weight repacking does not transfer to V4-Flash, and the row above does not
+move** (2026-08-10). Every always-read tensor in that container with a
+repackable shape is `Q8_0`, and ggml's repacked `Q8_0` kernels are NEON and
+RISC-V only — 42 offered, 42 declined, 0 repacked on x86. llama.cpp cannot even
+load the file with repacking on (a 137 GiB single-range `CPU_REPACK` buffer),
+which is why its figures here pass `--no-repack`. The attempt did fix a null
+dereference that would have killed `bigtea-run` on any `*.Q8_0.gguf`:
+`../research/v4flash-repacking-2026-08-10.md`.
+
 **Dense Qwen3-4B has never been compared to llama.cpp at all**, and it is the
 cheapest comparison available — it fits in RAM, so it isolates the compute path
 from all the streaming machinery. It should be the first cell closed.

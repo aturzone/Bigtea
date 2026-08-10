@@ -569,6 +569,200 @@ fn threads() -> usize {
     })
 }
 
+/// The dense tensors it is **safe** to rearrange, named one at a time.
+///
+/// # Why this is an allow-list and not an exclusion list
+///
+/// The dense path excludes three known-bad uses and repacks the rest, which is
+/// right there because a new tensor arriving in a llama-family container is
+/// almost certainly an ordinary `mul_mat` weight. Here the default has to be
+/// the other way round.
+///
+/// Repacking interleaves rows. Every use except "first operand of `mul_mat`,
+/// two-dimensional" reads the bytes by position — and **not one of them
+/// fails**: `get_rows` returns the wrong row, a `view_1d` at a byte offset
+/// returns the wrong slice, a `reshape_3d` cuts the matrix in the wrong places.
+/// All three produce numbers, and numbers become fluent text. This
+/// architecture's graph has four such uses among twenty-odd tensors, so
+/// guessing from the name would be wrong roughly a fifth of the time, silently.
+///
+/// The audit behind the list, by what each tensor is actually passed to:
+///
+/// | tensor | use | repack |
+/// |---|---|---|
+/// | `token_embd` | `get_rows` by token id | **no** |
+/// | `attn_compressor_ape` | `get_rows` by within-block position | **no** |
+/// | `ffn_gate_tid2eid` | `get_rows` by token id | **no** |
+/// | `*_hc_scale`, `*_hc_base` | `view_1d` at a byte offset | **no** |
+/// | `attn_output_a` | `reshape_3d` into a grouped `mul_mat` | **no** |
+/// | `attn_sinks` | sinks argument of `flash_attn_ext` | **no** |
+/// | `*_norm` | `mul`, elementwise | no — and F32, so nothing to pack |
+/// | `blk.*.ffn_*_exps` | **routed, streamed from disk** | **never** |
+/// | the fourteen below | `mul_mat(w, x)`, 2-D | **yes** |
+///
+/// The routed experts are the load-bearing exclusion. They are bound zero-copy
+/// from a pointer into the mapped container, one slice at a time, and never go
+/// near [`bind_dense`] — that is what lets a 144 GB model run on a 15.7 GiB
+/// machine at all. Repacking them would need the whole bank in RAM, which is
+/// the thing this engine exists to avoid.
+const REPACKABLE_DENSE: [&str; 14] = [
+    "hc_attn_fn",
+    "hc_ffn_fn",
+    "attn_q_a",
+    "attn_q_b",
+    "attn_kv",
+    // `attn_output_a` is deliberately absent — see the table above.
+    "attn_output_b",
+    "ffn_gate_inp",
+    "ffn_gate_shexp",
+    "ffn_up_shexp",
+    "ffn_down_shexp",
+    "attn_compressor_kv",
+    "attn_compressor_gate",
+    "output_hc_fn",
+    "output",
+];
+
+/// Whether `name` is one of the tensors [`REPACKABLE_DENSE`] allows.
+///
+/// Matches the suffix after the block prefix, so `blk.7.attn_kv.weight` and the
+/// un-prefixed `output.weight` are both recognised — and
+/// `blk.7.attn_kv_a_norm.weight` is not, because the comparison is on the whole
+/// suffix rather than a prefix of it.
+fn is_repackable_dense(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".weight") else {
+        return false;
+    };
+    let suffix = match stem.strip_prefix("blk.") {
+        Some(rest) => match rest.split_once('.') {
+            Some((n, suffix)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => suffix,
+            _ => return false,
+        },
+        None => stem,
+    };
+    REPACKABLE_DENSE.contains(&suffix)
+}
+
+/// Always-read weights rearranged into the CPU kernels' layout, once, at load.
+///
+/// # Why this is not simply `bind_repacked` inside [`bind_dense`]
+///
+/// Repacking is worth **1.42x on prefill** on the dense path, where
+/// `load_resident` builds one `WeightSet` that lives for the session. V4-Flash
+/// owns an arena **per block** — chaining 43 blocks into one `ggml` context
+/// costs hundreds of megabytes each — so it builds a fresh context and a fresh
+/// `WeightSet` for every block of every pass. Rearranging inside that loop
+/// would re-do the whole always-read set 43 times per token: not a smaller win,
+/// a large loss.
+///
+/// So the rearrangement happens once, here, and each block binds the result by
+/// pointing a fresh tensor at bytes that are already in the right order.
+///
+/// # Why only tensors that are already resident
+///
+/// The rearranged copy lives in memory this process owns. Repacking a tensor
+/// that was **not** resident would quietly spend RAM the residency budget had
+/// already decided it did not have — and that budget exists because
+/// over-committing makes the OS swap, which is slower than the streaming it
+/// replaces.
+///
+/// For one that *is* resident the exchange is even: the original is taken out
+/// of the set and dropped as soon as the rearranged copy exists, so the peak is
+/// one tensor rather than a second whole set.
+pub struct RepackedDense {
+    tensors: std::collections::HashMap<String, std::sync::Arc<bigtea_ggml::Repacked>>,
+    bytes: usize,
+    declined: usize,
+}
+
+impl RepackedDense {
+    /// Rearrange every resident tensor the allow-list permits.
+    ///
+    /// Takes each one out of `resident` as it goes, so the two copies never
+    /// coexist beyond the tensor being converted. `BIGTEA_NO_REPACK` returns an
+    /// empty set, which is the same switch the dense path reads.
+    pub fn build(resident: &mut ResidentSet, model: &Model) -> Result<Self> {
+        let mut tensors = std::collections::HashMap::new();
+        let mut bytes = 0usize;
+        let mut declined = 0usize;
+        if std::env::var("BIGTEA_NO_REPACK").is_ok() {
+            return Ok(RepackedDense {
+                tensors,
+                bytes,
+                declined,
+            });
+        }
+        // Only what is actually in RAM is a candidate, so the set walks itself.
+        let names = resident.names();
+        for name in &names {
+            if !is_repackable_dense(name) {
+                continue;
+            }
+            let Some(loc) = model.location(name) else {
+                continue;
+            };
+            let (ty, dims) = (loc.ty, loc.dims.clone());
+            let (ne0, ne1) = match dims.as_slice() {
+                [a] => (*a as i64, 1i64),
+                [a, b] => (*a as i64, *b as i64),
+                // Nothing in the allow-list is higher rank, and guessing how to
+                // flatten one would be exactly the silent mistake the list is
+                // here to prevent.
+                _ => continue,
+            };
+            if !bigtea_ggml::is_repackable(ty, ne0, ne1) {
+                continue;
+            }
+            // Only if it is already in RAM — see the type's docs.
+            let Some(original) = resident.take(name) else {
+                continue;
+            };
+            match bigtea_ggml::Repacked::new(ty, ne0, ne1, &original[..]) {
+                Ok(Some(repacked)) => {
+                    bytes += repacked.bytes();
+                    tensors.insert(name.clone(), std::sync::Arc::new(repacked));
+                    // `original` is dropped here: the rearranged bytes replace
+                    // it, and holding both is what this design exists to avoid.
+                    drop(original);
+                }
+                // ggml declined after the shape check said it might not. Put it
+                // back rather than leaving it to stream from disk every token.
+                Ok(None) => {
+                    declined += 1;
+                    resident.put_back(name.clone(), original);
+                }
+                Err(e) => {
+                    resident.put_back(name.clone(), original);
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(RepackedDense {
+            tensors,
+            bytes,
+            declined,
+        })
+    }
+
+    fn get(&self, name: &str) -> Option<std::sync::Arc<bigtea_ggml::Repacked>> {
+        self.tensors.get(name).cloned()
+    }
+
+    /// How many tensors were rearranged, the bytes they hold, and how many
+    /// `ggml` declined after the shape check said it might not.
+    pub fn stats(&self) -> (usize, usize, usize) {
+        (self.tensors.len(), self.bytes, self.declined)
+    }
+
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
+}
+
 /// One block's forward pass, and the state it threads.
 pub struct Deepseek4Forward<'m> {
     model: &'m Model,
@@ -577,6 +771,10 @@ pub struct Deepseek4Forward<'m> {
     /// is correct but costs 23% of a prefill and would cost it again on every
     /// generated token.
     resident: Option<&'m ResidentSet>,
+    /// Always-read weights already rearranged into the CPU kernels' layout.
+    /// Consulted **before** `resident`, because a repacked tensor was taken out
+    /// of that set and only exists here.
+    repacked: Option<&'m RepackedDense>,
     /// Routed expert slices held across blocks and tokens. `None` streams every
     /// slice from disk on every use.
     ///
@@ -592,6 +790,7 @@ impl<'m> Deepseek4Forward<'m> {
             model,
             config,
             resident: None,
+            repacked: None,
             cache: None,
         }
     }
@@ -599,6 +798,17 @@ impl<'m> Deepseek4Forward<'m> {
     /// Serve always-read weights from `resident` instead of from disk.
     pub fn with_resident(mut self, resident: &'m ResidentSet) -> Self {
         self.resident = Some(resident);
+        self
+    }
+
+    /// Serve the tensors in `repacked` from their rearranged copies.
+    ///
+    /// Must be the same [`RepackedDense`] that was built from this forward's
+    /// `ResidentSet`: `build` **removes** what it rearranges, so without this
+    /// those tensors would fall back to streaming from disk on every block of
+    /// every token — correct, and far slower than not repacking at all.
+    pub fn with_repacked(mut self, repacked: &'m RepackedDense) -> Self {
+        self.repacked = Some(repacked);
         self
     }
 
@@ -1830,6 +2040,13 @@ fn bind_dense<'c>(
     prefetched: &std::collections::HashMap<String, std::sync::Arc<SkewedBuf>>,
 ) -> Result<u64> {
     let loc = fw.model.location(name).expect("present").clone();
+    // Repacked first. `RepackedDense::build` takes what it rearranges out of
+    // the resident set, so for those tensors this is the only place the bytes
+    // exist — checking residency first would find nothing and stream from disk.
+    if let Some(repacked) = fw.repacked.and_then(|r| r.get(name)) {
+        weights.bind_repacked_shared(wctx, name, repacked)?;
+        return Ok(0);
+    }
     if let Some(shared) = fw.resident.and_then(|r| r.get_shared(name)) {
         weights.bind_shared(wctx, name, loc.ty, &loc.dims, shared)?;
         return Ok(0);
@@ -1867,7 +2084,14 @@ fn prefetch_dense(
 ) -> Result<std::collections::HashMap<String, std::sync::Arc<SkewedBuf>>> {
     let missing: Vec<&String> = names
         .iter()
-        .filter(|n| fw.resident.and_then(|r| r.get_shared(n)).is_none())
+        .filter(|n| {
+            // A repacked tensor is in RAM too — it is simply held elsewhere,
+            // having been taken out of the resident set. Without this it would
+            // look absent and be re-read from disk on every block of every
+            // token, which is the exact cost repacking was meant to avoid.
+            fw.repacked.and_then(|r| r.get(n)).is_none()
+                && fw.resident.and_then(|r| r.get_shared(n)).is_none()
+        })
         .collect();
     if missing.len() < 2 {
         // One tensor has nothing to overlap with, and the common case — a fully
@@ -2162,7 +2386,7 @@ pub fn step(
 
 #[cfg(test)]
 mod routing_tests {
-    use super::{pool_passes, record_into};
+    use super::{is_repackable_dense, pool_passes, record_into};
 
     /// Selections land in the newest pass, and pooling sums every pass.
     ///
@@ -2178,6 +2402,116 @@ mod routing_tests {
         assert_eq!(log[0][0], vec![0, 2, 1, 0], "pass 0 keeps only its own");
         assert_eq!(log[1][0], vec![0, 0, 1, 1], "pass 1 starts from zero");
         assert_eq!(pool_passes(&log)[0], vec![0, 2, 2, 1]);
+    }
+
+    /// The four uses that read repacked bytes **by position**, and produce
+    /// confident nonsense rather than an error when they get them. This is the
+    /// list the allow-list exists to enforce; a regression here is not a failing
+    /// forward pass, it is a fluent wrong answer.
+    #[test]
+    fn tensors_read_by_position_are_never_repackable() {
+        for name in [
+            // `get_rows` — a repacked tensor's rows are interleaved, so row 5
+            // is not where row 5 was.
+            "token_embd.weight",
+            "blk.0.attn_compressor_ape.weight",
+            "blk.12.ffn_gate_tid2eid.weight",
+            // `view_1d` at a byte offset, into the unpacked layout.
+            "blk.3.hc_attn_scale.weight",
+            "blk.3.hc_attn_base.weight",
+            "blk.3.hc_ffn_scale.weight",
+            "blk.3.hc_ffn_base.weight",
+            "output_hc_scale.weight",
+            "output_hc_base.weight",
+            // `reshape_3d` into a grouped `mul_mat`, which cuts the matrix in
+            // places the interleave has moved.
+            "blk.7.attn_output_a.weight",
+            // The sinks argument of `flash_attn_ext`, not a matmul weight.
+            "blk.7.attn_sinks.weight",
+        ] {
+            assert!(!is_repackable_dense(name), "{name} must never be repacked");
+        }
+    }
+
+    /// The routed experts are the exclusion that matters most: they stream from
+    /// disk zero-copy, one slice at a time, and that is what lets a 144 GB model
+    /// run on a 15.7 GiB machine. Repacking them would need the whole bank in
+    /// RAM — the exact thing this engine exists to avoid.
+    #[test]
+    fn routed_experts_are_never_repackable() {
+        for name in [
+            "blk.5.ffn_gate_exps.weight",
+            "blk.5.ffn_up_exps.weight",
+            "blk.5.ffn_down_exps.weight",
+        ] {
+            assert!(
+                !is_repackable_dense(name),
+                "{name} streams; never repack it"
+            );
+        }
+    }
+
+    /// The shared expert is *not* routed — it runs for every token and is part
+    /// of the always-read set, so it is both repackable and one of the largest
+    /// wins available. The names differ by three characters (`shexp` against
+    /// `exps`), which is exactly the kind of near-miss a substring rule gets
+    /// wrong in one direction or the other.
+    #[test]
+    fn shared_experts_are_repackable_but_routed_ones_are_not() {
+        assert!(is_repackable_dense("blk.5.ffn_gate_shexp.weight"));
+        assert!(is_repackable_dense("blk.5.ffn_up_shexp.weight"));
+        assert!(is_repackable_dense("blk.5.ffn_down_shexp.weight"));
+        assert!(!is_repackable_dense("blk.5.ffn_gate_exps.weight"));
+    }
+
+    #[test]
+    fn plain_matmul_weights_are_repackable() {
+        for name in [
+            "blk.0.attn_q_a.weight",
+            "blk.41.attn_q_b.weight",
+            "blk.9.attn_kv.weight",
+            "blk.9.attn_output_b.weight",
+            "blk.9.ffn_gate_inp.weight",
+            "blk.9.attn_compressor_kv.weight",
+            "blk.9.attn_compressor_gate.weight",
+            "blk.9.hc_attn_fn.weight",
+            "blk.9.hc_ffn_fn.weight",
+            "output_hc_fn.weight",
+            "output.weight",
+        ] {
+            assert!(
+                is_repackable_dense(name),
+                "{name} is a plain mul_mat weight"
+            );
+        }
+    }
+
+    /// The suffix is matched whole, not as a prefix. `attn_kv` is repackable and
+    /// `attn_kv_a_norm` is not, and a `starts_with` rule would take both — the
+    /// norm is F32 so `is_repackable` would decline it today, but that is luck
+    /// rather than intent and would stop holding on a quantised norm.
+    #[test]
+    fn a_longer_name_that_starts_with_an_allowed_one_is_not_allowed() {
+        assert!(is_repackable_dense("blk.2.attn_kv.weight"));
+        assert!(!is_repackable_dense("blk.2.attn_kv_a_norm.weight"));
+        assert!(!is_repackable_dense("blk.2.attn_q_a_norm.weight"));
+        assert!(!is_repackable_dense("blk.2.attn_norm.weight"));
+        assert!(!is_repackable_dense("blk.2.ffn_norm.weight"));
+        assert!(!is_repackable_dense("blk.2.attn_compressor_norm.weight"));
+    }
+
+    /// Names that are not `blk.<digits>.<suffix>` or a known global must not be
+    /// coaxed into matching — a bias is not a weight, and a non-numeric segment
+    /// is not a block.
+    #[test]
+    fn malformed_and_unknown_names_are_refused() {
+        assert!(!is_repackable_dense("blk.3.exp_probs_b.bias"));
+        assert!(!is_repackable_dense("attn_kv.weight.extra"));
+        assert!(!is_repackable_dense("blk.x.attn_kv.weight"));
+        assert!(!is_repackable_dense("blk..attn_kv.weight"));
+        assert!(!is_repackable_dense("blk.attn_kv.weight"));
+        assert!(!is_repackable_dense("attn_kv"));
+        assert!(!is_repackable_dense(""));
     }
 
     /// The property R0.1 rests on: because the model is causal, a later pass
