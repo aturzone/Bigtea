@@ -17,6 +17,7 @@ mod deepseek4;
 mod deepseek4_forward;
 mod expert_cache;
 mod kv;
+pub mod log;
 mod qwen3;
 pub mod sample;
 pub mod spectrum;

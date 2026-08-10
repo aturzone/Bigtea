@@ -165,7 +165,7 @@ impl RopeOverrides {
             changed.push(format!("yarn orig_ctx {v}"));
         }
         if !changed.is_empty() {
-            println!("rope       overridden: {}", changed.join(", "));
+            bigtea_arch::info!("rope       overridden: {}", changed.join(", "));
         }
     }
 }
@@ -298,12 +298,12 @@ fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool, system: Option<&str>)
     }
     let format = tokenizer.chat_format();
     if format.is_known() {
-        println!("chat       {} template", format.name());
+        bigtea_arch::info!("chat       {} template", format.name());
     } else {
         // Do not pretend. An unrecognised template framed as someone else's is
         // how a model quietly answers the wrong question.
-        println!("chat       template not recognised -- using a plain framing;");
-        println!("           the model may not respond as an assistant.");
+        bigtea_arch::info!("chat       template not recognised -- using a plain framing;");
+        bigtea_arch::info!("           the model may not respond as an assistant.");
     }
     let mut messages = Vec::new();
     if let Some(sys) = system {
@@ -402,7 +402,7 @@ fn perplexity_run(
         }
         chunks += 1;
         let ppl = (total_nll / counted as f64).exp();
-        println!(
+        bigtea_arch::info!(
             "chunk {chunks:>4}   {counted:>7} tokens   ppl {ppl:.4}   ({:.1}s)",
             start.elapsed().as_secs_f64()
         );
@@ -417,12 +417,14 @@ fn perplexity_run(
     }
     let ppl = (total_nll / counted as f64).exp();
     println!();
-    println!("perplexity {ppl:.4} over {counted} tokens in {chunks} chunks of {chunk_size}");
-    println!(
+    bigtea_arch::info!(
+        "perplexity {ppl:.4} over {counted} tokens in {chunks} chunks of {chunk_size}"
+    );
+    bigtea_arch::info!(
         "           mean NLL {:.4} nats/token",
         total_nll / counted as f64
     );
-    println!("total      {:.1}s", t0.elapsed().as_secs_f64());
+    bigtea_arch::info!("total      {:.1}s", t0.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -486,6 +488,15 @@ fn dense_max_tokens(config: &Qwen3Config, budget: u64) -> i64 {
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
+    // Before the positional model path is taken. `--version` as the first
+    // argument would otherwise *be* the path, and the runner would report that
+    // it cannot open a file called `--version`.
+    if let Some(first) = std::env::args().nth(1) {
+        if first == "--version" {
+            println!("bigtea-run {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+    }
     let Some(path) = args.next() else {
         eprintln!("usage: bigtea-run <model.gguf> \"prompt\" [options]");
         eprintln!();
@@ -539,6 +550,14 @@ fn main() -> ExitCode {
         eprintln!("  --yarn-beta-fast F    YaRN high-frequency cutoff");
         eprintln!("  --yarn-beta-slow F    YaRN low-frequency cutoff");
         eprintln!("  --yarn-orig-ctx N     context the model was trained at");
+        eprintln!("  --log-disable       silence the status lines");
+        eprintln!("  --log-file F        write status to a file instead of stderr");
+        eprintln!("  --log-timestamps    prefix each status line with elapsed time");
+        eprintln!("  --log-prefix        prefix each status line with its level");
+        eprintln!("  -v, --verbose       verbosity 2");
+        eprintln!("  --verbosity N       0 quiet, 1 normal, 2+ verbose");
+        eprintln!("  --no-perf           omit the timing summary");
+        eprintln!("  --version           print the version and exit");
         eprintln!("  --perplexity        score a corpus instead of generating");
         eprintln!("  --ppl-chunk N       perplexity chunk size (default 512)");
         eprintln!("  --seed S            reproducible sampling");
@@ -577,6 +596,8 @@ fn main() -> ExitCode {
     };
     let mut escape = true;
     let mut rope = RopeOverrides::default();
+    let mut logcfg = bigtea_arch::log::LogConfig::default();
+    let mut show_perf = true;
     let mut system_prompt: Option<String> = None;
     let mut ctx_size: Option<usize> = None;
     let mut stop: Vec<String> = Vec::new();
@@ -724,6 +745,51 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // --- logging: status is diagnostics, the text is output --------
+            "--log-disable" => {
+                logcfg.verbosity = 0;
+                i += 1;
+            }
+            "--log-file" => {
+                logcfg.file = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--log-timestamps" => {
+                logcfg.timestamps = true;
+                i += 1;
+            }
+            "--no-log-timestamps" => {
+                logcfg.timestamps = false;
+                i += 1;
+            }
+            "--log-prefix" => {
+                logcfg.prefix = true;
+                i += 1;
+            }
+            "--no-log-prefix" => {
+                logcfg.prefix = false;
+                i += 1;
+            }
+            "-v" | "--verbose" | "--log-verbose" => {
+                logcfg.verbosity = 2;
+                i += 1;
+            }
+            "--verbosity" | "--log-verbosity" => {
+                logcfg.verbosity = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1);
+                i += 2;
+            }
+            "--perf" => {
+                show_perf = true;
+                i += 1;
+            }
+            "--no-perf" => {
+                show_perf = false;
+                i += 1;
+            }
+            "--version" => {
+                println!("bigtea-run {}", env!("CARGO_PKG_VERSION"));
+                return ExitCode::SUCCESS;
+            }
             // --- RoPE, for a container whose metadata is wrong or absent ---
             "--rope-freq-base" => {
                 rope.freq_base = rest.get(i + 1).and_then(|v| v.parse().ok());
@@ -941,6 +1007,7 @@ fn main() -> ExitCode {
     }
     let prompt = prompt;
 
+    bigtea_arch::log::configure(logcfg);
     match run(
         &path,
         &prompt,
@@ -955,6 +1022,7 @@ fn main() -> ExitCode {
         ui,
         system_prompt,
         rope,
+        show_perf,
         ctx_size,
         stop,
         force,
@@ -988,6 +1056,7 @@ fn run_streaming(
     stop: Vec<String>,
     perplexity: Option<usize>,
     ui: Ui,
+    show_perf: bool,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -1049,7 +1118,7 @@ fn run_streaming(
         }
     };
     let mut runner = StreamingRunner::new(model, config.clone(), budget as usize);
-    println!(
+    bigtea_arch::info!(
         "cache      {:.2} GiB for experts (headroom {:.2} GiB: {:.2} kv + {:.2} arenas + 2.00 os)",
         budget as f64 / GIB,
         headroom as f64 / GIB,
@@ -1062,14 +1131,14 @@ fn run_streaming(
     let load_start = std::time::Instant::now();
     let resident = runner.load_resident(&ctx, &mut weights)?;
     let (n_repacked, repacked_bytes) = weights.repacked();
-    println!(
+    bigtea_arch::info!(
         "resident   {} tensors, {:.2} GiB in {:.1}s (experts stream on demand)",
         weights.len(),
         resident as f64 / GIB,
         load_start.elapsed().as_secs_f64()
     );
     if n_repacked > 0 {
-        println!(
+        bigtea_arch::info!(
             "repacked   {n_repacked} tensors, {:.2} GiB in the CPU kernels' layout",
             repacked_bytes as f64 / GIB
         );
@@ -1078,7 +1147,7 @@ fn run_streaming(
     // Say which counts are in use and where they came from. Generation settles
     // on a measured count, and an unexplained "2" on a 20-thread machine reads
     // as a bug rather than as the 1.8x it is worth.
-    println!(
+    bigtea_arch::info!(
         "threads    {} prefilling, generation {}",
         bigtea_arch::configured_threads_batch(),
         if std::env::var("BIGTEA_THREADS").is_ok() {
@@ -1121,7 +1190,7 @@ fn run_streaming(
         debug_assert!(cache.is_consistent(), "kv cache layers fell out of step");
     }
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
-    println!(
+    bigtea_arch::info!(
         "prefill    {prompt_len} tokens in {prefill_secs:.1}s ({:.2} tok/s)",
         prompt_len as f64 / prefill_secs.max(1e-9)
     );
@@ -1220,25 +1289,27 @@ fn run_streaming(
     }
     let _ = turns;
     println!("\n");
-    println!(
+    bigtea_arch::info!(
         "generated  {produced} tokens in {secs:.1}s ({:.2} tok/s)",
         produced as f64 / secs.max(1e-9)
     );
-    println!(
+    bigtea_arch::info!(
         "kv cache   {} positions, {:.1} MiB",
         cache.len(),
         cache.bytes() as f64 / (1 << 20) as f64
     );
-    println!("streaming  {}", runner.stats);
+    if show_perf {
+        bigtea_arch::info!("streaming  {}", runner.stats);
+    }
     // What the tuner settled on. Printed even when it did not finish, because
     // "still tuning after N tokens" explains an odd tok/s that would otherwise
     // look like a regression.
     let (settled, done) = runner.generation_threads();
-    println!(
+    bigtea_arch::info!(
         "threads    generation used {settled}{}",
         if done { "" } else { " (still tuning)" }
     );
-    println!("total      {:.1}s", t0.elapsed().as_secs_f64());
+    bigtea_arch::info!("total      {:.1}s", t0.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -1259,6 +1330,7 @@ fn run(
     ui: Ui,
     system_prompt: Option<String>,
     rope: RopeOverrides,
+    show_perf: bool,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -1324,7 +1396,7 @@ fn run(
     // DeepSeek-V4-Flash shares the residency and streaming machinery but almost
     // none of the graph, so it gets its own path rather than a config branch.
     if model.architecture() == "deepseek4" {
-        println!("model      {} ({})", model.architecture(), model.io_mode());
+        bigtea_arch::info!("model      {} ({})", model.architecture(), model.io_mode());
         let tokenizer = Tokenizer::from_metadata(model.metadata())?;
         let prompt = &framed(
             &tokenizer,
@@ -1350,20 +1422,25 @@ fn run(
     let config = config;
     let arch = Qwen3Model::new(config.clone());
 
-    println!("model      {} ({})", model.architecture(), model.io_mode());
-    println!(
+    bigtea_arch::info!("model      {} ({})", model.architecture(), model.io_mode());
+    bigtea_arch::info!(
         "shape      {} layers, {} embd, {} heads ({} kv), head_dim {}",
-        config.n_layer, config.n_embd, config.n_head, config.n_head_kv, config.head_dim
+        config.n_layer,
+        config.n_embd,
+        config.n_head,
+        config.n_head_kv,
+        config.head_dim
     );
     if config.is_moe() {
-        println!(
+        bigtea_arch::info!(
             "experts    {} total, {} per token",
-            config.n_expert, config.n_expert_used
+            config.n_expert,
+            config.n_expert_used
         );
     } else {
-        println!("experts    none (dense)");
+        bigtea_arch::info!("experts    none (dense)");
     }
-    println!(
+    bigtea_arch::info!(
         "attention  {} rope, per-head QK norm {}",
         if config.rope_type == 0 {
             "NORM"
@@ -1376,12 +1453,12 @@ fn run(
         // Say it rather than let the user discover it in the output. Both RoPE
         // conventions run without error on either layout, so a wrong guess is
         // fluent nonsense and nothing downstream can detect it.
-        println!(
+        bigtea_arch::info!(
             "           NOTE: {:?} is not an architecture this build has verified.",
             model.architecture()
         );
-        println!("           NeoX rope and the tensor layout are assumed. If the output");
-        println!("           is fluent but wrong, that assumption is the first suspect.");
+        bigtea_arch::info!("           NeoX rope and the tensor layout are assumed. If the output");
+        bigtea_arch::info!("           is fluent but wrong, that assumption is the first suspect.");
     }
 
     // Fail on a missing tensor now, not at layer 37.
@@ -1396,7 +1473,7 @@ fn run(
         system_prompt.as_deref(),
     );
     let mut tokens: Vec<u32> = tokenizer.encode(prompt);
-    println!("prompt     {prompt:?} -> {} tokens", tokens.len());
+    bigtea_arch::info!("prompt     {prompt:?} -> {} tokens", tokens.len());
     if tokens.is_empty() {
         return Err("prompt encoded to zero tokens".into());
     }
@@ -1427,6 +1504,7 @@ fn run(
             stop,
             perplexity,
             ui,
+            show_perf,
             t0,
         );
     }
@@ -1456,7 +1534,7 @@ fn run(
         bound_bytes += data.len() as u64;
         weights.bind(&weight_ctx, "output.weight", loc.ty, &loc.dims, data)?;
     }
-    println!(
+    bigtea_arch::info!(
         "weights    {} tensors, {:.2} GiB bound in {:.1}s (zero-copy)",
         weights.len(),
         bound_bytes as f64 / GIB,
@@ -1468,7 +1546,7 @@ fn run(
     // bug rather than the 1.7x it is worth.
     let threads = bigtea_arch::configured_threads();
     let threads_batch = bigtea_arch::configured_threads_batch();
-    println!("threads    {threads} generating, {threads_batch} prefilling");
+    bigtea_arch::info!("threads    {threads} generating, {threads_batch} prefilling");
 
     // --- generate ----------------------------------------------------------
     println!("\n{prompt}");
@@ -1551,11 +1629,11 @@ fn run(
     let secs = gen_start.elapsed().as_secs_f64();
     let count = tokens.len() - tokenizer.encode(prompt).len();
     println!("\n");
-    println!(
+    bigtea_arch::info!(
         "generated  {count} tokens in {secs:.1}s ({:.2} tok/s)",
         count as f64 / secs.max(1e-9)
     );
-    println!("total      {:.1}s", t0.elapsed().as_secs_f64());
+    bigtea_arch::info!("total      {:.1}s", t0.elapsed().as_secs_f64());
     if produced.trim().is_empty() {
         println!("\n! produced no visible text -- check the forward pass");
     }
@@ -1599,7 +1677,7 @@ fn report_residency_shortfall(report: &bigtea_model::LoadReport, machine: &bigte
     } else {
         1e9
     };
-    println!(
+    bigtea_arch::info!(
         "           {:.2} GiB will be re-read from disk on EVERY token (~{:.1}s each)",
         missing as f64 / GIB,
         missing as f64 / rate
@@ -1607,11 +1685,11 @@ fn report_residency_shortfall(report: &bigtea_model::LoadReport, machine: &bigte
 
     let holders = bigtea_probe::processes::grouped(256 << 20);
     if holders.is_empty() {
-        println!("           nothing large is closeable; this model needs more RAM than this machine has");
+        bigtea_arch::info!("           nothing large is closeable; this model needs more RAM than this machine has");
         return;
     }
     let free: u64 = holders.iter().map(|(_, b, _)| *b).sum();
-    println!(
+    bigtea_arch::info!(
         "           closing these would free up to {:.2} GiB:",
         free as f64 / GIB
     );
@@ -1621,12 +1699,12 @@ fn report_residency_shortfall(report: &bigtea_model::LoadReport, machine: &bigte
         } else {
             String::new()
         };
-        println!("             {name:<28} {:.2} GiB{n}", *bytes as f64 / GIB);
+        bigtea_arch::info!("             {name:<28} {:.2} GiB{n}", *bytes as f64 / GIB);
     }
     if free >= missing {
-        println!("           that is enough to make the whole model resident.");
+        bigtea_arch::info!("           that is enough to make the whole model resident.");
     } else {
-        println!(
+        bigtea_arch::info!(
             "           still {:.2} GiB short after that — a smaller quant would fit.",
             (missing - free) as f64 / GIB
         );
@@ -1653,7 +1731,7 @@ fn run_deepseek4(
         return Err("empty prompt".into());
     }
 
-    println!(
+    bigtea_arch::info!(
         "shape      {} blocks, {} embd, {} heads, {} experts ({} used, {} shared)",
         config.n_layer,
         config.n_embd,
@@ -1662,7 +1740,7 @@ fn run_deepseek4(
         config.n_expert_used,
         config.n_expert_shared
     );
-    println!("prompt     {} tokens", tokens.len());
+    bigtea_arch::info!("prompt     {} tokens", tokens.len());
 
     // Hold the always-read weights in RAM. Without this every block re-reads
     // them from disk on every forward pass — 23% of a prefill, and the whole
@@ -1678,7 +1756,7 @@ fn run_deepseek4(
     let reserve = ((arena_mib as u64) << 20) + (512 << 20) + (768 << 20);
     let budget = machine.usable_ram_for_weights(reserve);
     let (mut resident, report) = ResidentSet::load(model, budget)?;
-    println!("resident   {report}");
+    bigtea_arch::info!("resident   {report}");
     report_residency_shortfall(&report, &machine);
 
     // Rearrange the always-read weights into the layout the CPU kernels want,
@@ -1695,13 +1773,15 @@ fn run_deepseek4(
     let repacked = bigtea_arch::RepackedDense::build(&mut resident, model)?;
     let (n_repacked, repacked_bytes, declined) = repacked.stats();
     if n_repacked > 0 {
-        println!(
+        bigtea_arch::info!(
             "repacked   {n_repacked} tensors, {:.2} GiB in the CPU kernels' layout, {:.1}s",
             repacked_bytes as f64 / GIB,
             repack_start.elapsed().as_secs_f64()
         );
         if declined > 0 {
-            println!("repacked   {declined} declined by ggml and left in their stored layout");
+            bigtea_arch::info!(
+                "repacked   {declined} declined by ggml and left in their stored layout"
+            );
         }
     }
 
@@ -1748,14 +1828,16 @@ fn run_deepseek4(
     let shortfall = report.skipped_over_budget;
     let expert_budget = match expert_cache_budget {
         Some(b) if b > 0 && shortfall > 0 => {
-            println!(
+            bigtea_arch::info!(
                 "cache      refusing {:.2} GiB for experts: {:.2} GiB of always-read",
                 b as f64 / GIB,
                 shortfall as f64 / GIB
             );
-            println!("cache      weights is still streaming, and a resident byte is read");
-            println!("cache      every token (100%) against ~13% for a cached expert.");
-            println!(
+            bigtea_arch::info!(
+                "cache      weights is still streaming, and a resident byte is read"
+            );
+            bigtea_arch::info!("cache      every token (100%) against ~13% for a cached expert.");
+            bigtea_arch::info!(
                 "cache      Free ~{:.1} GiB and it becomes worth having.",
                 shortfall as f64 / GIB
             );
@@ -1766,14 +1848,14 @@ fn run_deepseek4(
     };
     if expert_budget > 0 {
         fw = fw.with_expert_cache(expert_budget as usize);
-        println!(
+        bigtea_arch::info!(
             "cache      {:.2} GiB for routed experts, warmed from the prompt (not pinned)",
             expert_budget as f64 / GIB
         );
     } else if shortfall == 0 && expert_cache_budget.is_none() {
-        println!("cache      off. The always-read set fits, so --cache <GiB> is now");
-        println!("cache      worth measuring: a cached step reads 6 experts per layer,");
-        println!("cache      not the ~123 a long prefill does.");
+        bigtea_arch::info!("cache      off. The always-read set fits, so --cache <GiB> is now");
+        bigtea_arch::info!("cache      worth measuring: a cached step reads 6 experts per layer,");
+        bigtea_arch::info!("cache      not the ~123 a long prefill does.");
     }
     let fw = fw;
     if !fw.indexer_is_exact(tokens.len()) {
@@ -1784,7 +1866,7 @@ fn run_deepseek4(
             tokens.len()
         );
     }
-    println!("loaded     {:.1}s", t0.elapsed().as_secs_f64());
+    bigtea_arch::info!("loaded     {:.1}s", t0.elapsed().as_secs_f64());
 
     let t_prefill = std::time::Instant::now();
     let mut seq = tokens.clone();
@@ -1793,7 +1875,7 @@ fn run_deepseek4(
     let mut kv = bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
     let logits = bigtea_arch::forward(&fw, &mut kv, &seq, arena_mib << 20)?;
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
-    println!(
+    bigtea_arch::info!(
         "prefill    {} tokens in {prefill_secs:.1}s ({:.2} tok/s)",
         seq.len(),
         seq.len() as f64 / prefill_secs
@@ -1848,7 +1930,7 @@ fn run_deepseek4(
     // configuration it had, because the cached bytes were being paged out — so a
     // hit rate on its own is not evidence of anything.
     if let Some((stats, bytes)) = fw.cache_stats() {
-        println!(
+        bigtea_arch::info!(
             "cache      {:.1}% hits ({} of {}), {:.2} GiB resident of {:.2} GiB, \
              {} evictions, {:.1} GiB not read",
             stats.hit_rate() * 100.0,

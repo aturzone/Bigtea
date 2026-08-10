@@ -14,12 +14,12 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 
 | bucket | flags | state |
 |---|---:|---|
-| **have** | **58** | done |
+| **have** | **69** | done |
 | **samplers** | 22 | **13 done 2026-08-10**, DRY (5) + `--samplers` ordering (3) left |
 | interaction / prompt handling | 22 | **done 2026-08-11** — including a real REPL |
 | runtime / threading / memory | 31 | mostly gap; several are meaningless here |
 | RoPE, YaRN, context shift | 15 | **9 done 2026-08-11**; the other 6 refused, see below |
-| logging | 13 | gap, cheap |
+| logging | 13 | **11 done 2026-08-11**; status moved to stderr |
 | **GPU** | 15 | **won't** — no backend to apply them to |
 | fetch / Hugging Face | 9 | partly covered by `bigtea-pull`, different spelling |
 | reasoning / speculative draft | 8 | gap |
@@ -27,7 +27,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 | chat template | 6 | 2 done (detection), `--jinja` won't |
 | LoRA / control vectors | 5 | gap |
 | grammar / JSON schema | 4 | gap |
-| meta (`--help`, `--version`) | 4 | 1 done |
+| meta (`--help`, `--version`) | 4 | 2 done |
 
 **"All of them" is not the right target and this table is why.** Fifteen are
 GPU-only on an engine with no GPU backend; several more (`--no-mmap`,
@@ -128,6 +128,38 @@ printed.
 not implemented), `--context-shift`/`--no-context-shift` and `--defrag-thold`
 (no context shift and no KV fragmentation to threshold), `--swa-full` (we always
 keep the full window cache, so the flag has nothing to switch).
+
+## Done 2026-08-11 — logging, and the bug underneath it
+
+`--log-disable`, `--log-file`, `--log-timestamps`/`--no-log-timestamps`,
+`--log-prefix`/`--no-log-prefix`, `-v`/`--verbose`/`--log-verbose`,
+`--verbosity`/`--log-verbosity`, `--perf`/`--no-perf`, `--version`.
+
+**The flags are the smaller half. The real change is that status now goes to
+stderr.** Everything the runner says about itself — shape, residency, prefill
+timing — is diagnostics; the generated text is output. They shared stdout, so
+`bigtea-run … > answer.txt` captured a 16-line header along with the answer and
+there was no way to separate them.
+
+```
+$ bigtea-run <llama-3.2-1b> "The capital of France is" -n 6 --log-disable 2>/dev/null
+ Paris. The capital of France
+
+$ bigtea-run … --log-file bt.log 2>/dev/null | head -3
+ Paris. The capital of France
+   [bt.log: 16 lines, starting "model      llama (direct (cache bypassed))"]
+
+$ bigtea-run … --log-timestamps --log-prefix
+   0.152 I model      llama (direct (cache bypassed))
+```
+
+`--version` is handled **before the positional model path is taken**. Parsed
+with the other flags it became the path, and the runner reported that it could
+not open a file called `--version`.
+
+Two of the thirteen are refused: `--log-colors` (status goes to a stream that
+may be a file; llama.cpp's colour applies to a level marker we render as one
+character) and `--no-host`, which is not a logging flag at all.
 
 ## Next batches, in order
 
