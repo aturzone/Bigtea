@@ -41,14 +41,14 @@ deep:
 
 | ticket | what | unlocks | state |
 |---|---|---|---|
-| **A1** | make QK-norm optional in the dense path | `llama`, `mistral`, `qwen2` structurally | **gap — small** |
-| **A2** | SPM tokenizer (`tokenizer.ggml.model = "llama"`) | the whole Llama/Mistral family's text | **gap — medium** |
-| **A3** | accept the `llama` arch name and its metadata aliases | Llama 1/2/3, TinyLlama, CodeLlama, Vicuna, most finetunes | gap |
+| **A1** | make QK-norm optional in the dense path | `llama`, `mistral`, `qwen2` structurally | **DONE** |
+| **A2** | SPM tokenizer (`tokenizer.ggml.model = "llama"`) | the whole Llama/Mistral family's text | **DONE** — verified on TinyLlama |
+| **A3** | accept the `llama` arch name and its metadata aliases | Llama 1/2/3, TinyLlama, CodeLlama, Vicuna, most finetunes | **DONE** — verified on TinyLlama and Llama-3.2 |
 | A4 | `gemma`/`gemma2` (post-norm, logit soft-cap, tied embeddings) | Gemma family | gap |
 | A5 | `phi3`, `qwen2` explicit | Phi, Qwen2 | gap |
 | A6 | WPM + UGM tokenizers | BERT-family, T5-family | gap |
 | A7 | tied embeddings (`output.weight` absent → reuse `token_embd`) | many small models | gap |
-| A8 | a clear error naming the *architecture* and what is missing | every unsupported model | gap |
+| A8 | a clear error naming the *architecture* and what is missing | every unsupported model | **partial** — an unverified architecture now says its RoPE layout is a guess |
 
 **A8 is not cosmetic and should land first.** "Open any model" fails safely only
 if the failure says which architecture, which tensor, and whether it is a gap or
@@ -84,8 +84,8 @@ reads + ~0.6 s of everything else, so with R2 overlap it is **~0.65 tok/s agains
 
 | ticket | what | state |
 |---|---|---|
-| C1 | sampling: temperature, top-k, top-p, min-p, repeat penalty, seed | **gap — greedy only today** |
-| C2 | chat templates from `tokenizer.chat_template` | **gap** |
+| C1 | sampling: temperature, top-k, top-p, min-p, repeat penalty, seed | **DONE 2026-08-10** — 10 unit tests, `--llamacpp-defaults` for like-for-like comparison |
+| C2 | chat templates from `tokenizer.chat_template` | **DONE 2026-08-10** — 9 families, detected from the real templates; control tokens encode to single ids |
 | C3 | streaming responses (SSE) in `bigtea-serve` | gap |
 | C4 | `-c` context size, `-b` batch, `-t` threads as flags | partial |
 | C5 | stop sequences, `max_tokens`, `n_predict` | partial |

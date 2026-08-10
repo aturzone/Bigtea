@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use bigtea_arch::{KvCache, Qwen3Config, Qwen3Model, Sampler, SamplerConfig};
 use bigtea_ggml::{Context, WeightSet};
 use bigtea_model::{Model, ResidentSet};
-use bigtea_tokenizer::Tokenizer;
+use bigtea_tokenizer::{Message, Tokenizer};
 
 const GIB: f64 = (1u64 << 30) as f64;
 
@@ -58,6 +58,28 @@ impl TokenWriter {
     }
 }
 
+/// Apply the model's chat template when asked, and say which one was used.
+///
+/// An instruct model trained on `<|im_start|>user` does not fail on raw text —
+/// it continues it. Asked to "Write one sentence about the sea", Llama-3.2
+/// answered "The sentence should be concise and evocative", because it was
+/// completing an instruction rather than following one.
+fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool) -> String {
+    if !chat {
+        return prompt.to_string();
+    }
+    let format = tokenizer.chat_format();
+    if format.is_known() {
+        println!("chat       {} template", format.name());
+    } else {
+        // Do not pretend. An unrecognised template framed as someone else's is
+        // how a model quietly answers the wrong question.
+        println!("chat       template not recognised -- using a plain framing;");
+        println!("           the model may not respond as an assistant.");
+    }
+    tokenizer.apply_chat_template(&[Message::new("user", prompt)], true)
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
@@ -75,6 +97,7 @@ fn main() -> ExitCode {
         eprintln!("  --repeat-last-n N   penalty window (default 64)");
         eprintln!("  --seed S            reproducible sampling");
         eprintln!("  --llamacpp-defaults temp 0.8, top-k 40, top-p 0.95, min-p 0.05, repeat 1.1");
+        eprintln!("  --chat              apply the model's chat template to the prompt");
         return ExitCode::from(2);
     };
     let mut prompt = String::new();
@@ -88,6 +111,7 @@ fn main() -> ExitCode {
     let mut cache_budget: Option<u64> = None;
     // Greedy by default, so existing behaviour is unchanged until asked.
     let mut sampler = SamplerConfig::default();
+    let mut chat = false;
     let rest: Vec<String> = args.collect();
     let mut i = 0;
     while i < rest.len() {
@@ -131,6 +155,13 @@ fn main() -> ExitCode {
             "--seed" => {
                 sampler.seed = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0);
                 i += 2;
+            }
+            // Frame the prompt as a chat turn, the way the model was trained.
+            // Off by default: a raw prompt is still the right thing for a base
+            // model and for diagnosing the forward pass.
+            "--chat" => {
+                chat = true;
+                i += 1;
             }
             // One flag for "sample the way llama.cpp does by default", so a
             // quality comparison is not silently comparing sampler settings.
@@ -183,6 +214,7 @@ fn main() -> ExitCode {
         prefill_block,
         cache_budget,
         sampler,
+        chat,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -350,6 +382,7 @@ fn run(
     prefill_block: usize,
     cache_budget: Option<u64>,
     sampler: SamplerConfig,
+    chat: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
 
@@ -361,6 +394,7 @@ fn run(
     if model.architecture() == "deepseek4" {
         println!("model      {} ({})", model.architecture(), model.io_mode());
         let tokenizer = Tokenizer::from_metadata(model.metadata())?;
+        let prompt = &framed(&tokenizer, prompt, chat);
         run_deepseek4(
             &model,
             &tokenizer,
@@ -416,6 +450,7 @@ fn run(
 
     // --- tokenizer ---------------------------------------------------------
     let tokenizer = Tokenizer::from_metadata(model.metadata())?;
+    let prompt = &framed(&tokenizer, prompt, chat);
     let mut tokens: Vec<u32> = tokenizer.encode(prompt);
     println!("prompt     {prompt:?} -> {} tokens", tokens.len());
     if tokens.is_empty() {

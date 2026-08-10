@@ -322,6 +322,47 @@ permanently. `decode_bytes` returns bytes and generation now buffers to a valid
 UTF-8 boundary. **This affected the BPE path too**, so it was breaking non-ASCII
 output on every model, not just the new ones.
 
+## C2 chat templates — instruct models now actually answer (2026-08-10)
+
+The single largest quality gap, and it was invisible because nothing errored.
+
+**Same model, same prompt, greedy decoding, Llama-3.2-1B:**
+
+| | answer |
+|---|---|
+| raw prompt (before) | *"The sentence should be concise and evocative, using sensory details…"* |
+| `--chat` (after) | *"The vast expanse of the ocean stretches out before us, a seemingly endless blue canvas of waves, tides, and mysteries…"* |
+
+An instruct model handed raw text does not fail — it **completes the
+instruction instead of following it**. Every quality impression of this runner
+so far was formed against that.
+
+**Detection, not Jinja evaluation.** GGUF stores the template as Jinja2;
+Llama-3's alone uses `set`, `if defined`, loops and tool-call branches. llama.cpp
+does not evaluate them either — it matches known families by substring and
+applies a hardcoded formatter, and so does this. Nine families: chatml, llama3,
+llama2, mistral, zephyr, phi3, gemma, vicuna, alpaca. An unrecognised template
+reports itself **not recognised** rather than borrowing someone else's framing.
+
+Verified against the real templates in the containers on this machine:
+
+| model | template detected |
+|---|---|
+| TinyLlama-1.1B | zephyr |
+| Llama-3.2-1B | llama3 |
+| Qwen3-4B | chatml |
+
+**The invisible half — control tokens.** Applying the template changed nothing
+at first. `<|start_header_id|>` was being run through BPE and split into `<`,
+`|`, `start`, … — pieces the model has never seen in that position — so the
+framed prompt was just characters and the model answered as if given raw text.
+There is no error anywhere in that path. `encode` now partitions on the
+container's CONTROL and USER_DEFINED tokens and maps each to its own id;
+the framed prompt above is **17 tokens**, not 40-odd.
+
+`bigtea-serve` now parses `messages[]` with roles in order and applies the
+template, instead of concatenating the contents.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

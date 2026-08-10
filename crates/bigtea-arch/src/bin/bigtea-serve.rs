@@ -36,7 +36,7 @@ use std::process::ExitCode;
 
 use bigtea_arch::{Deepseek4Cache, Deepseek4Config, Deepseek4Forward};
 use bigtea_model::{Model, ResidentSet};
-use bigtea_tokenizer::Tokenizer;
+use bigtea_tokenizer::{Message, Tokenizer};
 
 const GIB: f64 = (1u64 << 30) as f64;
 
@@ -256,7 +256,11 @@ fn complete(
     tokenizer: &Tokenizer,
     config: &Deepseek4Config,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let prompt = extract_prompt(body)?;
+    let messages = extract_messages(body)?;
+    // The framing the model was trained on. Concatenating the contents -- what
+    // this did before -- makes an instruct model continue the conversation
+    // rather than answer it.
+    let prompt = tokenizer.apply_chat_template(&messages, true);
     let max_tokens = extract_int(body, "max_tokens").unwrap_or(64).clamp(1, 4096) as usize;
 
     let tokens: Vec<i32> = tokenizer
@@ -326,30 +330,55 @@ fn argmax(v: &[f32]) -> i32 {
 /// HTTP crate: the shape is fixed and known. It handles what a client actually
 /// sends — `messages: [{role, content}]` — and refuses anything it does not
 /// understand instead of guessing.
-fn extract_prompt(body: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let mut prompt = String::new();
+/// Pull `messages[]` out of a chat-completions body, in order, with roles.
+///
+/// Hand-rolled because this crate has no JSON dependency. It reads `"role"` and
+/// `"content"` pairs in document order, which is what the OpenAI schema
+/// guarantees, and refuses anything it cannot represent rather than sending the
+/// model half a request.
+fn extract_messages(body: &str) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+    let mut out: Vec<Message> = Vec::new();
     let mut rest = body;
-    while let Some(at) = rest.find("\"content\"") {
-        rest = &rest[at + "\"content\"".len()..];
-        let Some(colon) = rest.find(':') else { break };
-        let after = rest[colon + 1..].trim_start();
-        if !after.starts_with('"') {
-            // Non-string content (an array of parts, say). Refuse rather than
-            // silently send the model half a request.
-            return Err("only string `content` is supported".into());
+    // Track the most recent role so a content field is attributed correctly
+    // even though the two keys are separate.
+    let mut pending_role = String::from("user");
+    loop {
+        let role_at = rest.find("\"role\"");
+        let content_at = rest.find("\"content\"");
+        match (role_at, content_at) {
+            (Some(r), Some(c)) if r < c => {
+                let after = rest[r + "\"role\"".len()..].trim_start();
+                let Some(colon) = after.find(':') else { break };
+                let val = after[colon + 1..].trim_start();
+                if let Some(body) = val.strip_prefix('"') {
+                    let (text, _) = read_json_string(body)?;
+                    pending_role = text;
+                }
+                let off = rest.len() - after.len() + colon + 1;
+                rest = &rest[off..];
+            }
+            (_, Some(c)) => {
+                let after = rest[c + "\"content\"".len()..].trim_start();
+                let Some(colon) = after.find(':') else { break };
+                let val = after[colon + 1..].trim_start();
+                if !val.starts_with('"') {
+                    // An array of content parts (images, audio). Refusing is
+                    // the honest answer -- this runner is text only.
+                    return Err("only string `content` is supported".into());
+                }
+                let (text, consumed) = read_json_string(&val[1..])?;
+                out.push(Message::new(&pending_role, &text));
+                pending_role = String::from("user");
+                let off = rest.len() - val.len() + 1 + consumed;
+                rest = &rest[off..];
+            }
+            _ => break,
         }
-        let (text, consumed) = read_json_string(&after[1..])?;
-        if !prompt.is_empty() {
-            prompt.push('\n');
-        }
-        prompt.push_str(&text);
-        let offset = rest.len() - after.len() + 1 + consumed;
-        rest = &rest[offset..];
     }
-    if prompt.is_empty() {
+    if out.is_empty() {
         return Err("no `messages[].content` in the request body".into());
     }
-    Ok(prompt)
+    Ok(out)
 }
 
 /// Read a JSON string body (the opening quote already consumed).
@@ -418,17 +447,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_normal_chat_request_yields_its_messages() {
+    fn a_normal_chat_request_yields_its_messages_with_roles() {
         let body = r#"{"model":"x","messages":[{"role":"system","content":"Be brief."},
                       {"role":"user","content":"Hello"}],"max_tokens":16}"#;
-        assert_eq!(extract_prompt(body).unwrap(), "Be brief.\nHello");
+        let msgs = extract_messages(body).unwrap();
+        assert_eq!(msgs.len(), 2);
+        // Roles must survive: a system turn framed as a user turn is a
+        // different prompt, and the model answers it differently.
+        assert_eq!(msgs[0], Message::new("system", "Be brief."));
+        assert_eq!(msgs[1], Message::new("user", "Hello"));
         assert_eq!(extract_int(body, "max_tokens"), Some(16));
     }
 
     #[test]
     fn escapes_survive_the_round_trip() {
         let body = r#"{"messages":[{"role":"user","content":"say \"hi\"\nand a tab\there"}]}"#;
-        let got = extract_prompt(body).unwrap();
+        let got = extract_messages(body).unwrap().remove(0).content;
         assert_eq!(got, "say \"hi\"\nand a tab\there");
         // And what comes back out must be valid JSON again.
         let e = escape(&got);
@@ -444,12 +478,12 @@ mod tests {
         // Multimodal clients send an array of parts. Sending the model a
         // half-understood request is worse than saying no.
         let body = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#;
-        assert!(extract_prompt(body).is_err());
+        assert!(extract_messages(body).is_err());
     }
 
     #[test]
     fn a_request_without_content_is_an_error() {
-        assert!(extract_prompt(r#"{"model":"x"}"#).is_err());
+        assert!(extract_messages(r#"{"model":"x"}"#).is_err());
     }
 
     #[test]

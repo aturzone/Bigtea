@@ -13,10 +13,12 @@
 //! (byte mapping, splitting, merging) rather than only end to end.
 
 mod bytes;
+pub mod chat;
 mod pretok;
 pub mod spm;
 
 pub use bytes::{decode as bytes_decode, encode as bytes_encode};
+pub use chat::{ChatFormat, Message};
 pub use pretok::pre_tokenize;
 
 /// Which tokenization rule a container asks for.
@@ -89,6 +91,20 @@ pub struct Tokenizer {
     pub eos: Option<u32>,
     pub add_bos: bool,
     pub add_eos: bool,
+    /// The raw Jinja template, kept so the chat format can be identified and
+    /// so a caller can print it when the format is not recognised.
+    chat_template: Option<String>,
+    /// Control tokens, longest first, with their ids.
+    ///
+    /// These must be matched **literally in the text and mapped to one id**.
+    /// Running `<|start_header_id|>` through BPE splits it into `<`, `|`,
+    /// `start`, … — pieces the model has never seen in that position — so a
+    /// chat template applies without error and the model answers as though it
+    /// had been given raw text. That is precisely what happened here: framing
+    /// Llama-3.2 changed nothing until this existed.
+    ///
+    /// Longest first so `<|eot_id|>` cannot be shadowed by a shorter prefix.
+    specials: Vec<(String, u32)>,
 }
 
 impl Tokenizer {
@@ -136,6 +152,29 @@ impl Tokenizer {
             }
         }
 
+        // GGUF token types: 1 NORMAL, 2 UNKNOWN, 3 CONTROL, 4 USER_DEFINED,
+        // 5 UNUSED, 6 BYTE. CONTROL and USER_DEFINED are the ones that must be
+        // matched literally rather than merged.
+        let mut specials: Vec<(String, u32)> = Vec::new();
+        if let Some(types) = meta
+            .get("tokenizer.ggml.token_type")
+            .and_then(Value::as_array)
+        {
+            for (i, t) in types.iter().enumerate() {
+                let ty = t.as_u64().unwrap_or(1);
+                if (ty == 3 || ty == 4) && i < tokens.len() {
+                    let text = &tokens[i];
+                    // A single character marked USER_DEFINED is not a marker
+                    // worth partitioning on, and matching one would slice
+                    // ordinary text apart.
+                    if text.len() > 2 {
+                        specials.push((text.clone(), i as u32));
+                    }
+                }
+            }
+        }
+        specials.sort_by_key(|(text, _)| std::cmp::Reverse(text.len()));
+
         let id_of = |key: &str| meta.get(key).and_then(Value::as_u64).map(|v| v as u32);
         let flag = |key: &str| matches!(meta.get(key), Some(Value::Bool(true)));
 
@@ -178,6 +217,11 @@ impl Tokenizer {
                 _ => kind == Kind::Spm,
             },
             add_eos: flag("tokenizer.ggml.add_eos_token"),
+            chat_template: meta
+                .get("tokenizer.chat_template")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            specials,
         })
     }
 
@@ -197,11 +241,91 @@ impl Tokenizer {
         self.kind
     }
 
+    pub fn chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
+    }
+
+    /// Which chat framing this container asks for.
+    pub fn chat_format(&self) -> ChatFormat {
+        ChatFormat::detect(self.chat_template())
+    }
+
+    /// Render messages into the prompt string this model was trained on.
+    ///
+    /// The end-of-sequence *text* comes from the vocabulary rather than being
+    /// assumed to be `</s>`: Zephyr and Llama-2 embed it between turns, and a
+    /// wrong one there is a token the model has never seen in that position.
+    pub fn apply_chat_template(&self, messages: &[Message], add_generation_prompt: bool) -> String {
+        let eos = self
+            .eos
+            .and_then(|id| self.token_text(id))
+            .unwrap_or("</s>");
+        self.chat_format()
+            .apply(messages, eos, add_generation_prompt)
+    }
+
     /// Encode text to token ids, honouring the container's add_bos/add_eos.
+    ///
+    /// Control tokens in the text (`<|im_start|>`, `<|eot_id|>`, …) are mapped
+    /// to their own ids rather than merged — see [`Self::specials`].
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
         if self.add_bos {
             out.extend(self.bos);
+        }
+        // Split on control tokens first, then run the ordinary algorithm on the
+        // text between them. Without this a chat template is just characters.
+        for (piece, special) in self.partition_specials(text) {
+            match special {
+                Some(id) => out.push(id),
+                None => self.encode_plain(&piece, &mut out),
+            }
+        }
+        if self.add_eos {
+            out.extend(self.eos);
+        }
+        out
+    }
+
+    /// Cut `text` into ordinary spans and control tokens, in order.
+    fn partition_specials(&self, text: &str) -> Vec<(String, Option<u32>)> {
+        if self.specials.is_empty() || text.is_empty() {
+            return vec![(text.to_string(), None)];
+        }
+        let mut out = Vec::new();
+        let mut rest = text;
+        'outer: while !rest.is_empty() {
+            // Earliest match wins; ties break to the longest, which is why
+            // `specials` is sorted longest-first.
+            let mut best: Option<(usize, &String, u32)> = None;
+            for (tok, id) in &self.specials {
+                if let Some(at) = rest.find(tok.as_str()) {
+                    if best.is_none_or(|(b, _, _)| at < b) {
+                        best = Some((at, tok, *id));
+                    }
+                }
+            }
+            match best {
+                Some((at, tok, id)) => {
+                    if at > 0 {
+                        out.push((rest[..at].to_string(), None));
+                    }
+                    out.push((tok.clone(), Some(id)));
+                    rest = &rest[at + tok.len()..];
+                }
+                None => {
+                    out.push((rest.to_string(), None));
+                    break 'outer;
+                }
+            }
+        }
+        out
+    }
+
+    /// The ordinary path, with no special-token handling.
+    fn encode_plain(&self, text: &str, out: &mut Vec<u32>) {
+        if text.is_empty() {
+            return;
         }
         if self.kind == Kind::Spm {
             // No pre-tokenizer: SentencePiece works on the whole string, and
@@ -213,10 +337,7 @@ impl Tokenizer {
                 &self.scores,
                 self.add_dummy_prefix,
             ));
-            if self.add_eos {
-                out.extend(self.eos);
-            }
-            return out;
+            return;
         }
         for piece in pre_tokenize(text) {
             let encoded = bytes::encode(piece.as_bytes());
@@ -235,10 +356,6 @@ impl Tokenizer {
                 }
             }
         }
-        if self.add_eos {
-            out.extend(self.eos);
-        }
-        out
     }
 
     /// Decode ids back to text.
