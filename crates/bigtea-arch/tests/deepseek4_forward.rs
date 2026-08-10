@@ -3294,7 +3294,7 @@ fn attention_5tok<'c>(
     // of hole the one-token RoPE capture had. Running the kernel without them
     // must give a different number.
     let no_sinks = ctx
-        .flash_attn_ext(&q_perm, &k, &k, &mask, scale)
+        .flash_attn_ext(&q_perm, &k, &k, &mask, scale, 0.0)
         .expect("flash_attn_ext without sinks");
     ctx.compute(&no_sinks, 12).expect("compute attention");
     let without: f32 = no_sinks.to_vec_f32().iter().sum();

@@ -69,7 +69,8 @@ fn rope_type_for(arch: &str) -> (i32, bool) {
 /// So the default is to refuse an architecture nobody has checked. `--force`
 /// runs it anyway, which is the right escape hatch for someone testing a new
 /// architecture — but it has to be asked for.
-pub const VERIFIED_ARCHITECTURES: &[&str] = &["deepseek4", "llama", "phi3", "qwen3", "qwen3moe"];
+pub const VERIFIED_ARCHITECTURES: &[&str] =
+    &["deepseek4", "gemma2", "llama", "phi3", "qwen3", "qwen3moe"];
 
 /// Whether this build has been run against `arch` and had its output checked.
 pub fn architecture_is_verified(arch: &str) -> bool {
@@ -122,6 +123,24 @@ pub struct Qwen3Config {
     ///
     /// Also Phi-3. `ffn_up` is `2 * n_ff` rows: gate first, then up.
     pub fused_gate_up: bool,
+    /// Gemma normalises again *after* attention and *after* the FFN, on top of
+    /// the pre-norms every other architecture here uses.
+    ///
+    /// Detected from the container. Omitting these does not fail — the residual
+    /// stream simply drifts, and the model answers fluently and wrongly.
+    pub post_norms: bool,
+    /// Multiply the embeddings by `sqrt(n_embd)` on the way in. Gemma only.
+    pub scale_embeddings: bool,
+    /// `tanh` soft cap on attention logits; `0.0` means none. Gemma-2 uses 50.
+    pub attn_logit_softcap: f32,
+    /// `tanh` soft cap on the final logits; `0.0` means none. Gemma-2 uses 30.
+    pub final_logit_softcap: f32,
+    /// Sliding-window attention width, `0` for full attention.
+    ///
+    /// Gemma-2 alternates full and windowed layers. Below the window every
+    /// layer is effectively full, which is why a short prompt cannot reveal a
+    /// missing implementation — see the length guard in `Qwen3Config::verify`.
+    pub sliding_window: u32,
 }
 
 impl Qwen3Config {
@@ -177,11 +196,37 @@ impl Qwen3Config {
             fused_qkv: model.location("blk.0.attn_qkv.weight").is_some(),
             fused_gate_up: model.location("blk.0.ffn_gate.weight").is_none()
                 && model.location("blk.0.ffn_up.weight").is_some(),
+            post_norms: model.location("blk.0.post_attention_norm.weight").is_some(),
+            // Gemma scales by sqrt(n_embd) on the way in. Keyed on the
+            // architecture because nothing in the weights reveals it.
+            scale_embeddings: arch.starts_with("gemma"),
+            attn_logit_softcap: model.arch_f32("attn_logit_softcapping").unwrap_or(0.0),
+            final_logit_softcap: model.arch_f32("final_logit_softcapping").unwrap_or(0.0),
+            sliding_window: model.arch_u64("attention.sliding_window").unwrap_or(0) as u32,
         })
     }
 
     pub fn is_moe(&self) -> bool {
         self.n_expert > 0 && self.n_expert_used > 0
+    }
+
+    /// The longest sequence this build can run *correctly* for this model.
+    ///
+    /// Gemma-2 alternates full-attention and sliding-window layers. **The
+    /// window is not implemented here**, and below it every layer is
+    /// effectively full attention — so short sequences are exactly right and
+    /// long ones would silently let the local layers see too far.
+    ///
+    /// Refusing past the window is the honest boundary. It is not a limit of
+    /// the architecture, it is a limit of this implementation, and saying so is
+    /// the difference between a clear refusal and confident nonsense at 5000
+    /// tokens that nobody would trace back to attention.
+    pub fn correct_context_limit(&self) -> usize {
+        if self.sliding_window > 0 {
+            self.sliding_window as usize
+        } else {
+            usize::MAX
+        }
     }
 
     /// Scale applied to attention scores before softmax.
@@ -279,6 +324,11 @@ impl Qwen3Model {
         for il in 0..c.n_layer {
             for suffix in ["attn_norm.weight", "attn_output.weight", "ffn_norm.weight"] {
                 names.push(format!("blk.{il}.{suffix}"));
+            }
+            if c.post_norms {
+                for suffix in ["post_attention_norm.weight", "post_ffw_norm.weight"] {
+                    names.push(format!("blk.{il}.{suffix}"));
+                }
             }
             if c.fused_qkv {
                 names.push(format!("blk.{il}.attn_qkv.weight"));
@@ -518,7 +568,7 @@ impl Qwen3Model {
         mask.set_bytes(mask_f16)?;
 
         // [head_dim, n_head, n_new], already permuted for the reshape.
-        let out = ctx.flash_attn_ext(&q, &k, &v, &mask, c.attn_scale())?;
+        let out = ctx.flash_attn_ext(&q, &k, &v, &mask, c.attn_scale(), c.attn_logit_softcap)?;
         Ok(ctx.reshape_2d(&ctx.cont(&out)?, (c.head_dim * c.n_head) as i64, n_new)?)
     }
 
@@ -734,6 +784,11 @@ mod tests {
             rope_type_is_known: true,
             fused_qkv: false,
             fused_gate_up: false,
+            post_norms: false,
+            scale_embeddings: false,
+            attn_logit_softcap: 0.0,
+            final_logit_softcap: 0.0,
+            sliding_window: 0,
         }
     }
 
@@ -863,15 +918,17 @@ mod tests {
 
     #[test]
     fn only_checked_architectures_are_called_verified() {
-        // The list is a claim about what has been RUN and read, not about what
-        // loads. Gemma-2 loads through this path without any error and answers
-        // "The capital of France is" with "himselff"; Phi-3 fails cleanly on a
-        // fused attn_qkv. Only the first kind is dangerous, and only refusing
-        // by default catches it.
-        for arch in ["deepseek4", "llama", "phi3", "qwen3", "qwen3moe"] {
+        // The list is a claim about what has been RUN and its output read, not
+        // about what loads. Before its post-norms and soft-capping were
+        // implemented, Gemma-2 loaded through this path with no error at all
+        // and answered "The capital of France is" with "himselff" — which is
+        // exactly why loading is not evidence of anything.
+        for arch in ["deepseek4", "gemma2", "llama", "phi3", "qwen3", "qwen3moe"] {
             assert!(architecture_is_verified(arch), "{arch} should be verified");
         }
-        for arch in ["gemma2", "gemma", "falcon", "mamba", "something-new"] {
+        // `gemma` (v1) is deliberately absent: it is close to `gemma2` but not
+        // identical, and nobody has run it.
+        for arch in ["gemma", "gemma3", "falcon", "mamba", "something-new"] {
             assert!(
                 !architecture_is_verified(arch),
                 "{arch} has not been checked and must not claim to be"

@@ -21,11 +21,11 @@ the real distance to "any model", and it is far larger than the performance gap.
 
 | | Bigtea | llama.cpp |
 |---|---|---|
-| architectures | 3 (`deepseek4`, `qwen3moe`, `qwen3`) | ~100 |
-| tokenizer families | 1 (`gpt2` BPE) | 6 (spm, bpe, wpm, ugm, rwkv, plamo2) |
+| architectures | **6** (`deepseek4`, `gemma2`, `llama`, `phi3`, `qwen3`, `qwen3moe`) | ~100 |
+| tokenizer families | **2** (`gpt2` BPE, `llama` SPM) | 6 (spm, bpe, wpm, ugm, rwkv, plamo2) |
 | quant types | all ggml can decode | same |
-| CLI flags | 3 | ~100 |
-| chat templates | none | ~40 |
+| CLI flags | **15** | ~100 |
+| chat templates | **9 families** | ~40 |
 | backends | CPU | CPU, CUDA, Metal, Vulkan, ROCm, SYCL |
 
 ## A. Open any model — the biggest gap, and the cheapest wins in it
@@ -44,7 +44,7 @@ deep:
 | **A1** | make QK-norm optional in the dense path | `llama`, `mistral`, `qwen2` structurally | **DONE** |
 | **A2** | SPM tokenizer (`tokenizer.ggml.model = "llama"`) | the whole Llama/Mistral family's text | **DONE** — verified on TinyLlama |
 | **A3** | accept the `llama` arch name and its metadata aliases | Llama 1/2/3, TinyLlama, CodeLlama, Vicuna, most finetunes | **DONE** — verified on TinyLlama and Llama-3.2 |
-| A4 | `gemma`/`gemma2` (post-norm, logit soft-cap, tied embeddings) | Gemma family | gap — **downloaded and confirmed broken**: loads with no error and answers `himſelf`. Needs post-norms, logit/attn soft-capping, `sqrt(n_embd)` embedding scaling, sliding-window attention |
+| A4 | `gemma`/`gemma2` | Gemma family | **gemma2 DONE 2026-08-10** — post-norms, attention soft-cap (50, into the fused kernel), final soft-cap (30), `sqrt(n_embd)` embedding scaling. Output matches llama.cpp exactly. **Refused past its 4096 sliding window**, which is not implemented |
 | A5 | `phi3`, `qwen2` explicit | Phi, Qwen2 | **phi3 DONE 2026-08-10** — fused `attn_qkv` *and* fused `ffn_up` split into views; verified against llama.cpp's own output |
 | A6 | WPM + UGM tokenizers | BERT-family, T5-family | gap |
 | A7 | tied embeddings (`output.weight` absent → reuse `token_embd`) | many small models | **DONE** — Llama-3.2-1B is tied and loads |

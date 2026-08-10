@@ -347,6 +347,17 @@ fn run_streaming(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
 
+    // Past this the implementation is wrong, not merely slow -- see
+    // `correct_context_limit`. Refusing is the only honest option.
+    let correct = config.correct_context_limit();
+    if tokens.len() + n_predict > correct {
+        return Err(format!(
+            "prompt is {} tokens and -n is {n_predict}, past the {correct} this build can run              correctly for this model (its sliding-window attention is not implemented, so              beyond the window the local layers would attend too far -- silently)",
+            tokens.len()
+        )
+        .into());
+    }
+
     // A context cap the user asked for, enforced before any work rather than
     // discovered as an arena abort partway through.
     if let Some(limit) = ctx_size {

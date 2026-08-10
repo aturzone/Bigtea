@@ -899,6 +899,36 @@ impl<'m> StreamingRunner<'m> {
         self.expert_ffn(x, il, router_probs)
     }
 
+    /// One post-norm applied to a whole activation buffer.
+    ///
+    /// Gemma normalises the attention output and the FFN output *before* each
+    /// rejoins the residual stream. Both arrive here as plain `Vec<f32>`
+    /// because the streaming path materialises between phases.
+    fn post_norm<'a>(
+        &self,
+        weights: &WeightSet<'a>,
+        il: u32,
+        values: &[f32],
+        n_new: i64,
+        suffix: &str,
+    ) -> Result<Vec<f32>> {
+        let n_embd = self.arch.config.n_embd as i64;
+        let name = format!("blk.{il}.{suffix}.weight");
+        let w = weights
+            .get(&name)
+            .copied()
+            .ok_or(ArchError::MissingTensor(name))?;
+        let ctx = Context::new(arena_for(&[(n_embd, n_new)], 12))?;
+        let t = ctx.new_f32_2d(n_embd, n_new)?;
+        t.set_f32(values)?;
+        let out = self.arch.norm_scaled(&ctx, &t, &w)?;
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        ctx.compute(&out, threads)?;
+        Ok(out.to_vec_f32())
+    }
+
     /// Incremental forward pass: computes only the new positions, attending
     /// over cached history.
     ///
@@ -964,6 +994,14 @@ impl<'m> StreamingRunner<'m> {
                 .get("token_embd.weight")
                 .ok_or_else(|| ArchError::MissingTensor("token_embd.weight".into()))?;
             let rows = ctx.get_rows(emb, &tok)?;
+            // Gemma multiplies the embeddings by sqrt(n_embd) on the way in.
+            // Skipping it does not fail -- every activation downstream is just
+            // the wrong magnitude, and the model answers fluently and wrongly.
+            let rows = if c.scale_embeddings {
+                ctx.scale(&rows, (c.n_embd as f32).sqrt())?
+            } else {
+                rows
+            };
             ctx.compute(&rows, threads)?;
             rows.to_vec_f32()
         };
@@ -1116,6 +1154,14 @@ impl<'m> StreamingRunner<'m> {
             self.stats.attn_seconds += attn_secs;
 
             // Residual, then the feed-forward.
+            // Gemma normalises the attention output *before* it rejoins the
+            // residual stream, on top of the pre-norm every other architecture
+            // here uses.
+            let attn_out = if c.post_norms {
+                self.post_norm(weights, il, &attn_out, n_new, "post_attention_norm")?
+            } else {
+                attn_out
+            };
             let mut ffn_input = residual;
             for (dst, v) in ffn_input.iter_mut().zip(attn_out) {
                 *dst += v;
@@ -1144,6 +1190,12 @@ impl<'m> StreamingRunner<'m> {
                     // triple on resident weights, so it runs here rather than
                     // through the expert machinery.
                     let ffn = self.arch.dense_ffn(&ctx, weights, &normed, il)?;
+                    let ffn = if c.post_norms {
+                        let w = get(weights, format!("blk.{il}.post_ffw_norm.weight"))?;
+                        self.arch.norm_scaled(&ctx, &ffn, &w)?
+                    } else {
+                        ffn
+                    };
                     let out = ctx.add(&ffn, &xt)?;
                     let t = std::time::Instant::now();
                     ctx.compute(&out, threads)?;
@@ -1164,6 +1216,11 @@ impl<'m> StreamingRunner<'m> {
 
             let mut next = ffn_input;
             let expert_out = self.expert_ffn_block(&normed_v, il, &probs_v, tokens.len())?;
+            let expert_out = if c.post_norms {
+                self.post_norm(weights, il, &expert_out, n_new, "post_ffw_norm")?
+            } else {
+                expert_out
+            };
             for (dst, v) in next.iter_mut().zip(expert_out) {
                 *dst += v;
             }
@@ -1201,6 +1258,9 @@ impl<'m> StreamingRunner<'m> {
                 .ok_or_else(|| ArchError::MissingTensor(out_name.into()))?,
             &normed,
         )?;
+        // Gemma bounds the final logits smoothly rather than clipping them.
+        // Without it every sampling decision is made on the wrong scale.
+        let out = ctx.softcap(&out, c.final_logit_softcap)?;
         ctx.compute(&out, threads)?;
         let logits = out.to_vec_f32();
         self.stats.other_seconds += t_out.elapsed().as_secs_f64();
@@ -1346,6 +1406,11 @@ mod tests {
             rope_type_is_known: true,
             fused_qkv: false,
             fused_gate_up: false,
+            post_norms: false,
+            scale_embeddings: false,
+            attn_logit_softcap: 0.0,
+            final_logit_softcap: 0.0,
+            sliding_window: 0,
         }
     }
 

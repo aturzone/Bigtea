@@ -482,7 +482,25 @@ none, so it was being rotated at 100x the right frequency. llama.cpp's default
 is 10000 and that is now ours. Qwen3 (1e6) and Llama-3.2 (5e5) declare theirs,
 so nothing regressed — checked on all four.
 
-Gemma stays open as A4, with what it needs recorded from measurement.
+**Gemma-2 is now supported too.** It needed four things, none of which announce
+themselves: post-norms after attention *and* the FFN, attention-logit
+soft-capping at 50 (which has to go **into** the fused kernel — those logits do
+not exist outside it), final-logit soft-capping at 30, and embedding scaling by
+`sqrt(n_embd)`. Output now matches llama.cpp exactly, markdown and all:
+
+```
+llama.cpp   The capital of France is **Paris**. 🇫
+Bigtea      The capital of France is **Paris**.
+```
+
+**Its 4096-token sliding window is not implemented, so anything past 4096 is
+refused** — below the window every layer is effectively full attention, so short
+sequences are exactly right and long ones would silently let the local layers
+see too far. That is a limit of this implementation, not of the architecture,
+and it says so.
+
+`VERIFIED_ARCHITECTURES` is now **deepseek4, gemma2, llama, phi3, qwen3,
+qwen3moe** — six families, from two at the start of the day.
 
 ## Known limitations
 
