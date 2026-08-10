@@ -418,7 +418,7 @@ compute path on its own.** Both command lines and outputs:
 | Qwen3-4B dense, CPU, 20 threads | Bigtea | llama.cpp | verdict |
 |---|---:|---:|---|
 | prefill (matched, 519 vs 512) | **83.4 tok/s** | **88.3** | **1.06x behind** |
-| generation | **5.13 tok/s** | **5.90** (tg128) | **1.15x behind** |
+| generation (128 tok, 3 reps) | **4.3 tok/s** | **5.28 ± 0.33** (tg128) | **1.23x behind** |
 
 *(The original 38.5 / 0.67 figures were taken on the uncached path with a
 broken arena; both are superseded.)*
@@ -598,13 +598,24 @@ they share a graph"*. The code did not.
 `Context::compute_many` expands one graph with several roots. Measured on
 Qwen3-4B, 96 tokens:
 
-| | before | after |
+| Qwen3-4B, 96 tokens | before | after |
 |---|---:|---:|
 | generation | 3.94 tok/s | **5.13** |
 | Q/K/V phase | 8.3 s | **5.3 s** |
 
-**1.30x, and the deficit against llama.cpp goes ~1.4x → 1.15x.** Output is
-unchanged on all five architectures.
+**1.30x**, and output is unchanged on all five architectures.
+
+**The deficit that follows from it is 1.23x, not 1.15x**, and the difference is
+a lesson rather than a rounding error. 5.13 was measured at 96 tokens against a
+llama.cpp run that happened to report 5.90; re-measured at the *same* 128 tokens
+`llama-bench` uses, with 3 repetitions, llama.cpp is **5.28 ± 0.33** and Bigtea
+is **4.3**. Generation slows as context grows, so a shorter run flatters us —
+and a single un-repeated reference run has a ±0.33 spread that is a third of the
+gap being claimed. Both sides now get matched length and repetitions.
+
+Llama-3.2-1B, same treatment: Bigtea **13.5**, llama.cpp **16.21 ± 0.29** —
+**1.20x behind**. An earlier single llama.cpp run read 12.91, which would have
+made this a *win*. It is not one.
 
 This is the third time this exact fact has cost time — it is already in
 `CLAUDE.md` as *"24 calls per block became 6 — 1.9x"*. Worth grepping for
