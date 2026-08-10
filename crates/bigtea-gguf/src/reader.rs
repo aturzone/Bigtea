@@ -212,8 +212,20 @@ impl Gguf {
         let mut metadata: Metadata = BTreeMap::new();
         for _ in 0..kv_count {
             let key = cur.string("metadata key")?;
+            if key.is_empty() {
+                return Err(Error::EmptyKey);
+            }
             let ty = cur.u32("metadata value type")?;
-            metadata.insert(key, cur.value(ty)?);
+            let value = cur.value(ty)?;
+            // Refuse rather than overwrite. `BTreeMap::insert` silently kept the
+            // last value, so a container with two `general.architecture` keys
+            // loaded as whichever came second while another reader might take
+            // the first -- the definition of a silent wrong value. llama.cpp
+            // refuses these too.
+            if metadata.contains_key(&key) {
+                return Err(Error::DuplicateKey(key));
+            }
+            metadata.insert(key, value);
         }
 
         let mut tensors = Vec::with_capacity(tensor_count.min(65536) as usize);
@@ -232,6 +244,11 @@ impl Gguf {
             }
             let ty = GgmlType(cur.u32("tensor type")?);
             let offset = cur.u64("tensor offset")?;
+            // Names are how every caller finds a tensor, so two with the same
+            // name means one is unreachable and which one is arbitrary.
+            if tensors.iter().any(|t: &TensorInfo| t.name == name) {
+                return Err(Error::DuplicateTensor(name));
+            }
             tensors.push(TensorInfo {
                 name,
                 dims,

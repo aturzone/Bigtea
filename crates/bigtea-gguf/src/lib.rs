@@ -53,6 +53,13 @@ pub enum Error {
     /// A declared count is implausible — treated as corruption rather than
     /// trusted, since these drive allocations.
     ImplausibleCount { what: &'static str, value: u64 },
+    /// The same metadata key appeared twice. Keeping either one silently would
+    /// mean the file decides which, and two readers could disagree.
+    DuplicateKey(String),
+    /// A metadata key was the empty string.
+    EmptyKey,
+    /// Two tensors share a name, so a lookup by name is ambiguous.
+    DuplicateTensor(String),
 }
 
 impl fmt::Display for Error {
@@ -85,6 +92,15 @@ impl fmt::Display for Error {
             Error::UnknownValueType(t) => write!(f, "unknown metadata value type {t}"),
             Error::UnknownTensorType(t) => write!(f, "unknown tensor type {t}"),
             Error::BadUtf8 => write!(f, "string field was not valid UTF-8"),
+            Error::DuplicateKey(k) => write!(
+                f,
+                "metadata key {k:?} appears more than once; the container does not \n                 say which value is meant"
+            ),
+            Error::EmptyKey => f.write_str("a metadata key is the empty string"),
+            Error::DuplicateTensor(name) => write!(
+                f,
+                "two tensors are both named {name:?}, so looking one up by name \n                 is ambiguous"
+            ),
             Error::ImplausibleCount { what, value } => {
                 write!(
                     f,

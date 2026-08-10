@@ -102,7 +102,7 @@ without samplers, and it is a day of work.
 
 | ticket | what | state |
 |---|---|---|
-| D1 | read every GGUF metadata type incl. arrays and nested | likely done, **untested against a fuzz corpus** |
+| D1 | read every GGUF metadata type incl. arrays and nested | **DONE 2026-08-10** — 16 tests: hand-written malformed corpus plus two sweeps that need no fuzzing crate (every prefix of a valid container; >1,000 single-byte corruptions). Found one real bug: **a duplicate metadata key overwrote silently**, so a file with two `general.architecture` entries loaded as the second one with no error — now `DuplicateKey`, alongside `EmptyKey` and `DuplicateTensor`, matching llama.cpp. See `../research/malformed-containers-2026-08-10.md` |
 | D2 | GGUF v2 and v3 | **DONE 2026-08-10** — v2 and v3 proved to parse identically from in-memory headers, v1 and future versions refused, alignment honoured only when a power of two. **The ticket's premise was wrong**: the `u32`→`u64` length change was v1→v2, not v2→v3, and implementing it as written would have mis-read every real v2 container — llama.cpp has no width branch and refuses v1 outright. Also added: a byte-swapped version is now named as an endianness mismatch instead of "unsupported version 50331648". See `../research/gguf-v2-premise-was-wrong-2026-08-10.md` |
 | D3 | split containers (`-00001-of-0000N`) | **done** |
 | D4 | every ggml quant type ggml can decode | **done — delegated to ggml** |
