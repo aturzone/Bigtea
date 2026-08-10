@@ -21,7 +21,7 @@ pub mod wpm;
 
 pub use bytes::{decode as bytes_decode, encode as bytes_encode};
 pub use chat::{ChatFormat, Message};
-pub use pretok::pre_tokenize;
+pub use pretok::{pre_tokenize, PreTokenizer, UnknownPreTokenizer};
 
 /// Which tokenization rule a container asks for.
 ///
@@ -58,6 +58,8 @@ pub enum TokenizerError {
     BadMerge(String),
     /// SentencePiece needs one score per token and the container disagrees.
     MissingScores { have: usize, want: usize },
+    /// The container asks for a pre-tokenizer this build has not verified.
+    UnsupportedPreTokenizer(UnknownPreTokenizer),
 }
 
 impl fmt::Display for TokenizerError {
@@ -74,6 +76,7 @@ impl fmt::Display for TokenizerError {
                 )
             }
             TokenizerError::BadMerge(m) => write!(f, "malformed merge rule {m:?}"),
+            TokenizerError::UnsupportedPreTokenizer(e) => write!(f, "{e}"),
             TokenizerError::MissingScores { have, want } => write!(
                 f,
                 "SentencePiece needs one score per token, but the container has \
@@ -109,6 +112,9 @@ pub struct Tokenizer {
     /// the vocabulary rather than assumed -- see [`wpm`], where guessing it
     /// costs every ordinary word without producing an error.
     wpm_spelling: wpm::Spelling,
+    /// Which pre-tokenizer this container asked for. Only byte-level BPE uses
+    /// one; SentencePiece, WordPiece and Unigram do their own splitting.
+    pre: PreTokenizer,
     /// Whether each token is `USER_DEFINED`, indexed by id. Unigram scores those
     /// 0 so an added token beats any ordinary segmentation of the same span.
     user_defined: Vec<bool>,
@@ -234,6 +240,23 @@ impl Tokenizer {
         let wpm_spelling = wpm::detect_spelling(&tokens);
         let max_token_len = ugm::max_token_len(&tokens);
 
+        // `tokenizer.ggml.pre` selects the splitting rule, and it was previously
+        // read by nobody: a Qwen container was split with Llama's rule, which
+        // groups three digits where Qwen takes one, so every number and every
+        // boundary after it moved. Only byte-level BPE consults it -- the other
+        // three do their own splitting -- so an unfamiliar name on those is not
+        // a reason to refuse the model.
+        let pre = match kind {
+            Kind::Bpe => {
+                let name = meta
+                    .get("tokenizer.ggml.pre")
+                    .and_then(Value::as_str)
+                    .unwrap_or("llama-bpe");
+                PreTokenizer::from_name(name).map_err(TokenizerError::UnsupportedPreTokenizer)?
+            }
+            _ => PreTokenizer::LlamaBpe,
+        };
+
         Ok(Tokenizer {
             tokens,
             ids,
@@ -249,6 +272,7 @@ impl Tokenizer {
             },
             unk: id_of("tokenizer.ggml.unknown_token_id"),
             wpm_spelling,
+            pre,
             user_defined,
             max_token_len,
             remove_extra_whitespaces: match meta.get("tokenizer.ggml.remove_extra_whitespaces") {
@@ -415,7 +439,7 @@ impl Tokenizer {
             ));
             return;
         }
-        for piece in pre_tokenize(text) {
+        for piece in pre_tokenize(text, self.pre) {
             let encoded = bytes::encode(piece.as_bytes());
             for token in self.bpe(&encoded) {
                 match self.ids.get(&token) {
