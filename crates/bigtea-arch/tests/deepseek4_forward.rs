@@ -3509,6 +3509,145 @@ fn the_library_forward_pass_matches_llama_cpp() {
     eprintln!("  library predicts token {best} after {:?}", TOKENS_2);
 }
 
+/// **The repacked path, against the same llama.cpp checkpoint.**
+///
+/// Repacking rearranges a quantised tensor into the interleaved layout the CPU
+/// kernels want. Every use except a 2-D `mul_mat` weight reads those bytes by
+/// position, and **none of the wrong ones fail**: `get_rows` returns the wrong
+/// row, a `view_1d` at a byte offset the wrong slice, a `reshape_3d` cuts the
+/// matrix in the wrong places. All three yield numbers, and numbers become
+/// fluent text.
+///
+/// So this cannot be checked by running and seeing no error, and it cannot be
+/// checked against our own unrepacked output either — that would only prove the
+/// two agree, not that either is right. It is checked against **the same
+/// llama.cpp logit sum and argmax** that
+/// [`the_library_forward_pass_matches_llama_cpp`] uses.
+///
+/// The budget is deliberately far below the 7.38 GiB always-read set, so the
+/// run is *mixed*: the largest tensors are resident and repacked, the rest
+/// stream from disk unrepacked, and both feed the same graph. A layout mistake
+/// in either shows up in the same two numbers.
+#[test]
+#[ignore = "reads weights from a 144 GB container, 43 blocks"]
+fn repacked_resident_weights_match_llama_cpp() {
+    let _heavy = heavy();
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+
+    // Small enough to hold on any machine that can run these tests at all, and
+    // large enough that the biggest always-read tensors — the shared-expert FFN
+    // and the output projection — land in it.
+    const BUDGET: u64 = 3 << 30;
+    let (mut resident, report) =
+        bigtea_model::ResidentSet::load(&model, BUDGET).expect("load resident");
+    let repacked =
+        bigtea_arch::RepackedDense::build(&mut resident, &model).expect("repack resident");
+    let (n, bytes, declined) = repacked.stats();
+    eprintln!(
+        "  resident {:.2} GiB, repacked {n} tensors ({:.2} GiB), {declined} declined",
+        report.loaded_bytes as f64 / (1u64 << 30) as f64,
+        bytes as f64 / (1u64 << 30) as f64
+    );
+    // Zero is the **correct** answer on x86, and it must not read as a pass.
+    //
+    // Every dense tensor in this container with a repackable shape is `Q8_0`
+    // (`attn_q_a`/`q_b`/`kv`, `attn_output_b`, the three `shexp`, both
+    // compressors, `output`), and ggml's repacked `Q8_0` kernels are NEON and
+    // RISC-V only. The rest are F32 or BF16 and have nothing to pack. So on
+    // this CPU there is nothing to check, and saying so is the point — an ARM
+    // runner will actually exercise the path below.
+    if n == 0 {
+        eprintln!(
+            "  skipping: ggml has no repacked kernel for any of this container's \
+             dense tensors on this CPU ({declined} offered, all declined)"
+        );
+        return;
+    }
+
+    let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone())
+        .with_resident(&resident)
+        .with_repacked(&repacked);
+
+    let logits = bigtea_arch::prefill(&fw, TOKENS_2, 1024 << 20).expect("prefill");
+    assert_eq!(logits.len(), config.vocab_size as usize);
+
+    let last = sums_2tok(config.n_layer);
+    assert_sum(
+        "repacked result_output",
+        logits.iter().sum::<f32>(),
+        last.get("result_output"),
+    );
+
+    let best = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+        .map(|(i, _)| i)
+        .expect("non-empty logits");
+    eprintln!("  repacked predicts token {best} after {:?}", TOKENS_2);
+}
+
+/// A repacked tensor is **taken out** of the resident set, so anything that
+/// still asks residency for it gets `None` and silently streams it from disk on
+/// every block of every token — slower than never repacking at all, and with no
+/// symptom other than the clock.
+///
+/// This pins the handover: what left the set is exactly what the repacked store
+/// now holds, none of it is a tensor read by position, and the set's byte count
+/// fell by what it gave up.
+#[test]
+#[ignore = "reads weights from a 144 GB container"]
+fn repacking_hands_bytes_over_rather_than_duplicating_them() {
+    let _heavy = heavy();
+    let Some(model) = open() else { return };
+
+    const BUDGET: u64 = 3 << 30;
+    let (mut resident, _) = bigtea_model::ResidentSet::load(&model, BUDGET).expect("load resident");
+    let before: std::collections::HashSet<String> = resident.names().into_iter().collect();
+    let bytes_before = resident.bytes();
+
+    let repacked =
+        bigtea_arch::RepackedDense::build(&mut resident, &model).expect("repack resident");
+    let after: std::collections::HashSet<String> = resident.names().into_iter().collect();
+    let (n, _, declined) = repacked.stats();
+    if n == 0 {
+        // The expected result on x86 — see the sibling test for why.
+        eprintln!("  skipping: nothing repackable on this CPU ({declined} declined)");
+        assert_eq!(
+            resident.names().len(),
+            before.len(),
+            "nothing was repacked, so nothing may have left the resident set"
+        );
+        assert_eq!(resident.bytes(), bytes_before);
+        return;
+    }
+
+    let gone: Vec<&String> = before.difference(&after).collect();
+    assert_eq!(
+        gone.len(),
+        n,
+        "every repacked tensor must have left the resident set, and nothing else"
+    );
+    assert!(
+        resident.bytes() < bytes_before,
+        "the resident set still accounts for bytes it handed over"
+    );
+    // None of the tensors read by position may have been taken. These are the
+    // uses that would produce confident nonsense rather than an error.
+    for name in &gone {
+        assert!(
+            !name.ends_with("token_embd.weight")
+                && !name.ends_with("attn_compressor_ape.weight")
+                && !name.ends_with("ffn_gate_tid2eid.weight")
+                && !name.ends_with("attn_output_a.weight")
+                && !name.ends_with("attn_sinks.weight")
+                && !name.contains("_exps"),
+            "{name} is read by position or streamed, and must never be repacked"
+        );
+    }
+}
+
 /// **Does contextual sparsity survive contact with the disk?**
 ///
 /// The router picks 6 experts of 256. Inside a chosen expert there is a

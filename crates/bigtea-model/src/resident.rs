@@ -322,6 +322,52 @@ impl ResidentSet {
         self.tensors.contains_key(name)
     }
 
+    /// The names held, for a caller that wants to walk the set.
+    ///
+    /// Owned rather than borrowed because the one caller — weight repacking —
+    /// mutates the set as it goes.
+    pub fn names(&self) -> Vec<String> {
+        self.tensors.keys().cloned().collect()
+    }
+
+    /// Hand a resident tensor's bytes to a caller that will hold them itself,
+    /// and stop accounting for them here.
+    ///
+    /// # Why a set that has just been filled would want to give bytes back
+    ///
+    /// Weight repacking rearranges a quantised tensor into the layout the CPU
+    /// kernels want, and it allocates its own buffer to do it. Keeping the
+    /// original alongside would **double** the memory for everything it
+    /// touches, and this set exists precisely because that memory is the
+    /// binding constraint — a 7.38 GiB always-read set on a 15.7 GiB machine
+    /// has no second copy to give.
+    ///
+    /// The rearranged bytes are a complete replacement, so the caller takes
+    /// this handle, repacks from it, and drops it. Peak cost is one tensor
+    /// rather than the whole set, and the steady state is unchanged.
+    ///
+    /// The name is then absent: [`get`](Self::get) and
+    /// [`get_shared`](Self::get_shared) report `None` and a caller that has not
+    /// been told about the replacement falls back to streaming it from disk —
+    /// slower, but correct. **It is the taker's job to serve it instead.**
+    pub fn take(&mut self, name: &str) -> Option<Arc<SkewedBuf>> {
+        let taken = self.tensors.remove(name)?;
+        self.bytes = self.bytes.saturating_sub(taken.len() as u64);
+        Some(taken)
+    }
+
+    /// Return bytes a caller took but could not use after all.
+    ///
+    /// Repacking asks `ggml` whether it has a kernel for a given type and
+    /// shape, and the shape check is a heuristic — `ggml` has the final say and
+    /// can still decline. Without this the tensor would be left absent and
+    /// stream from disk on every token, which is much worse than the
+    /// rearrangement simply not happening.
+    pub fn put_back(&mut self, name: String, bytes: Arc<SkewedBuf>) {
+        self.bytes += bytes.len() as u64;
+        self.tensors.insert(name, bytes);
+    }
+
     /// Tensors that were planned but not loaded, and why.
     pub fn skipped(&self) -> &[Skipped] {
         &self.skipped

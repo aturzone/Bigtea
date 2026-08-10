@@ -178,6 +178,18 @@ impl Gguf {
             return Err(Error::BadMagic { found: magic });
         }
         let version = cur.u32("version")?;
+        // A version whose low half is zero is a small number byte-swapped:
+        // v3 written big-endian reads as 0x03000000 here. Saying so beats
+        // reporting "unsupported version 50331648", which reads like corruption
+        // and sends the reader looking at the wrong thing. llama.cpp makes the
+        // same check for the same reason.
+        if version != 0 && (version & 0x0000_FFFF) == 0 {
+            return Err(Error::ByteOrderMismatch { found: version });
+        }
+        // **v2 and v3 have the same layout.** The u32-to-u64 change to string
+        // and array lengths was v1 to v2, not v2 to v3 -- v3 added big-endian
+        // support and left the field widths alone. llama.cpp reads both with one
+        // code path and refuses v1 outright; so does this.
         if !(2..=3).contains(&version) {
             return Err(Error::UnsupportedVersion(version));
         }
@@ -200,8 +212,20 @@ impl Gguf {
         let mut metadata: Metadata = BTreeMap::new();
         for _ in 0..kv_count {
             let key = cur.string("metadata key")?;
+            if key.is_empty() {
+                return Err(Error::EmptyKey);
+            }
             let ty = cur.u32("metadata value type")?;
-            metadata.insert(key, cur.value(ty)?);
+            let value = cur.value(ty)?;
+            // Refuse rather than overwrite. `BTreeMap::insert` silently kept the
+            // last value, so a container with two `general.architecture` keys
+            // loaded as whichever came second while another reader might take
+            // the first -- the definition of a silent wrong value. llama.cpp
+            // refuses these too.
+            if metadata.contains_key(&key) {
+                return Err(Error::DuplicateKey(key));
+            }
+            metadata.insert(key, value);
         }
 
         let mut tensors = Vec::with_capacity(tensor_count.min(65536) as usize);
@@ -220,6 +244,11 @@ impl Gguf {
             }
             let ty = GgmlType(cur.u32("tensor type")?);
             let offset = cur.u64("tensor offset")?;
+            // Names are how every caller finds a tensor, so two with the same
+            // name means one is unreachable and which one is arbitrary.
+            if tensors.iter().any(|t: &TensorInfo| t.name == name) {
+                return Err(Error::DuplicateTensor(name));
+            }
             tensors.push(TensorInfo {
                 name,
                 dims,

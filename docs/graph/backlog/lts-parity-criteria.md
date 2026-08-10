@@ -46,7 +46,7 @@ deep:
 | **A3** | accept the `llama` arch name and its metadata aliases | Llama 1/2/3, TinyLlama, CodeLlama, Vicuna, most finetunes | **DONE** — verified on TinyLlama and Llama-3.2 |
 | A4 | `gemma`/`gemma2` | Gemma family | **gemma2 DONE 2026-08-10** — post-norms, attention soft-cap (50, into the fused kernel), final soft-cap (30), `sqrt(n_embd)` embedding scaling. Output matches llama.cpp exactly. **Sliding window implemented 2026-08-10** — a second mask for the even layers; verified above the window against llama.cpp at 5201 tokens, and the layer parity shown to be load-bearing by flipping it. The 4096 refusal is gone. See `../research/gemma2-sliding-window-2026-08-10.md` |
 | A5 | `phi3`, `qwen2` explicit | Phi, Qwen2 | **phi3 DONE 2026-08-10** — fused `attn_qkv` *and* fused `ffn_up` split into views; verified against llama.cpp's own output |
-| A6 | WPM + UGM tokenizers | BERT-family, T5-family | gap |
+| A6 | WPM + UGM tokenizers | BERT-family, T5-family | **WPM DONE 2026-08-10** — verified token-for-token against `llama-tokenize` on `all-MiniLM-L6-v2`, 13 cases. GGUF stores WordPiece in *SentencePiece* spelling (`▁capital` + bare `ization`), not HuggingFace's `##`, so a textbook implementation `[UNK]`s every ordinary word without erroring: `../research/wordpiece-spelling-2026-08-10.md`. **UGM DONE 2026-08-10** — Viterbi lattice, `USER_DEFINED` scored 0, `f64` path sums; verified on `flan-t5-small`, 5 cases. **Caveat: the precompiled charsmap (NFKC) is not applied**, so input not already in normal form (fullwidth, ligatures) diverges: `../research/unigram-lattice-2026-08-10.md`. **Pre-tokenizers DONE 2026-08-10** — `tokenizer.ggml.pre` was read by nobody, so every BPE container was split with DeepSeek's rule: Qwen's digits grouped in threes instead of singly and `don't` was cut into three pieces on *both* families. `llama-bpe`/`llama3`, `qwen2` and `joyai-llm` now verified against real containers; every other variant is **refused by name** rather than guessed: `../research/pretokenizer-was-ignored-2026-08-10.md` |
 | A7 | tied embeddings (`output.weight` absent → reuse `token_embd`) | many small models | **DONE** — Llama-3.2-1B is tied and loads |
 | A8 | a clear error naming the *architecture* and what is missing | every unsupported model | **DONE 2026-08-10** — unverified architectures are **refused**; `--force` on the CLI only, never on the server |
 
@@ -70,6 +70,15 @@ measured back to back in one session with both command lines recorded.
 | generation tok/s | 0.37 vs 0.39 | 1.07 vs 2.16 | **4.27 vs 5.90 — 1.38x behind** (Llama-3.2-1B: 10.12 vs 12.91, 1.28x) |
 | memory footprint at equal speed | **ours, by design** | ours | — |
 | long-context generation | untested | untested | untested |
+
+**Weight repacking does not transfer to V4-Flash, and the row above does not
+move** (2026-08-10). Every always-read tensor in that container with a
+repackable shape is `Q8_0`, and ggml's repacked `Q8_0` kernels are NEON and
+RISC-V only — 42 offered, 42 declined, 0 repacked on x86. llama.cpp cannot even
+load the file with repacking on (a 137 GiB single-range `CPU_REPACK` buffer),
+which is why its figures here pass `--no-repack`. The attempt did fix a null
+dereference that would have killed `bigtea-run` on any `*.Q8_0.gguf`:
+`../research/v4flash-repacking-2026-08-10.md`.
 
 **Dense Qwen3-4B has never been compared to llama.cpp at all**, and it is the
 cheapest comparison available — it fits in RAM, so it isolates the compute path
@@ -102,8 +111,8 @@ without samplers, and it is a day of work.
 
 | ticket | what | state |
 |---|---|---|
-| D1 | read every GGUF metadata type incl. arrays and nested | likely done, **untested against a fuzz corpus** |
-| D2 | GGUF v2 and v3 | v3 done; v2 untested |
+| D1 | read every GGUF metadata type incl. arrays and nested | **DONE 2026-08-10** — 16 tests: hand-written malformed corpus plus two sweeps that need no fuzzing crate (every prefix of a valid container; >1,000 single-byte corruptions). Found one real bug: **a duplicate metadata key overwrote silently**, so a file with two `general.architecture` entries loaded as the second one with no error — now `DuplicateKey`, alongside `EmptyKey` and `DuplicateTensor`, matching llama.cpp. See `../research/malformed-containers-2026-08-10.md` |
+| D2 | GGUF v2 and v3 | **DONE 2026-08-10** — v2 and v3 proved to parse identically from in-memory headers, v1 and future versions refused, alignment honoured only when a power of two. **The ticket's premise was wrong**: the `u32`→`u64` length change was v1→v2, not v2→v3, and implementing it as written would have mis-read every real v2 container — llama.cpp has no width branch and refuses v1 outright. Also added: a byte-swapped version is now named as an endianness mismatch instead of "unsupported version 50331648". See `../research/gguf-v2-premise-was-wrong-2026-08-10.md` |
 | D3 | split containers (`-00001-of-0000N`) | **done** |
 | D4 | every ggml quant type ggml can decode | **done — delegated to ggml** |
 | D5 | OpenAI API surface: `/v1/chat/completions`, `/v1/models`, `/v1/completions`, `/v1/embeddings` | **3 of 4 + an honest 501.** Chat streams and serves any supported architecture; `/v1/completions` runs the prompt verbatim; **embeddings refuse with 501** rather than returning a logit-derived vector that would look right and behave like noise |

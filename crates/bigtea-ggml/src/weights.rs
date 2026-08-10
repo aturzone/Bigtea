@@ -104,6 +104,10 @@ pub struct WeightSet<'ctx> {
     /// Held here for exactly the same reason as `_buffers`: dropping one frees
     /// the weights a graph is still pointing at.
     _repacked: Vec<crate::repack::RepackBuffer>,
+    /// Repacked weights rearranged **before** this set existed and shared with
+    /// every other set that binds them — the V4-Flash path, which rebuilds its
+    /// `WeightSet` once per block.
+    _shared_repacked: Vec<Arc<crate::repack::Repacked>>,
     repacked_bytes: usize,
 }
 
@@ -113,6 +117,7 @@ impl<'ctx> WeightSet<'ctx> {
             tensors: HashMap::new(),
             _buffers: Vec::new(),
             _repacked: Vec::new(),
+            _shared_repacked: Vec::new(),
             repacked_bytes: 0,
         }
     }
@@ -194,6 +199,34 @@ impl<'ctx> WeightSet<'ctx> {
                 Ok(false)
             }
         }
+    }
+
+    /// Bind a tensor that was rearranged **earlier**, without moving a byte.
+    ///
+    /// The V4-Flash path's case. Its arena is per block, so it builds a fresh
+    /// context and a fresh `WeightSet` for each of 43 blocks on every pass;
+    /// [`bind_repacked`](Self::bind_repacked) there would rearrange the whole
+    /// always-read set 43 times per token. The rearrangement happens once at
+    /// load and this points a fresh tensor at the result.
+    ///
+    /// The `Arc` is held so the buffer cannot be freed while a graph in this
+    /// set still reads it, exactly as `_buffers` does for borrowed bytes.
+    pub fn bind_repacked_shared(
+        &mut self,
+        ctx: &'ctx Context,
+        name: &str,
+        repacked: Arc<crate::repack::Repacked>,
+    ) -> Result<(), GgmlError> {
+        let (ne0, ne1) = repacked.shape();
+        let tensor = ctx.new_typed_2d(repacked.ty(), ne0, ne1)?;
+        // SAFETY: `tensor` is live in `ctx`, created no_alloc so its data
+        // pointer is null and nothing is orphaned, and it was built from this
+        // `Repacked`'s own type and shape. `self` holds the `Arc`, so the
+        // buffer outlives the tensor.
+        unsafe { repacked.attach(tensor.as_ptr()) }?;
+        self._shared_repacked.push(repacked);
+        self.tensors.insert(name.to_string(), tensor);
+        Ok(())
     }
 
     fn shape_2d(dims: &[u64]) -> Result<(i64, i64), GgmlError> {

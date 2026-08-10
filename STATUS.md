@@ -488,6 +488,48 @@ All five architectures answer correctly, and the 19 container-backed V4-Flash
 tests still pass — that path binds through `ResidentSet` rather than
 `load_resident`, so it is untouched and could take the same win later.
 
+### The V4-Flash path cannot take that win, and trying found a crash (2026-08-10)
+
+**"The same 1.42x is sitting there for V4-Flash" is false on x86, and the number
+is 0 tensors, not 1.42x.** Detail and both engines' output:
+`docs/graph/research/v4flash-repacking-2026-08-10.md`.
+
+`ggml_repack_get_optimal_repack_type` branches on the **CPU** as well as the
+tensor, and `Q8_0` has no x86 branch at all — its repacked kernels are NEON and
+RISC-V only. Every always-read tensor in `V4-Flash-UD-Q4_K_XL` with a repackable
+shape is `Q8_0`; the rest are F32 or BF16. Measured: **42 offered, 42 declined,
+0 repacked.** The container upcasts exactly the tensors repacking would help.
+
+**llama.cpp is worse off on the same file, not better**: with repacking on (its
+default) it does not load at all, because its repack buffer is one range for the
+whole model —
+
+```
+E alloc_tensor_range: failed to allocate CPU_REPACK buffer of size 147169738752
+E llama_model_load: error loading model: unable to allocate CPU_REPACK buffer
+```
+
+137 GiB. That is why every V4-Flash figure here passes `--no-repack`, a quirk
+that had been recorded without its cause. Bigtea repacks per tensor, so the same
+container loads, reports `0 repacked`, and runs. **No tok/s is won by this** —
+it is a difference in kind, and `--no-repack` gets llama.cpp running too.
+
+**A crash was already shipping.** ggml's repack `init_tensor` sets
+`tensor->extra` to `nullptr` when there is no kernel and returns
+`GGML_STATUS_SUCCESS`; `set_tensor` then dereferences it. No assert, no error
+code — `STATUS_ACCESS_VIOLATION` and the process is gone. `is_repackable`
+accepts `Q8_0` and `Q2_K`, so **any `*.Q8_0.gguf` would have killed `bigtea-run`
+on x86 before printing a token.** None of the Q4_K_M containers here hold a
+`Q8_0` 2-D weight, which is the only reason it had never been seen. `repack` now
+reads what ggml actually decided instead of trusting the shape check.
+
+The machinery was kept and is verified: `RepackedDense` rearranges once at load
+(V4-Flash rebuilds its `WeightSet` per block, so rearranging in the bind loop
+would redo the whole set 43 times per token), hands the bytes over out of the
+resident set rather than duplicating them, and re-attaches per block. Checked
+numerically on x86 with `Q4_K` against ggml's own ordinary kernel, bound into two
+contexts from one rearrangement. An ARM build gets the win for free.
+
 **FIXED the same day.** The cause was one branch condition: `forward_cached`
 already had a working KV cache but was only reached `if config.is_moe()`, so
 dense models fell through to a stateless path that rebuilt the whole sequence
