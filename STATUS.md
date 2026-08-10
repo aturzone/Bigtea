@@ -968,3 +968,47 @@ nothing in the compute path touches it.
   Never in git config, never echoed. Model files stay gitignored.
 - Graph docs live in `docs/graph/`; read `INDEX.md`, then only the 2–3 nodes a
   task links to. Any node change updates its INDEX line in the same commit.
+
+## R10.1 — constrained decoding: GBNF and JSON schema (2026-08-11)
+
+`crates/bigtea-grammar` (new, **no dependencies at all** — not ggml, not even
+the tokenizer) parses GBNF, compiles it to a stack matcher, and turns the bytes
+generated so far into the token ids that may legally come next. Detail:
+`docs/graph/research/gbnf-grammars-2026-08-11.md`.
+
+Unlocks 4 of the 182 flags: `--grammar`, `--grammar-file`, `--json-schema`,
+`--json-schema-file`. **The library is done; the CLI wiring is not** —
+`sample.rs` and `bigtea-run.rs` belong to another session, so the hook stops at
+one function:
+
+```rust
+constraint.allowed(generated_so_far).apply(&mut logits);
+```
+
+**Verified against llama.cpp, not against expectations.** A grammar that accepts
+everything passes any test that only checks acceptance, so the accepted text is
+llama.cpp's own output under the same grammar at `--temp 0`, and every case
+also checks a rejection that is a one-character edit of it.
+
+| grammar | llama.cpp's output | ours |
+|---|---|---|
+| `json.gbnf` | `{"name":"John","age":30,...}` | accepted, complete |
+| `--json-schema` person | `{"name":"John","age":30}` | accepted, complete |
+| `--json-schema` array | `{"city": "New York", "scores": [1, 2, 3, 4, 5] }` | accepted, complete |
+
+Two bugs, one found by a unit test and one only findable this way:
+
+1. **Only the first alternative of the root rule was explored.** A rule is
+   entered through a `RuleRef`, which fans out over alternatives; the root has
+   none pointing at it. `root ::= "cat" | "car"` took `cat` and refused `car`.
+2. **Three of the eight grammars llama.cpp ships did not parse.** `json.gbnf`,
+   `json_arr.gbnf` and `c.gbnf` put the rule body on the line after `::=`.
+   A test that walks the whole `grammars/` directory found it on its first run.
+
+Everything unimplemented is **refused by name, never ignored** — token literals
+(`<think>`), `allOf`, `pattern`, `minimum`, `additionalProperties: true` and the
+rest. Ignoring a schema keyword yields a grammar *looser* than asked for, so the
+model emits output that satisfies the grammar and violates the schema, and
+nothing downstream can tell.
+
+66 tests here; 255 pass in the ggml-free CI job, which now includes this crate.
