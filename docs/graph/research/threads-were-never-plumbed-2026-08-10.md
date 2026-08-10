@@ -227,18 +227,41 @@ with `-t`, `"The capital of France is"`, `-n 4`:
 | 8 | 0.346 |
 | 20 — its current default | 0.296 |
 
-**1.28x is sitting unclaimed on the model this project exists for.** The fix is
-one line — the fallback in `deepseek4_forward.rs` should be the tuner, or at
-minimum not `available_parallelism()`.
+**Fixed once r9 was merged in** — and it was *not* the one-line cap it looked
+like. Capping `threads()` at 4 was the first attempt, and V4-Flash prefill
+promptly lost 1.29x:
 
-**Not done here on purpose**: that file has uncommitted work in another
-worktree, and a merge conflict in the V4-Flash forward pass costs more than the
-change is worth today. It is a one-line follow-up with the measurement already
-attached.
+| V4-Flash, back to back | 4 threads | all cores |
+|---|---:|---:|
+| generation | **0.196** | 0.177 |
+| prefill, 180 tokens | 2.24 | **2.89** |
 
-*(These are 3 generated tokens on a cold cache and are not comparable to the
-published 0.374 tok/s, which was 47 tokens with a warm one. The ratio between
-thread counts is the result here; the absolute numbers are not.)*
+So this file needed the same split as the dense path, not a cap. `threads()`
+reads a batch size that `forward` sets — the single funnel both `prefill` and
+`step` pass through — and resolves the two counts through `BIGTEA_THREADS` and
+`BIGTEA_THREADS_BATCH`.
+
+**This retires a line that was in `CLAUDE.md`**: "4/12/20 threads all cost the
+same on a V4-Flash prefill". That was measured at **5 tokens**, where the pass
+is almost entirely disk. At 180 tokens it is 2.24 against 2.89. *A measurement
+taken at one prompt length is not a fact about the engine* — the same error as
+scoring a hot set on the prompt it was chosen from.
+
+### The version that made it slower
+
+The first split called `std::env::var` inside `threads()`. That function runs at
+every `ctx.compute` — thousands of times per token — and each call locks the
+process environment and allocates a `String`. Generation fell to **0.267**,
+*below* the 0.296 the change was meant to fix. Both counts are resolved once
+now; the per-call cost is an atomic load and a branch.
+
+### Absolute V4-Flash numbers drift, badly
+
+The same `-t 4` vs `-t 20` comparison read **0.380 / 0.296** earlier in the day
+and **0.196 / 0.177** after a dozen heavy runs, as the page cache for a 144 GB
+container filled with the wrong things. The direction held both times; the
+magnitude did not. **Only compare V4-Flash numbers within one session**, and
+never against the published 0.374 tok/s, which was 47 tokens with a warm cache.
 
 ## What this does not measure
 

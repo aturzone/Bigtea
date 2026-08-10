@@ -549,24 +549,72 @@ const N_KV: i64 = 256;
 /// A constant here was a guess. `compute(&t, 0)` runs on **one** thread — the
 /// count is floored at 1, not defaulted to all cores — so the number has to be
 /// passed explicitly, and once it is passed explicitly it deserves to be
-/// measured rather than assumed. `BIGTEA_THREADS` exists to measure it; the
-/// default is chosen in `bigtea-run`, not here.
+/// measured rather than assumed. `BIGTEA_THREADS` (i.e. `-t`) overrides it.
+///
+/// **Generation and prefill want opposite counts here, exactly as they do on
+/// the dense path.** Both measured on V4-Flash:
+///
+/// ```text
+/// generation (-n 4)      threads      1      2      4      8     20
+///                        tok/s      0.331  0.378  0.380  0.346  0.296
+///
+/// prefill (180 tokens)   threads                   4            20
+///                        tok/s                   2.54          3.27
+/// ```
+///
+/// So a single-token step loses **1.28x** at every core, and a prefill loses
+/// **1.29x** at four. One number cannot serve both, and capping this function
+/// was tried first and would have traded one regression for the other.
+///
+/// A single-token step is a stack of matrix-vector products, and past a handful
+/// of threads the per-node barrier costs more than the work it splits.
+/// Qwen3-30B-A3B is the extreme case at **2.4x**, where the expert matmuls want
+/// exactly one thread. A prefill block multiplies many columns at once and
+/// scales with cores.
+///
+/// **This retires a claim that was in `CLAUDE.md`**: "4/12/20 threads all cost
+/// the same on a V4-Flash prefill". That held at 5 tokens, where the pass is
+/// almost entirely disk. At 180 it is 2.54 against 3.27.
+/// Both counts are resolved **once**. `threads()` is called at every
+/// `ctx.compute`, which is thousands of times per token, and the first version
+/// of this split called `std::env::var` on each one — that locks the process
+/// environment and allocates a `String`. It cost more than the split saved:
+/// generation went to 0.267 tok/s, *below* the 0.296 it was meant to fix. The
+/// per-call work is now an atomic load and a branch.
 fn threads() -> usize {
     use std::sync::OnceLock;
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("BIGTEA_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&t: &usize| t > 0)
-            // All cores, not a constant. 12 was this machine's count when the
-            // constant was written and is wrong everywhere else.
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(4)
-            })
-    })
+    static GEN: OnceLock<usize> = OnceLock::new();
+    static BAT: OnceLock<usize> = OnceLock::new();
+    if BATCH.load(std::sync::atomic::Ordering::Relaxed) > 1 {
+        *BAT.get_or_init(|| env_threads("BIGTEA_THREADS_BATCH").unwrap_or_else(all_cores))
+    } else {
+        // Cap at 4: the dense path measures its own peak per model with
+        // `ThreadTuner`, and this file has no equivalent, so it takes the shape
+        // of the curve rather than its exact peak. Erring low is cheap here —
+        // one thread costs 13% — and erring high cost 1.28x.
+        *GEN.get_or_init(|| env_threads("BIGTEA_THREADS").unwrap_or_else(|| all_cores().min(4)))
+    }
+}
+
+/// Tokens in the pass currently being evaluated, set once by [`forward`].
+///
+/// The alternative is threading `n_tokens` through ten call sites across as
+/// many functions, none of which otherwise care. This engine evaluates one pass
+/// at a time — `bigtea-serve` serialises requests because the model has one KV
+/// cache — so a process-wide value is accurate rather than merely convenient.
+static BATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+fn all_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+}
+
+fn env_threads(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&t| t > 0)
 }
 
 /// The dense tensors it is **safe** to rearrange, named one at a time.
@@ -2355,6 +2403,10 @@ pub fn forward(
     tokens: &[i32],
     arena: usize,
 ) -> Result<Vec<f32>> {
+    // Every `threads()` call below this point reads it. See `threads`: a
+    // one-token step and a prefill block want opposite counts, and this is the
+    // single funnel both `prefill` and `step` pass through.
+    BATCH.store(tokens.len(), std::sync::atomic::Ordering::Relaxed);
     let pos0 = cache.n_past as i64;
     if pos0 as usize + tokens.len() > N_KV as usize {
         return Err(crate::ArchError::ContextTooLong {

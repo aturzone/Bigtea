@@ -767,10 +767,33 @@ the tuner, so the flagship model still defaults to every core:
 |---|---:|---:|---:|---:|---:|
 | V4-Flash generation | 0.331 | 0.378 | **0.380** | 0.346 | 0.296 |
 
-**Not changed here on purpose** — that file has uncommitted work in another
-worktree, and a conflict in the V4-Flash forward pass costs more than the
-one-line fix is worth today. **This is the first thing to do on that branch.**
-(3 tokens, cold cache; the ratio is the result, not the absolute numbers.)
+**Done once r9 was merged in.** `deepseek4_forward.rs` now splits the count the
+same way the dense path does, and the split had to be measured in *both*
+directions because a blanket cap was tried first and would have traded one
+regression for the other:
+
+| V4-Flash, back to back | 4 threads | all cores |
+|---|---:|---:|
+| generation | **0.196** | 0.177 |
+| prefill, 180 tokens | 2.24 | **2.89** |
+
+**Prefill loses 1.29x at four threads; generation loses 1.11x at twenty.** So
+`threads()` reads the batch size set by `forward`, the single funnel both
+`prefill` and `step` pass through.
+
+**This retires a note that was in `CLAUDE.md`** — "4/12/20 threads all cost the
+same on a V4-Flash prefill". True at 5 tokens, where the pass is almost entirely
+disk; false at 180.
+
+**V4-Flash absolute numbers drift hard with page-cache state.** The same
+`-t 4` vs `-t 20` comparison read 0.380/0.296 earlier in the day and 0.196/0.177
+after a dozen heavy runs. Only compare within one session.
+
+One trap on the way: the first version of the split called `std::env::var`
+inside `threads()`, which is called at every `ctx.compute` — thousands of times
+per token. Locking the environment and allocating a `String` that often cost
+more than the split saved, taking generation to 0.267, *below* the 0.296 it was
+meant to fix. Both counts are resolved once now.
 
 ## Gemma-2 sliding-window attention (2026-08-10) — the 4096 refusal is gone
 
