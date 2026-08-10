@@ -877,7 +877,32 @@ impl<'m> StreamingRunner<'m> {
         weights: &mut WeightSet<'a>,
     ) -> Result<u64> {
         let mut total = 0u64;
-        for name in self.resident_tensor_names() {
+        let c_fused_gate_up = self.arch.config.fused_gate_up;
+        // Repacking rearranges a quantised tensor into the layout the CPU
+        // kernels want, and it is worth **1.39x on prefill** -- the entire
+        // measured gap against llama.cpp on Qwen3-4B.
+        //
+        // Only for weights that are already resident. It allocates its own
+        // buffer, so it doubles the memory for whatever it touches: free when
+        // the bytes were being copied into RAM anyway, and fatal on the
+        // streaming path, where ggml is handed a pointer into the mapped
+        // container and that is what makes a 144 GB model run at all.
+        //
+        // `bind_repacked` falls back to an ordinary bind whenever ggml has no
+        // repacked kernel for the type or shape, so every tensor can be offered.
+        // Repacking is OFF by default until it is proven byte-identical. It
+        // is not: enabling it for every resident tensor made Phi-3 emit
+        // "[PAD32063]rit[PAD32063]..." and changed Llama-3.2's continuation.
+        //
+        // The cause is structural, not a tuning problem. A repacked tensor's
+        // bytes are *rearranged*, so any `view_2d` into it by byte offset --
+        // which is exactly how Phi-3's fused `attn_qkv` and `ffn_up` are split
+        // into q/k/v and gate/up -- addresses the wrong weights. Views and
+        // repacking cannot both be right without teaching the splitter about
+        // the packed layout.
+        let repack = std::env::var("BIGTEA_REPACK").is_ok();
+        let names: Vec<String> = self.resident_tensor_names().into_iter().collect();
+        for name in names {
             let loc = self
                 .model
                 .location(&name)
@@ -885,7 +910,25 @@ impl<'m> StreamingRunner<'m> {
                 .clone();
             let data = self.model.read_tensor(&name)?;
             total += data.len() as u64;
-            weights.bind(ctx, &name, loc.ty, &loc.dims, data)?;
+            // Repacking is safe **only** for a tensor used exclusively as the
+            // weight argument of `mul_mat`. Two other uses break on it, and
+            // neither fails loudly:
+            //
+            //   * `get_rows` -- `token_embd` is indexed by token id, and a
+            //     repacked tensor's rows are interleaved, so row 5 is not
+            //     where row 5 was. Llama-3.2 ties this to its output
+            //     projection, so repacking it corrupted both at once.
+            //   * `view_2d` by byte offset -- Phi-3's fused `attn_qkv` and
+            //     `ffn_up` are split into q/k/v and gate/up that way, and the
+            //     offsets address the unpacked layout.
+            let sliced = name.ends_with("attn_qkv.weight")
+                || (c_fused_gate_up && name.ends_with("ffn_up.weight"));
+            let indexed = name == "token_embd.weight";
+            if repack && !sliced && !indexed {
+                weights.bind_repacked(ctx, &name, loc.ty, &loc.dims, data)?;
+            } else {
+                weights.bind(ctx, &name, loc.ty, &loc.dims, data)?;
+            }
         }
         // The output projection may be tied to the embeddings.
         if self.model.location("output.weight").is_some() {
@@ -896,7 +939,11 @@ impl<'m> StreamingRunner<'m> {
                 .clone();
             let data = self.model.read_tensor("output.weight")?;
             total += data.len() as u64;
-            weights.bind(ctx, "output.weight", loc.ty, &loc.dims, data)?;
+            if repack {
+                weights.bind_repacked(ctx, "output.weight", loc.ty, &loc.dims, data)?;
+            } else {
+                weights.bind(ctx, "output.weight", loc.ty, &loc.dims, data)?;
+            }
         }
         self.stats.resident_bytes = total;
         Ok(total)

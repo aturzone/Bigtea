@@ -1257,6 +1257,12 @@ impl Tensor<'_> {
     /// not take ownership and will not keep the memory alive — a dangling
     /// pointer here reads freed memory *successfully*, yielding plausible
     /// numbers instead of a crash.
+    /// The raw `ggml_tensor`, for the repack path which must call into
+    /// `ggml-backend` with it.
+    pub(crate) fn as_ptr(&self) -> *mut std::ffi::c_void {
+        self.raw.as_ptr().cast()
+    }
+
     pub(crate) unsafe fn set_data_ptr(&self, ptr: *mut std::os::raw::c_void) {
         (*(self.raw.as_ptr() as *mut crate::weights::RawTensor)).data = ptr;
     }

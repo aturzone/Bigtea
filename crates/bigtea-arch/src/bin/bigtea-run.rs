@@ -163,6 +163,8 @@ fn main() -> ExitCode {
         eprintln!("  -c, --ctx-size N    cap the context; refuses past it rather than aborting");
         eprintln!("  --stop TEXT         stop when this appears (repeatable)");
         eprintln!("  --force             run an unverified architecture anyway");
+        eprintln!("  --repack            rearrange resident weights for the CPU kernels");
+        eprintln!("                      (1.35x prefill; changes output on near ties)");
         return ExitCode::from(2);
     };
     let mut prompt = String::new();
@@ -234,6 +236,12 @@ fn main() -> ExitCode {
             }
             "--force" => {
                 force = true;
+                i += 1;
+            }
+            // Opt-in: worth 1.35x on prefill, and not byte-identical -- see
+            // `bigtea_ggml::repack`.
+            "--repack" => {
+                std::env::set_var("BIGTEA_REPACK", "1");
                 i += 1;
             }
             // llama.cpp spells these -t and -c; matching its names matters more
@@ -416,12 +424,19 @@ fn run_streaming(
     let mut weights = WeightSet::new();
     let load_start = std::time::Instant::now();
     let resident = runner.load_resident(&ctx, &mut weights)?;
+    let (n_repacked, repacked_bytes) = weights.repacked();
     println!(
         "resident   {} tensors, {:.2} GiB in {:.1}s (experts stream on demand)",
         weights.len(),
         resident as f64 / GIB,
         load_start.elapsed().as_secs_f64()
     );
+    if n_repacked > 0 {
+        println!(
+            "repacked   {n_repacked} tensors, {:.2} GiB in the CPU kernels' layout",
+            repacked_bytes as f64 / GIB
+        );
+    }
 
     let _ = arch;
     let prompt_len = tokens.len();

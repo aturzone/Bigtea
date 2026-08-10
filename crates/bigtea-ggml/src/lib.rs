@@ -23,6 +23,7 @@ use std::fmt;
 use bigtea_gguf::GgmlType;
 
 mod graph;
+pub mod repack;
 mod weights;
 
 #[cfg(have_ggml)]

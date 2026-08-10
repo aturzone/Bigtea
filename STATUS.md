@@ -439,11 +439,34 @@ kernel itself (our FFN runs at 472 GFLOP/s against a measured Q4_K ceiling of
 420). Detail and the command lines:
 `docs/graph/research/qwen3-4b-vs-llamacpp-2026-08-10.md`.
 
-We do not repack because weights are bound **zero-copy** — a pointer into the
-mapped container — which is what makes a 144 GB model run at all. But for a
-**resident dense model** the weights are already copied, so repacking them once
-at load costs a rearrange and no extra memory. That is the next performance
-ticket and it is contained: streaming keeps zero-copy binding untouched.
+**Built, same day, behind `--repack`:**
+
+| Qwen3-4B prefill, 519 tokens | tok/s |
+|---|---:|
+| Bigtea, `--repack` | **74.1** |
+| Bigtea, default | 58.6 |
+
+**1.35x**, against the 1.39x llama.cpp gets from its own repacking — so the
+mechanism is doing what it does there. 216 tensors, 1.64 GiB rearranged. The
+prefill deficit against llama.cpp goes **1.46x → 1.19x**.
+
+It reaches `ggml`'s repacked kernels without adopting `ggml-backend`: a tensor
+allocated in the repack buffer type gets `tensor_traits` hung off its `extra`,
+and `ggml_compute_forward` consults that **on the plain graph path too**.
+
+**Off by default, and it stays off until it is byte-identical.** Three uses
+break on a repacked tensor and none of them fail loudly:
+
+- **`get_rows`** — `token_embd` is indexed by token id and repacked rows are
+  interleaved. Llama-3.2 ties it to the output projection, so repacking it
+  corrupted both at once.
+- **`view_2d` by byte offset** — Phi-3's fused `attn_qkv` and `ffn_up` are split
+  into q/k/v and gate/up that way. Repacking them made Phi-3 emit
+  `[PAD32063]rit[PAD32063]…`.
+- Both are excluded now, and all five architectures answer correctly under
+  `--repack`. But **Llama-3.2's continuation still differs** from the unpacked
+  path — both correct, a near-tie flipping on a different accumulation order.
+  Until that is understood, opt-in is the honest default.
 
 **FIXED the same day.** The cause was one branch condition: `forward_cached`
 already had a working KV cache but was only reached `if config.is_moe()`, so
