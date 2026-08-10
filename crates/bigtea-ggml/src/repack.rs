@@ -43,6 +43,12 @@
 //! per tensor and the caller decides.
 
 use std::ffi::c_void;
+// Every use of `NonNull` is behind `cfg(have_ggml)` — the `raw` field and the
+// allocation that fills it — so an unconditional import is unused in the build
+// that has no ggml, and `-D warnings` turns that into a build failure. That is
+// the one CI job whose whole purpose is proving the other seven crates are
+// usable on a machine that has never compiled a line of C.
+#[cfg(have_ggml)]
 use std::ptr::NonNull;
 
 use bigtea_gguf::GgmlType;
