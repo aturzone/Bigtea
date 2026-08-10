@@ -559,7 +559,13 @@ fn threads() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&t: &usize| t > 0)
-            .unwrap_or(12)
+            // All cores, not a constant. 12 was this machine's count when the
+            // constant was written and is wrong everywhere else.
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(4)
+            })
     })
 }
 

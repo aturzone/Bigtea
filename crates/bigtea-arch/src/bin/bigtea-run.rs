@@ -156,6 +156,9 @@ fn main() -> ExitCode {
         eprintln!("  --seed S            reproducible sampling");
         eprintln!("  --llamacpp-defaults temp 0.8, top-k 40, top-p 0.95, min-p 0.05, repeat 1.1");
         eprintln!("  --chat              apply the model's chat template to the prompt");
+        eprintln!("  -t, --threads N     compute threads (default: all cores)");
+        eprintln!("  -c, --ctx-size N    cap the context; refuses past it rather than aborting");
+        eprintln!("  --stop TEXT         stop when this appears (repeatable)");
         return ExitCode::from(2);
     };
     let mut prompt = String::new();
@@ -170,6 +173,9 @@ fn main() -> ExitCode {
     // Greedy by default, so existing behaviour is unchanged until asked.
     let mut sampler = SamplerConfig::default();
     let mut chat = false;
+    let mut threads: Option<usize> = None;
+    let mut ctx_size: Option<usize> = None;
+    let mut stop: Vec<String> = Vec::new();
     let rest: Vec<String> = args.collect();
     let mut i = 0;
     while i < rest.len() {
@@ -220,6 +226,29 @@ fn main() -> ExitCode {
             "--chat" => {
                 chat = true;
                 i += 1;
+            }
+            // llama.cpp spells these -t and -c; matching its names matters more
+            // than inventing better ones, because muscle memory is the whole
+            // reason an OpenAI-shaped API and a familiar CLI are worth having.
+            "-t" | "--threads" => {
+                threads = rest
+                    .get(i + 1)
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&t: &usize| t > 0);
+                i += 2;
+            }
+            "-c" | "--ctx-size" => {
+                ctx_size = rest
+                    .get(i + 1)
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&c: &usize| c > 0);
+                i += 2;
+            }
+            "--stop" => {
+                if let Some(v) = rest.get(i + 1) {
+                    stop.push(v.clone());
+                }
+                i += 2;
             }
             // One flag for "sample the way llama.cpp does by default", so a
             // quality comparison is not silently comparing sampler settings.
@@ -273,6 +302,9 @@ fn main() -> ExitCode {
         cache_budget,
         sampler,
         chat,
+        threads,
+        ctx_size,
+        stop,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -299,9 +331,23 @@ fn run_streaming(
     prefill_block: usize,
     cache_budget: Option<u64>,
     sampler_cfg: SamplerConfig,
+    ctx_size: Option<usize>,
+    stop: Vec<String>,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
+
+    // A context cap the user asked for, enforced before any work rather than
+    // discovered as an arena abort partway through.
+    if let Some(limit) = ctx_size {
+        if tokens.len() + n_predict > limit {
+            return Err(format!(
+                "prompt is {} tokens and -n is {n_predict}, which exceeds the -c limit of {limit}",
+                tokens.len()
+            )
+            .into());
+        }
+    }
 
     // Size the expert cache from the RAM that is actually free, not a constant.
     //
@@ -395,6 +441,10 @@ fn run_streaming(
 
     let mut writer = TokenWriter::new();
     let mut sampler = Sampler::new(sampler_cfg);
+    // Stop sequences are matched against the accumulated text, not the token:
+    // a stop string can straddle a token boundary and per-token matching would
+    // miss most of them.
+    let mut generated_text = String::new();
     for step in 0..n_predict {
         if logits.len() < vocab {
             return Err(format!("logits too small: {} < {vocab}", logits.len()).into());
@@ -407,6 +457,15 @@ fn run_streaming(
         }
         writer.push(tokenizer, next);
         tokens.push(next);
+        if !stop.is_empty() {
+            generated_text.push_str(&tokenizer.decode(std::slice::from_ref(&next)));
+            if stop
+                .iter()
+                .any(|s| !s.is_empty() && generated_text.contains(s.as_str()))
+            {
+                break;
+            }
+        }
 
         // Only the new token needs computing; history lives in the cache.
         // Skipped on the last step — nothing would read those logits.
@@ -433,6 +492,9 @@ fn run_streaming(
     Ok(())
 }
 
+// These are command-line options, not coupled state; grouping them into a
+// struct would add a layer without removing a decision.
+#[allow(clippy::too_many_arguments)]
 fn run(
     path: &str,
     prompt: &str,
@@ -441,8 +503,16 @@ fn run(
     cache_budget: Option<u64>,
     sampler: SamplerConfig,
     chat: bool,
+    threads_flag: Option<usize>,
+    ctx_size: Option<usize>,
+    stop: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
+    // Set once, read by every graph evaluation. A flag that only reached some
+    // of them would make -t look ineffective on exactly the paths that matter.
+    if let Some(t) = threads_flag {
+        std::env::set_var("BIGTEA_THREADS", t.to_string());
+    }
 
     // --- container ---------------------------------------------------------
     let model = Model::open_split(path)?;
@@ -537,6 +607,8 @@ fn run(
             prefill_block,
             cache_budget,
             sampler,
+            ctx_size,
+            stop,
             t0,
         );
     }
