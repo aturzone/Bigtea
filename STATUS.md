@@ -417,8 +417,8 @@ compute path on its own.** Both command lines and outputs:
 
 | Qwen3-4B dense, CPU, 20 threads | Bigtea | llama.cpp | verdict |
 |---|---:|---:|---|
-| prefill (matched, 519 vs 512) | **56.3 tok/s** | **111.2** (pp512) | **1.98x behind** |
-| generation | **4.27 tok/s** | **5.90** (tg128) | **1.38x behind** |
+| prefill (matched, 519 vs 512) | **83.4 tok/s** | **88.3** | **1.06x behind** |
+| generation | **3.96–4.27 tok/s** | **5.90** (tg128) | ~1.4x behind |
 
 *(The original 38.5 / 0.67 figures were taken on the uncached path with a
 broken arena; both are superseded.)*
@@ -439,23 +439,38 @@ kernel itself (our FFN runs at 472 GFLOP/s against a measured Q4_K ceiling of
 420). Detail and the command lines:
 `docs/graph/research/qwen3-4b-vs-llamacpp-2026-08-10.md`.
 
-**Built, same day, behind `--repack`:**
+**Built, and now ON by default:**
 
 | Qwen3-4B prefill, 519 tokens | tok/s |
 |---|---:|
-| Bigtea, `--repack` | **74.1** |
-| Bigtea, default | 58.6 |
+| llama.cpp | 88.3 |
+| **Bigtea** | **83.4** |
+| Bigtea, `--no-repack` | 58.6 |
 
-**1.35x**, against the 1.39x llama.cpp gets from its own repacking — so the
-mechanism is doing what it does there. 216 tensors, 1.64 GiB rearranged. The
-prefill deficit against llama.cpp goes **1.46x → 1.19x**.
+**1.42x, and the prefill deficit goes 1.46x → 1.06x.** 216 tensors, 1.64 GiB
+rearranged.
 
 It reaches `ggml`'s repacked kernels without adopting `ggml-backend`: a tensor
 allocated in the repack buffer type gets `tensor_traits` hung off its `extra`,
 and `ggml_compute_forward` consults that **on the plain graph path too**.
 
-**Off by default, and it stays off until it is byte-identical.** Three uses
-break on a repacked tensor and none of them fail loudly:
+**It defaults ON because it is the side that AGREES WITH llama.cpp** — which is
+the opposite of how it first looked. Enabling it changed Llama-3.2's
+continuation, which read as a regression until the reference was actually
+consulted. Raw greedy completion, same container:
+
+| prompt | llama.cpp | Bigtea repacked | Bigtea unpacked |
+|---|---|---|---|
+| "The largest ocean on Earth is the" | "Pacific Ocean, covering an area of approximately" | **same** | "which covers an area of" |
+| "Water boils at" | "100 degrees Celsius at standard atmospheric pressure" | same | same |
+
+**The repacked path matches; the unpacked one is the outlier.** Whatever the
+residual difference in the plain Q4_K path is, repacking is the side that
+reproduces the reference implementation — so it is the better default on
+correctness grounds *before* the 1.42x is counted. `--no-repack` turns it off.
+
+Three uses break on a repacked tensor and none fail loudly, so all three are
+excluded:
 
 - **`get_rows`** — `token_embd` is indexed by token id and repacked rows are
   interleaved. Llama-3.2 ties it to the output projection, so repacking it
@@ -463,10 +478,9 @@ break on a repacked tensor and none of them fail loudly:
 - **`view_2d` by byte offset** — Phi-3's fused `attn_qkv` and `ffn_up` are split
   into q/k/v and gate/up that way. Repacking them made Phi-3 emit
   `[PAD32063]rit[PAD32063]…`.
-- Both are excluded now, and all five architectures answer correctly under
-  `--repack`. But **Llama-3.2's continuation still differs** from the unpacked
-  path — both correct, a near-tie flipping on a different accumulation order.
-  Until that is understood, opt-in is the honest default.
+All five architectures answer correctly, and the 19 container-backed V4-Flash
+tests still pass — that path binds through `ResidentSet` rather than
+`load_resident`, so it is untouched and could take the same win later.
 
 **FIXED the same day.** The cause was one branch condition: `forward_cached`
 already had a working KV cache but was only reached `if config.is_moe()`, so

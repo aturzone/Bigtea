@@ -163,8 +163,8 @@ fn main() -> ExitCode {
         eprintln!("  -c, --ctx-size N    cap the context; refuses past it rather than aborting");
         eprintln!("  --stop TEXT         stop when this appears (repeatable)");
         eprintln!("  --force             run an unverified architecture anyway");
-        eprintln!("  --repack            rearrange resident weights for the CPU kernels");
-        eprintln!("                      (1.35x prefill; changes output on near ties)");
+        eprintln!("  --no-repack         keep resident weights in their stored layout");
+        eprintln!("                      (repacking is on by default: 1.35x prefill)");
         return ExitCode::from(2);
     };
     let mut prompt = String::new();
@@ -238,10 +238,10 @@ fn main() -> ExitCode {
                 force = true;
                 i += 1;
             }
-            // Opt-in: worth 1.35x on prefill, and not byte-identical -- see
-            // `bigtea_ggml::repack`.
-            "--repack" => {
-                std::env::set_var("BIGTEA_REPACK", "1");
+            // On by default -- it is 1.35x faster AND agrees with llama.cpp.
+            // This turns it off, for measuring the difference.
+            "--no-repack" => {
+                std::env::set_var("BIGTEA_NO_REPACK", "1");
                 i += 1;
             }
             // llama.cpp spells these -t and -c; matching its names matters more

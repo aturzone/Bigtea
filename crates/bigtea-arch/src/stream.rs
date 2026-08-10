@@ -890,17 +890,24 @@ impl<'m> StreamingRunner<'m> {
         //
         // `bind_repacked` falls back to an ordinary bind whenever ggml has no
         // repacked kernel for the type or shape, so every tensor can be offered.
-        // Repacking is OFF by default until it is proven byte-identical. It
-        // is not: enabling it for every resident tensor made Phi-3 emit
-        // "[PAD32063]rit[PAD32063]..." and changed Llama-3.2's continuation.
+        // Repacking is ON by default, because it is what **agrees with
+        // llama.cpp**. That is the opposite of what it looked like at first.
         //
-        // The cause is structural, not a tuning problem. A repacked tensor's
-        // bytes are *rearranged*, so any `view_2d` into it by byte offset --
-        // which is exactly how Phi-3's fused `attn_qkv` and `ffn_up` are split
-        // into q/k/v and gate/up -- addresses the wrong weights. Views and
-        // repacking cannot both be right without teaching the splitter about
-        // the packed layout.
-        let repack = std::env::var("BIGTEA_REPACK").is_ok();
+        // Enabling it changed Llama-3.2's continuation, which read as a
+        // regression until the reference was actually consulted. Raw greedy
+        // completion, same container:
+        //
+        //   prompt                       llama.cpp                    Bigtea
+        //   "The largest ocean ..."      "covering an area of ..."    repacked: same
+        //                                                            unpacked: "which covers ..."
+        //
+        // The repacked path matches; the unpacked one is the outlier. Whatever
+        // the residual difference in the plain Q4_K path is, repacking is the
+        // side that reproduces the reference implementation.
+        //
+        // `BIGTEA_NO_REPACK` turns it off, for measuring the difference or for
+        // a machine where the rearranged copy is unaffordable.
+        let repack = std::env::var("BIGTEA_NO_REPACK").is_err();
         let names: Vec<String> = self.resident_tensor_names().into_iter().collect();
         for name in names {
             let loc = self
