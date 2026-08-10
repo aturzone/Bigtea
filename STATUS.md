@@ -418,7 +418,7 @@ compute path on its own.** Both command lines and outputs:
 | Qwen3-4B dense, CPU, 20 threads | Bigtea | llama.cpp | verdict |
 |---|---:|---:|---|
 | prefill (matched, 519 vs 512) | **83.4 tok/s** | **88.3** | **1.06x behind** |
-| generation | **3.96–4.27 tok/s** | **5.90** (tg128) | ~1.4x behind |
+| generation (128 tok, 3 reps) | **4.3 tok/s** | **5.28 ± 0.33** (tg128) | **1.23x behind** |
 
 *(The original 38.5 / 0.67 figures were taken on the uncached path with a
 broken arena; both are superseded.)*
@@ -625,6 +625,149 @@ process. It surfaced as `error: test failed ... process didn't exit
 successfully` rather than as a failing test, and every result after the abort
 was lost — so in practice they had stopped being run. They now share a `heavy()`
 lock, and the plain command above works without `--test-threads=1`.
+
+## Generation: q, k and v now share one graph — 1.30x
+
+`compute()` re-evaluates the **whole ancestor graph** of its output. The Q/K/V
+phase called it three times, once per tensor, so the normalisation they share
+ran three times and it paid three graph builds and three threadpool cycles per
+layer per token. At one token those fixed costs dominate: the matmuls are
+matrix-*vector* products and tiny.
+
+The comment above the code already said *"one compute materialises all three;
+they share a graph"*. The code did not.
+
+`Context::compute_many` expands one graph with several roots. Measured on
+Qwen3-4B, 96 tokens:
+
+| Qwen3-4B, 96 tokens | before | after |
+|---|---:|---:|
+| generation | 3.94 tok/s | **5.13** |
+| Q/K/V phase | 8.3 s | **5.3 s** |
+
+**1.30x**, and output is unchanged on all five architectures.
+
+**The deficit that follows from it is 1.23x, not 1.15x**, and the difference is
+a lesson rather than a rounding error. 5.13 was measured at 96 tokens against a
+llama.cpp run that happened to report 5.90; re-measured at the *same* 128 tokens
+`llama-bench` uses, with 3 repetitions, llama.cpp is **5.28 ± 0.33** and Bigtea
+is **4.3**. Generation slows as context grows, so a shorter run flatters us —
+and a single un-repeated reference run has a ±0.33 spread that is a third of the
+gap being claimed. Both sides now get matched length and repetitions.
+
+Llama-3.2-1B, same treatment: Bigtea **13.5**, llama.cpp **16.21 ± 0.29** —
+**1.20x behind**. An earlier single llama.cpp run read 12.91, which would have
+made this a *win*. It is not one.
+
+This is the third time this exact fact has cost time — it is already in
+`CLAUDE.md` as *"24 calls per block became 6 — 1.9x"*. Worth grepping for
+`compute(` in any hot loop before assuming the arithmetic is the cost.
+
+## `-t` was never plumbed, and the default was the worst setting (2026-08-10)
+
+Full write-up, every command line both sides:
+`docs/graph/research/threads-were-never-plumbed-2026-08-10.md`.
+
+`-t N` set `BIGTEA_THREADS` and **only `deepseek4_forward.rs` read it.** Every
+other architecture computed its own count from `available_parallelism()`. What
+exposed it: `-t 1` and `-t 20` produced *bit-identical* phase timings. An
+earlier sweep reading 4.07/4.00/4.31/4.67 tok/s had been recorded as "threads
+are not the lever" — it was six measurements of one configuration.
+
+**A sweep whose knob is disconnected is indistinguishable from a flat response.**
+Confirm the knob moves something before concluding it moves nothing.
+
+Once connected, generation and prefill turned out to want opposite counts, so
+there are now two — `-t` and llama.cpp's `-tb` / `--threads-batch` — chosen by
+the token count of the step, not the call site:
+
+| threads | Qwen3-4B gen | Llama-3.2-1B gen | Qwen3-4B prefill |
+|---:|---:|---:|---:|
+| 2 | **7.64** | **21.95** | — |
+| 4 | 7.51 | 21.45 | 47.4 |
+| 8 | 6.24 | 16.78 | 70.9 |
+| 20 (the old default) | 4.49 | 12.22 | **81.5** |
+
+Generation streams every weight once per token and saturates DRAM long before it
+runs out of cores; prefill multiplies a whole block and scales with cores.
+llama.cpp shows the same curve on this machine, so it is the hardware, not us.
+
+**A calibration that failed and was deleted**: a 150 ms DRAM-saturation
+microbenchmark at load chose 6, 8, 12, 12, 4, 6 on six consecutive runs while
+the optimum was 2-4, and its spread (5.51-8.20) was worse than the bad default
+it replaced. A pure read has no per-node barrier; a ggml graph does. *A proxy
+that must be corrected until it agrees with the objective is the objective,
+measured badly.* What shipped instead tunes on **real generated tokens** and
+stops after ~4 of them.
+
+Interleaved A/B, same session, `-n 64`, 3 reps:
+
+| | tuned (new default) | `-t 20` (old default) | |
+|---|---:|---:|---|
+| Qwen3-4B | **8.01** | 4.83 | **1.66x** |
+| Llama-3.2-1B | **20.05** | 11.89 | **1.69x** |
+
+### Against llama.cpp — both cells, neither quotable alone
+
+| generation | Bigtea | llama.cpp | verdict |
+|---|---:|---:|---|
+| Qwen3-4B, **both at default** | **8.01** | 6.52 ± 0.33 (t=10) | **1.23x ahead** |
+| Llama-3.2-1B, **both at default** | 20.05 | 20.91 ± 0.65 (t=10) | 1.04x — parity |
+| Qwen3-4B, **both hand-tuned** | 7.64 (t=2) | 9.16 ± 0.43 (t=4) | 1.20x behind |
+| Llama-3.2-1B, **both hand-tuned** | 21.95 (t=2) | 27.85 ± 1.98 (t=4) | 1.27x behind |
+
+Out of the box we lead on Qwen3-4B because we measure the machine and llama.cpp
+uses a fixed default. **Given equal care on both sides llama.cpp is still
+faster.** The hand-tuned deficit (1.20x) matches what was recorded before any of
+this work (1.23x), which is what says the ratio is real rather than an artefact
+of where on the curve each engine was sitting.
+
+Output is byte-identical at 2 and 20 threads on all five verified dense
+architectures. 229 tests pass.
+
+## Gemma-2 sliding-window attention (2026-08-10) — the 4096 refusal is gone
+
+Detail and command lines: `docs/graph/research/gemma2-sliding-window-2026-08-10.md`.
+
+Gemma-2 alternates a sliding-window layer with a full-attention one. Neither the
+window nor a way to live without it existed, so anything past 4096 tokens was
+refused. Now the even layers get a second mask with the old keys closed off.
+
+Verified three ways, because two of them prove nothing alone:
+
+1. **Below the window** output is unchanged (`**Paris**.`) — a regression check.
+2. **Above the window** (5201 tokens, greedy, `-no-cnv` on both sides) Bigtea and
+   llama.cpp produce the same continuation.
+3. **The layer parity is load-bearing** — flipping it to odd-slide changes the
+   output on the same prompt. Without this, check 2 is also consistent with the
+   window never being applied, because a repetitive prompt continues itself.
+
+`-no-cnv` matters: without it `llama-completion` applies Gemma's chat template
+and answers as an assistant, and the two engines are not doing the same work.
+
+### Three arenas were short; reading ggml's error correctly found the one that mattered
+
+**`available` in `not enough space in the context's memory pool` is the pool's
+total size, not the remainder.** Reading it as the remainder points at whichever
+arena was nearly full instead of the one that was too small, and cost two wrong
+fixes. `56,624,208 ≈ 3 × 18,874,368` identified it exactly: `post_norm` budgeted
+one `n_embd × n_new` tensor and allocated three. Gemma-only, which is why nothing
+else ever hit it. The dense-FFN and attention arenas were under-counted too and
+are fixed here; they would have aborted at a larger block.
+
+**`arena_for` doubles its total, and that doubling is what hides an undercount
+until the block grows enough to eat it.**
+
+### Prefill: not a win, and it nearly got quoted as one
+
+| Gemma-2-2b prefill, 5200 tokens | best of each | verdict |
+|---|---:|---|
+| llama.cpp | **127.35** (t=20) | — |
+| Bigtea | 114.99 (t=4) | **1.11x behind** |
+
+At `-t 4` on both sides it reads 114.99 against 76.76 — 1.50x ahead — because
+prefill wants every core and llama.cpp was being handicapped. Run the opposing
+command at the setting its own author would choose.
 
 ## Known limitations
 

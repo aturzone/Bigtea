@@ -159,7 +159,9 @@ fn main() -> ExitCode {
         eprintln!("  --seed S            reproducible sampling");
         eprintln!("  --llamacpp-defaults temp 0.8, top-k 40, top-p 0.95, min-p 0.05, repeat 1.1");
         eprintln!("  --chat              apply the model's chat template to the prompt");
-        eprintln!("  -t, --threads N     compute threads (default: all cores)");
+        eprintln!("  -t, --threads N     threads for generation (default: measured -- generation");
+        eprintln!("                      is bandwidth-bound and all cores is 1.7x SLOWER)");
+        eprintln!("  -tb, --threads-batch N  threads for prefill (default: all cores)");
         eprintln!("  -c, --ctx-size N    cap the context; refuses past it rather than aborting");
         eprintln!("  --stop TEXT         stop when this appears (repeatable)");
         eprintln!("  --force             run an unverified architecture anyway");
@@ -180,6 +182,7 @@ fn main() -> ExitCode {
     let mut sampler = SamplerConfig::default();
     let mut chat = false;
     let mut threads: Option<usize> = None;
+    let mut threads_batch: Option<usize> = None;
     let mut ctx_size: Option<usize> = None;
     let mut stop: Vec<String> = Vec::new();
     let mut force = false;
@@ -254,6 +257,16 @@ fn main() -> ExitCode {
                     .filter(|&t: &usize| t > 0);
                 i += 2;
             }
+            // Generation and prefill want opposite thread counts — one is
+            // bandwidth-bound, the other compute-bound — so llama.cpp carries
+            // two flags and so do we, with its spelling.
+            "-tb" | "--threads-batch" => {
+                threads_batch = rest
+                    .get(i + 1)
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&t: &usize| t > 0);
+                i += 2;
+            }
             "-c" | "--ctx-size" => {
                 ctx_size = rest
                     .get(i + 1)
@@ -320,6 +333,7 @@ fn main() -> ExitCode {
         sampler,
         chat,
         threads,
+        threads_batch,
         ctx_size,
         stop,
         force,
@@ -438,6 +452,19 @@ fn run_streaming(
         );
     }
 
+    // Say which counts are in use and where they came from. Generation settles
+    // on a measured count, and an unexplained "2" on a 20-thread machine reads
+    // as a bug rather than as the 1.8x it is worth.
+    println!(
+        "threads    {} prefilling, generation {}",
+        bigtea_arch::configured_threads_batch(),
+        if std::env::var("BIGTEA_THREADS").is_ok() {
+            format!("{} (-t)", bigtea_arch::configured_threads())
+        } else {
+            "tuned on the first tokens".to_string()
+        }
+    );
+
     let _ = arch;
     let prompt_len = tokens.len();
 
@@ -524,6 +551,14 @@ fn run_streaming(
         cache.bytes() as f64 / (1 << 20) as f64
     );
     println!("streaming  {}", runner.stats);
+    // What the tuner settled on. Printed even when it did not finish, because
+    // "still tuning after N tokens" explains an odd tok/s that would otherwise
+    // look like a regression.
+    let (settled, done) = runner.generation_threads();
+    println!(
+        "threads    generation used {settled}{}",
+        if done { "" } else { " (still tuning)" }
+    );
     println!("total      {:.1}s", t0.elapsed().as_secs_f64());
     Ok(())
 }
@@ -540,6 +575,7 @@ fn run(
     sampler: SamplerConfig,
     chat: bool,
     threads_flag: Option<usize>,
+    threads_batch_flag: Option<usize>,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -549,6 +585,9 @@ fn run(
     // of them would make -t look ineffective on exactly the paths that matter.
     if let Some(t) = threads_flag {
         std::env::set_var("BIGTEA_THREADS", t.to_string());
+    }
+    if let Some(t) = threads_batch_flag {
+        std::env::set_var("BIGTEA_THREADS_BATCH", t.to_string());
     }
 
     // --- container ---------------------------------------------------------
@@ -727,11 +766,15 @@ fn run(
         load_start.elapsed().as_secs_f64()
     );
 
+    // Say which counts are in use and why. The generation default is a
+    // measurement, and an unexplained "2" on a 20-thread machine looks like a
+    // bug rather than the 1.7x it is worth.
+    let threads = bigtea_arch::configured_threads();
+    let threads_batch = bigtea_arch::configured_threads_batch();
+    println!("threads    {threads} generating, {threads_batch} prefilling");
+
     // --- generate ----------------------------------------------------------
     println!("\n{prompt}");
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
 
     let mut produced = String::new();
     let gen_start = std::time::Instant::now();

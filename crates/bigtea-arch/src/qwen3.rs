@@ -212,21 +212,17 @@ impl Qwen3Config {
 
     /// The longest sequence this build can run *correctly* for this model.
     ///
-    /// Gemma-2 alternates full-attention and sliding-window layers. **The
-    /// window is not implemented here**, and below it every layer is
-    /// effectively full attention — so short sequences are exactly right and
-    /// long ones would silently let the local layers see too far.
+    /// Gemma-2 alternates a sliding-window layer with a full-attention one.
+    /// The window **is** implemented now (`stream.rs` builds a second mask and
+    /// hands it to the even layers), so there is no length past which the local
+    /// layers quietly see too far, and nothing left to refuse.
     ///
-    /// Refusing past the window is the honest boundary. It is not a limit of
-    /// the architecture, it is a limit of this implementation, and saying so is
-    /// the difference between a clear refusal and confident nonsense at 5000
-    /// tokens that nobody would trace back to attention.
+    /// Kept as a function rather than deleted: it is the right place for the
+    /// next architecture whose limit is this implementation rather than the
+    /// model, and refusing beats confident nonsense at 5000 tokens that nobody
+    /// would trace back to attention.
     pub fn correct_context_limit(&self) -> usize {
-        if self.sliding_window > 0 {
-            self.sliding_window as usize
-        } else {
-            usize::MAX
-        }
+        usize::MAX
     }
 
     /// Scale applied to attention scores before softmax.

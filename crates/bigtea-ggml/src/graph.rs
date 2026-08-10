@@ -1088,6 +1088,39 @@ impl Context {
     ///
     /// Nothing has been computed before this call — the tensors describe a
     /// plan, not values.
+    /// Evaluate several outputs in **one** graph.
+    ///
+    /// `compute` re-evaluates the whole ancestor graph of its output, so
+    /// computing `q`, then `k`, then `v` — which share a normalisation — does
+    /// that normalisation three times, and pays three graph builds and three
+    /// threadpool cycles for it. At one token those fixed costs are the
+    /// dominant term: the matmuls are matrix-*vector* products and tiny.
+    ///
+    /// `ggml_build_forward_expand` accepts several roots on one graph, so this
+    /// is the same work with the sharing preserved.
+    pub fn compute_many(&self, outputs: &[&Tensor<'_>], threads: usize) -> Result<(), GgmlError> {
+        if outputs.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: valid context; the graph lives in the same arena.
+        let graph = unsafe { ggml_new_graph(self.raw.as_ptr()) };
+        if graph.is_null() {
+            return Err(GgmlError::ArenaExhausted);
+        }
+        for out in outputs {
+            // SAFETY: `graph` is non-null and every output was built here.
+            unsafe { ggml_build_forward_expand(graph, out.raw.as_ptr()) };
+        }
+        // SAFETY: graph and context match.
+        let status = unsafe {
+            ggml_graph_compute_with_ctx(self.raw.as_ptr(), graph, threads.max(1) as c_int)
+        };
+        if status != 0 {
+            return Err(GgmlError::ComputeFailed(status));
+        }
+        Ok(())
+    }
+
     pub fn compute(&self, output: &Tensor<'_>, threads: usize) -> Result<(), GgmlError> {
         // SAFETY: valid context; the returned graph lives in the same arena.
         let graph = unsafe { ggml_new_graph(self.raw.as_ptr()) };
