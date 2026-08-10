@@ -1,8 +1,57 @@
 ---
-topic: The scoped ticket for the remaining 1.60x on Qwen3-30B — batch the expert matmuls so a barrier has real work. Includes the arithmetic that says it pays, and the measurement that would say it does not
-status: scoped, not started
+topic: Batching the expert matmuls — BUILT, MEASURED, REVERTED. The batched kernel is 1.7x faster and making the experts contiguous costs exactly what it saves. The version that would pay needs the expert tensor resident, not streamed
+status: closed — negative, with the code that produced it described below
 links: [../research/threads-were-never-plumbed-2026-08-10.md, lts-parity-criteria.md]
 ---
+
+## Result first: implemented, correct, and slower. Reverted.
+
+It was built on `ticket/r7-factored-experts`, produced **byte-identical output**
+("Paris. The capital of Italy is Rome. The capital of"), and lost:
+
+| Qwen3-30B-A3B, 24 tokens | baseline | batched |
+|---|---:|---:|
+| expert compute | 7.0 s | **4.2 s** |
+| contiguity copy (in no phase counter) | 0 | **~3.1 s** |
+| **generation** | **1.34-1.55 tok/s** | 1.11-1.27 |
+
+**The batched matmul saved ~117 ms/token and the copy cost ~100-130 ms/token.**
+They cancel, and the arithmetic says they always will: the pass moves ~1.02 GB
+of expert weights per token, so making them contiguous is ~100 ms at 10 GB/s no
+matter how good the kernel that follows is.
+
+### Why the kernelbench evidence was misleading
+
+`bigtea-kernelbench` measured the batched form at 11.17 GiB/s and 2.86x thread
+scaling, and that is real — **but it binds the model's already-stacked expert
+tensor zero-copy.** The streaming path holds the selected experts as unrelated
+`Arc<[u8]>` and has to build the stack itself. The ticket named this caveat
+("it can do that because it mmaps the entire model") and then under-weighted it
+in the estimate. *A kernel benchmark measures the kernel, not the data movement
+required to feed it.*
+
+One real bug was found and fixed on the way, worth keeping in mind: returning
+`Arc<[u8]>` from the stacking closure **copied everything a second time**, because
+`Arc::from(Box<[u8]>)` reallocates. Handing over the `Vec<u8>` directly is free —
+`WeightBytes` is implemented for anything that derefs to `[u8]`, so `bind` just
+moves it. That mistake alone cost 12 s of a 27 s run (0.88 tok/s against 1.34).
+
+### The version that would pay, and it is a different ticket
+
+**Bind the whole stacked expert tensor and pass the real expert ids.** No copy at
+all, and the full 1.7x on expert compute. That requires the expert tensor to be
+**resident**, which is exactly what llama.cpp gets from mmap and what Bigtea
+gives up in order to run a 144 GB model on 15.7 GiB.
+
+But it is not always given up: **Qwen3-30B-A3B is 17.28 GiB and fits on a 32 GB
+machine.** So the right shape is a *residency-dependent* expert path — stacked
+and zero-copy when the experts fit, per-expert streaming when they do not — and
+that belongs with the tok/s-versus-RAM frontier work, not here.
+
+---
+
+## Everything below is the original scoping, kept because the arithmetic is the
+## part that turned out to be wrong and it should stay visible.
 
 ## Where this came from
 
