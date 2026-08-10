@@ -295,6 +295,22 @@ impl Qwen3Model {
             cur = ctx.add(&ffn_out, &ffn_input)?;
         }
 
+        // Only the final position predicts the next token, so the output
+        // projection is taken on that row alone.
+        //
+        // Projecting all of them is what a naive graph does, and it is enormous:
+        // the vocabulary is 151936 wide, so a 651-token prompt costs
+        // `651 x 2560 x 151936` = **253 GFLOP** and 395 MB of logits, of which
+        // one row is used. It also made the arena quadratic-looking when the
+        // real driver was this term, and a 651-token prompt aborted with
+        // `GGML_ASSERT` on a 2 GiB arena.
+        let cur = ctx.view_2d(
+            &cur,
+            c.n_embd as i64,
+            1,
+            c.n_embd as usize * std::mem::size_of::<f32>(),
+            (n_tokens - 1) as usize * c.n_embd as usize * std::mem::size_of::<f32>(),
+        )?;
         let cur = self.rms_norm_mul(ctx, &cur, get("output_norm.weight")?)?;
         // Output projection; tied to the embedding table when absent.
         let out_name = if weights.get("output.weight").is_some() {

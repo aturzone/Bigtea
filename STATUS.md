@@ -408,6 +408,37 @@ code: the SSE headers were being emitted with **leading whitespace**, because a
 multi-line string literal in the source kept its indentation. `curl` tolerated
 it; a stricter client would not.
 
+## The first dense head-to-head (2026-08-10) — and it is a deficit
+
+Every previous comparison was on a model that streams from disk, where I/O
+dominates. **Qwen3-4B fits in RAM, so this is the first measurement of the
+compute path on its own.** Both command lines and outputs:
+`docs/graph/research/qwen3-4b-vs-llamacpp-2026-08-10.md`.
+
+| Qwen3-4B dense, CPU, 20 threads | Bigtea | llama.cpp | verdict |
+|---|---:|---:|---|
+| prefill | 38.5 tok/s (651 tok) | **111.2** (pp512) | **2.9x behind** |
+| generation | 0.67 tok/s (128 tok) | **5.90** (tg128) | **8.8x behind** |
+
+**The generation gap has one cause: the dense path has no KV cache.** Every
+token rebuilds the graph over the whole sequence — 128 tokens from a 9-token
+prompt is ~9,300 token-positions of work to produce 128 tokens. It is the same
+defect R3 fixed on V4-Flash, where it was worth 2.3x. `KvCache` already exists
+and the equivalence harness that verified it applies unchanged. **This is now
+the largest single performance item on the LTS list.**
+
+Two bugs found while measuring, both fixed:
+
+- **A 651-token prompt aborted the process.** The dense arena was a hardcoded
+  2 GiB, and `ggml` answers exhaustion with `GGML_ASSERT`, not an error. The
+  arena is now computed from the shape — and the term that was missing is that
+  it is **per layer**: one graph spans all 36 blocks in one context and `ggml`
+  frees nothing inside a context. `bigtea-run` now refuses a prompt that will
+  not fit, naming the arena needed and the longest prompt that would work.
+- **The output projection ran on every position.** `build_graph` projected the
+  whole sequence through the 151936-wide output matrix and used one row — 253
+  GFLOP wasted on a 651-token prompt. Now only the final position is projected.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

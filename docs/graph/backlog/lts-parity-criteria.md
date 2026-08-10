@@ -66,8 +66,8 @@ measured back to back in one session with both command lines recorded.
 | criterion | V4-Flash | Qwen3-30B-A3B | Qwen3-4B dense |
 |---|---|---|---|
 | load / time-to-first-token | 1.25x behind | — | — |
-| prefill tok/s | 1.25x behind | **ahead** @565, @2206 | not measured |
-| generation tok/s | 0.37 vs 0.39 | 1.07 vs 2.16 | **3.53, not compared** |
+| prefill tok/s | 1.25x behind | **ahead** @565, @2206 | **38.5 vs 111.2 — 2.9x behind** |
+| generation tok/s | 0.37 vs 0.39 | 1.07 vs 2.16 | **0.67 vs 5.90 — 8.8x behind, no KV cache** |
 | memory footprint at equal speed | **ours, by design** | ours | — |
 | long-context generation | untested | untested | untested |
 

@@ -80,6 +80,64 @@ fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool) -> String {
     tokenizer.apply_chat_template(&[Message::new("user", prompt)], true)
 }
 
+/// Bytes of `ggml` arena a dense forward pass over `n` tokens needs.
+///
+/// The dominant term is attention: `n * n` scores per head, held twice (the
+/// scores and their softmax), in `f32`. Everything else — activations, Q/K/V,
+/// the FFN intermediates, the logits — is linear in `n` and is covered by the
+/// second term plus generous slack.
+///
+/// Deliberately generous. Under-estimating does not return an error: `ggml`
+/// calls `GGML_ASSERT` and the process dies, so the cost of being wrong is
+/// asymmetric and the slack is cheap.
+fn dense_arena_bytes(config: &Qwen3Config, n: i64) -> usize {
+    let n = n.max(1) as u64;
+    let layers = config.n_layer.max(1) as u64;
+    // **Per layer**, and that is the whole point. One graph spans every block in
+    // a single context, and `ggml` frees nothing inside a context, so all 36
+    // layers' intermediates are alive at once. Sizing this for one layer is what
+    // made a 651-token prompt abort.
+    let per_layer = {
+        // Attention scores and their softmax: n x n per head, twice.
+        let scores = n * n * config.n_head as u64 * 4 * 2;
+        // Activations, Q/K/V, the FFN intermediates: roughly a dozen tensors of
+        // n_embd x n, plus the wider FFN ones.
+        let activations = n * config.n_embd as u64 * 4 * 12 + n * config.n_ff as u64 * 4 * 3;
+        // 25% over the counted tensors. The count is a reading of the graph and
+        // the graph changes; being 0.2% short still aborts, and being 25% over
+        // only refuses slightly sooner.
+        (scores + activations) * 5 / 4
+    };
+    // The logits are one row now, not `n` of them — see `build_graph`.
+    let head = config.vocab_size as u64 * 4 * 2;
+    // `ggml_graph_compute_with_ctx` allocates the graph struct **and its
+    // per-thread work buffer** out of this same arena, so the tensor data is
+    // not the whole requirement. Sizing for the data alone left it 0.1% short,
+    // which is still an abort.
+    let data = per_layer * layers + head;
+    (data + data / 8 + (512 << 20)) as usize
+}
+
+/// The longest prompt this machine can prefill in one graph, for this model.
+///
+/// The dense path builds one graph over every layer, so its arena grows with
+/// the sequence and there is a length past which it does not fit. Saying so is
+/// the difference between a clear refusal and `GGML_ASSERT` killing the process
+/// with no message this code can catch.
+fn dense_max_tokens(config: &Qwen3Config, budget: u64) -> i64 {
+    let mut lo = 1i64;
+    let mut hi = 32_768i64;
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if dense_arena_bytes(config, mid) as u64 <= budget {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
@@ -513,15 +571,51 @@ fn run(
     let mut produced = String::new();
     let gen_start = std::time::Instant::now();
 
+    // Refuse a prompt this machine cannot prefill, with the numbers — rather
+    // than letting ggml abort partway through, which is a `GGML_ASSERT` and
+    // kills the process with nothing this code can catch or report.
+    {
+        let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
+        let budget = machine
+            .ram_available_bytes
+            .unwrap_or(4 << 30)
+            .saturating_sub(1 << 30);
+        let need = dense_arena_bytes(&config, (tokens.len() + n_predict) as i64) as u64;
+        if need > budget {
+            return Err(format!(
+                "this prompt is {} tokens and needs {:.2} GiB of compute arena, but only \
+                 {:.2} GiB is free.\n           The dense path builds one graph over all {} \
+                 layers and ggml frees nothing inside a context, so the arena grows with the \
+                 sequence.\n           The longest that fits here is about {} tokens. Close \
+                 some applications, or use a shorter prompt.",
+                tokens.len(),
+                need as f64 / GIB,
+                budget as f64 / GIB,
+                config.n_layer,
+                dense_max_tokens(&config, budget),
+            )
+            .into());
+        }
+    }
+
     let mut sampler = Sampler::new(sampler);
     let mut writer = TokenWriter::new();
     for step in 0..n_predict {
+        let n = tokens.len() as i64;
         // A fresh compute arena per token: intermediates are dead once the
         // token is chosen, and reclaiming them keeps peak memory flat rather
         // than growing with the sequence.
-        let ctx = Context::new(2 << 30)?;
+        //
+        // Sized from the sequence, not fixed. A flat 2 GiB **aborted** on a
+        // 651-token prompt — `ggml_new_object: not enough space`, which is a
+        // `GGML_ASSERT` and kills the process rather than returning an error
+        // this code could report. Attention holds `n * n * n_head` floats for
+        // the scores and again for their softmax, so the requirement is
+        // quadratic in the sequence and a constant can only ever be wrong at
+        // some length.
+        let arena = dense_arena_bytes(&config, n);
+        let ctx = Context::new(arena)?;
 
-        let n = tokens.len() as i64;
         let tok = ctx.new_i32_1d(n)?;
         tok.set_i32(&tokens.iter().map(|&t| t as i32).collect::<Vec<_>>())?;
         let pos = ctx.new_i32_1d(n)?;
