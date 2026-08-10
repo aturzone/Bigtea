@@ -53,7 +53,7 @@ struct Slice {
 
 /// Batch sizes to sweep. 1 is a cached generation step; 8-32 is the range a
 /// speculative verify pass would live in.
-const BATCHES: &[i64] = &[1, 2, 4, 8, 16, 32];
+const BATCHES: &[i64] = &[1, 8, 32, 128, 512];
 
 fn main() -> ExitCode {
     let mut path: Option<PathBuf> = None;

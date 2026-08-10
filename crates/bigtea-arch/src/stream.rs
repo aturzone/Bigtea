@@ -57,9 +57,15 @@ pub struct StreamStats {
     /// Grows with context length times layers, so it is a prime suspect for
     /// why generation slows down as the prompt gets longer.
     pub kv_build_seconds: f64,
-    /// Everything else computed per token: embeddings, Q/K/V, the router and
-    /// the vocabulary projection.
+    /// Everything else computed per token: embeddings, the router and the
+    /// vocabulary projection.
     pub other_seconds: f64,
+    /// The Q/K/V projections, separated from `other_seconds` because on a dense
+    /// model they and the feed-forward are the whole prefill cost and knowing
+    /// which dominates decides what to optimise.
+    pub qkv_seconds: f64,
+    /// The feed-forward, dense or expert-router-driven.
+    pub ffn_seconds: f64,
 }
 
 impl std::fmt::Display for StreamStats {
@@ -78,11 +84,13 @@ impl std::fmt::Display for StreamStats {
         )?;
         write!(
             f,
-            "\n           time: {:.1}s disk, {:.1}s expert compute, {:.1}s attention, \
-             {:.1}s slice copies, {:.1}s kv build, {:.1}s other compute",
+            "\n           time: {:.1}s disk, {:.1}s qkv, {:.1}s attention, {:.1}s ffn, \
+             {:.1}s expert compute, {:.1}s slice copies, {:.1}s kv build, {:.1}s other",
             self.read_seconds,
-            self.expert_seconds,
+            self.qkv_seconds,
             self.attn_seconds,
+            self.ffn_seconds,
+            self.expert_seconds,
             self.copy_seconds,
             self.kv_build_seconds,
             self.other_seconds
@@ -1081,7 +1089,7 @@ impl<'m> StreamingRunner<'m> {
                 ctx.compute(&q, threads)?;
                 ctx.compute(&k, threads)?;
                 ctx.compute(&v, threads)?;
-                self.stats.other_seconds += t.elapsed().as_secs_f64();
+                self.stats.qkv_seconds += t.elapsed().as_secs_f64();
                 (q.to_vec_f32(), k.to_vec_f32(), v.to_vec_f32(), x.clone())
             };
 
@@ -1215,7 +1223,7 @@ impl<'m> StreamingRunner<'m> {
                     let out = ctx.add(&ffn, &xt)?;
                     let t = std::time::Instant::now();
                     ctx.compute(&out, threads)?;
-                    self.stats.other_seconds += t.elapsed().as_secs_f64();
+                    self.stats.ffn_seconds += t.elapsed().as_secs_f64();
                     x = out.to_vec_f32();
                     continue;
                 }
@@ -1226,7 +1234,7 @@ impl<'m> StreamingRunner<'m> {
                 let probs = ctx.soft_max_ext(&logits, None, 1.0, 0.0)?;
                 let t = std::time::Instant::now();
                 ctx.compute(&probs, threads)?;
-                self.stats.other_seconds += t.elapsed().as_secs_f64();
+                self.stats.ffn_seconds += t.elapsed().as_secs_f64();
                 (normed.to_vec_f32(), probs.to_vec_f32())
             };
 

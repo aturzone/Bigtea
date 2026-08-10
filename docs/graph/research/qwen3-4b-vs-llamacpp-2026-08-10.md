@@ -126,6 +126,68 @@ checkable, rather than being asserted once and then trusted).
 **6.4x on Qwen3-4B generation from one branch condition.** The remaining ~1.3x
 is real and is now the honest gap on dense generation.
 
+## The prefill gap is weight repacking, and nothing else
+
+Measured after the KV cache and the arena fix, at matched length, with
+`llama-completion` on the **same file and the same prompt file** so the two
+sides are doing identical work:
+
+```
+$ llama-completion -m Qwen3-4B-Q4_K_M.gguf -f target/p512.txt -n 1 -t 20 --no-warmup
+prompt eval time = 5970.89 ms / 527 tokens (88.26 tokens per second)
+
+$ llama-completion ... --no-repack
+prompt eval time = 8276.33 ms / 527 tokens (63.68 tokens per second)
+
+$ bigtea-run Qwen3-4B-Q4_K_M.gguf -f target/p512.txt -n 1 -t 8
+prefill 519 tokens in 8.6s (60.29 tok/s)
+```
+
+| Qwen3-4B prefill, 20 threads | tok/s | vs Bigtea |
+|---|---:|---:|
+| llama.cpp, repacking **on** (its default) | **88.26** | 1.46x ahead |
+| llama.cpp, repacking **off** | 63.68 | **1.06x ahead** |
+| Bigtea | 60.29 | — |
+
+**Repacking is worth 1.39x to llama.cpp. Without it the two engines are 6%
+apart.** Since both link the *same* ggml, that is the expected result once the
+call pattern is equivalent — and it says the remaining gap is one named,
+buildable thing rather than a diffuse deficit.
+
+### What was ruled out on the way
+
+Each of these was the obvious suspect and each is measured, not assumed:
+
+| suspect | measurement | verdict |
+|---|---|---|
+| thread count | 8/10/12/16/20 give 60.3/57.9/54.6/56.8/57.4 tok/s | **not it** |
+| graph-build and threadpool overhead | 108 `compute()` calls over 9.3 s ≈ 0.2% | **not it** |
+| the matmul kernel itself | FFN runs at 472 GFLOP/s; `bigtea-kernelbench` peaks at 420 for Q4_K | **already at the ceiling** |
+| our arena sizing | fixed; was aborting, not slowing | **not it** |
+
+Where the time goes, from the runner's own breakdown at 519 tokens:
+
+```
+1.5s qkv    1.2s attention    5.6s ffn    (of 9.3s)
+```
+
+The feed-forward is 60% of prefill, which is where repacking would land.
+
+### Why we do not repack, and what it would take
+
+Bigtea binds weights **zero-copy**: `ggml` is handed a pointer into the mapped
+container. That is what makes a 144 GB model run on a 15.7 GiB machine, and it
+is not negotiable on the streaming path.
+
+llama.cpp repacks through `ggml-backend`'s *extra buffer types*, which rearrange
+a quantised tensor into a vectorisation-friendly layout when it is allocated.
+Bigtea uses the raw graph API and never sees that path.
+
+**For a dense model that fits in RAM the trade is different**: the weights are
+already copied into memory, so repacking them once at load costs a rearrange
+and no extra residency. That is a contained change — it applies only where the
+model is resident, and the streaming path keeps zero-copy binding untouched.
+
 ## What this does not measure
 
 - **Quality.** Both engines were run greedy where possible; no perplexity or

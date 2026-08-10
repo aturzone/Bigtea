@@ -423,6 +423,28 @@ compute path on its own.** Both command lines and outputs:
 *(The original 38.5 / 0.67 figures were taken on the uncached path with a
 broken arena; both are superseded.)*
 
+**The prefill gap is weight repacking, and nothing else.** Same file, same
+prompt, `llama-completion` both sides:
+
+| Qwen3-4B prefill | tok/s |
+|---|---:|
+| llama.cpp, repacking on (default) | **88.26** |
+| llama.cpp, `--no-repack` | 63.68 |
+| Bigtea | 60.29 |
+
+**Without repacking the two engines are 6% apart** — expected, since both link
+the same ggml. Ruled out by measurement on the way: thread count (8–20 all
+within 10%), graph/threadpool overhead (~0.2% of the pass), and the matmul
+kernel itself (our FFN runs at 472 GFLOP/s against a measured Q4_K ceiling of
+420). Detail and the command lines:
+`docs/graph/research/qwen3-4b-vs-llamacpp-2026-08-10.md`.
+
+We do not repack because weights are bound **zero-copy** — a pointer into the
+mapped container — which is what makes a 144 GB model run at all. But for a
+**resident dense model** the weights are already copied, so repacking them once
+at load costs a rearrange and no extra memory. That is the next performance
+ticket and it is contained: streaming keeps zero-copy binding untouched.
+
 **FIXED the same day.** The cause was one branch condition: `forward_cached`
 already had a working KV cache but was only reached `if config.is_moe()`, so
 dense models fell through to a stateless path that rebuilt the whole sequence
