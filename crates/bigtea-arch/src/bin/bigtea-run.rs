@@ -7,7 +7,10 @@
 
 use std::process::ExitCode;
 
-use bigtea_arch::{KvCache, Qwen3Config, Qwen3Model, Sampler, SamplerConfig};
+use bigtea_arch::{
+    architecture_is_verified, KvCache, Qwen3Config, Qwen3Model, Sampler, SamplerConfig,
+    VERIFIED_ARCHITECTURES,
+};
 use bigtea_ggml::{Context, WeightSet};
 use bigtea_model::{Model, ResidentSet};
 use bigtea_tokenizer::{Message, Tokenizer};
@@ -159,6 +162,7 @@ fn main() -> ExitCode {
         eprintln!("  -t, --threads N     compute threads (default: all cores)");
         eprintln!("  -c, --ctx-size N    cap the context; refuses past it rather than aborting");
         eprintln!("  --stop TEXT         stop when this appears (repeatable)");
+        eprintln!("  --force             run an unverified architecture anyway");
         return ExitCode::from(2);
     };
     let mut prompt = String::new();
@@ -176,6 +180,7 @@ fn main() -> ExitCode {
     let mut threads: Option<usize> = None;
     let mut ctx_size: Option<usize> = None;
     let mut stop: Vec<String> = Vec::new();
+    let mut force = false;
     let rest: Vec<String> = args.collect();
     let mut i = 0;
     while i < rest.len() {
@@ -225,6 +230,10 @@ fn main() -> ExitCode {
             // model and for diagnosing the forward pass.
             "--chat" => {
                 chat = true;
+                i += 1;
+            }
+            "--force" => {
+                force = true;
                 i += 1;
             }
             // llama.cpp spells these -t and -c; matching its names matters more
@@ -305,6 +314,7 @@ fn main() -> ExitCode {
         threads,
         ctx_size,
         stop,
+        force,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -506,6 +516,7 @@ fn run(
     threads_flag: Option<usize>,
     ctx_size: Option<usize>,
     stop: Vec<String>,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -516,6 +527,51 @@ fn run(
 
     // --- container ---------------------------------------------------------
     let model = Model::open_split(path)?;
+
+    // Refuse an architecture nobody has checked, rather than answering wrongly
+    // and confidently. Gemma-2 loads through the generic dense path with no
+    // error at all and replies to "The capital of France is" with "himſelf".
+    if !architecture_is_verified(model.architecture()) && !force {
+        // Built line by line: a multi-line format string keeps its source
+        // indentation and prints a ragged message.
+        let mut msg = String::new();
+        msg.push_str(&format!(
+            "{:?} is not an architecture this build has been verified against.
+",
+            model.architecture()
+        ));
+        msg.push_str(&format!(
+            "           verified: {}
+",
+            VERIFIED_ARCHITECTURES.join(", ")
+        ));
+        msg.push_str(
+            "
+           It may load and generate, and be WRONG with no error.
+",
+        );
+        msg.push_str(
+            "           Gemma-2 does exactly that: it answers \"The capital of
+",
+        );
+        msg.push_str(
+            "           France is\" with \"himselff\", because it needs post-norms,
+",
+        );
+        msg.push_str(
+            "           logit soft-capping and embedding scaling this path does not
+",
+        );
+        msg.push_str(
+            "           implement -- none of which appear as a missing tensor.
+",
+        );
+        msg.push_str(
+            "
+           Pass --force to run it anyway.",
+        );
+        return Err(msg.into());
+    }
 
     // DeepSeek-V4-Flash shares the residency and streaming machinery but almost
     // none of the graph, so it gets its own path rather than a config branch.

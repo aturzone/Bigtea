@@ -29,7 +29,7 @@ pub use deepseek4_forward::{
 };
 pub use expert_cache::{CacheStats, ExpertCache};
 pub use kv::{KvCache, KvError};
-pub use qwen3::{Qwen3Config, Qwen3Model};
+pub use qwen3::{architecture_is_verified, Qwen3Config, Qwen3Model, VERIFIED_ARCHITECTURES};
 pub use sample::{Sampler, SamplerConfig};
 pub use stream::{StreamStats, StreamingRunner};
 

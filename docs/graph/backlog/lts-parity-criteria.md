@@ -44,11 +44,11 @@ deep:
 | **A1** | make QK-norm optional in the dense path | `llama`, `mistral`, `qwen2` structurally | **DONE** |
 | **A2** | SPM tokenizer (`tokenizer.ggml.model = "llama"`) | the whole Llama/Mistral family's text | **DONE** — verified on TinyLlama |
 | **A3** | accept the `llama` arch name and its metadata aliases | Llama 1/2/3, TinyLlama, CodeLlama, Vicuna, most finetunes | **DONE** — verified on TinyLlama and Llama-3.2 |
-| A4 | `gemma`/`gemma2` (post-norm, logit soft-cap, tied embeddings) | Gemma family | gap |
-| A5 | `phi3`, `qwen2` explicit | Phi, Qwen2 | gap |
+| A4 | `gemma`/`gemma2` (post-norm, logit soft-cap, tied embeddings) | Gemma family | gap — **downloaded and confirmed broken**: loads with no error and answers `himſelf`. Needs post-norms, logit/attn soft-capping, `sqrt(n_embd)` embedding scaling, sliding-window attention |
+| A5 | `phi3`, `qwen2` explicit | Phi, Qwen2 | gap — **downloaded and confirmed**: Phi-3 fails cleanly on a fused `attn_qkv`, so it needs a fused-QKV split, not new maths |
 | A6 | WPM + UGM tokenizers | BERT-family, T5-family | gap |
 | A7 | tied embeddings (`output.weight` absent → reuse `token_embd`) | many small models | **DONE** — Llama-3.2-1B is tied and loads |
-| A8 | a clear error naming the *architecture* and what is missing | every unsupported model | **partial** — an unverified architecture now says its RoPE layout is a guess |
+| A8 | a clear error naming the *architecture* and what is missing | every unsupported model | **DONE 2026-08-10** — unverified architectures are **refused**; `--force` on the CLI only, never on the server |
 
 **A8 is not cosmetic and should land first.** "Open any model" fails safely only
 if the failure says which architecture, which tensor, and whether it is a gap or
@@ -107,7 +107,7 @@ without samplers, and it is a day of work.
 | D3 | split containers (`-00001-of-0000N`) | **done** |
 | D4 | every ggml quant type ggml can decode | **done — delegated to ggml** |
 | D5 | OpenAI API surface: `/v1/chat/completions`, `/v1/models`, `/v1/completions`, `/v1/embeddings` | **3 of 4 + an honest 501.** Chat streams and serves any supported architecture; `/v1/completions` runs the prompt verbatim; **embeddings refuse with 501** rather than returning a logit-derived vector that would look right and behave like noise |
-| D6 | refuse an unsupported container clearly rather than producing nonsense | partial — **the most important safety property this runner has** |
+| D6 | refuse an unsupported container clearly rather than producing nonsense | **DONE** — see A8. Gemma-2 was the proof that it was needed |
 
 ## The order
 

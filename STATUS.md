@@ -446,6 +446,32 @@ Two bugs found while measuring, both fixed:
   whole sequence through the 151936-wide output matrix and used one row — 253
   GFLOP wasted on a 651-token prompt. Now only the final position is projected.
 
+## A8: unverified architectures are now refused, not answered wrongly
+
+Downloaded Gemma-2-2b and Phi-3-mini to verify A4/A5 rather than guess. They
+failed in the two opposite ways, and only one of them is safe:
+
+| model | outcome |
+|---|---|
+| **Phi-3-mini** | fails cleanly — `container has no tensor "blk.0.attn_q.weight"` (fused QKV) |
+| **Gemma-2-2b** | **loads, runs, and answers "The capital of France is" with `himſelf`** |
+
+Gemma-2 needs post-norms after attention and the FFN, logit soft-capping,
+attention soft-capping, embedding scaling by `sqrt(n_embd)` and sliding-window
+attention on alternate layers. **None of those announce themselves as a missing
+tensor**, so the generic dense path ran it and produced confident nonsense.
+
+That is the failure mode this project is most expensive at, and it is the one
+thing a runner whose pitch is *"it tells you the truth about your machine"*
+cannot do. So `VERIFIED_ARCHITECTURES` is now a list of what has actually been
+run and read — `deepseek4, llama, qwen3, qwen3moe` — and anything else is
+**refused with the reason**. `bigtea-run --force` runs it anyway; **the server
+does not offer that escape hatch at all**, because an API client has no way to
+see that an answer is unsound.
+
+Gemma and Phi-3 support stay open as A4/A5. What changed is that not having
+them is now visible instead of silent.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

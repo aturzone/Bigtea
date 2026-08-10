@@ -35,8 +35,8 @@ use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
 
 use bigtea_arch::{
-    Deepseek4Cache, Deepseek4Config, Deepseek4Forward, Qwen3Config, Qwen3Model, Sampler,
-    SamplerConfig,
+    architecture_is_verified, Deepseek4Cache, Deepseek4Config, Deepseek4Forward, Qwen3Config,
+    Qwen3Model, Sampler, SamplerConfig, VERIFIED_ARCHITECTURES,
 };
 use bigtea_ggml::{Context, WeightSet};
 use bigtea_model::{Model, ResidentSet};
@@ -102,6 +102,16 @@ fn serve(path: &str, port: u16, cache_gib: f64) -> Result<(), Box<dyn std::error
     let t0 = std::time::Instant::now();
     let model = Model::open_split(path)?;
     let tokenizer = Tokenizer::from_metadata(model.metadata())?;
+    // Same rule as the runner: refuse an architecture nobody has checked rather
+    // than serving confident nonsense to an agent that cannot tell.
+    if !architecture_is_verified(model.architecture()) {
+        return Err(format!(
+            "{:?} is not an architecture this build has been verified against              (verified: {}). It may load and answer WRONG with no error.              bigtea-run --force will run it; the server will not, because a client              has no way to see that the answer is unsound.",
+            model.architecture(),
+            VERIFIED_ARCHITECTURES.join(", "),
+        )
+        .into());
+    }
     println!("model      {} ({})", model.architecture(), model.io_mode());
     let format = tokenizer.chat_format();
     if format.is_known() {

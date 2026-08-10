@@ -47,6 +47,35 @@ fn rope_type_for(arch: &str) -> (i32, bool) {
     }
 }
 
+/// Architectures this build has actually been run against and checked.
+///
+/// # Why a list, and why refusing is the right default
+///
+/// Gemma-2 loads through the generic dense path without a single error and
+/// answers "The capital of France is" with **"himſelf"**. It has post-norms
+/// after attention and the FFN, logit soft-capping, attention soft-capping,
+/// embedding scaling by `sqrt(n_embd)` and sliding-window attention on
+/// alternate layers — none of which this path implements, and none of which
+/// announce themselves as a missing tensor.
+///
+/// That is the failure this project is most expensive at: **fluent nonsense
+/// rather than an error.** A runner whose selling point is telling you the
+/// truth about your machine cannot answer a question wrongly and confidently.
+///
+/// Phi-3 is the other outcome and the safe one: it uses a fused `attn_qkv`
+/// rather than separate projections, so it fails immediately with the name of
+/// the tensor it wanted.
+///
+/// So the default is to refuse an architecture nobody has checked. `--force`
+/// runs it anyway, which is the right escape hatch for someone testing a new
+/// architecture — but it has to be asked for.
+pub const VERIFIED_ARCHITECTURES: &[&str] = &["deepseek4", "llama", "qwen3", "qwen3moe"];
+
+/// Whether this build has been run against `arch` and had its output checked.
+pub fn architecture_is_verified(arch: &str) -> bool {
+    VERIFIED_ARCHITECTURES.contains(&arch)
+}
+
 /// Shape and hyper-parameters, read from the container rather than assumed.
 #[derive(Debug, Clone)]
 pub struct Qwen3Config {
@@ -735,6 +764,31 @@ mod tests {
         for il in 0..2 {
             assert!(names.contains(&format!("blk.{il}.attn_q_norm.weight")));
             assert!(names.contains(&format!("blk.{il}.attn_k_norm.weight")));
+        }
+    }
+
+    #[test]
+    fn only_checked_architectures_are_called_verified() {
+        // The list is a claim about what has been RUN and read, not about what
+        // loads. Gemma-2 loads through this path without any error and answers
+        // "The capital of France is" with "himselff"; Phi-3 fails cleanly on a
+        // fused attn_qkv. Only the first kind is dangerous, and only refusing
+        // by default catches it.
+        for arch in ["deepseek4", "llama", "qwen3", "qwen3moe"] {
+            assert!(architecture_is_verified(arch), "{arch} should be verified");
+        }
+        for arch in [
+            "gemma2",
+            "gemma",
+            "phi3",
+            "falcon",
+            "mamba",
+            "something-new",
+        ] {
+            assert!(
+                !architecture_is_verified(arch),
+                "{arch} has not been checked and must not claim to be"
+            );
         }
     }
 }
