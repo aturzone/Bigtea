@@ -78,10 +78,6 @@ const SUMS_5TOK: &str = "tests/fixtures/v4flash-sums-5tok.txt";
 
 const SUMS_165TOK: &str = "tests/fixtures/v4flash-sums-165tok.txt";
 
-/// The 165-token capture. 165 tokens is the shortest length tried at which
-/// **both** compressed attentions fire: CSA compresses every 4 positions (41
-/// blocks here) and HCA every 128 (one block).
-
 /// Serialise the tests that allocate multi-gigabyte `ggml` arenas.
 ///
 /// Nineteen of these run at once by default and each one asks for GB-sized
@@ -101,6 +97,9 @@ fn heavy() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The 165-token capture. 165 tokens is the shortest length tried at which
+/// **both** compressed attentions fire: CSA compresses every 4 positions (41
+/// blocks here) and HCA every 128 (one block).
 fn sums_165tok(il: u32) -> LayerSums {
     LayerSums::load(SUMS_165TOK, il, TOKENS_165)
 }
