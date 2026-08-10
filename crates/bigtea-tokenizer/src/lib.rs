@@ -16,6 +16,7 @@ mod bytes;
 pub mod chat;
 mod pretok;
 pub mod spm;
+pub mod ugm;
 pub mod wpm;
 
 pub use bytes::{decode as bytes_decode, encode as bytes_encode};
@@ -37,6 +38,9 @@ pub enum Kind {
     /// `"bert"` — WordPiece: longest-prefix match, `##` continuations, and one
     /// `[UNK]` for any word the vocabulary cannot cover. No byte fallback.
     Wpm,
+    /// `"t5"` — Unigram: the highest-scoring path through a lattice of every
+    /// possible segmentation, not a greedy merge. See [`ugm`].
+    Ugm,
 }
 
 use std::collections::HashMap;
@@ -66,7 +70,7 @@ impl fmt::Display for TokenizerError {
                 write!(
                     f,
                     "unsupported tokenizer model {m:?} \
-                     (implemented: \"gpt2\" byte-level BPE, \"llama\" SentencePiece,                       \"bert\" WordPiece)"
+                     (implemented: \"gpt2\" byte-level BPE, \"llama\" SentencePiece,                       \"bert\" WordPiece, \"t5\" Unigram)"
                 )
             }
             TokenizerError::BadMerge(m) => write!(f, "malformed merge rule {m:?}"),
@@ -105,6 +109,13 @@ pub struct Tokenizer {
     /// the vocabulary rather than assumed -- see [`wpm`], where guessing it
     /// costs every ordinary word without producing an error.
     wpm_spelling: wpm::Spelling,
+    /// Whether each token is `USER_DEFINED`, indexed by id. Unigram scores those
+    /// 0 so an added token beats any ordinary segmentation of the same span.
+    user_defined: Vec<bool>,
+    /// Longest token in bytes, which bounds Unigram's prefix search.
+    max_token_len: usize,
+    /// SentencePiece's `remove_extra_whitespaces`.
+    remove_extra_whitespaces: bool,
     /// Control tokens, longest first, with their ids.
     ///
     /// These must be matched **literally in the text and mapped to one id**.
@@ -131,6 +142,7 @@ impl Tokenizer {
             "gpt2" => Kind::Bpe,
             "llama" => Kind::Spm,
             "bert" => Kind::Wpm,
+            "t5" => Kind::Ugm,
             other => return Err(TokenizerError::UnsupportedModel(other.to_string())),
         };
 
@@ -187,6 +199,19 @@ impl Tokenizer {
         }
         specials.sort_by_key(|(text, _)| std::cmp::Reverse(text.len()));
 
+        // USER_DEFINED (4), indexed by id. Unigram gives these a score of 0.
+        let mut user_defined = vec![false; tokens.len()];
+        if let Some(types) = meta
+            .get("tokenizer.ggml.token_type")
+            .and_then(Value::as_array)
+        {
+            for (i, t) in types.iter().enumerate() {
+                if t.as_u64().unwrap_or(1) == 4 && i < user_defined.len() {
+                    user_defined[i] = true;
+                }
+            }
+        }
+
         let id_of = |key: &str| meta.get(key).and_then(Value::as_u64).map(|v| v as u32);
 
         // SentencePiece merges by score, so the array is not optional there —
@@ -198,7 +223,7 @@ impl Tokenizer {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_f32).collect())
             .unwrap_or_default();
-        if kind == Kind::Spm && scores.len() != tokens.len() {
+        if matches!(kind, Kind::Spm | Kind::Ugm) && scores.len() != tokens.len() {
             return Err(TokenizerError::MissingScores {
                 have: scores.len(),
                 want: tokens.len(),
@@ -207,6 +232,7 @@ impl Tokenizer {
 
         // Before the struct takes ownership of `tokens`.
         let wpm_spelling = wpm::detect_spelling(&tokens);
+        let max_token_len = ugm::max_token_len(&tokens);
 
         Ok(Tokenizer {
             tokens,
@@ -219,10 +245,16 @@ impl Tokenizer {
             // on, which is what every Llama-family model uses.
             add_dummy_prefix: match meta.get("tokenizer.ggml.add_space_prefix") {
                 Some(Value::Bool(v)) => *v,
-                _ => kind == Kind::Spm,
+                _ => matches!(kind, Kind::Spm | Kind::Ugm),
             },
             unk: id_of("tokenizer.ggml.unknown_token_id"),
             wpm_spelling,
+            user_defined,
+            max_token_len,
+            remove_extra_whitespaces: match meta.get("tokenizer.ggml.remove_extra_whitespaces") {
+                Some(Value::Bool(v)) => *v,
+                _ => true,
+            },
             bos: id_of("tokenizer.ggml.bos_token_id"),
             eos: id_of("tokenizer.ggml.eos_token_id"),
             // Llama-family containers frequently omit the flag and still expect
@@ -356,6 +388,21 @@ impl Tokenizer {
             out.extend(wpm::encode(text, &self.ids, self.unk, self.wpm_spelling));
             return;
         }
+        if self.kind == Kind::Ugm {
+            // Unigram scores whole segmentations, so pre-splitting would forbid
+            // the very paths the lattice exists to compare.
+            let normalized =
+                ugm::normalize(text, self.add_dummy_prefix, self.remove_extra_whitespaces);
+            out.extend(ugm::encode(
+                &normalized,
+                &self.ids,
+                &self.scores,
+                &self.user_defined,
+                self.unk,
+                self.max_token_len,
+            ));
+            return;
+        }
         if self.kind == Kind::Spm {
             // No pre-tokenizer: SentencePiece works on the whole string, and
             // splitting it first would prevent merges across the boundaries the
@@ -408,7 +455,7 @@ impl Tokenizer {
         if self.kind == Kind::Wpm {
             return self.decode(ids).into_bytes();
         }
-        if self.kind == Kind::Spm {
+        if matches!(self.kind, Kind::Spm | Kind::Ugm) {
             let mut bytes = Vec::new();
             for &id in ids {
                 if Some(id) == self.bos || Some(id) == self.eos {
@@ -435,7 +482,7 @@ impl Tokenizer {
                 .collect();
             return wpm::decode(&pieces, self.wpm_spelling);
         }
-        if self.kind == Kind::Spm {
+        if matches!(self.kind, Kind::Spm | Kind::Ugm) {
             let mut bytes = Vec::new();
             for &id in ids {
                 // BOS/EOS have no text of their own; emitting their spelling
@@ -449,13 +496,20 @@ impl Tokenizer {
             }
             let text = String::from_utf8_lossy(&bytes).into_owned();
             // Undo the dummy prefix `encode` added — but **only** when this is a
-            // whole sequence, which BOS in first position is the evidence for.
+            // whole sequence.
             //
             // Generation decodes one token at a time, and `▁The` must stay
             // " The" there. Stripping unconditionally ran every word together
             // ("Thecapital") — output that looks like a broken forward pass and
             // is really a detokenizer applying a whole-sequence rule per piece.
-            let whole_sequence = self.bos.is_some() && ids.first().copied() == self.bos;
+            //
+            // BOS in first position is the evidence for the Llama family. **T5
+            // has no BOS at all** (`add_bos_token = false`), so that test never
+            // fires there and every decoded T5 sequence kept a leading space.
+            // A terminating EOS is the same evidence for a family that brackets
+            // the other way; a lone generated token is neither.
+            let whole_sequence = (self.bos.is_some() && ids.first().copied() == self.bos)
+                || (self.eos.is_some() && ids.len() > 1 && ids.last().copied() == self.eos);
             return match whole_sequence && self.add_dummy_prefix {
                 true => text.strip_prefix(' ').unwrap_or(&text).to_string(),
                 false => text,
