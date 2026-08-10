@@ -14,11 +14,11 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 
 | bucket | flags | state |
 |---|---:|---|
-| **have** | **49** | done |
+| **have** | **58** | done |
 | **samplers** | 22 | **13 done 2026-08-10**, DRY (5) + `--samplers` ordering (3) left |
 | interaction / prompt handling | 22 | **done 2026-08-11** — including a real REPL |
 | runtime / threading / memory | 31 | mostly gap; several are meaningless here |
-| RoPE, YaRN, context shift | 15 | gap; `--rope-freq-base`/`--rope-scale` are cheap and real |
+| RoPE, YaRN, context shift | 15 | **9 done 2026-08-11**; the other 6 refused, see below |
 | logging | 13 | gap, cheap |
 | **GPU** | 15 | **won't** — no backend to apply them to |
 | fetch / Hugging Face | 9 | partly covered by `bigtea-pull`, different spelling |
@@ -96,6 +96,38 @@ Two things that would otherwise be silent:
 `--keep` is deliberately **not** accepted. It controls what survives a context
 shift, and Bigtea has no context shift — accepting it would be a flag that does
 nothing, which is the exact failure this audit exists to prevent.
+
+## Done 2026-08-11 — RoPE and YaRN, 9 of the 15
+
+`--rope-freq-base`, `--rope-freq-scale`, `--rope-scale`, `--rope-scaling`,
+`--yarn-ext-factor`, `--yarn-attn-factor`, `--yarn-beta-fast`,
+`--yarn-beta-slow`, `--yarn-orig-ctx`.
+
+These were nearly free and had been sitting there: `RopeParams` already carried
+all six YaRN fields and `rope()` set exactly one of them, so ggml's `rope_ext`
+was being handed defaults for the rest on every model. The container is now read
+for `rope.scaling.factor`, `rope.scaling.type`, `attn_factor`, `beta_fast`,
+`beta_slow` and `original_context_length`, and the flags override that.
+
+**`--rope-scale` is the reciprocal of `--rope-freq-scale`** — llama.cpp's is a
+multiplier on the *context*, ours on the *frequency*. Storing it unconverted
+inverts every long-context model, silently.
+
+Overrides are **printed**, not applied quietly:
+
+```
+$ bigtea-run <llama-3.2-1b> ... --rope-freq-base 50000 --rope-scale 2
+rope       overridden: freq_base 500000 -> 50000, freq_scale 1 -> 0.5
+```
+
+RoPE is the setting most likely to turn a working model into a fluent-but-wrong
+one, and 500000 is Llama-3.2's real base — visible here only because the line is
+printed.
+
+**The other six are refused, not accepted:** `--grp-attn-n`/`-w` (self-extend,
+not implemented), `--context-shift`/`--no-context-shift` and `--defrag-thold`
+(no context shift and no KV fragmentation to threshold), `--swa-full` (we always
+keep the full window cache, so the flag has nothing to switch).
 
 ## Next batches, in order
 

@@ -277,6 +277,13 @@ impl Model {
         self.get_u64(&format!("{}.{}", self.architecture, suffix))
     }
 
+    /// An architecture-scoped string, e.g. `qwen3.rope.scaling.type`.
+    pub fn arch_str(&self, suffix: &str) -> Option<&str> {
+        self.metadata
+            .get(&format!("{}.{}", self.architecture, suffix))
+            .and_then(bigtea_gguf::Value::as_str)
+    }
+
     pub fn arch_f32(&self, suffix: &str) -> Option<f32> {
         self.metadata
             .get(&format!("{}.{}", self.architecture, suffix))

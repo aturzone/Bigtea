@@ -1028,9 +1028,14 @@ impl<'m> StreamingRunner<'m> {
 
     /// RoPE parameters this architecture uses.
     pub fn rope(&self) -> RopeParams {
+        let c = &self.arch.config;
         RopeParams {
-            freq_base: self.arch.config.rope_freq_base,
-            ..RopeParams::default()
+            freq_base: c.rope_freq_base,
+            freq_scale: c.rope_freq_scale,
+            ext_factor: c.rope_ext_factor,
+            attn_factor: c.rope_attn_factor,
+            beta_fast: c.rope_beta_fast,
+            beta_slow: c.rope_beta_slow,
         }
     }
 
@@ -1836,6 +1841,12 @@ mod tests {
             vocab_size: 32,
             rms_eps: 1e-6,
             rope_freq_base: 1_000_000.0,
+            rope_freq_scale: 1.0,
+            rope_ext_factor: 0.0,
+            rope_attn_factor: 1.0,
+            rope_beta_fast: 32.0,
+            rope_beta_slow: 1.0,
+            rope_orig_ctx: 0,
             n_expert: 4,
             n_expert_used: 2,
             n_ff_expert: 16,

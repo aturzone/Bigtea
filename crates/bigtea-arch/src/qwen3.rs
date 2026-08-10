@@ -89,6 +89,20 @@ pub struct Qwen3Config {
     pub vocab_size: u32,
     pub rms_eps: f32,
     pub rope_freq_base: f32,
+    /// Linear RoPE scaling. `1.0` is unscaled; `0.5` doubles the effective
+    /// context by halving every frequency. llama.cpp's `--rope-freq-scale`,
+    /// and the reciprocal of its `--rope-scale`.
+    pub rope_freq_scale: f32,
+    /// YaRN mix, `0.0` = pure linear scaling (i.e. YaRN off). ggml's
+    /// `rope_ext` consumes all four of these; nothing else here reads them.
+    pub rope_ext_factor: f32,
+    /// YaRN's magnitude correction, applied to the whole attention score.
+    pub rope_attn_factor: f32,
+    pub rope_beta_fast: f32,
+    pub rope_beta_slow: f32,
+    /// The context length the model was trained at, which YaRN interpolates
+    /// *from*. `0` means the container did not say.
+    pub rope_orig_ctx: u32,
     /// Expert count; zero for the dense variant.
     pub n_expert: u32,
     pub n_expert_used: u32,
@@ -184,6 +198,27 @@ impl Qwen3Config {
             // *declared* value generalised into a fallback, which silently gave
             // Phi-3 the wrong rotation.
             rope_freq_base: model.arch_f32("rope.freq_base").unwrap_or(10_000.0),
+            // `rope.scaling.factor` is the multiplier on the *context*, so the
+            // frequency scale is its reciprocal. Storing the factor here
+            // instead would invert every long-context model silently.
+            rope_freq_scale: model
+                .arch_f32("rope.scaling.factor")
+                .filter(|f| *f > 0.0)
+                .map(|f| 1.0 / f)
+                .unwrap_or(1.0),
+            // YaRN off unless the container asks for it by name. Applying its
+            // correction to a model trained without it is not an error, just
+            // subtly wrong attention at every position.
+            rope_ext_factor: match model.arch_str("rope.scaling.type") {
+                Some("yarn") => 1.0,
+                _ => 0.0,
+            },
+            rope_attn_factor: model.arch_f32("rope.scaling.attn_factor").unwrap_or(1.0),
+            rope_beta_fast: model.arch_f32("rope.scaling.beta_fast").unwrap_or(32.0),
+            rope_beta_slow: model.arch_f32("rope.scaling.beta_slow").unwrap_or(1.0),
+            rope_orig_ctx: model
+                .arch_u64("rope.scaling.original_context_length")
+                .unwrap_or(0) as u32,
             n_expert: model.arch_u64("expert_count").unwrap_or(0) as u32,
             n_expert_used: model.arch_u64("expert_used_count").unwrap_or(0) as u32,
             n_ff_expert: model.arch_u64("expert_feed_forward_length").unwrap_or(0) as u32,
@@ -772,6 +807,12 @@ mod tests {
             vocab_size: 100,
             rms_eps: 1e-6,
             rope_freq_base: 1_000_000.0,
+            rope_freq_scale: 1.0,
+            rope_ext_factor: 0.0,
+            rope_attn_factor: 1.0,
+            rope_beta_fast: 32.0,
+            rope_beta_slow: 1.0,
+            rope_orig_ctx: 0,
             n_expert: 0,
             n_expert_used: 0,
             n_ff_expert: 0,

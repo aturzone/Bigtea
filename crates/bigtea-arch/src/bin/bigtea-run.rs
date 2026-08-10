@@ -89,6 +89,87 @@ impl TokenWriter {
     }
 }
 
+/// RoPE settings the user supplied, each `None` unless asked for.
+///
+/// `Option` per field rather than a filled-in struct, because "not given" and
+/// "given the same value the container has" must not be the same thing: the
+/// container is right far more often than a flag is, and silently overwriting
+/// its RoPE base with a default is how a long-context model starts answering
+/// fluently and wrongly.
+#[derive(Clone, Default)]
+struct RopeOverrides {
+    freq_base: Option<f32>,
+    freq_scale: Option<f32>,
+    scaling: Option<String>,
+    ext_factor: Option<f32>,
+    attn_factor: Option<f32>,
+    beta_fast: Option<f32>,
+    beta_slow: Option<f32>,
+    orig_ctx: Option<u32>,
+}
+
+impl RopeOverrides {
+    /// Apply to a config read from the container, and say what changed.
+    ///
+    /// Printed rather than applied quietly: RoPE is the setting most likely to
+    /// turn a working model into a fluent-but-wrong one, and a user who mistyped
+    /// `--rope-freq-base 1000` for `100000` should be able to see it.
+    fn apply(&self, c: &mut Qwen3Config) {
+        let mut changed: Vec<String> = Vec::new();
+        if let Some(v) = self.freq_base {
+            changed.push(format!("freq_base {} -> {v}", c.rope_freq_base));
+            c.rope_freq_base = v;
+        }
+        if let Some(v) = self.freq_scale {
+            changed.push(format!("freq_scale {} -> {v}", c.rope_freq_scale));
+            c.rope_freq_scale = v;
+        }
+        match self.scaling.as_deref() {
+            Some("none") => {
+                changed.push("scaling -> none".into());
+                c.rope_freq_scale = 1.0;
+                c.rope_ext_factor = 0.0;
+            }
+            Some("linear") => {
+                changed.push("scaling -> linear".into());
+                c.rope_ext_factor = 0.0;
+            }
+            Some("yarn") => {
+                changed.push("scaling -> yarn".into());
+                // Only default the mix if the user did not state one; a bare
+                // `--rope-scaling yarn` means "on", not "on at zero strength".
+                if self.ext_factor.is_none() && c.rope_ext_factor == 0.0 {
+                    c.rope_ext_factor = 1.0;
+                }
+            }
+            _ => {}
+        }
+        if let Some(v) = self.ext_factor {
+            c.rope_ext_factor = v;
+            changed.push(format!("yarn ext_factor {v}"));
+        }
+        if let Some(v) = self.attn_factor {
+            c.rope_attn_factor = v;
+            changed.push(format!("yarn attn_factor {v}"));
+        }
+        if let Some(v) = self.beta_fast {
+            c.rope_beta_fast = v;
+            changed.push(format!("yarn beta_fast {v}"));
+        }
+        if let Some(v) = self.beta_slow {
+            c.rope_beta_slow = v;
+            changed.push(format!("yarn beta_slow {v}"));
+        }
+        if let Some(v) = self.orig_ctx {
+            c.rope_orig_ctx = v;
+            changed.push(format!("yarn orig_ctx {v}"));
+        }
+        if !changed.is_empty() {
+            println!("rope       overridden: {}", changed.join(", "));
+        }
+    }
+}
+
 /// How the terminal side behaves — llama.cpp's interaction flags.
 ///
 /// Grouped rather than passed individually because they are all "how it talks
@@ -449,6 +530,15 @@ fn main() -> ExitCode {
         eprintln!("  -e, --escape        process backslash escapes in -p (default on)");
         eprintln!("  --no-escape         take -p literally");
         eprintln!("  -r, --reverse-prompt S    llama.cpp's name for --stop");
+        eprintln!("  --rope-freq-base B  override the container's RoPE base");
+        eprintln!("  --rope-freq-scale S linear RoPE scaling (1.0 = off)");
+        eprintln!("  --rope-scale N      context multiplier (= 1 / freq-scale)");
+        eprintln!("  --rope-scaling T    none | linear | yarn");
+        eprintln!("  --yarn-ext-factor F   YaRN mix (0 = pure linear)");
+        eprintln!("  --yarn-attn-factor F  YaRN magnitude correction");
+        eprintln!("  --yarn-beta-fast F    YaRN high-frequency cutoff");
+        eprintln!("  --yarn-beta-slow F    YaRN low-frequency cutoff");
+        eprintln!("  --yarn-orig-ctx N     context the model was trained at");
         eprintln!("  --perplexity        score a corpus instead of generating");
         eprintln!("  --ppl-chunk N       perplexity chunk size (default 512)");
         eprintln!("  --seed S            reproducible sampling");
@@ -486,6 +576,7 @@ fn main() -> ExitCode {
         ..Ui::default()
     };
     let mut escape = true;
+    let mut rope = RopeOverrides::default();
     let mut system_prompt: Option<String> = None;
     let mut ctx_size: Option<usize> = None;
     let mut stop: Vec<String> = Vec::new();
@@ -633,6 +724,50 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // --- RoPE, for a container whose metadata is wrong or absent ---
+            "--rope-freq-base" => {
+                rope.freq_base = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--rope-freq-scale" => {
+                rope.freq_scale = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            // llama.cpp's --rope-scale is the context multiplier, i.e. the
+            // reciprocal of the frequency scale. Storing it unconverted would
+            // invert the meaning of every long-context flag.
+            "--rope-scale" => {
+                rope.freq_scale = rest
+                    .get(i + 1)
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|f| *f > 0.0)
+                    .map(|f| 1.0 / f);
+                i += 2;
+            }
+            "--rope-scaling" => {
+                rope.scaling = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--yarn-ext-factor" => {
+                rope.ext_factor = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--yarn-attn-factor" => {
+                rope.attn_factor = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--yarn-beta-fast" => {
+                rope.beta_fast = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--yarn-beta-slow" => {
+                rope.beta_slow = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--yarn-orig-ctx" => {
+                rope.orig_ctx = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
             // --- interaction, llama.cpp's spellings ---------------------
             "-i" | "--interactive" => {
                 ui.interactive = true;
@@ -819,6 +954,7 @@ fn main() -> ExitCode {
         perplexity,
         ui,
         system_prompt,
+        rope,
         ctx_size,
         stop,
         force,
@@ -1122,6 +1258,7 @@ fn run(
     perplexity: Option<usize>,
     ui: Ui,
     system_prompt: Option<String>,
+    rope: RopeOverrides,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -1208,7 +1345,9 @@ fn run(
         return Ok(());
     }
 
-    let config = Qwen3Config::from_model(&model)?;
+    let mut config = Qwen3Config::from_model(&model)?;
+    rope.apply(&mut config);
+    let config = config;
     let arch = Qwen3Model::new(config.clone());
 
     println!("model      {} ({})", model.architecture(), model.io_mode());
