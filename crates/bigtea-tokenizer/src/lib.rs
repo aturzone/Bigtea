@@ -16,10 +16,12 @@ mod bytes;
 pub mod chat;
 mod pretok;
 pub mod spm;
+pub mod ugm;
+pub mod wpm;
 
 pub use bytes::{decode as bytes_decode, encode as bytes_encode};
 pub use chat::{ChatFormat, Message};
-pub use pretok::pre_tokenize;
+pub use pretok::{pre_tokenize, PreTokenizer, UnknownPreTokenizer};
 
 /// Which tokenization rule a container asks for.
 ///
@@ -33,6 +35,12 @@ pub enum Kind {
     /// `"llama"` — SentencePiece: merge by vocabulary score, `▁` for space,
     /// `<0xXX>` byte fallback.
     Spm,
+    /// `"bert"` — WordPiece: longest-prefix match, `##` continuations, and one
+    /// `[UNK]` for any word the vocabulary cannot cover. No byte fallback.
+    Wpm,
+    /// `"t5"` — Unigram: the highest-scoring path through a lattice of every
+    /// possible segmentation, not a greedy merge. See [`ugm`].
+    Ugm,
 }
 
 use std::collections::HashMap;
@@ -50,6 +58,8 @@ pub enum TokenizerError {
     BadMerge(String),
     /// SentencePiece needs one score per token and the container disagrees.
     MissingScores { have: usize, want: usize },
+    /// The container asks for a pre-tokenizer this build has not verified.
+    UnsupportedPreTokenizer(UnknownPreTokenizer),
 }
 
 impl fmt::Display for TokenizerError {
@@ -62,10 +72,11 @@ impl fmt::Display for TokenizerError {
                 write!(
                     f,
                     "unsupported tokenizer model {m:?} \
-                     (implemented: \"gpt2\" byte-level BPE, \"llama\" SentencePiece)"
+                     (implemented: \"gpt2\" byte-level BPE, \"llama\" SentencePiece,                       \"bert\" WordPiece, \"t5\" Unigram)"
                 )
             }
             TokenizerError::BadMerge(m) => write!(f, "malformed merge rule {m:?}"),
+            TokenizerError::UnsupportedPreTokenizer(e) => write!(f, "{e}"),
             TokenizerError::MissingScores { have, want } => write!(
                 f,
                 "SentencePiece needs one score per token, but the container has \
@@ -94,6 +105,23 @@ pub struct Tokenizer {
     /// The raw Jinja template, kept so the chat format can be identified and
     /// so a caller can print it when the format is not recognised.
     chat_template: Option<String>,
+    /// The id for text the vocabulary cannot represent. WordPiece has no byte
+    /// fallback, so without this an unknown word would silently disappear.
+    unk: Option<u32>,
+    /// Which continuation spelling this WordPiece vocabulary uses. Read off
+    /// the vocabulary rather than assumed -- see [`wpm`], where guessing it
+    /// costs every ordinary word without producing an error.
+    wpm_spelling: wpm::Spelling,
+    /// Which pre-tokenizer this container asked for. Only byte-level BPE uses
+    /// one; SentencePiece, WordPiece and Unigram do their own splitting.
+    pre: PreTokenizer,
+    /// Whether each token is `USER_DEFINED`, indexed by id. Unigram scores those
+    /// 0 so an added token beats any ordinary segmentation of the same span.
+    user_defined: Vec<bool>,
+    /// Longest token in bytes, which bounds Unigram's prefix search.
+    max_token_len: usize,
+    /// SentencePiece's `remove_extra_whitespaces`.
+    remove_extra_whitespaces: bool,
     /// Control tokens, longest first, with their ids.
     ///
     /// These must be matched **literally in the text and mapped to one id**.
@@ -119,6 +147,8 @@ impl Tokenizer {
         let kind = match model {
             "gpt2" => Kind::Bpe,
             "llama" => Kind::Spm,
+            "bert" => Kind::Wpm,
+            "t5" => Kind::Ugm,
             other => return Err(TokenizerError::UnsupportedModel(other.to_string())),
         };
 
@@ -175,8 +205,20 @@ impl Tokenizer {
         }
         specials.sort_by_key(|(text, _)| std::cmp::Reverse(text.len()));
 
+        // USER_DEFINED (4), indexed by id. Unigram gives these a score of 0.
+        let mut user_defined = vec![false; tokens.len()];
+        if let Some(types) = meta
+            .get("tokenizer.ggml.token_type")
+            .and_then(Value::as_array)
+        {
+            for (i, t) in types.iter().enumerate() {
+                if t.as_u64().unwrap_or(1) == 4 && i < user_defined.len() {
+                    user_defined[i] = true;
+                }
+            }
+        }
+
         let id_of = |key: &str| meta.get(key).and_then(Value::as_u64).map(|v| v as u32);
-        let flag = |key: &str| matches!(meta.get(key), Some(Value::Bool(true)));
 
         // SentencePiece merges by score, so the array is not optional there —
         // an absent one would make every merge score 0.0 and reduce the
@@ -187,12 +229,33 @@ impl Tokenizer {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_f32).collect())
             .unwrap_or_default();
-        if kind == Kind::Spm && scores.len() != tokens.len() {
+        if matches!(kind, Kind::Spm | Kind::Ugm) && scores.len() != tokens.len() {
             return Err(TokenizerError::MissingScores {
                 have: scores.len(),
                 want: tokens.len(),
             });
         }
+
+        // Before the struct takes ownership of `tokens`.
+        let wpm_spelling = wpm::detect_spelling(&tokens);
+        let max_token_len = ugm::max_token_len(&tokens);
+
+        // `tokenizer.ggml.pre` selects the splitting rule, and it was previously
+        // read by nobody: a Qwen container was split with Llama's rule, which
+        // groups three digits where Qwen takes one, so every number and every
+        // boundary after it moved. Only byte-level BPE consults it -- the other
+        // three do their own splitting -- so an unfamiliar name on those is not
+        // a reason to refuse the model.
+        let pre = match kind {
+            Kind::Bpe => {
+                let name = meta
+                    .get("tokenizer.ggml.pre")
+                    .and_then(Value::as_str)
+                    .unwrap_or("llama-bpe");
+                PreTokenizer::from_name(name).map_err(TokenizerError::UnsupportedPreTokenizer)?
+            }
+            _ => PreTokenizer::LlamaBpe,
+        };
 
         Ok(Tokenizer {
             tokens,
@@ -205,7 +268,16 @@ impl Tokenizer {
             // on, which is what every Llama-family model uses.
             add_dummy_prefix: match meta.get("tokenizer.ggml.add_space_prefix") {
                 Some(Value::Bool(v)) => *v,
-                _ => kind == Kind::Spm,
+                _ => matches!(kind, Kind::Spm | Kind::Ugm),
+            },
+            unk: id_of("tokenizer.ggml.unknown_token_id"),
+            wpm_spelling,
+            pre,
+            user_defined,
+            max_token_len,
+            remove_extra_whitespaces: match meta.get("tokenizer.ggml.remove_extra_whitespaces") {
+                Some(Value::Bool(v)) => *v,
+                _ => true,
             },
             bos: id_of("tokenizer.ggml.bos_token_id"),
             eos: id_of("tokenizer.ggml.eos_token_id"),
@@ -214,9 +286,16 @@ impl Tokenizer {
             // absent flag genuinely means "no".
             add_bos: match meta.get("tokenizer.ggml.add_bos_token") {
                 Some(Value::Bool(v)) => *v,
-                _ => kind == Kind::Spm,
+                // BERT containers declare neither flag and still expect the
+                // sequence wrapped in [CLS] .. [SEP] -- llama.cpp adds both
+                // unconditionally for WordPiece, and a missing [CLS] shifts
+                // every position by one.
+                _ => matches!(kind, Kind::Spm | Kind::Wpm),
             },
-            add_eos: flag("tokenizer.ggml.add_eos_token"),
+            add_eos: match meta.get("tokenizer.ggml.add_eos_token") {
+                Some(Value::Bool(v)) => *v,
+                _ => kind == Kind::Wpm,
+            },
             chat_template: meta
                 .get("tokenizer.chat_template")
                 .and_then(Value::as_str)
@@ -327,6 +406,27 @@ impl Tokenizer {
         if text.is_empty() {
             return;
         }
+        if self.kind == Kind::Wpm {
+            // No pre-tokenizer and no byte fallback: WordPiece does its own
+            // splitting, and anything it cannot cover becomes one [UNK].
+            out.extend(wpm::encode(text, &self.ids, self.unk, self.wpm_spelling));
+            return;
+        }
+        if self.kind == Kind::Ugm {
+            // Unigram scores whole segmentations, so pre-splitting would forbid
+            // the very paths the lattice exists to compare.
+            let normalized =
+                ugm::normalize(text, self.add_dummy_prefix, self.remove_extra_whitespaces);
+            out.extend(ugm::encode(
+                &normalized,
+                &self.ids,
+                &self.scores,
+                &self.user_defined,
+                self.unk,
+                self.max_token_len,
+            ));
+            return;
+        }
         if self.kind == Kind::Spm {
             // No pre-tokenizer: SentencePiece works on the whole string, and
             // splitting it first would prevent merges across the boundaries the
@@ -339,7 +439,7 @@ impl Tokenizer {
             ));
             return;
         }
-        for piece in pre_tokenize(text) {
+        for piece in pre_tokenize(text, self.pre) {
             let encoded = bytes::encode(piece.as_bytes());
             for token in self.bpe(&encoded) {
                 match self.ids.get(&token) {
@@ -376,7 +476,10 @@ impl Tokenizer {
     /// valid UTF-8 boundary. [`Self::decode`] is for whole sequences, where the
     /// bytes are all present and the conversion is safe.
     pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
-        if self.kind == Kind::Spm {
+        if self.kind == Kind::Wpm {
+            return self.decode(ids).into_bytes();
+        }
+        if matches!(self.kind, Kind::Spm | Kind::Ugm) {
             let mut bytes = Vec::new();
             for &id in ids {
                 if Some(id) == self.bos || Some(id) == self.eos {
@@ -393,7 +496,17 @@ impl Tokenizer {
     }
 
     pub fn decode(&self, ids: &[u32]) -> String {
-        if self.kind == Kind::Spm {
+        if self.kind == Kind::Wpm {
+            // [CLS]/[SEP] carry no text; printing their spelling would put
+            // markup in the user's output.
+            let pieces: Vec<&str> = ids
+                .iter()
+                .filter(|id| Some(**id) != self.bos && Some(**id) != self.eos)
+                .filter_map(|&id| self.token_text(id))
+                .collect();
+            return wpm::decode(&pieces, self.wpm_spelling);
+        }
+        if matches!(self.kind, Kind::Spm | Kind::Ugm) {
             let mut bytes = Vec::new();
             for &id in ids {
                 // BOS/EOS have no text of their own; emitting their spelling
@@ -407,13 +520,20 @@ impl Tokenizer {
             }
             let text = String::from_utf8_lossy(&bytes).into_owned();
             // Undo the dummy prefix `encode` added — but **only** when this is a
-            // whole sequence, which BOS in first position is the evidence for.
+            // whole sequence.
             //
             // Generation decodes one token at a time, and `▁The` must stay
             // " The" there. Stripping unconditionally ran every word together
             // ("Thecapital") — output that looks like a broken forward pass and
             // is really a detokenizer applying a whole-sequence rule per piece.
-            let whole_sequence = self.bos.is_some() && ids.first().copied() == self.bos;
+            //
+            // BOS in first position is the evidence for the Llama family. **T5
+            // has no BOS at all** (`add_bos_token = false`), so that test never
+            // fires there and every decoded T5 sequence kept a leading space.
+            // A terminating EOS is the same evidence for a family that brackets
+            // the other way; a lone generated token is neither.
+            let whole_sequence = (self.bos.is_some() && ids.first().copied() == self.bos)
+                || (self.eos.is_some() && ids.len() > 1 && ids.last().copied() == self.eos);
             return match whole_sequence && self.add_dummy_prefix {
                 true => text.strip_prefix(' ').unwrap_or(&text).to_string(),
                 false => text,
