@@ -234,10 +234,164 @@ pub struct StreamingRunner<'m> {
     scratch: Vec<u8>,
     /// Reader threads, created once. Declared after `model` so it drops first.
     pool: ReadPool,
-    /// Threads for expert matmuls. Held rather than queried per call because
-    /// the expert loop runs it thousands of times per token.
+    /// Threads for a single-token step. Held rather than queried per call
+    /// because the expert loop runs it thousands of times per token, and the
+    /// default is now a measurement rather than a constant.
     threads: usize,
+    /// Threads for a multi-token block. Separate because prefill is
+    /// compute-bound and generation is bandwidth-bound, and the best count for
+    /// one is close to the worst for the other.
+    threads_batch: usize,
+    /// Walks a ladder of thread counts over the first generated tokens and
+    /// then settles. `None` once settled, or immediately when `-t` was given.
+    tuner: Option<ThreadTuner>,
     pub stats: StreamStats,
+}
+
+fn env_threads(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+fn logical_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+/// Tries thread counts on **real generated tokens** and keeps the fastest.
+///
+/// # Why the obvious cheaper thing does not work
+///
+/// The first attempt was a 150 ms microbenchmark at load: stream a buffer
+/// larger than L3 across `t` threads and take the smallest `t` that saturates
+/// DRAM. It measures a real quantity and it is **not predictive of this one** —
+/// it chose 6, 8, 12, 12, 4, 6 on six consecutive runs of the same binary while
+/// the true optimum was 2-4, and the run-to-run spread it introduced was worse
+/// than the bad default it replaced (5.51-8.20 tok/s against 7.53-7.74 pinned).
+/// A pure read has no per-node barrier; a ggml graph has one per node, and that
+/// is most of what extra threads cost. Deleted rather than tuned, because a
+/// proxy that has to be corrected until it agrees with the objective is just
+/// the objective measured badly.
+///
+/// So this measures the objective: one candidate per generated token, timed
+/// where it actually happens. It costs a handful of early tokens and cannot be
+/// wrong about what it is optimising.
+///
+/// The ladder is walked small-to-large and ties go to the earlier entry, which
+/// biases the answer downward. That is deliberate — the curve is steep on the
+/// over-threaded side (1.8x lost at 20 threads) and nearly flat on the other
+/// (~10% between 2 and 4), so erring low is much cheaper than erring high.
+struct ThreadTuner {
+    ladder: Vec<usize>,
+    at: usize,
+    secs: Vec<f64>,
+}
+
+impl ThreadTuner {
+    fn new(cores: usize) -> Option<Self> {
+        let mut ladder: Vec<usize> = [1usize, 2, 4, 6, 8, 12, 16]
+            .into_iter()
+            .filter(|&t| t < cores)
+            .collect();
+        ladder.push(cores);
+        // Nothing to choose between on a machine with one or two threads.
+        if ladder.len() < 2 {
+            return None;
+        }
+        Some(ThreadTuner {
+            secs: Vec::with_capacity(ladder.len()),
+            ladder,
+            at: 0,
+        })
+    }
+
+    /// The count to use for the next single-token step.
+    fn candidate(&self) -> usize {
+        self.ladder[self.at.min(self.ladder.len() - 1)]
+    }
+
+    /// Record how long that step took. `Some(best)` once a winner is known.
+    ///
+    /// Stops early on two consecutive regressions rather than always walking
+    /// the whole ladder. The curve has one peak and falls away monotonically
+    /// after it — measured on two models and reproduced on llama.cpp — so once
+    /// it has turned down twice there is nothing above worth paying for. That
+    /// takes the usual cost from eight tuning tokens to about four, which
+    /// matters because a short generation would otherwise spend most of itself
+    /// measuring. Two in a row rather than one, so a single noisy step does not
+    /// end it prematurely.
+    fn record(&mut self, secs: f64) -> Option<usize> {
+        self.secs.push(secs);
+        self.at += 1;
+        let best = self.best();
+        let walked = self.at >= self.ladder.len();
+        // Four samples minimum, and a regression has to be worth noticing.
+        // With three it could stop at the first entry on noise alone and pin
+        // generation to one thread, which is a 1.45x loss — the exact mistake
+        // this tuner exists to prevent, made in the other direction.
+        let turned_down = self.secs.len() >= 4
+            && self.secs[self.secs.len() - 1] > self.secs[best] * 1.05
+            && self.secs[self.secs.len() - 2] > self.secs[best] * 1.05;
+        if walked || turned_down {
+            return Some(self.ladder[best]);
+        }
+        None
+    }
+
+    fn best(&self) -> usize {
+        let mut best = 0usize;
+        for i in 1..self.secs.len() {
+            // Strictly less, so a tie keeps the smaller thread count.
+            if self.secs[i] < self.secs[best] {
+                best = i;
+            }
+        }
+        best
+    }
+}
+
+/// Threads for **generating one token at a time**.
+///
+/// `-t` sets `BIGTEA_THREADS` before any model is opened. **It used to be read
+/// only by the V4-Flash path**, so on every other architecture the flag was
+/// parsed, echoed in the header and then ignored. What exposed it: `-t 1` and
+/// `-t 20` on Qwen3-4B produced *bit-identical* phase timings — 1.0s qkv, 0.7s
+/// attention, 1.7s ffn — which no real matmul does. A second, differently
+/// spelled variable (`BIGTEA_EXPERT_THREADS`) was read here into a binding
+/// named `_threads` and discarded, so that override had never worked either.
+///
+/// Once the flag reached the graph it turned out the **default was the worst
+/// setting available**. Generation streams every weight once per token and does
+/// almost no arithmetic per byte, so it saturates DRAM long before it runs out
+/// of cores; past that point threads only contend. On this machine every
+/// logical core gave 4.49 tok/s on Qwen3-4B where two gave 7.64 — **1.70x
+/// thrown away by a default**. So the count is *measured*, not assumed: see
+/// [`bigtea_probe::saturating_threads`].
+/// Where tuning starts, and the answer when `-t` was given.
+///
+/// Without `-t` this is only a starting point — [`ThreadTuner`] replaces it
+/// within the first handful of generated tokens. It is deliberately low rather
+/// than "all cores": the first tokens are generated at this count, and the
+/// over-threaded side of the curve is the expensive one.
+pub fn configured_threads() -> usize {
+    env_threads("BIGTEA_THREADS").unwrap_or_else(|| logical_cores().clamp(1, 4))
+}
+
+/// Threads for **processing a block of tokens at once** — prefill.
+///
+/// The opposite problem to [`configured_threads`], and this is why llama.cpp
+/// carries two flags rather than one. A prefill block multiplies many columns
+/// at a time, so it is compute-bound and scales with cores: on Qwen3-4B, 519
+/// tokens ran at 47.4 tok/s on 4 threads and **81.5 on 20**. Handing prefill
+/// the generation count would cost as much as the generation default was
+/// already costing, in the other direction.
+///
+/// llama.cpp spells the override `-tb` / `--threads-batch`; so do we.
+pub fn configured_threads_batch() -> usize {
+    env_threads("BIGTEA_THREADS_BATCH").unwrap_or_else(logical_cores)
 }
 
 impl<'m> StreamingRunner<'m> {
@@ -245,14 +399,6 @@ impl<'m> StreamingRunner<'m> {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        // Generation runs single-column matmuls, where the work per thread can
-        // be smaller than the barrier that synchronises them. Overridable so
-        // the trade-off can be measured rather than assumed.
-        let _threads = std::env::var("BIGTEA_EXPERT_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(cores);
         StreamingRunner {
             // The reader pool always gets every core: its threads block on
             // disk rather than compete for CPU.
@@ -266,15 +412,35 @@ impl<'m> StreamingRunner<'m> {
             keys: Vec::new(),
             rng: 0x9E3779B97F4A7C15,
             scratch: Vec::new(),
-            threads: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4),
+            threads: configured_threads(),
+            threads_batch: configured_threads_batch(),
+            // An explicit `-t` is an instruction, not a hint: do not overrule
+            // it with a measurement the user did not ask for.
+            tuner: if env_threads("BIGTEA_THREADS").is_some() {
+                None
+            } else {
+                ThreadTuner::new(cores)
+            },
             stats: StreamStats::default(),
         }
     }
 
     pub fn config(&self) -> &Qwen3Config {
         &self.arch.config
+    }
+
+    /// The thread count for a step over `n_tokens` positions.
+    ///
+    /// One position is bandwidth-bound and wants few threads; a block is
+    /// compute-bound and wants every core. Deciding from the token count rather
+    /// than the call site means a path used by both phases — `forward_cached`
+    /// is — cannot get it wrong.
+    fn threads_for(&self, n_tokens: usize) -> usize {
+        if n_tokens > 1 {
+            self.threads_batch
+        } else {
+            self.threads
+        }
     }
 
     /// Tensors that stay in RAM: everything except routed experts.
@@ -412,7 +578,9 @@ impl<'m> StreamingRunner<'m> {
             // otherwise allocates and first-touches a fresh multi-megabyte
             // arena 55,296 times — 128 experts x 48 layers x 9 blocks.
             let mut buf = std::mem::take(&mut self.scratch);
-            let threads = self.threads;
+            // Only reached with more than one token — the single-position case
+            // returned above — so this is always the batch count.
+            let threads = self.threads_batch;
             let mut group_secs = 0f64;
             let group_result = (|| -> Result<()> {
                 for &expert in group {
@@ -984,10 +1152,7 @@ impl<'m> StreamingRunner<'m> {
         let t = ctx.new_f32_2d(n_embd, n_new)?;
         t.set_f32(values)?;
         let out = self.arch.norm_scaled(&ctx, &t, &w)?;
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        ctx.compute(&out, threads)?;
+        ctx.compute(&out, self.threads_for(n_new as usize))?;
         Ok(out.to_vec_f32())
     }
 
@@ -1009,15 +1174,54 @@ impl<'m> StreamingRunner<'m> {
         tokens: &[u32],
         pos_start: usize,
     ) -> Result<Vec<f32>> {
+        // Only single-token steps are tuned. A prefill block runs on the batch
+        // count, which is a different question with a different answer.
+        if tokens.len() != 1 || self.tuner.is_none() {
+            return self.forward_cached_inner(weights, cache, tokens, pos_start);
+        }
+        if let Some(t) = self.tuner.as_ref() {
+            self.threads = t.candidate();
+        }
+        let start = std::time::Instant::now();
+        let out = self.forward_cached_inner(weights, cache, tokens, pos_start);
+        let elapsed = start.elapsed().as_secs_f64();
+        // A step that failed took no meaningful time; do not let it win.
+        if out.is_ok() {
+            if let Some(best) = self.tuner.as_mut().and_then(|t| t.record(elapsed)) {
+                self.threads = best;
+                self.tuner = None;
+            }
+        }
+        out
+    }
+
+    /// The number of threads generation settled on, and whether it was tuned.
+    ///
+    /// `false` means the ladder has not finished — a generation shorter than
+    /// the ladder ends mid-tune, which is fine but should not be reported as a
+    /// measured answer.
+    pub fn generation_threads(&self) -> (usize, bool) {
+        (self.threads, self.tuner.is_none())
+    }
+
+    fn forward_cached_inner<'a>(
+        &mut self,
+        weights: &WeightSet<'a>,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        pos_start: usize,
+    ) -> Result<Vec<f32>> {
         let c = self.arch.config.clone();
         let n_new = tokens.len() as i64;
         let n_embd = c.n_embd as i64;
         let head_dim = c.head_dim as i64;
         let n_kv = c.n_head_kv as i64;
         let kv_width = (n_kv * head_dim) as usize;
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        // The same function serves both phases — a prefill block arrives here
+        // with many tokens, a generated token with one — so the thread count
+        // has to follow the batch rather than the call site. This is exactly
+        // llama.cpp's `n_threads_batch` rule.
+        let threads = self.threads_for(tokens.len());
 
         let positions: Vec<i32> = (0..n_new).map(|i| (pos_start as i64 + i) as i32).collect();
 
@@ -1364,9 +1568,7 @@ impl<'m> StreamingRunner<'m> {
         let c = self.arch.config.clone();
         let n_tokens = tokens.len() as i64;
         let n_embd = c.n_embd as i64;
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let threads = self.threads_for(tokens.len());
 
         // Embedding lookup, once.
         let mut x: Vec<f32> = {
@@ -1462,6 +1664,80 @@ impl<'m> StreamingRunner<'m> {
         )?;
         ctx.compute(&out, threads)?;
         Ok(out.to_vec_f32())
+    }
+}
+
+#[cfg(test)]
+mod tuner_tests {
+    use super::ThreadTuner;
+
+    /// Walk a tuner through a supplied cost curve, returning what it settles
+    /// on and how many tokens it spent getting there.
+    fn settle(cores: usize, cost: impl Fn(usize) -> f64) -> (usize, usize) {
+        let mut t = ThreadTuner::new(cores).expect("a ladder");
+        let mut spent = 0;
+        loop {
+            let candidate = t.candidate();
+            spent += 1;
+            if let Some(best) = t.record(cost(candidate)) {
+                return (best, spent);
+            }
+            assert!(spent < 64, "the tuner must terminate");
+        }
+    }
+
+    #[test]
+    fn it_finds_the_cheapest_thread_count() {
+        // The shape actually measured: a minimum at 2, rising after.
+        let (best, _) = settle(20, |t| match t {
+            1 => 0.190,
+            2 => 0.131,
+            4 => 0.133,
+            6 => 0.141,
+            8 => 0.160,
+            _ => 0.220,
+        });
+        assert_eq!(best, 2);
+    }
+
+    #[test]
+    fn it_stops_before_walking_the_whole_ladder() {
+        // Eight rungs exist; a curve that turns down should not cost eight
+        // tokens to discover, because a short generation is mostly tuning.
+        let (_, spent) = settle(20, |t| 0.1 + t as f64 * 0.01);
+        assert!(spent <= 5, "spent {spent} tokens tuning");
+    }
+
+    #[test]
+    fn a_flat_curve_keeps_the_smaller_count() {
+        // Ties go down: over-threading costs 1.8x and under-threading ~10%,
+        // so the two errors are not worth the same.
+        let (best, _) = settle(20, |_| 0.15);
+        assert_eq!(best, 1);
+    }
+
+    #[test]
+    fn one_slow_sample_does_not_end_the_search() {
+        // A single noisy step must not stop the walk — that is why the rule is
+        // two consecutive regressions and not one.
+        let (best, _) = settle(20, |t| match t {
+            1 => 0.190,
+            2 => 0.900, // a scheduler hiccup, not the real cost
+            4 => 0.120,
+            _ => 0.300,
+        });
+        assert_eq!(best, 4);
+    }
+
+    #[test]
+    fn the_ladder_never_exceeds_the_cores_available() {
+        for cores in [3usize, 4, 8, 20, 64] {
+            let t = ThreadTuner::new(cores).expect("a ladder");
+            assert!(t.ladder.iter().all(|&c| c <= cores), "cores={cores}");
+            assert_eq!(*t.ladder.last().expect("non-empty"), cores);
+        }
+        // Nothing to choose between with one thread.
+        assert!(ThreadTuner::new(1).is_none());
     }
 }
 

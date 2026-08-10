@@ -61,6 +61,15 @@ fn main() -> ExitCode {
                 cache_gib = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
                 i += 2;
             }
+            // Read by `configured_threads`, which every graph evaluation calls.
+            // Set here rather than threaded through `serve` because the engines
+            // are constructed several call-frames down.
+            "-t" | "--threads" => {
+                if let Some(t) = args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                    std::env::set_var("BIGTEA_THREADS", t.to_string());
+                }
+                i += 2;
+            }
             "-h" | "--help" => {
                 usage();
                 return ExitCode::SUCCESS;
@@ -88,7 +97,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() {
-    println!("usage: bigtea-serve <model.gguf> [--port 8080] [--cache GiB]");
+    println!("usage: bigtea-serve <model.gguf> [--port 8080] [--cache GiB] [-t N]");
     println!();
     println!("Serves an OpenAI-compatible endpoint on 127.0.0.1:");
     println!("  POST /v1/chat/completions   the one an agent calls");
@@ -773,9 +782,7 @@ fn advance(
             let pos = ctx.new_i32_1d(n)?;
             pos.set_i32(&(0..n as i32).collect::<Vec<_>>())?;
             let logits = arch.build_graph(&ctx, weights, &tok, &pos, n)?;
-            let threads = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1);
+            let threads = bigtea_arch::configured_threads();
             ctx.compute(&logits, threads)?;
             let all = logits.to_vec_f32();
             // Only the final position predicts the next token.

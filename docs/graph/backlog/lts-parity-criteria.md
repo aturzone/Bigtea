@@ -24,7 +24,7 @@ the real distance to "any model", and it is far larger than the performance gap.
 | architectures | **6** (`deepseek4`, `gemma2`, `llama`, `phi3`, `qwen3`, `qwen3moe`) | ~100 |
 | tokenizer families | **2** (`gpt2` BPE, `llama` SPM) | 6 (spm, bpe, wpm, ugm, rwkv, plamo2) |
 | quant types | all ggml can decode | same |
-| CLI flags | **15** | ~100 |
+| CLI flags | **16** | ~100 |
 | chat templates | **9 families** | ~40 |
 | backends | CPU | CPU, CUDA, Metal, Vulkan, ROCm, SYCL |
 
@@ -87,7 +87,7 @@ reads + ~0.6 s of everything else, so with R2 overlap it is **~0.65 tok/s agains
 | C1 | sampling: temperature, top-k, top-p, min-p, repeat penalty, seed | **DONE 2026-08-10** — 10 unit tests, `--llamacpp-defaults` for like-for-like comparison |
 | C2 | chat templates from `tokenizer.chat_template` | **DONE 2026-08-10** — 9 families, detected from the real templates; control tokens encode to single ids |
 | C3 | streaming responses (SSE) in `bigtea-serve` | **DONE 2026-08-10** — plus temperature/top_p/top_k/min_p/seed/stop from the request, EOS and stop sequences give `finish_reason: stop` |
-| C4 | `-c` context size, `-b` batch, `-t` threads as flags | **DONE 2026-08-10** — llama.cpp's own spellings; the thread default was a hardcoded 12 and is now all cores |
+| C4 | `-c` context size, `-b` batch, `-t` threads as flags | **DONE 2026-08-10, then found broken and re-done the same day.** `-t` reached only `deepseek4`; every other architecture ignored it. Now plumbed, plus llama.cpp's `-tb`/`--threads-batch`, because generation and prefill want opposite counts. The generation default is **tuned on real tokens** — 1.66x/1.69x over "all cores". See `../research/threads-were-never-plumbed-2026-08-10.md` |
 | C5 | stop sequences, `max_tokens`, `n_predict` | **DONE** — `--stop` (repeatable) on the CLI, string-or-array on the server; both match accumulated text, not tokens |
 | C6 | grammar / JSON-schema constrained output | **won't for LTS** — large, and not what an agent needs first |
 | C7 | LoRA adapters | **won't for LTS** — no user asking |

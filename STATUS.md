@@ -621,6 +621,68 @@ This is the third time this exact fact has cost time — it is already in
 `CLAUDE.md` as *"24 calls per block became 6 — 1.9x"*. Worth grepping for
 `compute(` in any hot loop before assuming the arithmetic is the cost.
 
+## `-t` was never plumbed, and the default was the worst setting (2026-08-10)
+
+Full write-up, every command line both sides:
+`docs/graph/research/threads-were-never-plumbed-2026-08-10.md`.
+
+`-t N` set `BIGTEA_THREADS` and **only `deepseek4_forward.rs` read it.** Every
+other architecture computed its own count from `available_parallelism()`. What
+exposed it: `-t 1` and `-t 20` produced *bit-identical* phase timings. An
+earlier sweep reading 4.07/4.00/4.31/4.67 tok/s had been recorded as "threads
+are not the lever" — it was six measurements of one configuration.
+
+**A sweep whose knob is disconnected is indistinguishable from a flat response.**
+Confirm the knob moves something before concluding it moves nothing.
+
+Once connected, generation and prefill turned out to want opposite counts, so
+there are now two — `-t` and llama.cpp's `-tb` / `--threads-batch` — chosen by
+the token count of the step, not the call site:
+
+| threads | Qwen3-4B gen | Llama-3.2-1B gen | Qwen3-4B prefill |
+|---:|---:|---:|---:|
+| 2 | **7.64** | **21.95** | — |
+| 4 | 7.51 | 21.45 | 47.4 |
+| 8 | 6.24 | 16.78 | 70.9 |
+| 20 (the old default) | 4.49 | 12.22 | **81.5** |
+
+Generation streams every weight once per token and saturates DRAM long before it
+runs out of cores; prefill multiplies a whole block and scales with cores.
+llama.cpp shows the same curve on this machine, so it is the hardware, not us.
+
+**A calibration that failed and was deleted**: a 150 ms DRAM-saturation
+microbenchmark at load chose 6, 8, 12, 12, 4, 6 on six consecutive runs while
+the optimum was 2-4, and its spread (5.51-8.20) was worse than the bad default
+it replaced. A pure read has no per-node barrier; a ggml graph does. *A proxy
+that must be corrected until it agrees with the objective is the objective,
+measured badly.* What shipped instead tunes on **real generated tokens** and
+stops after ~4 of them.
+
+Interleaved A/B, same session, `-n 64`, 3 reps:
+
+| | tuned (new default) | `-t 20` (old default) | |
+|---|---:|---:|---|
+| Qwen3-4B | **8.01** | 4.83 | **1.66x** |
+| Llama-3.2-1B | **20.05** | 11.89 | **1.69x** |
+
+### Against llama.cpp — both cells, neither quotable alone
+
+| generation | Bigtea | llama.cpp | verdict |
+|---|---:|---:|---|
+| Qwen3-4B, **both at default** | **8.01** | 6.52 ± 0.33 (t=10) | **1.23x ahead** |
+| Llama-3.2-1B, **both at default** | 20.05 | 20.91 ± 0.65 (t=10) | 1.04x — parity |
+| Qwen3-4B, **both hand-tuned** | 7.64 (t=2) | 9.16 ± 0.43 (t=4) | 1.20x behind |
+| Llama-3.2-1B, **both hand-tuned** | 21.95 (t=2) | 27.85 ± 1.98 (t=4) | 1.27x behind |
+
+Out of the box we lead on Qwen3-4B because we measure the machine and llama.cpp
+uses a fixed default. **Given equal care on both sides llama.cpp is still
+faster.** The hand-tuned deficit (1.20x) matches what was recorded before any of
+this work (1.23x), which is what says the ratio is real rather than an artefact
+of where on the curve each engine was sitting.
+
+Output is byte-identical at 2 and 20 threads on all five verified dense
+architectures. 229 tests pass.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

@@ -31,7 +31,7 @@ pub use expert_cache::{CacheStats, ExpertCache};
 pub use kv::{KvCache, KvError};
 pub use qwen3::{architecture_is_verified, Qwen3Config, Qwen3Model, VERIFIED_ARCHITECTURES};
 pub use sample::{Sampler, SamplerConfig};
-pub use stream::{StreamStats, StreamingRunner};
+pub use stream::{configured_threads, configured_threads_batch, StreamStats, StreamingRunner};
 
 use std::fmt;
 
