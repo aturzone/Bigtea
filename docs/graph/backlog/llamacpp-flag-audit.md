@@ -14,8 +14,8 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 
 | bucket | flags | state |
 |---|---:|---|
-| **have** | **71** | done |
-| **samplers** | 22 | **18 done**; `--samplers` ordering (3) + `--backend-sampling` left |
+| **have** | **72** | done |
+| **samplers** | 22 | **21 done**; only `--backend-sampling` left, and it is a GPU concept |
 | interaction / prompt handling | 22 | **done 2026-08-11** — including a real REPL |
 | runtime / threading / memory | 31 | mostly gap; several are meaningless here |
 | RoPE, YaRN, context shift | 15 | **9 done 2026-08-11**; the other 6 refused, see below |
@@ -191,10 +191,49 @@ One test caught the author, not the code: a fixture written as
 penalty is `base^2`, not `base^1`. The assertion was wrong and the
 implementation was right — both cases are pinned now.
 
-## Next batches, in order
+## Done 2026-08-11 — `--samplers` chain ordering; the sampler bucket is closed
 
-1. **`--samplers` ordering (3)** — finishes the sampler bucket. Needs the chain
-   to become data rather than a fixed sequence of calls.
+`--samplers`, `--sampler-seq`, `--sampling-seq` (three spellings of one flag).
+
+The chain was a fixed sequence of calls; it is now a `Vec<SamplerStage>` walked
+in order. Same seed, same model, different order, different answer:
+
+```
+$ ... --temp 1.5 --top-p 0.5 --seed 9 --samplers "top_k;typ_p;top_p;min_p;xtc;temperature"
+ vast and unpredictable, and its vastness is mirrored in t
+
+$ ... --temp 1.5 --top-p 0.5 --seed 9 --samplers "temperature;top_p"
+ turbulent, if we are successful it will determine us. Som
+```
+
+That is the whole point of the flag: a hot temperature flattens the
+distribution, so `top_p 0.5` *after* it keeps a different set than before it.
+Neither order is more correct and people ask for both.
+
+**What is not reorderable, stated rather than papered over:** the penalties, DRY
+and top-n-sigma act on **logits** and always run first; the six stages above act
+on probabilities. That is also where llama.cpp puts them in its own default
+chain, so the constraint costs nothing in practice.
+
+**An unknown stage refuses the whole run** rather than dropping that stage:
+
+```
+$ ... --samplers "top_k;top_q"
+bigtea-run: --samplers: unknown stage "top_q"
+  known stages: top_k, typ_p, top_p, min_p, xtc, temperature
+  penalties, dry and top_n_sigma act on logits and always run first
+$ echo $?
+2
+```
+
+A typo that silently removed a filter would be the same class of failure as a
+flag that does nothing — the user believes a constraint is active when it is
+not.
+
+`--backend-sampling` is the one sampler flag left and it is **won't**: it moves
+sampling onto the GPU, and there is no GPU backend to move it to.
+
+## Next batches, in order
 2. **RoPE / context (15)** — `--rope-freq-base`, `--rope-freq-scale`,
    `--rope-scaling`, YaRN. Cheap, and needed for any model whose container
    disagrees with its training context.

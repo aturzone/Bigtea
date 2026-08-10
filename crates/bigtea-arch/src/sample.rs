@@ -26,6 +26,59 @@
 
 use std::collections::HashMap;
 
+/// One reorderable step of the sampling chain — llama.cpp's `--samplers`.
+///
+/// # What can and cannot be reordered, and why
+///
+/// The penalties, DRY and top-n-sigma act on **logits**; everything here acts
+/// on **probabilities**, after the softmax. Those three therefore always run
+/// first and are not part of this enum — which is not a limitation being
+/// papered over, it is where llama.cpp puts them in its own default chain too.
+///
+/// Within probability space the order genuinely changes the result.
+/// `temperature;top_p` flattens the distribution and *then* takes 90% of the
+/// mass, which is a different set from `top_p;temperature`. Both are things
+/// people ask for, and neither is more correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplerStage {
+    TopK,
+    TypicalP,
+    TopP,
+    MinP,
+    Xtc,
+    Temperature,
+}
+
+impl SamplerStage {
+    /// Parse llama.cpp's spelling. `None` for anything unrecognised, so a
+    /// caller can refuse the whole string rather than silently dropping a
+    /// stage the user asked for.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "top_k" | "topk" => Some(SamplerStage::TopK),
+            "typ_p" | "typical" | "typical_p" | "typ" => Some(SamplerStage::TypicalP),
+            "top_p" | "topp" => Some(SamplerStage::TopP),
+            "min_p" | "minp" => Some(SamplerStage::MinP),
+            "xtc" => Some(SamplerStage::Xtc),
+            "temperature" | "temp" => Some(SamplerStage::Temperature),
+            _ => None,
+        }
+    }
+
+    /// llama.cpp's default order, and the one this file used when the chain
+    /// was a fixed sequence of calls.
+    pub fn default_chain() -> Vec<Self> {
+        vec![
+            SamplerStage::TopK,
+            SamplerStage::TypicalP,
+            SamplerStage::TopP,
+            SamplerStage::MinP,
+            SamplerStage::Xtc,
+            SamplerStage::Temperature,
+        ]
+    }
+}
+
 /// Which filters run, and how hard.
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
@@ -102,6 +155,9 @@ pub struct SamplerConfig {
     pub ignore_eos: bool,
     /// The EOS id, needed by `ignore_eos`. `None` means the model declared none.
     pub eos: Option<u32>,
+    /// The order the probability-space filters run in — `--samplers`.
+    /// See [`SamplerStage`] for what is and is not reorderable.
+    pub chain: Vec<SamplerStage>,
     pub seed: u64,
 }
 
@@ -134,6 +190,7 @@ impl Default for SamplerConfig {
             logit_bias: Vec::new(),
             ignore_eos: false,
             eos: None,
+            chain: SamplerStage::default_chain(),
             seed: 0,
         }
     }
@@ -172,6 +229,7 @@ impl SamplerConfig {
             logit_bias: Vec::new(),
             ignore_eos: false,
             eos: None,
+            chain: SamplerStage::default_chain(),
             seed: 0,
         }
     }
@@ -392,34 +450,54 @@ impl Sampler {
             return self.sample_mirostat();
         }
 
-        apply_typical_p(&mut self.candidates, self.config.typical_p);
-        apply_top_p(&mut self.candidates, self.config.top_p);
-        apply_min_p(&mut self.candidates, self.config.min_p);
-        // Only drawn when XTC is on. Drawing unconditionally would consume a
-        // value from the seeded stream and change the output of every existing
-        // `--seed` run that never asked for XTC.
-        if self.config.xtc_probability > 0.0 {
-            let roll = self.next_f32();
-            apply_xtc(
-                &mut self.candidates,
-                self.config.xtc_probability,
-                self.config.xtc_threshold,
-                roll,
-            );
+        // The chain, in the order `--samplers` asked for. Default order is
+        // llama.cpp's and is identical to the fixed sequence this replaced.
+        let chain = self.config.chain.clone();
+        for stage in chain {
+            match stage {
+                // top_k already ran above, in logit space, where it is a pure
+                // rank cut and cheaper. Listing it here would truncate twice —
+                // harmless but wasteful — so it is a no-op unless the user
+                // moved it AFTER something, which is the case that matters.
+                SamplerStage::TopK => {
+                    if self.config.top_k > 0 && self.candidates.len() > self.config.top_k {
+                        self.candidates.truncate(self.config.top_k);
+                    }
+                }
+                SamplerStage::TypicalP => {
+                    apply_typical_p(&mut self.candidates, self.config.typical_p)
+                }
+                SamplerStage::TopP => apply_top_p(&mut self.candidates, self.config.top_p),
+                SamplerStage::MinP => apply_min_p(&mut self.candidates, self.config.min_p),
+                SamplerStage::Xtc => {
+                    // Only drawn when XTC is on. Drawing unconditionally would
+                    // consume a value from the seeded stream and change the
+                    // output of every `--seed` run that never asked for XTC.
+                    if self.config.xtc_probability > 0.0 {
+                        let roll = self.next_f32();
+                        apply_xtc(
+                            &mut self.candidates,
+                            self.config.xtc_probability,
+                            self.config.xtc_threshold,
+                            roll,
+                        );
+                    }
+                }
+                SamplerStage::Temperature => {
+                    let temp = if self.config.dynatemp_range > 0.0 {
+                        dynamic_temperature(
+                            &self.candidates,
+                            self.config.temperature,
+                            self.config.dynatemp_range,
+                            self.config.dynatemp_exponent,
+                        )
+                    } else {
+                        self.config.temperature
+                    };
+                    apply_temperature(&mut self.candidates, temp);
+                }
+            }
         }
-
-        // Temperature last, on the surviving set, so top_p meant what it says.
-        let temp = if self.config.dynatemp_range > 0.0 {
-            dynamic_temperature(
-                &self.candidates,
-                self.config.temperature,
-                self.config.dynatemp_range,
-                self.config.dynatemp_exponent,
-            )
-        } else {
-            self.config.temperature
-        };
-        apply_temperature(&mut self.candidates, temp);
 
         let r = self.next_f32();
         let mut acc = 0.0;
@@ -971,6 +1049,74 @@ mod tests {
             c[1].1, -8.0,
             "negative logit must be multiplied, not raised"
         );
+    }
+
+    #[test]
+    fn the_default_chain_is_llamacpp_s_order() {
+        assert_eq!(
+            SamplerStage::default_chain(),
+            vec![
+                SamplerStage::TopK,
+                SamplerStage::TypicalP,
+                SamplerStage::TopP,
+                SamplerStage::MinP,
+                SamplerStage::Xtc,
+                SamplerStage::Temperature,
+            ]
+        );
+    }
+
+    #[test]
+    fn stage_names_match_llamacpp_s_spelling() {
+        assert_eq!(SamplerStage::parse("top_k"), Some(SamplerStage::TopK));
+        assert_eq!(SamplerStage::parse("typ_p"), Some(SamplerStage::TypicalP));
+        assert_eq!(SamplerStage::parse("min_p"), Some(SamplerStage::MinP));
+        assert_eq!(
+            SamplerStage::parse(" TEMPERATURE "),
+            Some(SamplerStage::Temperature),
+            "whitespace and case must not decide whether a filter runs"
+        );
+        // Unknown returns None so the caller can refuse the whole string; a
+        // typo must not quietly remove a filter the user is relying on.
+        assert_eq!(SamplerStage::parse("top_q"), None);
+    }
+
+    #[test]
+    fn ordering_temperature_before_top_p_changes_the_result() {
+        // The point of the flag. A hot temperature flattens the distribution,
+        // so top_p 0.5 afterwards keeps MORE tokens than it would before —
+        // different surviving sets, and over many draws a different spread.
+        let logits = [4.0f32, 3.0, 2.0, 1.0, 0.0];
+        let draw = |chain: Vec<SamplerStage>| -> std::collections::HashSet<u32> {
+            let mut s = Sampler::new(SamplerConfig {
+                temperature: 2.0,
+                top_p: 0.5,
+                chain,
+                seed: 5,
+                ..SamplerConfig::default()
+            });
+            (0..200).map(|_| s.sample(&logits, &[])).collect()
+        };
+        let after = draw(vec![SamplerStage::TopP, SamplerStage::Temperature]);
+        let before = draw(vec![SamplerStage::Temperature, SamplerStage::TopP]);
+        assert_ne!(
+            after, before,
+            "chain order made no difference: {after:?} vs {before:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_chain_still_samples_rather_than_panicking() {
+        // A chain with no stages is a valid request: raw multinomial draw from
+        // the model's own distribution.
+        let mut s = Sampler::new(SamplerConfig {
+            temperature: 1.0,
+            chain: Vec::new(),
+            seed: 3,
+            ..SamplerConfig::default()
+        });
+        let id = s.sample(&[1.0, 2.0, 3.0], &[]);
+        assert!(id < 3, "returned an out-of-range token: {id}");
     }
 
     #[test]

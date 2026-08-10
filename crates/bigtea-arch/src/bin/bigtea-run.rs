@@ -528,6 +528,7 @@ fn main() -> ExitCode {
         eprintln!("  --dry-allowed-length N  repeats shorter than this are free (2)");
         eprintln!("  --dry-penalty-last-n N  how far DRY looks back. 0 = all");
         eprintln!("  --dry-sequence-breaker S  a match may not cross this, repeatable");
+        eprintln!("  --samplers SPEC     chain order, e.g. \"top_k;temperature;top_p\"");
         eprintln!("  -i, --interactive   keep the session open and take turns");
         eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
         eprintln!("  -st, --single-turn  one exchange, then exit");
@@ -752,6 +753,46 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // The chain order itself. Refused wholesale on an unknown name
+            // rather than dropping that stage: a typo would otherwise remove a
+            // filter the user is relying on, silently.
+            "--samplers" | "--sampler-seq" | "--sampling-seq" => {
+                if let Some(spec) = rest.get(i + 1) {
+                    let mut chain = Vec::new();
+                    let mut bad: Option<String> = None;
+                    for name in spec.split([';', ',']).filter(|n| !n.trim().is_empty()) {
+                        match bigtea_arch::SamplerStage::parse(name) {
+                            Some(stage) => chain.push(stage),
+                            None => {
+                                bad = Some(name.trim().to_string());
+                                break;
+                            }
+                        }
+                    }
+                    match bad {
+                        Some(name) => {
+                            // Built as separate lines: a `\` continuation in a
+                            // Rust string keeps the source indentation and
+                            // prints a ragged message, which is how the SSE
+                            // headers went out malformed earlier.
+                            eprintln!("bigtea-run: --samplers: unknown stage {name:?}");
+                            eprintln!(
+                                "  known stages: top_k, typ_p, top_p, min_p, xtc, temperature"
+                            );
+                            eprintln!(
+                                "  penalties, dry and top_n_sigma act on logits and always run first"
+                            );
+                            return ExitCode::from(2);
+                        }
+                        None if chain.is_empty() => {
+                            eprintln!("bigtea-run: --samplers: empty chain");
+                            return ExitCode::from(2);
+                        }
+                        None => sampler.chain = chain,
+                    }
+                }
+                i += 2;
+            }
             // --- DRY: penalise continuing a repeat, not reusing a word -----
             "--dry-multiplier" => {
                 sampler.dry_multiplier =
