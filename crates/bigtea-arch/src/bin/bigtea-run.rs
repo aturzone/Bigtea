@@ -515,7 +515,18 @@ fn run(
         return Err("prompt encoded to zero tokens".into());
     }
 
-    if config.is_moe() {
+    // Dense models go through the same path as MoE ones, because that is the
+    // path with a **KV cache**.
+    //
+    // The uncached branch below rebuilds the graph over the whole sequence for
+    // every token, which measured **0.67 tok/s against llama.cpp's 5.90** on
+    // Qwen3-4B — 128 tokens from a 9-token prompt costs ~9,300 token-positions
+    // of work. `StreamingRunner::forward_cached` computes only the new
+    // position and attends over cached history; for a dense model there are no
+    // routed experts, so "streaming" reduces to exactly that.
+    // `BIGTEA_UNCACHED=1` keeps the old stateless path reachable, so the gain
+    // can be measured rather than asserted.
+    if std::env::var("BIGTEA_UNCACHED").is_err() {
         return run_streaming(
             &model,
             config,

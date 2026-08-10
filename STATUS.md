@@ -420,12 +420,19 @@ compute path on its own.** Both command lines and outputs:
 | prefill | 38.5 tok/s (651 tok) | **111.2** (pp512) | **2.9x behind** |
 | generation | 0.67 tok/s (128 tok) | **5.90** (tg128) | **8.8x behind** |
 
-**The generation gap has one cause: the dense path has no KV cache.** Every
-token rebuilds the graph over the whole sequence — 128 tokens from a 9-token
-prompt is ~9,300 token-positions of work to produce 128 tokens. It is the same
-defect R3 fixed on V4-Flash, where it was worth 2.3x. `KvCache` already exists
-and the equivalence harness that verified it applies unchanged. **This is now
-the largest single performance item on the LTS list.**
+**FIXED the same day.** The cause was one branch condition: `forward_cached`
+already had a working KV cache but was only reached `if config.is_moe()`, so
+dense models fell through to a stateless path that rebuilt the whole sequence
+per token. Routing them through it needed two guards the streaming path lacked
+— QK norm (Qwen3-only) and the RoPE type (NORM for llama, NeoX for qwen).
+
+| generation, 128 tokens | before | after | llama.cpp | verdict |
+|---|---:|---:|---:|---|
+| **Qwen3-4B** | 0.67 tok/s | **4.27** | 5.90 | 8.8x behind → **1.38x** |
+| **Llama-3.2-1B** | — | **10.12** | 12.91 | **1.28x behind** |
+
+Cached and uncached produce **byte-identical** text on Qwen3-4B;
+`BIGTEA_UNCACHED=1` keeps the old path reachable so that stays checkable.
 
 Two bugs found while measuring, both fixed:
 

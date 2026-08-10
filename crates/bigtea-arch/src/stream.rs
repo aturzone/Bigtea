@@ -1009,20 +1009,33 @@ impl<'m> StreamingRunner<'m> {
 
                 let q = ctx.reshape_3d(&q, head_dim, c.n_head as i64, n_new)?;
                 let k = ctx.reshape_3d(&k, head_dim, n_kv, n_new)?;
-                let q = self.arch.norm_scaled(
-                    &ctx,
-                    &q,
-                    &get(weights, format!("blk.{il}.attn_q_norm.weight"))?,
-                )?;
-                let k = self.arch.norm_scaled(
-                    &ctx,
-                    &k,
-                    &get(weights, format!("blk.{il}.attn_k_norm.weight"))?,
-                )?;
+                // Qwen3 normalises each head before RoPE; llama, mistral,
+                // qwen2, gemma and phi have no such tensors at all, so asking
+                // for them refuses those containers outright.
+                let (q, k) = if c.qk_norm {
+                    (
+                        self.arch.norm_scaled(
+                            &ctx,
+                            &q,
+                            &get(weights, format!("blk.{il}.attn_q_norm.weight"))?,
+                        )?,
+                        self.arch.norm_scaled(
+                            &ctx,
+                            &k,
+                            &get(weights, format!("blk.{il}.attn_k_norm.weight"))?,
+                        )?,
+                    )
+                } else {
+                    (q, k)
+                };
 
                 let rp = self.rope();
-                let q = ctx.rope_ext(&q, &pos, None, head_dim as i32, ROPE_TYPE_NEOX, 0, rp)?;
-                let k = ctx.rope_ext(&k, &pos, None, head_dim as i32, ROPE_TYPE_NEOX, 0, rp)?;
+                // NORM for llama/mistral, NeoX for qwen/phi/gemma. Both run
+                // without error on either layout and the wrong one is fluent
+                // nonsense, so it comes from the config rather than a constant.
+                let rope_type = c.rope_type;
+                let q = ctx.rope_ext(&q, &pos, None, head_dim as i32, rope_type, 0, rp)?;
+                let k = ctx.rope_ext(&k, &pos, None, head_dim as i32, rope_type, 0, rp)?;
 
                 // One compute materialises all three; they share a graph.
                 let t = std::time::Instant::now();
@@ -1125,6 +1138,18 @@ impl<'m> StreamingRunner<'m> {
                     &xt,
                     &get(weights, format!("blk.{il}.ffn_norm.weight"))?,
                 )?;
+                if !c.is_moe() {
+                    // Dense: no router at all. The FFN is one gate/up/down
+                    // triple on resident weights, so it runs here rather than
+                    // through the expert machinery.
+                    let ffn = self.arch.dense_ffn(&ctx, weights, &normed, il)?;
+                    let out = ctx.add(&ffn, &xt)?;
+                    let t = std::time::Instant::now();
+                    ctx.compute(&out, threads)?;
+                    self.stats.other_seconds += t.elapsed().as_secs_f64();
+                    x = out.to_vec_f32();
+                    continue;
+                }
                 let logits = ctx.mul_mat(
                     &get(weights, format!("blk.{il}.ffn_gate_inp.weight"))?,
                     &normed,

@@ -526,7 +526,7 @@ impl Qwen3Model {
     }
 
     /// SwiGLU feed-forward: `down(silu(gate(x)) * up(x))`.
-    fn dense_ffn<'a>(
+    pub(crate) fn dense_ffn<'a>(
         &self,
         ctx: &'a Context,
         weights: &WeightSet<'a>,

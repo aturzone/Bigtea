@@ -67,7 +67,7 @@ measured back to back in one session with both command lines recorded.
 |---|---|---|---|
 | load / time-to-first-token | 1.25x behind | — | — |
 | prefill tok/s | 1.25x behind | **ahead** @565, @2206 | **38.5 vs 111.2 — 2.9x behind** |
-| generation tok/s | 0.37 vs 0.39 | 1.07 vs 2.16 | **0.67 vs 5.90 — 8.8x behind, no KV cache** |
+| generation tok/s | 0.37 vs 0.39 | 1.07 vs 2.16 | **4.27 vs 5.90 — 1.38x behind** (Llama-3.2-1B: 10.12 vs 12.91, 1.28x) |
 | memory footprint at equal speed | **ours, by design** | ours | — |
 | long-context generation | untested | untested | untested |
 

@@ -101,6 +101,31 @@ GFLOP** and 395 MB of logits, for one row of it.
 Now only the final position is projected. This is a large part of why the arena
 was so big, and it is pure waste removed rather than a trade.
 
+## FIXED, same day: the dense path now uses the KV cache
+
+`StreamingRunner::forward_cached` already existed and already had a working KV
+cache — it was only ever reached for MoE models, because the branch was
+`if config.is_moe()`. Dense models fell through to the stateless path. Routing
+them through the same code needed two guards that the streaming path was
+missing for non-Qwen architectures:
+
+- **QK norm**, which only Qwen3 has (the same fix already made in `qwen3.rs`).
+- **RoPE type**, which was hardcoded to NeoX and must be NORM for llama/mistral.
+  Both run without error on either layout, so this one would have been fluent
+  nonsense rather than the clean "missing tensor" the QK-norm one gave.
+
+Correctness first: cached and uncached produce **byte-identical text** on
+Qwen3-4B (`BIGTEA_UNCACHED=1` keeps the old path reachable so this stays
+checkable, rather than being asserted once and then trusted).
+
+| generation, 128 tokens | before | after | llama.cpp | verdict |
+|---|---:|---:|---:|---|
+| **Qwen3-4B** | 0.67 tok/s | **4.27** | 5.90 | 8.8x behind → **1.38x** |
+| **Llama-3.2-1B** | — | **10.12** | 12.91 | **1.28x behind** |
+
+**6.4x on Qwen3-4B generation from one branch condition.** The remaining ~1.3x
+is real and is now the honest gap on dense generation.
+
 ## What this does not measure
 
 - **Quality.** Both engines were run greedy where possible; no perplexity or
