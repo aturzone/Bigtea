@@ -14,7 +14,8 @@
 ```
 # ggml must be built first; point GGML_LIB_DIR at ggml-base.a, ggml-cpu.a, ggml.a
 export GGML_LIB_DIR=C:/Projects/llamacpp-unsloth/build/ggml/src   # PowerShell: $env:GGML_LIB_DIR=...
-cargo test --release          # 168 tests (+16 container-backed, --ignored)
+cargo test --release          # 224 tests
+cargo test --release --test deepseek4_forward -- --ignored   # 19 V4-Flash, needs the container
 cargo build --release
 ./target/release/bigtea-run <model.gguf> "prompt" -n 16
 ./target/release/bigtea-probe --quick          # RAM/disk/GPU + what to close
@@ -29,7 +30,7 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 
 ## Facts that cost time to rediscover
 
-- **ggml aborts** (`GGML_ASSERT`) when its arena is exhausted — no error to catch. Size arenas up front.
+- **ggml aborts** (`GGML_ASSERT`) when its arena is exhausted — no error to catch. Size arenas up front. **This also kills a whole test binary**: the 19 V4-Flash tests each allocate GB-sized arenas and, run in parallel, exhausted memory and aborted the process — reported as `process didn't exit successfully`, not as a failing test, with every later result lost. They hold a shared `heavy()` lock now, so plain `--ignored` works.
 - **ggml `ne[0]` is the fastest dimension.** Reading shapes as row-major transposes every matrix and yields confident nonsense.
 - **Weights are bound zero-copy** (`no_alloc` + data pointer). A copy would need 2× the model and not fit.
 - **Missing causal mask → repeated tokens**, not an error. Masked positions need `-inf`, not `0`.

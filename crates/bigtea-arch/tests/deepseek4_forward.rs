@@ -81,6 +81,26 @@ const SUMS_165TOK: &str = "tests/fixtures/v4flash-sums-165tok.txt";
 /// The 165-token capture. 165 tokens is the shortest length tried at which
 /// **both** compressed attentions fire: CSA compresses every 4 positions (41
 /// blocks here) and HCA every 128 (one block).
+
+/// Serialise the tests that allocate multi-gigabyte `ggml` arenas.
+///
+/// Nineteen of these run at once by default and each one asks for GB-sized
+/// contexts, so together they exhaust memory — and `ggml` answers an allocation
+/// failure with `GGML_ASSERT(ctx->mem_buffer != NULL)`, which **aborts the whole
+/// test binary**. The symptom is not a failing test, it is
+/// `error: test failed ... process didn't exit successfully`, and every result
+/// after the abort is lost.
+///
+/// That is why these were only ever run with `--test-threads=1`, and why in
+/// practice they stopped being run at all. Holding this lock makes the plain
+/// `cargo test -- --ignored` work.
+fn heavy() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A poisoned lock means an earlier heavy test panicked. That is its own
+    // failure and already reported; the rest should still run.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn sums_165tok(il: u32) -> LayerSums {
     LayerSums::load(SUMS_165TOK, il, TOKENS_165)
 }
@@ -241,6 +261,7 @@ fn bind_all<'c>(model: &Model, ctx: &'c Context, weights: &mut WeightSet<'c>, na
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn prologue_matches_llama_cpp() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
     let _arch = Deepseek4Model::new(config.clone());
@@ -316,6 +337,7 @@ fn prologue_matches_llama_cpp() {
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn hyper_connection_block_matches_llama_cpp() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -468,6 +490,7 @@ fn hyper_connection_block_matches_llama_cpp() {
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn q_projection_matches_llama_cpp() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -921,6 +944,7 @@ fn hc_gates<'c>(
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn rope_and_kv_match_llama_cpp_at_five_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1238,6 +1262,7 @@ fn q_and_kv_5tok<'c>(
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn attention_matches_llama_cpp_at_five_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1291,6 +1316,7 @@ fn attention_matches_llama_cpp_at_five_tokens() {
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn post_hyper_connection_matches_llama_cpp_at_five_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1357,6 +1383,7 @@ const SWIGLU_CLAMP_L0: f32 = 10.0;
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn moe_router_and_shared_expert_match_llama_cpp_at_five_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1548,6 +1575,7 @@ fn moe_routing_5tok<'c>(
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn routed_experts_and_layer_output_match_llama_cpp_at_five_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1822,6 +1850,7 @@ fn layer_body_5tok<'c>(
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn layers_compose_through_the_first_compressed_layer() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1957,6 +1986,7 @@ fn layer_owned(
 #[test]
 #[ignore = "reads weights from a 144 GB container, 165 tokens"]
 fn compressed_attention_runs_in_the_layer_loop_at_165_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -2004,6 +2034,7 @@ fn compressed_attention_runs_in_the_layer_loop_at_165_tokens() {
 #[test]
 #[ignore = "reads weights from a 144 GB container, 43 layers"]
 fn every_layer_runs_at_two_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -2900,6 +2931,7 @@ fn lid_query_5tok<'c>(
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn csa_compressor_matches_llama_cpp() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -3444,6 +3476,7 @@ fn attention_5tok<'c>(
 #[test]
 #[ignore = "reads weights from a 144 GB container, 43 blocks"]
 fn the_library_forward_pass_matches_llama_cpp() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
     let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());
@@ -3497,6 +3530,7 @@ fn the_library_forward_pass_matches_llama_cpp() {
 #[test]
 #[ignore = "reads from a 144 GB container; a disk benchmark, not a correctness test"]
 fn sparse_row_reads_versus_whole_slice() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let name = "blk.5.ffn_up_exps.weight";
     let loc = model.location(name).expect("expert tensor present").clone();
@@ -3610,6 +3644,7 @@ fn sparse_row_reads_versus_whole_slice() {
 #[test]
 #[ignore = "reads weights from a 144 GB container, 43 blocks, twice"]
 fn the_expert_cache_does_not_change_the_answer() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
     // Big enough to hold a 2-token pass's slices comfortably, so the second
@@ -3677,6 +3712,7 @@ fn the_expert_cache_does_not_change_the_answer() {
 #[test]
 #[ignore = "opens the 144 GB container (reads metadata only)"]
 fn a_prompt_longer_than_the_window_is_refused_not_a_panic() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
     let fw = bigtea_arch::Deepseek4Forward::new(&model, config);
@@ -3741,6 +3777,7 @@ fn a_prompt_longer_than_the_window_is_refused_not_a_panic() {
 /// they are identical, the cache is wrong and the sum is telling the truth.
 #[ignore = "reads weights from a 144 GB container, two full passes per length"]
 fn a_cached_step_agrees_with_a_full_prefill() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
     let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());
@@ -3817,6 +3854,7 @@ fn a_cached_step_agrees_with_a_full_prefill() {
 #[test]
 #[ignore = "reads weights from a 144 GB container, two full passes"]
 fn a_cached_step_agrees_through_the_compressed_path() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
     let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());
@@ -3881,6 +3919,7 @@ fn a_cached_step_agrees_through_the_compressed_path() {
 #[test]
 #[ignore = "reads weights from a 144 GB container, two full passes"]
 fn cached_step_routing_versus_full_prefill_routing() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
     let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());

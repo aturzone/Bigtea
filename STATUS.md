@@ -502,6 +502,26 @@ and it says so.
 `VERIFIED_ARCHITECTURES` is now **deepseek4, gemma2, llama, phi3, qwen3,
 qwen3moe** — six families, from two at the start of the day.
 
+## V4-Flash is re-verified after today's changes
+
+Today touched code V4-Flash shares with the dense path — `flash_attn_ext` gained
+a `logit_softcap` argument, `threads()` stopped defaulting to a hardcoded 12,
+and the RoPE frequency default changed. **All 19 container-backed V4-Flash tests
+pass**, including the ones comparing element sums against llama.cpp captures:
+
+```
+cargo test --release --test deepseek4_forward -- --ignored
+test result: ok. 19 passed; 0 failed  (272s)
+```
+
+**And they can now actually be run.** They aborted the whole test binary when
+run in parallel: 19 tests each allocating GB-sized arenas exhausted memory, and
+`ggml` answers that with `GGML_ASSERT(ctx->mem_buffer != NULL)`, which kills the
+process. It surfaced as `error: test failed ... process didn't exit
+successfully` rather than as a failing test, and every result after the abort
+was lost — so in practice they had stopped being run. They now share a `heavy()`
+lock, and the plain command above works without `--test-threads=1`.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
