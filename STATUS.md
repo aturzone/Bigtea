@@ -683,6 +683,50 @@ of where on the curve each engine was sitting.
 Output is byte-identical at 2 and 20 threads on all five verified dense
 architectures. 229 tests pass.
 
+## Gemma-2 sliding-window attention (2026-08-10) — the 4096 refusal is gone
+
+Detail and command lines: `docs/graph/research/gemma2-sliding-window-2026-08-10.md`.
+
+Gemma-2 alternates a sliding-window layer with a full-attention one. Neither the
+window nor a way to live without it existed, so anything past 4096 tokens was
+refused. Now the even layers get a second mask with the old keys closed off.
+
+Verified three ways, because two of them prove nothing alone:
+
+1. **Below the window** output is unchanged (`**Paris**.`) — a regression check.
+2. **Above the window** (5201 tokens, greedy, `-no-cnv` on both sides) Bigtea and
+   llama.cpp produce the same continuation.
+3. **The layer parity is load-bearing** — flipping it to odd-slide changes the
+   output on the same prompt. Without this, check 2 is also consistent with the
+   window never being applied, because a repetitive prompt continues itself.
+
+`-no-cnv` matters: without it `llama-completion` applies Gemma's chat template
+and answers as an assistant, and the two engines are not doing the same work.
+
+### Three arenas were short; reading ggml's error correctly found the one that mattered
+
+**`available` in `not enough space in the context's memory pool` is the pool's
+total size, not the remainder.** Reading it as the remainder points at whichever
+arena was nearly full instead of the one that was too small, and cost two wrong
+fixes. `56,624,208 ≈ 3 × 18,874,368` identified it exactly: `post_norm` budgeted
+one `n_embd × n_new` tensor and allocated three. Gemma-only, which is why nothing
+else ever hit it. The dense-FFN and attention arenas were under-counted too and
+are fixed here; they would have aborted at a larger block.
+
+**`arena_for` doubles its total, and that doubling is what hides an undercount
+until the block grows enough to eat it.**
+
+### Prefill: not a win, and it nearly got quoted as one
+
+| Gemma-2-2b prefill, 5200 tokens | best of each | verdict |
+|---|---:|---|
+| llama.cpp | **127.35** (t=20) | — |
+| Bigtea | 114.99 (t=4) | **1.11x behind** |
+
+At `-t 4` on both sides it reads 114.99 against 76.76 — 1.50x ahead — because
+prefill wants every core and llama.cpp was being handicapped. Run the opposing
+command at the setting its own author would choose.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

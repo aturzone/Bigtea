@@ -1148,7 +1148,19 @@ impl<'m> StreamingRunner<'m> {
             .get(&name)
             .copied()
             .ok_or(ArchError::MissingTensor(name))?;
-        let ctx = Context::new(arena_for(&[(n_embd, n_new)], 12))?;
+        // Three tensors, not one: the input, the rms intermediate and the
+        // scaled result. Budgeting for one and relying on `arena_for`'s
+        // doubling covered two, and Gemma-2 at `-b 2048` asked for 56,624,208
+        // bytes from a 54,532,608-byte pool — 3 x 18,874,368 plus headers,
+        // which is exactly the three.
+        //
+        // Note `available` in that message is the **pool size**, not what is
+        // left in it. Reading it as the remainder sends you looking at whichever
+        // arena was nearly full instead of the one that was too small.
+        let ctx = Context::new(arena_for(
+            &[(n_embd, n_new), (n_embd, n_new), (n_embd, n_new)],
+            12,
+        ))?;
         let t = ctx.new_f32_2d(n_embd, n_new)?;
         t.set_f32(values)?;
         let out = self.arch.norm_scaled(&ctx, &t, &w)?;
@@ -1247,6 +1259,37 @@ impl<'m> StreamingRunner<'m> {
             }
             let _ = F16_ZERO; // the default fill is already the zero pattern
             m
+        };
+
+        // Gemma-2 alternates a sliding-window layer with a full-attention one,
+        // starting with the window at layer 0. A windowed layer may only see
+        // the last `sliding_window` keys, so it needs its own mask — the causal
+        // one above with the *old* keys closed off as well.
+        //
+        // Below the window the two masks are identical, which is why this was
+        // invisible for so long and why the build simply refused past 4096
+        // rather than answering. Above it, using the full mask everywhere lets
+        // the local layers attend arbitrarily far back: no error, just steadily
+        // wronger text.
+        let swa_mask: Option<Vec<u8>> = if c.sliding_window > 0 {
+            let window = c.sliding_window as i64;
+            let mut m = mask.clone();
+            for query in 0..n_new {
+                let absolute = pos_start as i64 + query;
+                let row = (query * n_total_final) as usize * 2;
+                // Keys strictly older than the window. llama.cpp's rule is
+                // `pos_key <= pos_query - n_swa` is masked, so the oldest key
+                // still visible is `absolute - window + 1` and the window is
+                // `window` positions wide including the query itself.
+                let oldest_visible = absolute - window + 1;
+                for key in 0..oldest_visible.min(n_total_final).max(0) {
+                    let at = row + key as usize * 2;
+                    m[at..at + 2].copy_from_slice(&F16_NEG_INF);
+                }
+            }
+            Some(m)
+        } else {
+            None
         };
 
         let mut x: Vec<f32> = {
@@ -1377,17 +1420,27 @@ impl<'m> StreamingRunner<'m> {
             // remains is Q, K, V, the mask and the output — about 100 MiB where
             // the explicit path needed 1.3 GiB.
             let n_head = c.n_head as i64;
+            // Every tensor here is one `ggml` allocation, and three were
+            // missing: the Q the caller sets, and the K and V read out of the
+            // cache — only their *permuted contiguous* copies were counted.
+            // `arena_for` doubles the total, which hid it until `n_total` grew
+            // enough for the K/V terms to dominate: Gemma-2 at 5201 tokens
+            // asked for 56,624,208 bytes and had 54,532,608. **3.8% short is
+            // still an abort** — ggml calls `GGML_ASSERT` and the process dies.
             let need = arena_for(
                 &[
-                    (head_dim * n_head, n_new), // q, contiguous
-                    (head_dim * n_kv, n_total), // k, contiguous
-                    (head_dim * n_kv, n_total), // v, contiguous (not transposed)
+                    (head_dim * n_head, n_new), // q, as set from the caller
+                    (head_dim * n_head, n_new), // q, permuted and contiguous
+                    (head_dim * n_kv, n_total), // k from the cache (F16, over-counted)
+                    (head_dim * n_kv, n_total), // k, permuted and contiguous
+                    (head_dim * n_kv, n_total), // v from the cache (F16, over-counted)
+                    (head_dim * n_kv, n_total), // v, permuted and contiguous
                     (n_total, n_new),           // causal mask (F16, so over-counted)
                     (head_dim * n_new, n_head), // attention output
                     (head_dim * n_new, n_head), // ...made contiguous
                     (n_embd, n_new),            // output projection
                 ],
-                24,
+                32,
             );
             let mut buf = std::mem::take(&mut self.scratch);
             if buf.len() < need {
@@ -1395,6 +1448,15 @@ impl<'m> StreamingRunner<'m> {
             }
             let arch = &self.arch;
             let out_w = get(weights, format!("blk.{il}.attn_output.weight"))?;
+            // Even layers slide, odd layers see everything — Gemma-2's pattern,
+            // and it starts with the window. Reversing it is not an error and
+            // not a crash; it is a model that answers slightly wrongly, so the
+            // ordering is checked against llama.cpp's output rather than
+            // reasoned about.
+            let layer_mask = match swa_mask.as_ref() {
+                Some(swa) if il % 2 == 0 => swa,
+                _ => &mask,
+            };
             let attn_result = (|| -> Result<(Vec<f32>, f64, f64)> {
                 // SAFETY: `buf` is a local outliving `ctx`, and no other context
                 // is live on it — the Q/K/V context above was dropped and its
@@ -1412,7 +1474,8 @@ impl<'m> StreamingRunner<'m> {
                 v_all.set_bytes(cache.values(il as usize))?;
                 let kv_secs = tkv.elapsed().as_secs_f64();
 
-                let out = arch.attention_flash(&ctx, &q, &k_all, &v_all, n_new, n_total, &mask)?;
+                let out =
+                    arch.attention_flash(&ctx, &q, &k_all, &v_all, n_new, n_total, layer_mask)?;
                 let out = ctx.mul_mat(&out_w, &out)?;
                 let t = std::time::Instant::now();
                 ctx.compute(&out, threads)?;
@@ -1462,6 +1525,16 @@ impl<'m> StreamingRunner<'m> {
                         (n_embd, n_new),
                         (n_embd, n_new),
                     ]);
+                }
+                // Gemma's post-FFN norm runs in *this* context — an rms
+                // intermediate and the scaled result — and was not counted.
+                // The doubling inside `arena_for` hid it until the block grew:
+                // at `-b 2048` on a 5201-token prompt ggml asked for 56,624,208
+                // bytes with 54,532,608 left. **This is the third arena in this
+                // function found short the same way.** Every tensor a branch
+                // can allocate has to appear in the list for that branch.
+                if c.post_norms {
+                    shapes.extend([(n_embd, n_new), (n_embd, n_new)]);
                 }
                 let ctx = Context::new(arena_for(&shapes, 24))?;
                 let xt = ctx.new_f32_2d(n_embd, n_new)?;

@@ -44,7 +44,7 @@ deep:
 | **A1** | make QK-norm optional in the dense path | `llama`, `mistral`, `qwen2` structurally | **DONE** |
 | **A2** | SPM tokenizer (`tokenizer.ggml.model = "llama"`) | the whole Llama/Mistral family's text | **DONE** — verified on TinyLlama |
 | **A3** | accept the `llama` arch name and its metadata aliases | Llama 1/2/3, TinyLlama, CodeLlama, Vicuna, most finetunes | **DONE** — verified on TinyLlama and Llama-3.2 |
-| A4 | `gemma`/`gemma2` | Gemma family | **gemma2 DONE 2026-08-10** — post-norms, attention soft-cap (50, into the fused kernel), final soft-cap (30), `sqrt(n_embd)` embedding scaling. Output matches llama.cpp exactly. **Refused past its 4096 sliding window**, which is not implemented |
+| A4 | `gemma`/`gemma2` | Gemma family | **gemma2 DONE 2026-08-10** — post-norms, attention soft-cap (50, into the fused kernel), final soft-cap (30), `sqrt(n_embd)` embedding scaling. Output matches llama.cpp exactly. **Sliding window implemented 2026-08-10** — a second mask for the even layers; verified above the window against llama.cpp at 5201 tokens, and the layer parity shown to be load-bearing by flipping it. The 4096 refusal is gone. See `../research/gemma2-sliding-window-2026-08-10.md` |
 | A5 | `phi3`, `qwen2` explicit | Phi, Qwen2 | **phi3 DONE 2026-08-10** — fused `attn_qkv` *and* fused `ffn_up` split into views; verified against llama.cpp's own output |
 | A6 | WPM + UGM tokenizers | BERT-family, T5-family | gap |
 | A7 | tied embeddings (`output.weight` absent → reuse `token_embd`) | many small models | **DONE** — Llama-3.2-1B is tied and loads |
