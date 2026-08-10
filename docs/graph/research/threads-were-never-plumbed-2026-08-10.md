@@ -213,15 +213,40 @@ parallelises and ours does not. That is the concrete lead for the remaining
 1.60x: give each barrier real work — batch the expert matmuls — instead of 24
 tiny nodes per layer.
 
+## V4-Flash has the same curve, and still has its old default
+
+`deepseek4_forward.rs` reads `BIGTEA_THREADS` directly and does **not** go
+through the tuner, so the flagship model still defaults to every core. Swept
+with `-t`, `"The capital of France is"`, `-n 4`:
+
+| threads | V4-Flash generation |
+|---:|---:|
+| 1 | 0.331 tok/s |
+| 2 | 0.378 |
+| **4** | **0.380** |
+| 8 | 0.346 |
+| 20 — its current default | 0.296 |
+
+**1.28x is sitting unclaimed on the model this project exists for.** The fix is
+one line — the fallback in `deepseek4_forward.rs` should be the tuner, or at
+minimum not `available_parallelism()`.
+
+**Not done here on purpose**: that file has uncommitted work in another
+worktree, and a merge conflict in the V4-Flash forward pass costs more than the
+change is worth today. It is a one-line follow-up with the measurement already
+attached.
+
+*(These are 3 generated tokens on a cold cache and are not comparable to the
+published 0.374 tok/s, which was 47 tokens with a warm one. The ratio between
+thread counts is the result here; the absolute numbers are not.)*
+
 ## What this does not measure
 
 - **Any other machine.** Every number here is one laptop with one hybrid CPU and
   two memory channels. The *mechanism* (generation saturates DRAM, prefill
-  scales with cores) is general; the optimum is not, which is precisely why the
-  shipped answer is measured at run time rather than hardcoded.
-- **V4-Flash**, whose forward pass is a separate file and reads `BIGTEA_THREADS`
-  directly rather than going through the tuner. Given the Qwen3-30B result it
-  should be swept too.
+  scales with cores, and tiny per-node work makes threads a cost) is general;
+  the optimum is not, which is precisely why the shipped answer is measured at
+  run time rather than hardcoded.
 - **Long context**, where attention grows and the balance may shift.
 
 ## Correctness

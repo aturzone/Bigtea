@@ -716,6 +716,20 @@ barrier, rather than 24 tiny nodes per layer.
 `llama-bench -m Qwen3-30B-A3B-Q4_K_M.gguf -n 32 -p 0 -r 2 -t 1,4,10`:
 1.95 ± 0.64 / **4.21 ± 0.28** / 3.64 ± 0.22.
 
+### V4-Flash has the same curve and still has its old default — 1.28x unclaimed
+
+`deepseek4_forward.rs` reads `BIGTEA_THREADS` directly and does not go through
+the tuner, so the flagship model still defaults to every core:
+
+| threads | 1 | 2 | **4** | 8 | 20 *(its default)* |
+|---|---:|---:|---:|---:|---:|
+| V4-Flash generation | 0.331 | 0.378 | **0.380** | 0.346 | 0.296 |
+
+**Not changed here on purpose** — that file has uncommitted work in another
+worktree, and a conflict in the V4-Flash forward pass costs more than the
+one-line fix is worth today. **This is the first thing to do on that branch.**
+(3 tokens, cold cache; the ratio is the result, not the absolute numbers.)
+
 ## Gemma-2 sliding-window attention (2026-08-10) — the 4096 refusal is gone
 
 Detail and command lines: `docs/graph/research/gemma2-sliding-window-2026-08-10.md`.
