@@ -1186,6 +1186,52 @@ than from metadata keys, because containers disagree about which keys they set
 while the token text is stable. Qwen3-4B: 4 tokens found. Qwen2-0.5B: 0, and it
 says `0` rather than pretending.
 
+## Every llama.cpp flag is now recognised — 128 implemented, 57 declined
+
+`bigtea-run` accepts **185 long flags** against llama.cpp's 182. **That is not
+flag parity and must not be quoted as one:**
+
+| | count |
+|---|---:|
+| implemented — the flag changes something observable | **128** |
+| declined with a reason — recognised, exits 2, names what is missing | **57** |
+
+A command line copied from llama.cpp now runs or explains itself, instead of
+dying on an unknown flag. What it never does is quietly do less than it says:
+
+```
+$ bigtea-run -m m.gguf --n-gpu-layers 32
+bigtea-run: --n-gpu-layers is not supported: no GPU backend exists
+  Declined rather than ignored: a run never quietly does less
+  than its command line says. Drop the flag to continue.
+$ echo $?
+2
+```
+
+**`-t` was accepted and ignored here for weeks**, and a disconnected knob is
+indistinguishable from a flat response — the sweep that "proved threads are not
+the lever" was measuring a flag that reached nothing. Refusing out loud is the
+cheap defence against repeating that.
+
+What is declined, and the honest reason:
+
+| group | why |
+|---|---|
+| 15 GPU flags | **no GPU backend exists.** `bigtea-probe` detects the card and nothing uses it; a VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer |
+| 4 draft-model flags | speculative decoding measured ~1.4x here, not the literature's 2.2x, and is a net loss below ~0.75 acceptance |
+| 5 adapter flags | LoRA and control vectors are real work not yet done, and a silently unapplied LoRA is a model answering as though never fine-tuned |
+| 6 Jinja / chat-parsing | no Jinja engine. Templates are matched by family and verified byte-identical to llama.cpp for 52 of 54 names; a half-implemented Jinja would silently produce the wrong framing |
+| 6 reasoning-format | downstream of Jinja |
+| 8 download flags | `bigtea-pull` is the tool; wiring it in needs resumable, verified downloads rather than an alias |
+| 9 affinity / NUMA / poll | ggml owns its threadpool here; `-t`, `-tb` and `--prio` are the levers that exist |
+| 4 runner-shape | one sequence by design, an append-only KV cache that cannot fragment, no self-extend |
+
+Three more implemented in the same batch: `--mmap` (the default, spelled out),
+`--ubatch-size` (takes the smaller of it and `-b`, and says which), and
+`--swa-full`, which **is already the behaviour** — Bigtea's KV cache is always
+full and the window lives in the attention mask, so it reports that rather than
+accepting the flag silently.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

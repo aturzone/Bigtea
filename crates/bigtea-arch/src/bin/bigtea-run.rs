@@ -806,6 +806,246 @@ fn completion_bash() -> ExitCode {
 // being written.
 include!(concat!(env!("OUT_DIR"), "/flags.rs"));
 
+/// llama.cpp flags this build declines, and why.
+///
+/// # Why decline rather than ignore
+///
+/// A command line copied from llama.cpp should not die on an unknown flag --
+/// but it must not silently do less than it says either. `-t` was accepted and
+/// ignored for weeks here, and a disconnected knob is indistinguishable from a
+/// flat response: the sweep that "proved threads are not the lever" was
+/// measuring a flag that reached nothing.
+///
+/// So each of these is recognised, consumes its argument, and **exits with a
+/// message naming what it would have needed**. That is the difference between
+/// "Bigtea does not do this" and "Bigtea pretended to".
+const REFUSED: &[(&str, bool, &str)] = &[
+    // (flag, takes an argument, why)
+
+    // --- GPU. No GPU code exists at all: `bigtea-probe` detects the card and
+    // nothing uses it. A VRAM tier needs a CUDA-enabled ggml *and* a
+    // non-zero-copy binding path, because weights are bound here by handing
+    // ggml a host pointer.
+    (
+        "--device",
+        true,
+        "no GPU backend exists; every tensor is bound to host memory",
+    ),
+    (
+        "--list-devices",
+        false,
+        "no GPU backend exists; `bigtea-probe` reports the hardware instead",
+    ),
+    ("--gpu-layers", true, "no GPU backend exists"),
+    ("--n-gpu-layers", true, "no GPU backend exists"),
+    ("--main-gpu", true, "no GPU backend exists"),
+    ("--split-mode", true, "no GPU backend exists"),
+    ("--tensor-split", true, "no GPU backend exists"),
+    ("--kv-offload", false, "the KV cache is always host memory"),
+    (
+        "--no-kv-offload",
+        false,
+        "the KV cache is always host memory; this is already the behaviour",
+    ),
+    ("--op-offload", false, "no GPU backend exists"),
+    (
+        "--no-op-offload",
+        false,
+        "no GPU backend exists; this is already the behaviour",
+    ),
+    (
+        "--override-tensor",
+        true,
+        "buffer-type overrides select a backend, and there is only one",
+    ),
+    (
+        "--cpu-moe",
+        false,
+        "experts are always on the CPU here; this is already the behaviour",
+    ),
+    ("--n-cpu-moe", true, "experts are always on the CPU here"),
+    (
+        "--backend-sampling",
+        false,
+        "sampling runs on the host; there is no other backend to run it on",
+    ),
+    // --- draft models. Speculative decoding was measured at ~1.4x here rather
+    // than the literature's 2.2x, and below an acceptance rate of ~0.75 it is a
+    // net loss -- see `v4flash-has-no-slack-2026-08-10.md`. Nothing is built.
+    ("--cache-type-k-draft", true, "no draft model support"),
+    ("--cache-type-v-draft", true, "no draft model support"),
+    ("--spec-draft-type-k", true, "no draft model support"),
+    ("--spec-draft-type-v", true, "no draft model support"),
+    // --- adapters. Real work, not yet done; refusing is honest because a
+    // silently unapplied LoRA is a model answering as though it were never
+    // fine-tuned.
+    (
+        "--lora",
+        true,
+        "LoRA adapters are not implemented; the base model would answer unchanged",
+    ),
+    ("--lora-scaled", true, "LoRA adapters are not implemented"),
+    (
+        "--control-vector",
+        true,
+        "control vectors are not implemented",
+    ),
+    (
+        "--control-vector-scaled",
+        true,
+        "control vectors are not implemented",
+    ),
+    (
+        "--control-vector-layer-range",
+        true,
+        "control vectors are not implemented",
+    ),
+    // --- architecture of the runner itself.
+    (
+        "--parallel",
+        true,
+        "one sequence at a time by design: one weight set, one KV cache",
+    ),
+    (
+        "--defrag-thold",
+        true,
+        "the KV cache is append-only and never fragments",
+    ),
+    (
+        "--grp-attn-n",
+        true,
+        "self-extend is not implemented; `--rope-scale` and YaRN are",
+    ),
+    ("--grp-attn-w", true, "self-extend is not implemented"),
+    (
+        "--no-host",
+        false,
+        "this is a CLI, not a server; see `bigtea-serve`",
+    ),
+    ("--no-mmproj", false, "no multimodal projector support"),
+    // --- Jinja. llama.cpp evaluates chat templates with a real Jinja engine.
+    // This build matches them by family and applies a hardcoded renderer,
+    // verified byte-identical against llama.cpp for 52 of its 54 names. A
+    // half-implemented Jinja would silently produce the wrong framing, which is
+    // the failure this project is most expensive at.
+    (
+        "--jinja",
+        false,
+        "no Jinja engine; templates are matched by family (see --chat-template)",
+    ),
+    (
+        "--skip-chat-parsing",
+        false,
+        "no Jinja engine, so there is no parsed chat to skip",
+    ),
+    (
+        "--no-skip-chat-parsing",
+        false,
+        "no Jinja engine, so there is no parsed chat to skip",
+    ),
+    // --- reasoning-format parsing, which is downstream of Jinja.
+    (
+        "--reasoning-format",
+        true,
+        "reasoning-block parsing is not implemented; the block is emitted verbatim",
+    ),
+    (
+        "--reasoning",
+        true,
+        "reasoning-block parsing is not implemented",
+    ),
+    (
+        "--reasoning-budget",
+        true,
+        "reasoning-block parsing is not implemented",
+    ),
+    (
+        "--reasoning-budget-message",
+        true,
+        "reasoning-block parsing is not implemented",
+    ),
+    (
+        "--reasoning-preserve",
+        false,
+        "reasoning-block parsing is not implemented",
+    ),
+    (
+        "--no-reasoning-preserve",
+        false,
+        "reasoning-block parsing is not implemented",
+    ),
+    // --- downloads. `bigtea-pull` is the tool; wiring it into the runner is
+    // real work rather than an alias, because a partial download has to be
+    // resumable and verified before a forward pass touches it.
+    (
+        "--hf-repo",
+        true,
+        "use `bigtea-pull` and pass the resulting path",
+    ),
+    (
+        "--hf-file",
+        true,
+        "use `bigtea-pull` and pass the resulting path",
+    ),
+    (
+        "--hf-repo-v",
+        true,
+        "use `bigtea-pull` and pass the resulting path",
+    ),
+    (
+        "--hf-file-v",
+        true,
+        "use `bigtea-pull` and pass the resulting path",
+    ),
+    (
+        "--hf-token",
+        true,
+        "use `bigtea-pull`, which takes the token",
+    ),
+    (
+        "--model-url",
+        true,
+        "use `bigtea-pull` and pass the resulting path",
+    ),
+    ("--docker-repo", true, "no Docker model registry support"),
+    (
+        "--cache-list",
+        false,
+        "`bigtea-pull` owns the download cache",
+    ),
+    // --- NUMA and thread affinity.
+    ("--numa", true, "no NUMA-aware allocation to select between"),
+    (
+        "--poll",
+        true,
+        "ggml owns its threadpool here; `-t`/`-tb` are the levers that exist",
+    ),
+    ("--poll-batch", true, "ggml owns its threadpool here"),
+    (
+        "--cpu-mask",
+        true,
+        "no thread-affinity layer; `--prio` is the scheduling lever that exists",
+    ),
+    ("--cpu-mask-batch", true, "no thread-affinity layer"),
+    ("--cpu-range", true, "no thread-affinity layer"),
+    ("--cpu-range-batch", true, "no thread-affinity layer"),
+    ("--cpu-strict", true, "no thread-affinity layer"),
+    ("--cpu-strict-batch", true, "no thread-affinity layer"),
+    (
+        "--load-mode",
+        true,
+        "`--direct-io` / `--no-direct-io` are the two modes that exist",
+    ),
+];
+
+/// Whether `flag` is refused, and the message if so.
+fn refusal(flag: &str) -> Option<(bool, &'static str)> {
+    REFUSED
+        .iter()
+        .find(|(f, _, _)| *f == flag)
+        .map(|(_, takes_arg, why)| (*takes_arg, *why))
+}
+
 /// The fill-in-the-middle control tokens in this vocabulary.
 ///
 /// Read from the vocabulary's own text rather than from metadata keys, because
@@ -1334,6 +1574,37 @@ fn main() -> ExitCode {
                 i += 1;
             }
             // --- I/O mode and metadata overrides --------------------------
+            // The opposite of --no-mmap, and the default. Accepted so a
+            // llama.cpp command line that spells the default out still runs.
+            "--mmap" => {
+                std::env::set_var("BIGTEA_IO", "buffered");
+                i += 1;
+            }
+            // llama.cpp keeps a *windowed* KV cache for SWA models unless this
+            // is passed. Bigtea's cache is always full -- the window is applied
+            // in the attention mask, not in what is stored -- so this is
+            // already the behaviour, and saying so is better than accepting it
+            // silently or refusing something we do.
+            "--swa-full" => {
+                bigtea_arch::info!(
+                    "swa        the KV cache here is always full; --swa-full is already the behaviour"
+                );
+                i += 1;
+            }
+            // The physical batch. `-b` is the logical prefill block and already
+            // bounds the arena; ggml has no separate micro-batch here, so the
+            // smaller of the two wins and the runner says which it took.
+            "-ub" | "--ubatch-size" => {
+                if let Some(v) = rest.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                    if v > 0 && v < prefill_block {
+                        bigtea_arch::info!(
+                            "batch      -ub {v} is smaller than -b {prefill_block}; using {v}"
+                        );
+                        prefill_block = v;
+                    }
+                }
+                i += 2;
+            }
             "--direct-io" => {
                 std::env::set_var("BIGTEA_IO", "direct");
                 i += 1;
@@ -1744,6 +2015,14 @@ fn main() -> ExitCode {
                 i += 2;
             }
             other => {
+                // Declined, not ignored -- see `REFUSED`.
+                if let Some((takes_arg, why)) = refusal(other) {
+                    eprintln!("bigtea-run: {other} is not supported: {why}");
+                    eprintln!("  Declined rather than ignored: a run never quietly does less");
+                    eprintln!("  than its command line says. Drop the flag to continue.");
+                    let _ = takes_arg;
+                    return ExitCode::from(2);
+                }
                 if prompt.is_empty() {
                     prompt = other.to_string();
                 }
