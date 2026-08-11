@@ -5,8 +5,8 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-11 · **Version**: v0.0.2 · **Branch**: `main` at
-`c7a5534` · **Open PRs**: none.
+**Last updated**: 2026-08-11 · **Version**: v0.0.2 · **Branch**:
+`ticket/r11-grammar-cli`; `main` at `4c2de60` · **Open PRs**: none.
 
 **Everything is merged.** PR #55 brought R3, R7, R8 and R9 into `main` in one
 merge — the KV cache, six architectures, four tokenizer families, 106 CLI flags,
@@ -945,6 +945,50 @@ would have lied.
 architectures and two tokenizer families. That same tool then measured the
 quantised KV cache: **q8_0 costs 0.64% of perplexity for roughly half the
 memory**.
+
+## Gemma was running the wrong activation (2026-08-11) — and `VERIFIED` was wrong
+
+**`gemma2` was in `VERIFIED_ARCHITECTURES` and had never been diffed against
+llama.cpp.** Its output is now identical; it was not before.
+
+```
+bigtea (before)  **Paris**.
+llama.cpp        :  a) Paris  b) Lyon  c) Marseille  d)
+```
+
+Two bugs, both silent by construction:
+
+1. **SiLU where the whole Gemma family uses GELU.** `grep -rn "gelu" crates/`
+   returned nothing — every gated FFN in the crate was SwiGLU. Nothing in a
+   container records the activation: a GELU model and a SiLU model hold
+   **byte-identical tensor sets**, so this is not a missing tensor, not a shape
+   error and not a crash. It is a model that keeps answering in English and
+   disagrees with the reference from the first token. Now `FfnAct`, chosen by
+   architecture, applied in one place. **This alone fixed Gemma-3.**
+2. **The scale went to the kernel instead of into Q.** llama.cpp pre-scales Q
+   by `1/sqrt(head_dim)` and passes `scale = 1.0`; ggml folds the soft cap into
+   the scale (`scale /= cap`), so the two are the same algebra and
+   `0.0625f/50f` vs `0.0625f*(1f/50f)` differ by **one ULP**. Through the cap's
+   `tanh` that flipped Gemma-2's first token between `:` and ` Paris`, and with
+   it the whole completion. **A soft cap turns a scale into a non-linearity's
+   argument** — match the reference's order, not its algebra.
+
+Also fixed: the Gemma **27B-only** attention scale (`n_embd/n_head`, not
+`head_dim`), which coincides at every other size — a check that passed here
+would still have been wrong at 27B.
+
+**Verified**: 3 prompts x 32 tokens x both engines, `--temp 0`, back to back.
+`gemma-2-2b-it` and `gemma-3-1b-it` identical token for token; llama, qwen2 and
+qwen3-4b re-checked and unchanged. Architectures **7 -> 8**, tests **409 ->
+411**, clippy 0, fmt clean.
+
+New: **`print_hparams` at `-v`** — llama.cpp has printed its hyper-parameters at
+load since the beginning, and the hours spent guessing which scale Gemma-2 used
+were hours nobody with that output would have spent. It prints *derived* values
+(`attn_scale`, per-layer RoPE bases, the windowed-layer list), because a key
+read under the wrong name looks exactly like a key that was absent.
+
+Full account: `docs/graph/research/gemma-was-running-silu-2026-08-11.md`.
 
 ## Known limitations
 

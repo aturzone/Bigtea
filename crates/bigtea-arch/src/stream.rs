@@ -643,7 +643,7 @@ impl<'m> StreamingRunner<'m> {
 
                     let g = ctx.mul_mat(ws.get("gate").expect("bound"), &xt)?;
                     let u = ctx.mul_mat(ws.get("up").expect("bound"), &xt)?;
-                    let act = ctx.mul(&ctx.silu(&g)?, &u)?;
+                    let act = ctx.mul(&c.activate(&ctx, &g)?, &u)?;
                     let out = ctx.mul_mat(ws.get("down").expect("bound"), &act)?;
                     // Not 0: `compute` floors the count at 1, so passing 0 ran every
                     // expert matmul on a single thread — the bulk of the model's
@@ -771,7 +771,7 @@ impl<'m> StreamingRunner<'m> {
 
                 let g = ctx.mul_mat(ws.get(&gk).expect("bound"), &xt)?;
                 let u = ctx.mul_mat(ws.get(&uk).expect("bound"), &xt)?;
-                let act = ctx.mul(&ctx.silu(&g)?, &u)?;
+                let act = ctx.mul(&c.activate(&ctx, &g)?, &u)?;
                 let out = ctx.mul_mat(ws.get(&dk).expect("bound"), &act)?;
                 let scaled = ctx.scale(&out, weight)?;
                 total = Some(match total {
@@ -1008,7 +1008,7 @@ impl<'m> StreamingRunner<'m> {
 
             let g = ctx.mul_mat(ws.get("gate").expect("bound"), &xt)?;
             let u = ctx.mul_mat(ws.get("up").expect("bound"), &xt)?;
-            let act = ctx.mul(&ctx.silu(&g)?, &u)?;
+            let act = ctx.mul(&c.activate(&ctx, &g)?, &u)?;
             let out = ctx.mul_mat(ws.get("down").expect("bound"), &act)?;
             ctx.compute(&out, self.threads)?;
 
@@ -1469,6 +1469,7 @@ impl<'m> StreamingRunner<'m> {
                 &[
                     (head_dim * n_head, n_new), // q, as set from the caller
                     (head_dim * n_head, n_new), // q, permuted and contiguous
+                    (head_dim * n_head, n_new), // q, pre-scaled (Gemma only)
                     (head_dim * n_kv, n_total), // k from the cache (F16, over-counted)
                     (head_dim * n_kv, n_total), // k, permuted and contiguous
                     (head_dim * n_kv, n_total), // v from the cache (F16, over-counted)
@@ -1899,6 +1900,9 @@ mod tests {
             fused_gate_up: false,
             post_norms: false,
             scale_embeddings: false,
+            attn_scale_dim: 16,
+            prescale_q: false,
+            ffn_act: crate::qwen3::FfnAct::Silu,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             sliding_window: 0,

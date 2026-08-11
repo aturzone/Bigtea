@@ -649,6 +649,86 @@ fn perplexity_run(
 /// Deliberately generous. Under-estimating does not return an error: `ggml`
 /// calls `GGML_ASSERT` and the process dies, so the cost of being wrong is
 /// asymmetric and the slack is cheap.
+/// Print every hyper-parameter the forward pass actually reads, at `-v`.
+///
+/// Deliberately the *derived* values, not the raw metadata keys: `attn_scale`
+/// and the per-layer RoPE bases are what the graph uses, and a key that was
+/// present but read under the wrong name looks identical to one that was
+/// absent until you print the result.
+fn print_hparams(c: &Qwen3Config) {
+    if !bigtea_arch::log::enabled(2) {
+        return;
+    }
+    bigtea_arch::detail!(
+        "hparams    n_layer {} n_embd {} n_head {} n_head_kv {} head_dim {} n_ff {}",
+        c.n_layer,
+        c.n_embd,
+        c.n_head,
+        c.n_head_kv,
+        c.head_dim,
+        c.n_ff
+    );
+    bigtea_arch::detail!(
+        "hparams    vocab {} rms_eps {:e} attn_scale {} (1/sqrt {}, prescale_q {}) ffn_act {:?}",
+        c.vocab_size,
+        c.rms_eps,
+        c.attn_scale(),
+        c.attn_scale_dim,
+        c.prescale_q,
+        c.ffn_act
+    );
+    bigtea_arch::detail!(
+        "hparams    rope base {} scale {} type {} ({}) orig_ctx {}",
+        c.rope_freq_base,
+        c.rope_freq_scale,
+        c.rope_type,
+        if c.rope_type_is_known {
+            "known"
+        } else {
+            "guessed"
+        },
+        c.rope_orig_ctx
+    );
+    if c.sliding_window > 0 {
+        // The layer list rather than the pattern number: "pattern 6" is a
+        // claim, "layers 0-4 windowed, 5 global" is checkable against
+        // llama.cpp's own trace.
+        let windowed: Vec<u32> = (0..c.n_layer.min(12))
+            .filter(|&il| c.is_swa_layer(il))
+            .collect();
+        bigtea_arch::detail!(
+            "hparams    swa window {} pattern {} rope_swa {} first-12 windowed {:?}",
+            c.sliding_window,
+            c.swa_pattern,
+            c.rope_freq_base_swa,
+            windowed
+        );
+    }
+    if c.attn_logit_softcap > 0.0 || c.final_logit_softcap > 0.0 {
+        bigtea_arch::detail!(
+            "hparams    softcap attn {} final {}",
+            c.attn_logit_softcap,
+            c.final_logit_softcap
+        );
+    }
+    if c.is_moe() {
+        bigtea_arch::detail!(
+            "hparams    experts {} used {} n_ff_expert {}",
+            c.n_expert,
+            c.n_expert_used,
+            c.n_ff_expert
+        );
+    }
+    bigtea_arch::detail!(
+        "hparams    qk_norm {} post_norms {} scale_embd {} attn_bias {} fused_qkv {}",
+        c.qk_norm,
+        c.post_norms,
+        c.scale_embeddings,
+        c.attn_bias,
+        c.fused_qkv
+    );
+}
+
 fn dense_arena_bytes(config: &Qwen3Config, n: i64) -> usize {
     let n = n.max(1) as u64;
     let layers = config.n_layer.max(1) as u64;
@@ -1559,6 +1639,13 @@ fn run_streaming(
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
+
+    // llama.cpp's `llm_load_print_meta`, and worth the lines: every wrong
+    // answer this project has shipped came from a hyper-parameter that was
+    // read wrongly or defaulted silently, and none of them were visible from
+    // the outside. Three hours went into "gemma-2 diverges" before anyone
+    // could see which scale it was actually using.
+    print_hparams(&config);
 
     // Past this the implementation is wrong, not merely slow -- see
     // `correct_context_limit`. Refusing is the only honest option.

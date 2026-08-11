@@ -90,3 +90,24 @@ least one more thing differs. Remaining suspects, in the order worth checking:
 The infrastructure is worth having regardless: every later architecture with
 mixed local/global attention needs exactly this, and it is now one rule rather
 than a parity hardcoded per model.
+
+## Resolved 2026-08-11 — and none of the three suspects was it
+
+`gemma-was-running-silu-2026-08-11.md` has the full account. The cause was
+**SiLU where llama.cpp runs GELU**, in every gated feed-forward in the crate,
+for every architecture. Fixing that made Gemma-3 byte-identical to llama.cpp
+for 32 tokens on three prompts, and revealed that **Gemma-2 had never matched
+either** despite sitting in `VERIFIED_ARCHITECTURES`.
+
+Of the three suspects listed above, two were wrong and one was real but not the
+cause:
+
+1. RoPE scaling on global layers only — **not the cause**; gemma-3-1b declares
+   no RoPE scaling at all.
+2. `query_pre_attn_scalar` — **real, and fixed**, but it coincides with
+   `head_dim` at every size except 27B, so it could not have been this model's
+   bug. It is now `attn_scale_dim`.
+3. Final norm placement — **not the cause**; it was already correct.
+
+Worth recording: three plausible, specific, well-reasoned suspects, and the
+actual bug was in code shared by every architecture and visible to `grep`.
