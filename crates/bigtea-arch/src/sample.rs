@@ -24,6 +24,61 @@
 //! all of them, so `Sampler::default()` is exactly the old greedy behaviour and
 //! nothing changes for a caller that does not opt in.
 
+use std::collections::HashMap;
+
+/// One reorderable step of the sampling chain — llama.cpp's `--samplers`.
+///
+/// # What can and cannot be reordered, and why
+///
+/// The penalties, DRY and top-n-sigma act on **logits**; everything here acts
+/// on **probabilities**, after the softmax. Those three therefore always run
+/// first and are not part of this enum — which is not a limitation being
+/// papered over, it is where llama.cpp puts them in its own default chain too.
+///
+/// Within probability space the order genuinely changes the result.
+/// `temperature;top_p` flattens the distribution and *then* takes 90% of the
+/// mass, which is a different set from `top_p;temperature`. Both are things
+/// people ask for, and neither is more correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplerStage {
+    TopK,
+    TypicalP,
+    TopP,
+    MinP,
+    Xtc,
+    Temperature,
+}
+
+impl SamplerStage {
+    /// Parse llama.cpp's spelling. `None` for anything unrecognised, so a
+    /// caller can refuse the whole string rather than silently dropping a
+    /// stage the user asked for.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "top_k" | "topk" => Some(SamplerStage::TopK),
+            "typ_p" | "typical" | "typical_p" | "typ" => Some(SamplerStage::TypicalP),
+            "top_p" | "topp" => Some(SamplerStage::TopP),
+            "min_p" | "minp" => Some(SamplerStage::MinP),
+            "xtc" => Some(SamplerStage::Xtc),
+            "temperature" | "temp" => Some(SamplerStage::Temperature),
+            _ => None,
+        }
+    }
+
+    /// llama.cpp's default order, and the one this file used when the chain
+    /// was a fixed sequence of calls.
+    pub fn default_chain() -> Vec<Self> {
+        vec![
+            SamplerStage::TopK,
+            SamplerStage::TypicalP,
+            SamplerStage::TopP,
+            SamplerStage::MinP,
+            SamplerStage::Xtc,
+            SamplerStage::Temperature,
+        ]
+    }
+}
+
 /// Which filters run, and how hard.
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
@@ -51,6 +106,27 @@ pub struct SamplerConfig {
     pub presence_penalty: f32,
     /// How far back all three penalties look.
     pub repeat_last_n: usize,
+    /// DRY ("don't repeat yourself") strength. `0.0` disables.
+    ///
+    /// Unlike the three penalties above, DRY is about *sequences*: it looks for
+    /// the text about to repeat an earlier run of tokens and penalises only the
+    /// token that would continue it. A repeat penalty cannot express that — it
+    /// punishes a word for having been used, which also suppresses the ordinary
+    /// reuse that normal prose is made of.
+    pub dry_multiplier: f32,
+    /// Growth per token beyond `dry_allowed_length`. Penalty is
+    /// `multiplier * base^(match_len - allowed_len)`, so this decides how
+    /// sharply a longer repeat is punished.
+    pub dry_base: f32,
+    /// Repeats shorter than this are not penalised at all. Every language
+    /// repeats short spans constantly ("of the", "it is"), so a low value
+    /// suppresses grammar rather than repetition.
+    pub dry_allowed_length: usize,
+    /// How far back DRY looks. `0` means the whole history.
+    pub dry_penalty_last_n: usize,
+    /// Token ids a match may not cross — newline, quote, colon. Held as ids
+    /// rather than strings because the sampler never sees the tokenizer.
+    pub dry_sequence_breakers: Vec<u32>,
     /// Locally typical sampling: keep the smallest set whose surprise is
     /// closest to the distribution's entropy. `1.0` disables.
     pub typical_p: f32,
@@ -79,6 +155,9 @@ pub struct SamplerConfig {
     pub ignore_eos: bool,
     /// The EOS id, needed by `ignore_eos`. `None` means the model declared none.
     pub eos: Option<u32>,
+    /// The order the probability-space filters run in — `--samplers`.
+    /// See [`SamplerStage`] for what is and is not reorderable.
+    pub chain: Vec<SamplerStage>,
     pub seed: u64,
 }
 
@@ -94,6 +173,11 @@ impl Default for SamplerConfig {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             repeat_last_n: 64,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: 0,
+            dry_sequence_breakers: Vec::new(),
             typical_p: 1.0,
             top_n_sigma: 0.0,
             dynatemp_range: 0.0,
@@ -106,6 +190,7 @@ impl Default for SamplerConfig {
             logit_bias: Vec::new(),
             ignore_eos: false,
             eos: None,
+            chain: SamplerStage::default_chain(),
             seed: 0,
         }
     }
@@ -127,6 +212,11 @@ impl SamplerConfig {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             repeat_last_n: 64,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: 0,
+            dry_sequence_breakers: Vec::new(),
             typical_p: 1.0,
             top_n_sigma: 0.0,
             dynatemp_range: 0.0,
@@ -139,6 +229,7 @@ impl SamplerConfig {
             logit_bias: Vec::new(),
             ignore_eos: false,
             eos: None,
+            chain: SamplerStage::default_chain(),
             seed: 0,
         }
     }
@@ -163,12 +254,16 @@ impl SamplerConfig {
             && self.logit_bias.is_empty()
             && !self.ignore_eos
             && self.mirostat == 0
+            && self.dry_multiplier == 0.0
     }
 
     /// Whether any penalty is active, so a greedy-with-penalties path can
     /// still be taken without running the full sampling pipeline.
     pub fn has_penalties(&self) -> bool {
-        self.repeat_penalty != 1.0 || self.frequency_penalty != 0.0 || self.presence_penalty != 0.0
+        self.repeat_penalty != 1.0
+            || self.frequency_penalty != 0.0
+            || self.presence_penalty != 0.0
+            || self.dry_multiplier != 0.0
     }
 }
 
@@ -304,6 +399,15 @@ impl Sampler {
             self.config.presence_penalty,
             self.config.repeat_last_n,
         );
+        apply_dry(
+            &mut self.candidates,
+            history,
+            self.config.dry_multiplier,
+            self.config.dry_base,
+            self.config.dry_allowed_length,
+            self.config.dry_penalty_last_n,
+            &self.config.dry_sequence_breakers,
+        );
 
         // Temperature 0 with a penalty active is a normal request — an OpenAI
         // client sending `temperature: 0, frequency_penalty: 1.0` means "argmax
@@ -346,34 +450,54 @@ impl Sampler {
             return self.sample_mirostat();
         }
 
-        apply_typical_p(&mut self.candidates, self.config.typical_p);
-        apply_top_p(&mut self.candidates, self.config.top_p);
-        apply_min_p(&mut self.candidates, self.config.min_p);
-        // Only drawn when XTC is on. Drawing unconditionally would consume a
-        // value from the seeded stream and change the output of every existing
-        // `--seed` run that never asked for XTC.
-        if self.config.xtc_probability > 0.0 {
-            let roll = self.next_f32();
-            apply_xtc(
-                &mut self.candidates,
-                self.config.xtc_probability,
-                self.config.xtc_threshold,
-                roll,
-            );
+        // The chain, in the order `--samplers` asked for. Default order is
+        // llama.cpp's and is identical to the fixed sequence this replaced.
+        let chain = self.config.chain.clone();
+        for stage in chain {
+            match stage {
+                // top_k already ran above, in logit space, where it is a pure
+                // rank cut and cheaper. Listing it here would truncate twice —
+                // harmless but wasteful — so it is a no-op unless the user
+                // moved it AFTER something, which is the case that matters.
+                SamplerStage::TopK => {
+                    if self.config.top_k > 0 && self.candidates.len() > self.config.top_k {
+                        self.candidates.truncate(self.config.top_k);
+                    }
+                }
+                SamplerStage::TypicalP => {
+                    apply_typical_p(&mut self.candidates, self.config.typical_p)
+                }
+                SamplerStage::TopP => apply_top_p(&mut self.candidates, self.config.top_p),
+                SamplerStage::MinP => apply_min_p(&mut self.candidates, self.config.min_p),
+                SamplerStage::Xtc => {
+                    // Only drawn when XTC is on. Drawing unconditionally would
+                    // consume a value from the seeded stream and change the
+                    // output of every `--seed` run that never asked for XTC.
+                    if self.config.xtc_probability > 0.0 {
+                        let roll = self.next_f32();
+                        apply_xtc(
+                            &mut self.candidates,
+                            self.config.xtc_probability,
+                            self.config.xtc_threshold,
+                            roll,
+                        );
+                    }
+                }
+                SamplerStage::Temperature => {
+                    let temp = if self.config.dynatemp_range > 0.0 {
+                        dynamic_temperature(
+                            &self.candidates,
+                            self.config.temperature,
+                            self.config.dynatemp_range,
+                            self.config.dynatemp_exponent,
+                        )
+                    } else {
+                        self.config.temperature
+                    };
+                    apply_temperature(&mut self.candidates, temp);
+                }
+            }
         }
-
-        // Temperature last, on the surviving set, so top_p meant what it says.
-        let temp = if self.config.dynatemp_range > 0.0 {
-            dynamic_temperature(
-                &self.candidates,
-                self.config.temperature,
-                self.config.dynatemp_range,
-                self.config.dynatemp_exponent,
-            )
-        } else {
-            self.config.temperature
-        };
-        apply_temperature(&mut self.candidates, temp);
 
         let r = self.next_f32();
         let mut acc = 0.0;
@@ -386,6 +510,101 @@ impl Sampler {
         // Floating point can leave `acc` a hair under `r`; the last candidate is
         // the correct answer rather than a failure.
         self.candidates.last().map(|c| c.0).unwrap_or(0)
+    }
+}
+
+/// DRY — penalise the token that would *continue* an earlier sequence.
+///
+/// # What it does that a repeat penalty cannot
+///
+/// A repeat penalty punishes a token for having appeared. That also suppresses
+/// the ordinary reuse prose is made of — "the", "and", a character's name. DRY
+/// asks a narrower question: *is the text about to replay a run of tokens it
+/// has already produced?* Only the token that would extend that run is
+/// penalised, and the penalty grows with how long the run already is.
+///
+/// # The algorithm
+///
+/// Let the window end with token `L`. For every earlier position `i` holding
+/// `L`, measure how far the text agrees backwards from `i` and from the end.
+/// That common length is how much of a repeat is already in progress, and the
+/// token at `i + 1` is what would continue it. Penalty:
+///
+/// ```text
+/// multiplier * base^(match_len - allowed_len)      when match_len >= allowed_len
+/// ```
+///
+/// The **largest** penalty wins where several positions nominate the same
+/// token: two separate repeats of the same continuation are not twice as bad as
+/// one, but the longer of them is what matters.
+///
+/// `sequence_breakers` are ids a match may not cross — newline, quote, colon.
+/// Without them a repeat is happily detected across a paragraph boundary, and
+/// structured output (a list, a table) is penalised for having structure.
+fn apply_dry(
+    candidates: &mut [(u32, f32)],
+    history: &[u32],
+    multiplier: f32,
+    base: f32,
+    allowed_length: usize,
+    penalty_last_n: usize,
+    breakers: &[u32],
+) {
+    if multiplier <= 0.0 || history.len() < 2 {
+        return;
+    }
+    // `0` means the whole history, which is llama.cpp's convention and the
+    // opposite of what `0` means for `repeat_last_n`.
+    let window = if penalty_last_n == 0 || penalty_last_n >= history.len() {
+        history
+    } else {
+        &history[history.len() - penalty_last_n..]
+    };
+    let n = window.len();
+    if n < 2 {
+        return;
+    }
+    let is_breaker = |t: u32| breakers.contains(&t);
+    let last = window[n - 1];
+    // A breaker as the most recent token means no repeat is in progress at all.
+    if is_breaker(last) {
+        return;
+    }
+
+    let mut penalties: HashMap<u32, f32> = HashMap::new();
+    for i in 0..n - 1 {
+        if window[i] != last {
+            continue;
+        }
+        // Walk backwards from both ends while they agree, stopping at a
+        // breaker so a "repeat" cannot span a paragraph boundary.
+        let mut len = 1usize;
+        while len <= i
+            && len < n
+            && window[i - len] == window[n - 1 - len]
+            && !is_breaker(window[i - len])
+        {
+            len += 1;
+        }
+        if len < allowed_length {
+            continue;
+        }
+        let next = window[i + 1];
+        // `saturating_sub` for the boundary case: at exactly `allowed_length`
+        // the exponent is 0 and the penalty is the bare multiplier.
+        let penalty = multiplier * base.powi((len - allowed_length) as i32);
+        let slot = penalties.entry(next).or_insert(0.0);
+        if penalty > *slot {
+            *slot = penalty;
+        }
+    }
+    if penalties.is_empty() {
+        return;
+    }
+    for c in candidates.iter_mut() {
+        if let Some(p) = penalties.get(&c.0) {
+            c.1 -= p;
+        }
     }
 }
 
@@ -829,6 +1048,142 @@ mod tests {
         assert_eq!(
             c[1].1, -8.0,
             "negative logit must be multiplied, not raised"
+        );
+    }
+
+    #[test]
+    fn the_default_chain_is_llamacpp_s_order() {
+        assert_eq!(
+            SamplerStage::default_chain(),
+            vec![
+                SamplerStage::TopK,
+                SamplerStage::TypicalP,
+                SamplerStage::TopP,
+                SamplerStage::MinP,
+                SamplerStage::Xtc,
+                SamplerStage::Temperature,
+            ]
+        );
+    }
+
+    #[test]
+    fn stage_names_match_llamacpp_s_spelling() {
+        assert_eq!(SamplerStage::parse("top_k"), Some(SamplerStage::TopK));
+        assert_eq!(SamplerStage::parse("typ_p"), Some(SamplerStage::TypicalP));
+        assert_eq!(SamplerStage::parse("min_p"), Some(SamplerStage::MinP));
+        assert_eq!(
+            SamplerStage::parse(" TEMPERATURE "),
+            Some(SamplerStage::Temperature),
+            "whitespace and case must not decide whether a filter runs"
+        );
+        // Unknown returns None so the caller can refuse the whole string; a
+        // typo must not quietly remove a filter the user is relying on.
+        assert_eq!(SamplerStage::parse("top_q"), None);
+    }
+
+    #[test]
+    fn ordering_temperature_before_top_p_changes_the_result() {
+        // The point of the flag. A hot temperature flattens the distribution,
+        // so top_p 0.5 afterwards keeps MORE tokens than it would before —
+        // different surviving sets, and over many draws a different spread.
+        let logits = [4.0f32, 3.0, 2.0, 1.0, 0.0];
+        let draw = |chain: Vec<SamplerStage>| -> std::collections::HashSet<u32> {
+            let mut s = Sampler::new(SamplerConfig {
+                temperature: 2.0,
+                top_p: 0.5,
+                chain,
+                seed: 5,
+                ..SamplerConfig::default()
+            });
+            (0..200).map(|_| s.sample(&logits, &[])).collect()
+        };
+        let after = draw(vec![SamplerStage::TopP, SamplerStage::Temperature]);
+        let before = draw(vec![SamplerStage::Temperature, SamplerStage::TopP]);
+        assert_ne!(
+            after, before,
+            "chain order made no difference: {after:?} vs {before:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_chain_still_samples_rather_than_panicking() {
+        // A chain with no stages is a valid request: raw multinomial draw from
+        // the model's own distribution.
+        let mut s = Sampler::new(SamplerConfig {
+            temperature: 1.0,
+            chain: Vec::new(),
+            seed: 3,
+            ..SamplerConfig::default()
+        });
+        let id = s.sample(&[1.0, 2.0, 3.0], &[]);
+        assert!(id < 3, "returned an out-of-range token: {id}");
+    }
+
+    #[test]
+    fn dry_penalises_the_token_that_continues_a_repeat() {
+        // History "a b c a b" — the run "a b" is in progress, and `c` is what
+        // followed it last time. Only `c` should be penalised.
+        let history = [1u32, 2, 3, 1, 2];
+        let mut c = vec![(1u32, 0.0f32), (2, 0.0), (3, 0.0), (4, 0.0)];
+        apply_dry(&mut c, &history, 1.0, 2.0, 2, 0, &[]);
+        assert_eq!(c[2].1, -1.0, "token 3 continues the repeat: {c:?}");
+        assert_eq!(c[0].1, 0.0, "token 1 does not");
+        assert_eq!(c[3].1, 0.0, "an unseen token certainly does not");
+    }
+
+    #[test]
+    fn dry_grows_with_the_length_of_the_repeat() {
+        // Match length 2 with allowed 2 -> exponent 0 -> bare multiplier.
+        let mut c = vec![(3u32, 0.0f32)];
+        apply_dry(&mut c, &[1, 2, 3, 1, 2], 1.0, 3.0, 2, 0, &[]);
+        assert_eq!(c[0].1, -1.0);
+        // Match length 3 with allowed 2 -> exponent 1 -> multiplier * base.
+        // The leading tokens differ (8 vs 9) so the agreement stops at three;
+        // making them equal gives a match of four and a penalty of nine, which
+        // is what the first draft of this test asserted against by accident.
+        let mut c = vec![(4u32, 0.0f32)];
+        apply_dry(&mut c, &[8, 1, 2, 3, 4, 9, 1, 2, 3], 1.0, 3.0, 2, 0, &[]);
+        assert_eq!(c[0].1, -3.0, "a longer repeat costs more: {c:?}");
+
+        // ...and one token longer again is base^2, not base*2.
+        let mut c = vec![(4u32, 0.0f32)];
+        apply_dry(&mut c, &[9, 1, 2, 3, 4, 9, 1, 2, 3], 1.0, 3.0, 2, 0, &[]);
+        assert_eq!(c[0].1, -9.0, "growth must be geometric: {c:?}");
+    }
+
+    #[test]
+    fn dry_respects_allowed_length_and_being_off() {
+        // The repeat is length 2; allowing 3 means nothing is penalised.
+        let mut c = vec![(3u32, 0.0f32)];
+        apply_dry(&mut c, &[1, 2, 3, 1, 2], 1.0, 2.0, 3, 0, &[]);
+        assert_eq!(c[0].1, 0.0);
+        // Multiplier 0 is off.
+        let mut c = vec![(3u32, 0.0f32)];
+        apply_dry(&mut c, &[1, 2, 3, 1, 2], 0.0, 2.0, 2, 0, &[]);
+        assert_eq!(c[0].1, 0.0);
+    }
+
+    #[test]
+    fn a_sequence_breaker_stops_a_match_spanning_it() {
+        // Same history, but token 2 is a breaker. The backward walk must stop
+        // there, leaving a match too short to penalise. Without this, a list
+        // is penalised for having the shape of a list.
+        let mut c = vec![(3u32, 0.0f32)];
+        apply_dry(&mut c, &[1, 2, 3, 1, 2], 1.0, 2.0, 2, 0, &[2]);
+        assert_eq!(c[0].1, 0.0, "the match crossed a breaker: {c:?}");
+    }
+
+    #[test]
+    fn dry_takes_the_largest_penalty_not_the_sum() {
+        // Two separate repeats both nominate token 3. Two occurrences of the
+        // same continuation are not twice as bad as one; the longer run is
+        // what matters, so the penalties must not accumulate.
+        let history = [1u32, 2, 3, 1, 2, 3, 1, 2];
+        let mut c = vec![(3u32, 0.0f32)];
+        apply_dry(&mut c, &history, 1.0, 2.0, 2, 0, &[]);
+        assert!(
+            c[0].1 >= -8.0,
+            "penalties summed instead of taking the max: {c:?}"
         );
     }
 

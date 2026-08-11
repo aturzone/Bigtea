@@ -1028,9 +1028,14 @@ impl<'m> StreamingRunner<'m> {
 
     /// RoPE parameters this architecture uses.
     pub fn rope(&self) -> RopeParams {
+        let c = &self.arch.config;
         RopeParams {
-            freq_base: self.arch.config.rope_freq_base,
-            ..RopeParams::default()
+            freq_base: c.rope_freq_base,
+            freq_scale: c.rope_freq_scale,
+            ext_factor: c.rope_ext_factor,
+            attn_factor: c.rope_attn_factor,
+            beta_fast: c.rope_beta_fast,
+            beta_slow: c.rope_beta_slow,
         }
     }
 
@@ -1472,12 +1477,27 @@ impl<'m> StreamingRunner<'m> {
                 let q = ctx.new_f32_3d(head_dim, n_head, n_new)?;
                 q.set_f32(&q_v)?;
 
-                // F16, matching how the cache stores them and what the fused
-                // kernel wants — no conversion on this path at all.
+                // Whatever the cache stores, handed over unchanged — no
+                // conversion on this path at all. ggml's fused attention
+                // dispatches K through its type's `vec_dot` and V through its
+                // `to_float`, so a quantised cache needs no special case here;
+                // a type with neither would abort, which is why `KvType` is a
+                // closed set rather than an arbitrary id.
                 let tkv = std::time::Instant::now();
-                let k_all = ctx.new_f16_3d(head_dim, n_kv, n_total)?;
+                let kv_ty = bigtea_gguf::GgmlType(cache.kind().ggml_type());
+                let k_all = ctx.reshape_3d(
+                    &ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?,
+                    head_dim,
+                    n_kv,
+                    n_total,
+                )?;
                 k_all.set_bytes(cache.keys(il as usize))?;
-                let v_all = ctx.new_f16_3d(head_dim, n_kv, n_total)?;
+                let v_all = ctx.reshape_3d(
+                    &ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?,
+                    head_dim,
+                    n_kv,
+                    n_total,
+                )?;
                 v_all.set_bytes(cache.values(il as usize))?;
                 let kv_secs = tkv.elapsed().as_secs_f64();
 
@@ -1836,6 +1856,12 @@ mod tests {
             vocab_size: 32,
             rms_eps: 1e-6,
             rope_freq_base: 1_000_000.0,
+            rope_freq_scale: 1.0,
+            rope_ext_factor: 0.0,
+            rope_attn_factor: 1.0,
+            rope_beta_fast: 32.0,
+            rope_beta_slow: 1.0,
+            rope_orig_ctx: 0,
             n_expert: 4,
             n_expert_used: 2,
             n_ff_expert: 16,

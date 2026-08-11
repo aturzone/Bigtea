@@ -14,20 +14,38 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 
 | bucket | flags | state |
 |---|---:|---|
-| **have** | **49** | done |
-| **samplers** | 22 | **13 done 2026-08-10**, DRY (5) + `--samplers` ordering (3) left |
+| **have** | **106** | done |
+| **samplers** | 22 | **21 done**; only `--backend-sampling` left, and it is a GPU concept |
 | interaction / prompt handling | 22 | **done 2026-08-11** — including a real REPL |
-| runtime / threading / memory | 31 | mostly gap; several are meaningless here |
-| RoPE, YaRN, context shift | 15 | gap; `--rope-freq-base`/`--rope-scale` are cheap and real |
-| logging | 13 | gap, cheap |
+| runtime / threading / memory | 31 | I/O mode + `--override-kv` done; most of the rest **refused**, see below |
+| RoPE, YaRN, context shift | 15 | **9 done 2026-08-11**; the other 6 refused, see below |
+| logging | 13 | **11 done 2026-08-11**; status moved to stderr |
 | **GPU** | 15 | **won't** — no backend to apply them to |
 | fetch / Hugging Face | 9 | partly covered by `bigtea-pull`, different spelling |
 | reasoning / speculative draft | 8 | gap |
-| KV cache type / prompt cache | 7 | gap; `--cache-type-k/v` is real and substantial |
-| chat template | 6 | 2 done (detection), `--jinja` won't |
+| KV cache type / prompt cache | 7 | **done 2026-08-11** -- both halves |
+| chat template | 6 | 3 done; `--jinja`/`--chat-template-file` **won't**, see below |
 | LoRA / control vectors | 5 | gap |
 | grammar / JSON schema | 4 | gap |
-| meta (`--help`, `--version`) | 4 | 1 done |
+| meta (`--help`, `--version`) | 4 | 3 done |
+
+### The count in this document was wrong for eight commits
+
+Every "have" figure before 2026-08-11 was measured by grepping **the help
+text**, which lists a flag under one spelling and often the short one:
+`--cache-type-k` prints as `-ctk`, `--typical-p` as `--typical`. The parser
+accepted them; the count did not see them.
+
+Measured from the parser instead:
+
+```
+$ grep -oE '"(-{1,2}[a-zA-Z0-9][a-zA-Z0-9-]*)"' bigtea-run.rs     | tr -d '"' | grep '^--' | sort -u | wc -l
+106
+```
+
+**81 was an undercount of 25.** The lesson is the one this project keeps
+relearning: measure the thing, not a description of the thing. A help text is a
+description, and it drifts.
 
 **"All of them" is not the right target and this table is why.** Fifteen are
 GPU-only on an engine with no GPU backend; several more (`--no-mmap`,
@@ -97,11 +115,360 @@ Two things that would otherwise be silent:
 shift, and Bigtea has no context shift — accepting it would be a flag that does
 nothing, which is the exact failure this audit exists to prevent.
 
-## Next batches, in order
+## Done 2026-08-11 — RoPE and YaRN, 9 of the 15
 
-1. **DRY + `--samplers` ordering (8)** — finishes the sampler bucket. DRY needs
-   n-gram suffix matching and sequence breakers; the ordering flag needs the
-   chain to become data rather than a fixed sequence of calls.
+`--rope-freq-base`, `--rope-freq-scale`, `--rope-scale`, `--rope-scaling`,
+`--yarn-ext-factor`, `--yarn-attn-factor`, `--yarn-beta-fast`,
+`--yarn-beta-slow`, `--yarn-orig-ctx`.
+
+These were nearly free and had been sitting there: `RopeParams` already carried
+all six YaRN fields and `rope()` set exactly one of them, so ggml's `rope_ext`
+was being handed defaults for the rest on every model. The container is now read
+for `rope.scaling.factor`, `rope.scaling.type`, `attn_factor`, `beta_fast`,
+`beta_slow` and `original_context_length`, and the flags override that.
+
+**`--rope-scale` is the reciprocal of `--rope-freq-scale`** — llama.cpp's is a
+multiplier on the *context*, ours on the *frequency*. Storing it unconverted
+inverts every long-context model, silently.
+
+Overrides are **printed**, not applied quietly:
+
+```
+$ bigtea-run <llama-3.2-1b> ... --rope-freq-base 50000 --rope-scale 2
+rope       overridden: freq_base 500000 -> 50000, freq_scale 1 -> 0.5
+```
+
+RoPE is the setting most likely to turn a working model into a fluent-but-wrong
+one, and 500000 is Llama-3.2's real base — visible here only because the line is
+printed.
+
+**The other six are refused, not accepted:** `--grp-attn-n`/`-w` (self-extend,
+not implemented), `--context-shift`/`--no-context-shift` and `--defrag-thold`
+(no context shift and no KV fragmentation to threshold), `--swa-full` (we always
+keep the full window cache, so the flag has nothing to switch).
+
+## Done 2026-08-11 — logging, and the bug underneath it
+
+`--log-disable`, `--log-file`, `--log-timestamps`/`--no-log-timestamps`,
+`--log-prefix`/`--no-log-prefix`, `-v`/`--verbose`/`--log-verbose`,
+`--verbosity`/`--log-verbosity`, `--perf`/`--no-perf`, `--version`.
+
+**The flags are the smaller half. The real change is that status now goes to
+stderr.** Everything the runner says about itself — shape, residency, prefill
+timing — is diagnostics; the generated text is output. They shared stdout, so
+`bigtea-run … > answer.txt` captured a 16-line header along with the answer and
+there was no way to separate them.
+
+```
+$ bigtea-run <llama-3.2-1b> "The capital of France is" -n 6 --log-disable 2>/dev/null
+ Paris. The capital of France
+
+$ bigtea-run … --log-file bt.log 2>/dev/null | head -3
+ Paris. The capital of France
+   [bt.log: 16 lines, starting "model      llama (direct (cache bypassed))"]
+
+$ bigtea-run … --log-timestamps --log-prefix
+   0.152 I model      llama (direct (cache bypassed))
+```
+
+`--version` is handled **before the positional model path is taken**. Parsed
+with the other flags it became the path, and the runner reported that it could
+not open a file called `--version`.
+
+Two of the thirteen are refused: `--log-colors` (status goes to a stream that
+may be a file; llama.cpp's colour applies to a level marker we render as one
+character) and `--no-host`, which is not a logging flag at all.
+
+## Done 2026-08-11 — DRY, the sampler that actually breaks a loop
+
+`--dry-multiplier`, `--dry-base`, `--dry-allowed-length`,
+`--dry-penalty-last-n`, `--dry-sequence-breaker`.
+
+DRY asks a narrower question than a repeat penalty. A repeat penalty punishes a
+token for having appeared, which also suppresses the ordinary reuse prose is
+made of. DRY looks for a *sequence* replaying and penalises only the token that
+would continue it, growing the penalty geometrically with how long the run
+already is.
+
+```
+$ bigtea-run <llama-3.2-1b> "The sea is blue. The sea is blue. The sea is blue. The sea is" -n 14
+ blue. The sea is blue. The sea is blue. The sea      <- stuck
+
+$ ... --dry-multiplier 1.5
+ ... blue. (Repeat ad infinitum)  This is a classic example
+```
+
+**Sequence breakers are what stop it penalising structure.** A match may not
+cross a newline, quote, colon or asterisk, or a list is punished for having the
+shape of a list. They arrive as text and the sampler works in token ids, so they
+are resolved once the vocabulary exists; a breaker that is not a single token in
+this vocabulary is **skipped rather than approximated**.
+
+One test caught the author, not the code: a fixture written as
+`[9,1,2,3,4,9,1,2,3]` has `9 1 2 3` repeating, so the match is four long and the
+penalty is `base^2`, not `base^1`. The assertion was wrong and the
+implementation was right — both cases are pinned now.
+
+## Done 2026-08-11 — `--samplers` chain ordering; the sampler bucket is closed
+
+`--samplers`, `--sampler-seq`, `--sampling-seq` (three spellings of one flag).
+
+The chain was a fixed sequence of calls; it is now a `Vec<SamplerStage>` walked
+in order. Same seed, same model, different order, different answer:
+
+```
+$ ... --temp 1.5 --top-p 0.5 --seed 9 --samplers "top_k;typ_p;top_p;min_p;xtc;temperature"
+ vast and unpredictable, and its vastness is mirrored in t
+
+$ ... --temp 1.5 --top-p 0.5 --seed 9 --samplers "temperature;top_p"
+ turbulent, if we are successful it will determine us. Som
+```
+
+That is the whole point of the flag: a hot temperature flattens the
+distribution, so `top_p 0.5` *after* it keeps a different set than before it.
+Neither order is more correct and people ask for both.
+
+**What is not reorderable, stated rather than papered over:** the penalties, DRY
+and top-n-sigma act on **logits** and always run first; the six stages above act
+on probabilities. That is also where llama.cpp puts them in its own default
+chain, so the constraint costs nothing in practice.
+
+**An unknown stage refuses the whole run** rather than dropping that stage:
+
+```
+$ ... --samplers "top_k;top_q"
+bigtea-run: --samplers: unknown stage "top_q"
+  known stages: top_k, typ_p, top_p, min_p, xtc, temperature
+  penalties, dry and top_n_sigma act on logits and always run first
+$ echo $?
+2
+```
+
+A typo that silently removed a filter would be the same class of failure as a
+flag that does nothing — the user believes a constraint is active when it is
+not.
+
+`--backend-sampling` is the one sampler flag left and it is **won't**: it moves
+sampling onto the GPU, and there is no GPU backend to move it to.
+
+## Done 2026-08-11 - `--cache-type-k/v`, a quantised KV cache
+
+`--cache-type-k`/`-ctk`, `--cache-type-v`/`-ctv`, taking `f16` (default) or
+`q8_0`. This is the one flag in the list that changes what the engine *is* able
+to do rather than how it is driven: the KV cache is the memory that grows with
+context, and it is the axis this project competes on.
+
+```
+$ bigtea-run <llama-3.2-1b> "The capital of France is" -n 10
+kv cache   15 positions, 0.5 MiB, f16
+
+$ bigtea-run <llama-3.2-1b> "The capital of France is" -n 10 -ctk q8_0 -ctv q8_0
+kv cache   15 positions, 0.2 MiB, q8_0
+```
+
+**And the quality cost is measured, not asserted** - which is what the
+perplexity work earlier today was for:
+
+| KV storage | perplexity | bytes/value |
+|---|---:|---:|
+| f16 | 29.0909 | 2.00 |
+| q8_0 | 28.9047 | 1.0625 |
+
+**0.64% apart on 189 scored tokens.** q8_0 landing slightly *lower* is noise at
+that sample size, not an improvement, and it must not be quoted as one.
+
+Three things that would have been silent:
+
+- **A block may not span two heads.** Quantisation runs row by row, where a row
+  is `head_dim`; a block straddling a head boundary applies one head's scale to
+  another head's values, which is fluent nonsense rather than an error.
+- **`head_dim` must be a multiple of 32**, or a row does not hold whole blocks.
+  Every architecture here uses 64, 128 or 256, but one that did not falls back
+  to f16 **and says so** rather than being misquantised.
+- **`is_consistent()` was counting values where the vectors now hold bytes.** It
+  passed under f16 by coincidence and failed immediately under q8_0 - the test
+  that caught it existed already and was checking the right thing.
+
+K and V share one type because ggml's banded attention asserts
+`k->type == v->type`; accepting different ones would work until that path was
+reached. Both spellings are accepted and the last wins.
+
+`q4_0` is **not** offered. ggml has the kernels, but the accuracy cost at 4 bits
+in attention is real and unmeasured here, and offering a type without the
+perplexity number beside it is the thing this audit exists to prevent.
+
+## Done 2026-08-11 - I/O mode, metadata override, and a long refusal list
+
+`--direct-io`, `--no-direct-io`/`--no-mmap`, `--override-kv`, `--usage`.
+
+**`--no-mmap` lands on the same switch as `--no-direct-io`**, because what it
+means -- "do not let the OS page cache hold the weights" -- is what direct I/O
+already does here. Both are real modes in `bigtea-io`, so this is a genuine
+switch rather than an accepted no-op:
+
+```
+$ bigtea-run <model> ...
+model      llama (direct (cache bypassed))
+$ bigtea-run <model> ... --no-direct-io
+model      llama (buffered (page cache in use))
+```
+
+**`--override-kv key=type:value`** is the escape hatch for a container whose
+metadata is wrong. GGUFs are often converted by third parties, and a mislabelled
+`rope.freq_base` makes a model answer fluently and wrongly with nothing to point
+at. Overriding beats editing a multi-gigabyte file, and the run says which
+override it used. Proven load-bearing rather than merely printed:
+
+```
+$ bigtea-run <llama-3.2-1b> -f prose.txt -n 10
+ similar with the invention of the printing press. Befor
+
+$ ... --override-kv llama.rope.freq_base=float:1000
+ esta, and siesta is a thing, and
+```
+
+A malformed spec **refuses the run** (exit 2) rather than being skipped: an
+override silently dropped is worse than none, because the user believes the
+container has been corrected.
+
+### Long-form aliases and `-m`/`-p` - done 2026-08-11
+
+`-m`/`--model`, `-p`/`--prompt`, `--file`, `--batch-size`, `--n-predict`,
+`--predict`, `--repack`, `--help`, `-if`/`--interactive-first`.
+
+Muscle memory is the stated reason for copying a CLI, and until now the model
+and prompt could **only** be positional: someone typing
+`bigtea-run -m model.gguf -p "hi"` got a file-not-found for `-m`. The first
+argument is now treated as the path only when it is not a flag.
+
+`--interactive-first` is not an alias for `-i` and is implemented as its own
+thing: the user speaks before the model does.
+
+```
+$ printf 'What is 2 plus 2?
+' | bigtea-run -m <llama-3.2-1b>     -p "You are a calculator." -n 10 -if -cnv
+> The answer is... 4!
+```
+
+The option list is now one `usage()` function rather than a block inside
+`main`, so `--help`, `-h` and a bare invocation cannot drift apart.
+
+### Prompt cache - done 2026-08-11, and worth 19x on a repeated prompt
+
+`--prompt-cache FILE`, `--prompt-cache-all`, `--prompt-cache-ro`.
+
+Prefill is the expensive half for anything with a long prompt, and re-running
+the same prefix every invocation is the largest avoidable cost in an agent loop.
+
+```
+run 1  prompt cache  wrote 15.1 MiB for 482 tokens
+       prefill    482 tokens in 1.5s (318.59 tok/s)
+
+run 2  prompt cache  reused 481 of 482 tokens
+       prefill    482 tokens in 0.1s (6116.11 tok/s)
+```
+
+**Reuse stops at the first differing token.** Past it every stored key is
+conditioned on text that is no longer there, and attention would read it
+without complaint. So the cache is truncated to the common prefix rather than
+accepted or rejected whole -- which is what makes it useful for a prompt that
+was *edited* rather than repeated exactly:
+
+```
+$ bigtea-run <same model> -f edited.txt --prompt-cache pc.bin
+prompt cache  reused 115 of 121 tokens
+```
+
+The last prompt token is never restored: the forward pass has to run for at
+least one position to produce the logits generation starts from.
+
+**A fingerprint guards it.** Restoring keys computed by a different model, or
+under a different KV quantisation, is not an error anywhere downstream --
+attention reads numbers that mean nothing and the answer is fluent and wrong. So
+the file records the shape it was built with (layers, embedding, heads, kv
+heads, head_dim, vocab, KV type) and a mismatch discards it. Verified: the same
+cache offered to TinyLlama restores **nothing**.
+
+Correctness checked the only way that counts -- a reused cache must produce the
+**same text** as a cold run, and does.
+
+Failure never fails the run: an unreadable or unwritable cache is a lost
+optimisation, and is reported rather than raised.
+
+### `--chat-template` - done 2026-08-11
+
+Forces one of the nine known formats, overriding what the container declares.
+Two cases make it necessary rather than a curiosity: a container with **no**
+template (common in base-model conversions) and one whose template this build
+does not recognise. Both otherwise fall back to a plain framing the model was
+never trained on, and the model answers fluently and wrongly.
+
+Proven by the token stream rather than the header, on TinyLlama:
+
+```
+zephyr (detected)  23 tokens: [1, 529, 29989, 1792, 29989, 29958, ...]   <|user|>
+chatml (forced)    33 tokens: [1, 529, 29989, 326, 29918, 2962, ...]     <|im_start|>
+```
+
+An unknown name **refuses the run** and lists the nine, rather than falling back
+to generic framing.
+
+Applied on **both** engine paths. The dense path and V4-Flash build their
+tokenizers separately, and a flag honoured on only one of them is exactly the
+failure `-t` had for weeks — so it is one helper called twice, not two copies.
+
+**`--chat-template-file` and `--jinja` are refused.** They supply a Jinja
+template to be *evaluated*; this build identifies a format by matching the
+template text and then renders with its own code. Accepting a file and matching
+it against the same nine patterns would honour some files and silently ignore
+others, which is worse than declining.
+
+### `--mlock` - done 2026-08-11, and it is not one call
+
+Bigtea's whole design is deciding what stays in RAM. That decision is undone if
+the OS pages the resident set out, and this project has **measured** the
+consequence: past ~6 GiB the expert cache reached a 71% hit rate while being the
+slowest configuration tested, because the hits were page faults in disguise.
+
+On Windows `VirtualLock` alone is not enough. A process may only lock up to its
+working-set maximum, which defaults to a few megabytes, so locking a gigabyte
+fails with `ERROR_WORKING_SET_QUOTA` (1453) unless `SetProcessWorkingSetSize`
+raised the ceiling first. **A `--mlock` that called only `VirtualLock` would
+look implemented, return an error nobody checks, and lock nothing** — which is
+why this was deferred a tick rather than shipped quickly.
+
+```
+$ bigtea-run <llama-3.2-1b> ... --mlock
+mlock      0.31 GiB pinned in physical memory; 0.44 GiB of repacked weights
+           are in ggml arena and not covered
+resident   146 tensors, 0.74 GiB
+```
+
+**The line says what is not covered**, because 0.31 against a resident 0.74
+otherwise reads as a bug. Repacked tensors live inside ggml own arena and this
+code has no address for them. A partial lock stated plainly beats a total that
+quietly means something else.
+
+Failure is counted, not fatal: a partially locked residency still helps, and the
+run says how much did not take and why.
+
+### Refused, with reasons - most of the runtime bucket
+
+These are declined rather than accepted-and-ignored. That is the whole point of
+this audit, and the standard `-t` failed for weeks.
+
+| flag | why |
+|---|---|
+| `--numa` | no NUMA-aware allocation to select between |
+| `--parallel` | one sequence at a time by design: one weight set, one KV cache |
+| `--cpu-mask`, `--cpu-range`, `--cpu-strict`, `--poll`, `--prio` | no thread-affinity or scheduler layer; `-t`/`-tb` are the levers that exist |
+| `--defrag-thold` | the KV cache is append-only and never fragments |
+| `--warmup`/`--no-warmup` | nothing is warmed; the first token pays for what it needs |
+| `--ubatch-size` | `-b` is the only batch dimension here |
+| `--fit`, `--fit-ctx`, `--fit-target` | `bigtea-model-info --budget` answers this question already, in its own spelling |
+| `--check-tensors` | the container work in r8 validates structure at open; a values-level NaN scan would have to dequantise every tensor and is not obviously worth it |
+
+## Next batches, in order
 2. **RoPE / context (15)** — `--rope-freq-base`, `--rope-freq-scale`,
    `--rope-scaling`, YaRN. Cheap, and needed for any model whose container
    disagrees with its training context.

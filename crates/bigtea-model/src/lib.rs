@@ -183,7 +183,21 @@ impl Model {
         let mut declared_tensor_count = None;
 
         for (idx, path) in paths.iter().enumerate() {
-            let file = DirectFile::open(path).map_err(|source| Error::Io {
+            // `--no-direct-io` sets `BIGTEA_IO=buffered`. Direct I/O bypasses
+            // the page cache, which is what makes streaming a 144 GB model
+            // predictable -- but on a filesystem that refuses it, or when the
+            // same model is read repeatedly and the page cache is *wanted*,
+            // buffered is the better answer. Both are real modes here, which
+            // is why the flag exists rather than being declined.
+            let buffered = std::env::var("BIGTEA_IO")
+                .map(|v| v.eq_ignore_ascii_case("buffered"))
+                .unwrap_or(false);
+            let opened = if buffered {
+                DirectFile::open_buffered(path)
+            } else {
+                DirectFile::open(path)
+            };
+            let file = opened.map_err(|source| Error::Io {
                 path: path.clone(),
                 source,
             })?;
@@ -268,6 +282,27 @@ impl Model {
         &self.metadata
     }
 
+    /// Replace one metadata entry -- llama.cpp's `--override-kv`.
+    ///
+    /// The escape hatch for a container whose metadata is wrong. A GGUF is
+    /// often converted by a third party, and a mislabelled `rope.freq_base` or
+    /// a missing `attention.head_count_kv` makes the model answer fluently and
+    /// wrongly with nothing to point at. Overriding is safer than editing a
+    /// multi-gigabyte file, and it is visible in the run that used it.
+    ///
+    /// The architecture is re-read afterwards because `general.architecture`
+    /// is itself overridable, and it decides which config reader runs.
+    pub fn override_metadata(&mut self, key: &str, value: bigtea_gguf::Value) {
+        self.metadata.insert(key.to_string(), value);
+        if let Some(arch) = self
+            .metadata
+            .get("general.architecture")
+            .and_then(bigtea_gguf::Value::as_str)
+        {
+            self.architecture = arch.to_string();
+        }
+    }
+
     pub fn get_u64(&self, key: &str) -> Option<u64> {
         self.metadata.get(key).and_then(bigtea_gguf::Value::as_u64)
     }
@@ -275,6 +310,13 @@ impl Model {
     /// Architecture-scoped metadata, e.g. `arch_u64("expert_count")`.
     pub fn arch_u64(&self, suffix: &str) -> Option<u64> {
         self.get_u64(&format!("{}.{}", self.architecture, suffix))
+    }
+
+    /// An architecture-scoped string, e.g. `qwen3.rope.scaling.type`.
+    pub fn arch_str(&self, suffix: &str) -> Option<&str> {
+        self.metadata
+            .get(&format!("{}.{}", self.architecture, suffix))
+            .and_then(bigtea_gguf::Value::as_str)
     }
 
     pub fn arch_f32(&self, suffix: &str) -> Option<f32> {

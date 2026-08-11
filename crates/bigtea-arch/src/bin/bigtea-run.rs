@@ -89,6 +89,87 @@ impl TokenWriter {
     }
 }
 
+/// RoPE settings the user supplied, each `None` unless asked for.
+///
+/// `Option` per field rather than a filled-in struct, because "not given" and
+/// "given the same value the container has" must not be the same thing: the
+/// container is right far more often than a flag is, and silently overwriting
+/// its RoPE base with a default is how a long-context model starts answering
+/// fluently and wrongly.
+#[derive(Clone, Default)]
+struct RopeOverrides {
+    freq_base: Option<f32>,
+    freq_scale: Option<f32>,
+    scaling: Option<String>,
+    ext_factor: Option<f32>,
+    attn_factor: Option<f32>,
+    beta_fast: Option<f32>,
+    beta_slow: Option<f32>,
+    orig_ctx: Option<u32>,
+}
+
+impl RopeOverrides {
+    /// Apply to a config read from the container, and say what changed.
+    ///
+    /// Printed rather than applied quietly: RoPE is the setting most likely to
+    /// turn a working model into a fluent-but-wrong one, and a user who mistyped
+    /// `--rope-freq-base 1000` for `100000` should be able to see it.
+    fn apply(&self, c: &mut Qwen3Config) {
+        let mut changed: Vec<String> = Vec::new();
+        if let Some(v) = self.freq_base {
+            changed.push(format!("freq_base {} -> {v}", c.rope_freq_base));
+            c.rope_freq_base = v;
+        }
+        if let Some(v) = self.freq_scale {
+            changed.push(format!("freq_scale {} -> {v}", c.rope_freq_scale));
+            c.rope_freq_scale = v;
+        }
+        match self.scaling.as_deref() {
+            Some("none") => {
+                changed.push("scaling -> none".into());
+                c.rope_freq_scale = 1.0;
+                c.rope_ext_factor = 0.0;
+            }
+            Some("linear") => {
+                changed.push("scaling -> linear".into());
+                c.rope_ext_factor = 0.0;
+            }
+            Some("yarn") => {
+                changed.push("scaling -> yarn".into());
+                // Only default the mix if the user did not state one; a bare
+                // `--rope-scaling yarn` means "on", not "on at zero strength".
+                if self.ext_factor.is_none() && c.rope_ext_factor == 0.0 {
+                    c.rope_ext_factor = 1.0;
+                }
+            }
+            _ => {}
+        }
+        if let Some(v) = self.ext_factor {
+            c.rope_ext_factor = v;
+            changed.push(format!("yarn ext_factor {v}"));
+        }
+        if let Some(v) = self.attn_factor {
+            c.rope_attn_factor = v;
+            changed.push(format!("yarn attn_factor {v}"));
+        }
+        if let Some(v) = self.beta_fast {
+            c.rope_beta_fast = v;
+            changed.push(format!("yarn beta_fast {v}"));
+        }
+        if let Some(v) = self.beta_slow {
+            c.rope_beta_slow = v;
+            changed.push(format!("yarn beta_slow {v}"));
+        }
+        if let Some(v) = self.orig_ctx {
+            c.rope_orig_ctx = v;
+            changed.push(format!("yarn orig_ctx {v}"));
+        }
+        if !changed.is_empty() {
+            bigtea_arch::info!("rope       overridden: {}", changed.join(", "));
+        }
+    }
+}
+
 /// How the terminal side behaves — llama.cpp's interaction flags.
 ///
 /// Grouped rather than passed individually because they are all "how it talks
@@ -97,6 +178,8 @@ impl TokenWriter {
 #[derive(Clone, Default)]
 struct Ui {
     interactive: bool,
+    /// Take a turn from the user before generating anything.
+    interactive_first: bool,
     conversation: bool,
     single_turn: bool,
     multiline: bool,
@@ -202,6 +285,212 @@ fn unescape(text: &str) -> String {
     out
 }
 
+/// A saved KV cache, so a repeated prompt does not pay prefill twice.
+///
+/// # Why this earns its complexity
+///
+/// Prefill is the expensive half for anything with a long prompt: a system
+/// prompt plus a document is thousands of tokens of work before the first token
+/// of the answer. Re-running the same prefix every invocation is the single
+/// largest avoidable cost in an agent loop, and llama.cpp's `--prompt-cache`
+/// exists for exactly that.
+///
+/// # Format, and why every field is checked
+///
+/// ```text
+/// "BTPC" u32 version  u64 fingerprint  u32 kv_type  u32 layers
+/// u32 positions       u32 n_tokens     [u32; n_tokens] tokens
+/// per layer: u64 len, k bytes, u64 len, v bytes
+/// ```
+///
+/// The **fingerprint** is the shape the cache was built with. Restoring keys
+/// computed by a different model, or with a different KV quantisation, is not
+/// an error anywhere downstream — attention simply reads numbers that mean
+/// nothing, and the answer is fluent and wrong. So a mismatch discards the
+/// file rather than trying to use part of it.
+struct PromptCache;
+
+impl PromptCache {
+    const MAGIC: &'static [u8; 4] = b"BTPC";
+    const VERSION: u32 = 1;
+
+    /// Shape the cache depends on. Any change invalidates every saved file.
+    fn fingerprint(config: &Qwen3Config, kv: bigtea_arch::KvType) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64; // FNV-1a
+        for part in [
+            config.n_layer as u64,
+            config.n_embd as u64,
+            config.n_head as u64,
+            config.n_head_kv as u64,
+            config.head_dim as u64,
+            config.vocab_size as u64,
+            kv.ggml_type() as u64,
+        ] {
+            h ^= part;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Read a saved cache, returning its tokens and per-layer bytes.
+    ///
+    /// Any inconsistency returns `None`: a prompt cache is an optimisation, and
+    /// failing to use one must never fail the run.
+    #[allow(clippy::type_complexity)]
+    fn load(path: &str, want: u64) -> Option<(Vec<u32>, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let data = std::fs::read(path).ok()?;
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Option<&[u8]> {
+            let end = at.checked_add(n)?;
+            let out = data.get(at..end)?;
+            at = end;
+            Some(out)
+        };
+        if take(4)? != Self::MAGIC {
+            return None;
+        }
+        let u32_at = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        if u32_at(take(4)?) != Self::VERSION {
+            return None;
+        }
+        let fp = u64::from_le_bytes(take(8)?.try_into().ok()?);
+        if fp != want {
+            return None;
+        }
+        let _kv = u32_at(take(4)?);
+        let layers = u32_at(take(4)?) as usize;
+        let _positions = u32_at(take(4)?) as usize;
+        let n_tokens = u32_at(take(4)?) as usize;
+        let mut tokens = Vec::with_capacity(n_tokens);
+        for _ in 0..n_tokens {
+            tokens.push(u32_at(take(4)?));
+        }
+        let mut per_layer = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            let kn = u64::from_le_bytes(take(8)?.try_into().ok()?) as usize;
+            let k = take(kn)?.to_vec();
+            let vn = u64::from_le_bytes(take(8)?.try_into().ok()?) as usize;
+            let v = take(vn)?.to_vec();
+            per_layer.push((k, v));
+        }
+        Some((tokens, per_layer))
+    }
+
+    /// Write the cache covering `tokens`.
+    fn save(path: &str, fingerprint: u64, cache: &KvCache, tokens: &[u32]) -> std::io::Result<u64> {
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(Self::MAGIC);
+        out.extend_from_slice(&Self::VERSION.to_le_bytes());
+        out.extend_from_slice(&fingerprint.to_le_bytes());
+        out.extend_from_slice(&cache.kind().ggml_type().to_le_bytes());
+        out.extend_from_slice(&(cache.layers() as u32).to_le_bytes());
+        out.extend_from_slice(&(cache.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+        for t in tokens {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        for layer in 0..cache.layers() {
+            let k = cache.keys(layer);
+            let v = cache.values(layer);
+            out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            out.extend_from_slice(k);
+            out.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            out.extend_from_slice(v);
+        }
+        std::fs::write(path, &out)?;
+        Ok(out.len() as u64)
+    }
+}
+
+/// How many leading tokens two sequences share.
+fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// Apply `--chat-template`, refusing a name this build does not implement.
+///
+/// Both engine paths call it: the dense one and V4-Flash build their
+/// tokenizers separately, and a flag honoured on only one of them is the
+/// failure `-t` had for weeks.
+fn force_chat_template(
+    tokenizer: &mut Tokenizer,
+    name: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(name) = name else {
+        return Ok(());
+    };
+    match bigtea_tokenizer::ChatFormat::from_name(name) {
+        Some(fmt) => {
+            bigtea_arch::info!("chat       forced to the {} template", fmt.name());
+            tokenizer.set_chat_format(fmt);
+            Ok(())
+        }
+        // Refused rather than falling back to the generic framing: a template
+        // silently not applied is a model answering the wrong question
+        // fluently, which is this project's most expensive failure.
+        None => Err(format!(
+            "--chat-template: unknown template {name:?}. Known: {}",
+            bigtea_tokenizer::ChatFormat::known_names().join(", ")
+        )
+        .into()),
+    }
+}
+
+/// Pin every resident tensor in physical memory.
+///
+/// The ceiling is raised **once, for the whole set**, before any tensor is
+/// locked: doing it per tensor would raise the quota N times and still fail on
+/// the first large one, since the quota is a total rather than a per-call
+/// limit.
+///
+/// A failure is counted rather than aborting. A partially locked residency is
+/// still better than none, and the caller reports how much actually took.
+fn lock_resident(weights: &WeightSet<'_>) -> bigtea_io::lock::LockReport {
+    let mut report = bigtea_io::lock::LockReport::default();
+    let slices = weights.bound_slices();
+    let total: u64 = slices.iter().map(|s| s.len() as u64).sum();
+    if let Err(e) = bigtea_io::lock::reserve_working_set(total) {
+        report.failed_bytes = total;
+        report.reason = e;
+        return report;
+    }
+    for bytes in slices {
+        match bigtea_io::lock::lock_bytes(bytes) {
+            Ok(()) => report.locked_bytes += bytes.len() as u64,
+            Err(e) => {
+                report.failed_bytes += bytes.len() as u64;
+                if report.reason.is_empty() {
+                    report.reason = e;
+                }
+            }
+        }
+    }
+    report
+}
+
+/// Parse `key=type:value` for `--override-kv`.
+///
+/// llama.cpp's spelling exactly, because muscle memory is the point of
+/// matching a CLI. Returns `None` on anything malformed so the caller can
+/// refuse the run: an override silently dropped is worse than no override,
+/// since the user believes the container has been corrected.
+fn parse_override(spec: &str) -> Option<(String, bigtea_gguf::Value)> {
+    let (key, rest) = spec.split_once('=')?;
+    let (ty, raw) = rest.split_once(':')?;
+    let value = match ty.trim().to_ascii_lowercase().as_str() {
+        "int" | "i32" | "i64" | "u32" | "u64" => bigtea_gguf::Value::I64(raw.trim().parse().ok()?),
+        "float" | "f32" | "f64" => bigtea_gguf::Value::F32(raw.trim().parse().ok()?),
+        "bool" => bigtea_gguf::Value::Bool(match raw.trim() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            _ => return None,
+        }),
+        "str" | "string" => bigtea_gguf::Value::String(raw.to_string()),
+        _ => return None,
+    };
+    Some((key.trim().to_string(), value))
+}
+
 /// Apply the model's chat template when asked, and say which one was used.
 ///
 /// An instruct model trained on `<|im_start|>user` does not fail on raw text —
@@ -217,12 +506,12 @@ fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool, system: Option<&str>)
     }
     let format = tokenizer.chat_format();
     if format.is_known() {
-        println!("chat       {} template", format.name());
+        bigtea_arch::info!("chat       {} template", format.name());
     } else {
         // Do not pretend. An unrecognised template framed as someone else's is
         // how a model quietly answers the wrong question.
-        println!("chat       template not recognised -- using a plain framing;");
-        println!("           the model may not respond as an assistant.");
+        bigtea_arch::info!("chat       template not recognised -- using a plain framing;");
+        bigtea_arch::info!("           the model may not respond as an assistant.");
     }
     let mut messages = Vec::new();
     if let Some(sys) = system {
@@ -267,12 +556,14 @@ fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool, system: Option<&str>)
 /// matches: it defaults to 512 and different windowing gives a different number
 /// on the same file and the same model. Compare the two only with the same
 /// `--ppl-chunk` and the same corpus, and say so when quoting.
+#[allow(clippy::too_many_arguments)]
 fn perplexity_run(
     runner: &mut bigtea_arch::StreamingRunner<'_>,
     weights: &WeightSet<'_>,
     config: &Qwen3Config,
     tokens: &[u32],
     chunk_size: usize,
+    kv_type: bigtea_arch::KvType,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let vocab = config.vocab_size as usize;
@@ -292,10 +583,11 @@ fn perplexity_run(
         if chunk.len() < chunk_size {
             break;
         }
-        let mut cache = KvCache::new(
+        let mut cache = KvCache::with_type(
             config.n_layer as usize,
             config.n_head_kv as usize,
             config.head_dim as usize,
+            kv_type,
         );
         // Every position is still *evaluated* — the context has to be built —
         // but only the second half is scored.
@@ -321,7 +613,7 @@ fn perplexity_run(
         }
         chunks += 1;
         let ppl = (total_nll / counted as f64).exp();
-        println!(
+        bigtea_arch::info!(
             "chunk {chunks:>4}   {counted:>7} tokens   ppl {ppl:.4}   ({:.1}s)",
             start.elapsed().as_secs_f64()
         );
@@ -336,12 +628,14 @@ fn perplexity_run(
     }
     let ppl = (total_nll / counted as f64).exp();
     println!();
-    println!("perplexity {ppl:.4} over {counted} tokens in {chunks} chunks of {chunk_size}");
-    println!(
+    bigtea_arch::info!(
+        "perplexity {ppl:.4} over {counted} tokens in {chunks} chunks of {chunk_size}"
+    );
+    bigtea_arch::info!(
         "           mean NLL {:.4} nats/token",
         total_nll / counted as f64
     );
-    println!("total      {:.1}s", t0.elapsed().as_secs_f64());
+    bigtea_arch::info!("total      {:.1}s", t0.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -403,67 +697,134 @@ fn dense_max_tokens(config: &Qwen3Config, budget: u64) -> i64 {
     lo
 }
 
+/// The full option list. One place, so `--help`, `-h` and a bare
+/// invocation cannot drift apart.
+fn usage() -> ExitCode {
+    eprintln!("usage: bigtea-run <model.gguf> \"prompt\" [options]");
+    eprintln!();
+    eprintln!("  -n N                tokens to generate");
+    eprintln!("  -f FILE             read the prompt from a file");
+    eprintln!("  -b N                prefill block size");
+    eprintln!("  --cache GIB         expert cache budget");
+    eprintln!("  --temp T            0 = greedy (default)");
+    eprintln!("  --top-k K           0 = off");
+    eprintln!("  --top-p P           1.0 = off");
+    eprintln!("  --min-p P           0.0 = off");
+    eprintln!("  --repeat-penalty R  1.0 = off");
+    eprintln!("  --frequency-penalty F  subtract F x count. 0 = off");
+    eprintln!("  --presence-penalty P   subtract P if used at all. 0 = off");
+    eprintln!("  --repeat-last-n N   penalty window (default 64)");
+    eprintln!("  --typical P         locally typical sampling. 1.0 = off");
+    eprintln!("  --top-nsigma N      keep logits within N sigma of the max. 0 = off");
+    eprintln!("  --dynatemp-range R  entropy-driven temperature spread. 0 = off");
+    eprintln!("  --dynatemp-exp E    how sharply it reacts (default 1.0)");
+    eprintln!("  --xtc-probability P exclude top choices, chance per token. 0 = off");
+    eprintln!("  --xtc-threshold T   XTC only considers tokens above this (default 0.1)");
+    eprintln!("  --mirostat N        0 off, 1 v1, 2 v2 -- targets a surprise, not a mass");
+    eprintln!("  --mirostat-ent TAU  target surprise in bits (default 5.0)");
+    eprintln!("  --mirostat-lr ETA   mirostat learning rate (default 0.1)");
+    eprintln!("  --logit-bias ID+B   nudge one token, repeatable (e.g. 42-100)");
+    eprintln!("  --ignore-eos        never stop at end-of-sequence");
+    eprintln!("  --dry-multiplier M  DRY repetition penalty. 0 = off");
+    eprintln!("  --dry-base B        DRY growth per extra repeated token (1.75)");
+    eprintln!("  --dry-allowed-length N  repeats shorter than this are free (2)");
+    eprintln!("  --dry-penalty-last-n N  how far DRY looks back. 0 = all");
+    eprintln!("  --dry-sequence-breaker S  a match may not cross this, repeatable");
+    eprintln!("  --samplers SPEC     chain order, e.g. \"top_k;temperature;top_p\"");
+    eprintln!("  -ctk, -ctv TYPE     KV cache storage: f16 (default) or q8_0");
+    eprintln!("  --no-direct-io      read through the page cache (also --no-mmap)");
+    eprintln!("  --direct-io         bypass the page cache (default)");
+    eprintln!("  --override-kv K=T:V override one GGUF metadata entry");
+    eprintln!("  --mlock             pin resident weights so the OS cannot page them out");
+    eprintln!("  --chat-template N   force a chat template (chatml, llama3, gemma, ...)");
+    eprintln!("  --prompt-cache F    reuse a saved KV cache for a repeated prefix");
+    eprintln!("  --prompt-cache-all  also cache what was generated, not just the prompt");
+    eprintln!("  --prompt-cache-ro   read the cache but never write it");
+    eprintln!("  -i, --interactive   keep the session open and take turns");
+    eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
+    eprintln!("  -st, --single-turn  one exchange, then exit");
+    eprintln!("  --multiline-input   a trailing backslash continues the line");
+    eprintln!("  --in-prefix S       wrap user input (non-conversation mode)");
+    eprintln!("  --in-suffix S       ...and after it");
+    eprintln!("  --in-prefix-bos     prepend BOS to each user turn");
+    eprintln!("  -sys, --system-prompt S   system message (implies a template)");
+    eprintln!("  --system-prompt-file F    ...read from a file");
+    eprintln!("  -co, --color        colour the generated text");
+    eprintln!("  --simple-io         no ANSI, for pipes and logs");
+    eprintln!("  --no-display-prompt do not echo the prompt back");
+    eprintln!("  -sp, --special      show control tokens instead of hiding them");
+    eprintln!("  --print-token-count report prompt and generated counts");
+    eprintln!("  --verbose-prompt    print the tokenised prompt and its ids");
+    eprintln!("  -e, --escape        process backslash escapes in -p (default on)");
+    eprintln!("  --no-escape         take -p literally");
+    eprintln!("  -r, --reverse-prompt S    llama.cpp's name for --stop");
+    eprintln!("  --rope-freq-base B  override the container's RoPE base");
+    eprintln!("  --rope-freq-scale S linear RoPE scaling (1.0 = off)");
+    eprintln!("  --rope-scale N      context multiplier (= 1 / freq-scale)");
+    eprintln!("  --rope-scaling T    none | linear | yarn");
+    eprintln!("  --yarn-ext-factor F   YaRN mix (0 = pure linear)");
+    eprintln!("  --yarn-attn-factor F  YaRN magnitude correction");
+    eprintln!("  --yarn-beta-fast F    YaRN high-frequency cutoff");
+    eprintln!("  --yarn-beta-slow F    YaRN low-frequency cutoff");
+    eprintln!("  --yarn-orig-ctx N     context the model was trained at");
+    eprintln!("  --log-disable       silence the status lines");
+    eprintln!("  --log-file F        write status to a file instead of stderr");
+    eprintln!("  --log-timestamps    prefix each status line with elapsed time");
+    eprintln!("  --log-prefix        prefix each status line with its level");
+    eprintln!("  -v, --verbose       verbosity 2");
+    eprintln!("  --verbosity N       0 quiet, 1 normal, 2+ verbose");
+    eprintln!("  --no-perf           omit the timing summary");
+    eprintln!("  --version           print the version and exit");
+    eprintln!("  --perplexity        score a corpus instead of generating");
+    eprintln!("  --ppl-chunk N       perplexity chunk size (default 512)");
+    eprintln!("  --seed S            reproducible sampling");
+    eprintln!("  --llamacpp-defaults temp 0.8, top-k 40, top-p 0.95, min-p 0.05, repeat 1.1");
+    eprintln!("  --chat              apply the model's chat template to the prompt");
+    eprintln!("  -t, --threads N     threads for generation (default: measured -- generation");
+    eprintln!("                      is bandwidth-bound and all cores is 1.7x SLOWER)");
+    eprintln!("  -tb, --threads-batch N  threads for prefill (default: all cores)");
+    eprintln!("  -c, --ctx-size N    cap the context; refuses past it rather than aborting");
+    eprintln!("  --stop TEXT         stop when this appears (repeatable)");
+    eprintln!("  --force             run an unverified architecture anyway");
+    eprintln!("  --no-repack         keep resident weights in their stored layout");
+    eprintln!("                      (repacking is on by default: 1.35x prefill)");
+    ExitCode::from(2)
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
-    let Some(path) = args.next() else {
-        eprintln!("usage: bigtea-run <model.gguf> \"prompt\" [options]");
-        eprintln!();
-        eprintln!("  -n N                tokens to generate");
-        eprintln!("  -f FILE             read the prompt from a file");
-        eprintln!("  -b N                prefill block size");
-        eprintln!("  --cache GIB         expert cache budget");
-        eprintln!("  --temp T            0 = greedy (default)");
-        eprintln!("  --top-k K           0 = off");
-        eprintln!("  --top-p P           1.0 = off");
-        eprintln!("  --min-p P           0.0 = off");
-        eprintln!("  --repeat-penalty R  1.0 = off");
-        eprintln!("  --frequency-penalty F  subtract F x count. 0 = off");
-        eprintln!("  --presence-penalty P   subtract P if used at all. 0 = off");
-        eprintln!("  --repeat-last-n N   penalty window (default 64)");
-        eprintln!("  --typical P         locally typical sampling. 1.0 = off");
-        eprintln!("  --top-nsigma N      keep logits within N sigma of the max. 0 = off");
-        eprintln!("  --dynatemp-range R  entropy-driven temperature spread. 0 = off");
-        eprintln!("  --dynatemp-exp E    how sharply it reacts (default 1.0)");
-        eprintln!("  --xtc-probability P exclude top choices, chance per token. 0 = off");
-        eprintln!("  --xtc-threshold T   XTC only considers tokens above this (default 0.1)");
-        eprintln!("  --mirostat N        0 off, 1 v1, 2 v2 -- targets a surprise, not a mass");
-        eprintln!("  --mirostat-ent TAU  target surprise in bits (default 5.0)");
-        eprintln!("  --mirostat-lr ETA   mirostat learning rate (default 0.1)");
-        eprintln!("  --logit-bias ID+B   nudge one token, repeatable (e.g. 42-100)");
-        eprintln!("  --ignore-eos        never stop at end-of-sequence");
-        eprintln!("  -i, --interactive   keep the session open and take turns");
-        eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
-        eprintln!("  -st, --single-turn  one exchange, then exit");
-        eprintln!("  --multiline-input   a trailing backslash continues the line");
-        eprintln!("  --in-prefix S       wrap user input (non-conversation mode)");
-        eprintln!("  --in-suffix S       ...and after it");
-        eprintln!("  --in-prefix-bos     prepend BOS to each user turn");
-        eprintln!("  -sys, --system-prompt S   system message (implies a template)");
-        eprintln!("  --system-prompt-file F    ...read from a file");
-        eprintln!("  -co, --color        colour the generated text");
-        eprintln!("  --simple-io         no ANSI, for pipes and logs");
-        eprintln!("  --no-display-prompt do not echo the prompt back");
-        eprintln!("  -sp, --special      show control tokens instead of hiding them");
-        eprintln!("  --print-token-count report prompt and generated counts");
-        eprintln!("  --verbose-prompt    print the tokenised prompt and its ids");
-        eprintln!("  -e, --escape        process backslash escapes in -p (default on)");
-        eprintln!("  --no-escape         take -p literally");
-        eprintln!("  -r, --reverse-prompt S    llama.cpp's name for --stop");
-        eprintln!("  --perplexity        score a corpus instead of generating");
-        eprintln!("  --ppl-chunk N       perplexity chunk size (default 512)");
-        eprintln!("  --seed S            reproducible sampling");
-        eprintln!("  --llamacpp-defaults temp 0.8, top-k 40, top-p 0.95, min-p 0.05, repeat 1.1");
-        eprintln!("  --chat              apply the model's chat template to the prompt");
-        eprintln!("  -t, --threads N     threads for generation (default: measured -- generation");
-        eprintln!("                      is bandwidth-bound and all cores is 1.7x SLOWER)");
-        eprintln!("  -tb, --threads-batch N  threads for prefill (default: all cores)");
-        eprintln!("  -c, --ctx-size N    cap the context; refuses past it rather than aborting");
-        eprintln!("  --stop TEXT         stop when this appears (repeatable)");
-        eprintln!("  --force             run an unverified architecture anyway");
-        eprintln!("  --no-repack         keep resident weights in their stored layout");
-        eprintln!("                      (repacking is on by default: 1.35x prefill)");
-        return ExitCode::from(2);
-    };
+    // `-m model.gguf` puts a flag where the positional path used to be, so the
+    // first argument is only treated as the path when it is not one. Without
+    // this, `bigtea-run -m x.gguf -p "hi"` tries to open a file called `-m`.
+    let leads_with_flag = std::env::args()
+        .nth(1)
+        .map(|a| a.starts_with('-') && a != "-")
+        .unwrap_or(false);
+    // Before the positional model path is taken. `--version` as the first
+    // argument would otherwise *be* the path, and the runner would report that
+    // it cannot open a file called `--version`.
+    if let Some(first) = std::env::args().nth(1) {
+        if first == "--usage" {
+            // llama.cpp's alias for --help. Falls through to the usage block
+            // by leaving `path` unset.
+            eprintln!("usage: bigtea-run <model.gguf> \"prompt\" [options]");
+            eprintln!("  run with no arguments for the full option list");
+            return ExitCode::from(2);
+        }
+        if first == "--version" {
+            println!("bigtea-run {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        if first == "--help" || first == "-h" {
+            // Falls into the usage block below by leaving `path` unset, so
+            // there is one list rather than two that drift apart.
+            return usage();
+        }
+    }
+    let path_positional = if leads_with_flag { None } else { args.next() };
+    if path_positional.is_none() && !leads_with_flag {
+        return usage();
+    }
     let mut prompt = String::new();
     let mut n_predict = 8usize;
     // A block reads nearly the whole expert set whatever its size, so larger
@@ -486,15 +847,34 @@ fn main() -> ExitCode {
         ..Ui::default()
     };
     let mut escape = true;
+    let mut rope = RopeOverrides::default();
+    let mut logcfg = bigtea_arch::log::LogConfig::default();
+    // Held as text until a tokenizer exists to turn them into ids.
+    let mut dry_breakers: Vec<String> = Vec::new();
+    let mut kv_type = bigtea_arch::KvType::F16;
+    let mut overrides: Vec<(String, bigtea_gguf::Value)> = Vec::new();
+    let mut mlock = false;
+    let mut chat_template: Option<String> = None;
+    let mut model_flag: Option<String> = None;
+    let mut prompt_cache: Option<String> = None;
+    let mut prompt_cache_all = false;
+    let mut prompt_cache_ro = false;
+    let mut show_perf = true;
     let mut system_prompt: Option<String> = None;
     let mut ctx_size: Option<usize> = None;
     let mut stop: Vec<String> = Vec::new();
     let mut force = false;
-    let rest: Vec<String> = args.collect();
+    // With a leading flag nothing was consumed as the path, so every argument
+    // is a flag to parse.
+    let rest: Vec<String> = if leads_with_flag {
+        std::env::args().skip(1).collect()
+    } else {
+        args.collect()
+    };
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
-            "-n" => {
+            "-n" | "--n-predict" | "--predict" => {
                 n_predict = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(8);
                 i += 2;
             }
@@ -616,6 +996,11 @@ fn main() -> ExitCode {
             }
             // On by default -- it is 1.35x faster AND agrees with llama.cpp.
             // This turns it off, for measuring the difference.
+            // The default, spelled explicitly. llama.cpp has both, and a
+            // script passing --repack should not be told it is unknown.
+            "--repack" => {
+                i += 1;
+            }
             "--no-repack" => {
                 std::env::set_var("BIGTEA_NO_REPACK", "1");
                 i += 1;
@@ -633,9 +1018,247 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // Save and reuse the KV cache for a prompt prefix, so a repeated
+            // prompt does not pay prefill twice.
+            "--prompt-cache" => {
+                prompt_cache = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--prompt-cache-all" => {
+                prompt_cache_all = true;
+                i += 1;
+            }
+            "--prompt-cache-ro" => {
+                prompt_cache_ro = true;
+                i += 1;
+            }
+            // Force a chat format. Two cases make this necessary rather than a
+            // curiosity: a container with no template at all, and one whose
+            // template this build does not recognise. Both otherwise fall back
+            // to a plain framing the model was never trained on, and answer
+            // fluently and wrongly.
+            "--chat-template" => {
+                chat_template = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            // Pin the resident set in physical memory. Bigtea decides what
+            // stays in RAM; that decision is undone if the OS pages it out.
+            "--mlock" => {
+                mlock = true;
+                i += 1;
+            }
+            // --- I/O mode and metadata overrides --------------------------
+            "--direct-io" => {
+                std::env::set_var("BIGTEA_IO", "direct");
+                i += 1;
+            }
+            // Also llama.cpp's --no-mmap: it means "do not let the OS page
+            // cache hold the weights", which is what direct I/O already does
+            // here, so the two spellings land on the same switch.
+            "--no-direct-io" | "--no-mmap" => {
+                std::env::set_var("BIGTEA_IO", "buffered");
+                i += 1;
+            }
+            "--override-kv" => {
+                match rest.get(i + 1).and_then(|spec| parse_override(spec)) {
+                    Some(kv) => overrides.push(kv),
+                    None => {
+                        eprintln!(
+                            "bigtea-run: --override-kv: expected key=type:value, got {:?}",
+                            rest.get(i + 1).cloned().unwrap_or_default()
+                        );
+                        eprintln!("  types: int, float, bool, str");
+                        eprintln!("  e.g. --override-kv qwen3.rope.freq_base=float:1000000");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            // --- KV cache storage type ------------------------------------
+            // One type for both halves: ggml's banded attention asserts
+            // k->type == v->type, so accepting different ones would work until
+            // that path was reached. Both spellings are taken and the last
+            // wins, which is what a user passing `-ctk q8_0 -ctv q8_0` means.
+            "--cache-type-k" | "-ctk" | "--cache-type-v" | "-ctv" => {
+                match rest.get(i + 1).and_then(|v| bigtea_arch::KvType::parse(v)) {
+                    Some(t) => kv_type = t,
+                    None => {
+                        eprintln!(
+                            "bigtea-run: {}: unknown cache type {:?}",
+                            rest[i],
+                            rest.get(i + 1).cloned().unwrap_or_default()
+                        );
+                        eprintln!("  known: f16, q8_0");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            // The chain order itself. Refused wholesale on an unknown name
+            // rather than dropping that stage: a typo would otherwise remove a
+            // filter the user is relying on, silently.
+            "--samplers" | "--sampler-seq" | "--sampling-seq" => {
+                if let Some(spec) = rest.get(i + 1) {
+                    let mut chain = Vec::new();
+                    let mut bad: Option<String> = None;
+                    for name in spec.split([';', ',']).filter(|n| !n.trim().is_empty()) {
+                        match bigtea_arch::SamplerStage::parse(name) {
+                            Some(stage) => chain.push(stage),
+                            None => {
+                                bad = Some(name.trim().to_string());
+                                break;
+                            }
+                        }
+                    }
+                    match bad {
+                        Some(name) => {
+                            // Built as separate lines: a `\` continuation in a
+                            // Rust string keeps the source indentation and
+                            // prints a ragged message, which is how the SSE
+                            // headers went out malformed earlier.
+                            eprintln!("bigtea-run: --samplers: unknown stage {name:?}");
+                            eprintln!(
+                                "  known stages: top_k, typ_p, top_p, min_p, xtc, temperature"
+                            );
+                            eprintln!(
+                                "  penalties, dry and top_n_sigma act on logits and always run first"
+                            );
+                            return ExitCode::from(2);
+                        }
+                        None if chain.is_empty() => {
+                            eprintln!("bigtea-run: --samplers: empty chain");
+                            return ExitCode::from(2);
+                        }
+                        None => sampler.chain = chain,
+                    }
+                }
+                i += 2;
+            }
+            // --- DRY: penalise continuing a repeat, not reusing a word -----
+            "--dry-multiplier" => {
+                sampler.dry_multiplier =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                i += 2;
+            }
+            "--dry-base" => {
+                sampler.dry_base = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1.75);
+                i += 2;
+            }
+            "--dry-allowed-length" => {
+                sampler.dry_allowed_length =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(2);
+                i += 2;
+            }
+            "--dry-penalty-last-n" => {
+                sampler.dry_penalty_last_n =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                i += 2;
+            }
+            "--dry-sequence-breaker" => {
+                if let Some(v) = rest.get(i + 1) {
+                    dry_breakers.push(v.clone());
+                }
+                i += 2;
+            }
+            // --- logging: status is diagnostics, the text is output --------
+            "--log-disable" => {
+                logcfg.verbosity = 0;
+                i += 1;
+            }
+            "--log-file" => {
+                logcfg.file = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--log-timestamps" => {
+                logcfg.timestamps = true;
+                i += 1;
+            }
+            "--no-log-timestamps" => {
+                logcfg.timestamps = false;
+                i += 1;
+            }
+            "--log-prefix" => {
+                logcfg.prefix = true;
+                i += 1;
+            }
+            "--no-log-prefix" => {
+                logcfg.prefix = false;
+                i += 1;
+            }
+            "-v" | "--verbose" | "--log-verbose" => {
+                logcfg.verbosity = 2;
+                i += 1;
+            }
+            "--verbosity" | "--log-verbosity" => {
+                logcfg.verbosity = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1);
+                i += 2;
+            }
+            "--perf" => {
+                show_perf = true;
+                i += 1;
+            }
+            "--no-perf" => {
+                show_perf = false;
+                i += 1;
+            }
+            "--version" => {
+                println!("bigtea-run {}", env!("CARGO_PKG_VERSION"));
+                return ExitCode::SUCCESS;
+            }
+            // --- RoPE, for a container whose metadata is wrong or absent ---
+            "--rope-freq-base" => {
+                rope.freq_base = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--rope-freq-scale" => {
+                rope.freq_scale = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            // llama.cpp's --rope-scale is the context multiplier, i.e. the
+            // reciprocal of the frequency scale. Storing it unconverted would
+            // invert the meaning of every long-context flag.
+            "--rope-scale" => {
+                rope.freq_scale = rest
+                    .get(i + 1)
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|f| *f > 0.0)
+                    .map(|f| 1.0 / f);
+                i += 2;
+            }
+            "--rope-scaling" => {
+                rope.scaling = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--yarn-ext-factor" => {
+                rope.ext_factor = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--yarn-attn-factor" => {
+                rope.attn_factor = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--yarn-beta-fast" => {
+                rope.beta_fast = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--yarn-beta-slow" => {
+                rope.beta_slow = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--yarn-orig-ctx" => {
+                rope.orig_ctx = rest.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
             // --- interaction, llama.cpp's spellings ---------------------
             "-i" | "--interactive" => {
                 ui.interactive = true;
+                i += 1;
+            }
+            // llama.cpp's: interactive, but the user speaks first. Distinct
+            // from -i, which generates from the prompt and then waits.
+            "-if" | "--interactive-first" => {
+                ui.interactive = true;
+                ui.interactive_first = true;
                 i += 1;
             }
             "-cnv" | "--conversation" => {
@@ -761,7 +1384,7 @@ fn main() -> ExitCode {
                 sampler = SamplerConfig::llamacpp_defaults();
                 i += 1;
             }
-            "-b" => {
+            "-b" | "--batch-size" => {
                 prefill_block = rest
                     .get(i + 1)
                     .and_then(|v| v.parse().ok())
@@ -772,7 +1395,23 @@ fn main() -> ExitCode {
             // A long-context prompt does not fit on a command line; Windows
             // caps it around 32k characters, well under the token counts that
             // make streaming interesting.
-            "-f" => {
+            // llama.cpp names the model and the prompt with flags; this
+            // runner only ever took them positionally. Someone with the muscle
+            // memory types `-m model.gguf -p "..."`, and matching the spelling
+            // is the whole reason for copying a CLI.
+            "-m" | "--model" => {
+                if let Some(v) = rest.get(i + 1) {
+                    model_flag = Some(v.clone());
+                }
+                i += 2;
+            }
+            "-p" | "--prompt" => {
+                if let Some(v) = rest.get(i + 1) {
+                    prompt = v.clone();
+                }
+                i += 2;
+            }
+            "-f" | "--file" => {
                 let Some(file) = rest.get(i + 1) else {
                     eprintln!("bigtea-run: -f needs a file path");
                     return ExitCode::from(2);
@@ -805,7 +1444,12 @@ fn main() -> ExitCode {
         prompt = unescape(&prompt);
     }
     let prompt = prompt;
+    let Some(path) = model_flag.or(path_positional) else {
+        eprintln!("bigtea-run: no model given. Pass it positionally or with -m.");
+        return ExitCode::from(2);
+    };
 
+    bigtea_arch::log::configure(logcfg);
     match run(
         &path,
         &prompt,
@@ -819,6 +1463,16 @@ fn main() -> ExitCode {
         perplexity,
         ui,
         system_prompt,
+        rope,
+        show_perf,
+        dry_breakers,
+        kv_type,
+        overrides,
+        mlock,
+        chat_template,
+        prompt_cache,
+        prompt_cache_all,
+        prompt_cache_ro,
         ctx_size,
         stop,
         force,
@@ -852,6 +1506,12 @@ fn run_streaming(
     stop: Vec<String>,
     perplexity: Option<usize>,
     ui: Ui,
+    show_perf: bool,
+    kv_type: bigtea_arch::KvType,
+    mlock: bool,
+    prompt_cache: Option<String>,
+    prompt_cache_all: bool,
+    prompt_cache_ro: bool,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -913,7 +1573,7 @@ fn run_streaming(
         }
     };
     let mut runner = StreamingRunner::new(model, config.clone(), budget as usize);
-    println!(
+    bigtea_arch::info!(
         "cache      {:.2} GiB for experts (headroom {:.2} GiB: {:.2} kv + {:.2} arenas + 2.00 os)",
         budget as f64 / GIB,
         headroom as f64 / GIB,
@@ -925,15 +1585,48 @@ fn run_streaming(
     let mut weights = WeightSet::new();
     let load_start = std::time::Instant::now();
     let resident = runner.load_resident(&ctx, &mut weights)?;
+    if mlock {
+        let report = lock_resident(&weights);
+        if report.ok() {
+            // Says what is NOT covered, because the number is smaller than the
+            // resident line above and the difference looks like a bug. Repacked
+            // tensors live in `ggml`'s own arena, which this code has no
+            // address for — a partial lock stated plainly beats a total that
+            // quietly means something else.
+            let (n_repacked, repacked) = weights.repacked();
+            bigtea_arch::info!(
+                "mlock      {:.2} GiB pinned in physical memory{}",
+                report.locked_bytes as f64 / GIB,
+                if n_repacked > 0 {
+                    format!(
+                        "; {:.2} GiB of repacked weights are in ggml's arena and not covered",
+                        repacked as f64 / GIB
+                    )
+                } else {
+                    String::new()
+                }
+            );
+        } else {
+            // Loud, and not fatal. A partial lock still helps, but a user who
+            // asked for this must not believe it happened when it did not.
+            bigtea_arch::info!(
+                "mlock      FAILED for {:.2} GiB of {:.2}: {}",
+                report.failed_bytes as f64 / GIB,
+                (report.locked_bytes + report.failed_bytes) as f64 / GIB,
+                report.reason
+            );
+        }
+    }
+
     let (n_repacked, repacked_bytes) = weights.repacked();
-    println!(
+    bigtea_arch::info!(
         "resident   {} tensors, {:.2} GiB in {:.1}s (experts stream on demand)",
         weights.len(),
         resident as f64 / GIB,
         load_start.elapsed().as_secs_f64()
     );
     if n_repacked > 0 {
-        println!(
+        bigtea_arch::info!(
             "repacked   {n_repacked} tensors, {:.2} GiB in the CPU kernels' layout",
             repacked_bytes as f64 / GIB
         );
@@ -942,7 +1635,7 @@ fn run_streaming(
     // Say which counts are in use and where they came from. Generation settles
     // on a measured count, and an unexplained "2" on a 20-thread machine reads
     // as a bug rather than as the 1.8x it is worth.
-    println!(
+    bigtea_arch::info!(
         "threads    {} prefilling, generation {}",
         bigtea_arch::configured_threads_batch(),
         if std::env::var("BIGTEA_THREADS").is_ok() {
@@ -955,15 +1648,32 @@ fn run_streaming(
     let _ = arch;
     let prompt_len = tokens.len();
 
-    let mut cache = KvCache::new(
+    let mut cache = KvCache::with_type(
         config.n_layer as usize,
         config.n_head_kv as usize,
         config.head_dim as usize,
+        kv_type,
     );
+    if cache.kind() != kv_type {
+        bigtea_arch::info!(
+            "kv cache   {} refused: head_dim {} is not a multiple of 32, using {}",
+            kv_type.name(),
+            config.head_dim,
+            cache.kind().name()
+        );
+    }
     let vocab = config.vocab_size as usize;
 
     if let Some(chunk_size) = perplexity {
-        return perplexity_run(&mut runner, &weights, &config, &tokens, chunk_size, t0);
+        return perplexity_run(
+            &mut runner,
+            &weights,
+            &config,
+            &tokens,
+            chunk_size,
+            kv_type,
+            t0,
+        );
     }
 
     // Prefill in blocks. Attention holds n_total * n_new * n_head floats for
@@ -979,13 +1689,70 @@ fn run_streaming(
     let prefill_start = std::time::Instant::now();
     let mut logits: Vec<f32> = Vec::new();
     let mut pos = 0usize;
-    for block in tokens.chunks(prefill_block) {
+
+    // Reuse as much of a saved cache as the prompts share.
+    //
+    // Reusable only up to the FIRST DIFFERING TOKEN: past it, every stored key
+    // is conditioned on text that is no longer there, and attention would read
+    // it without complaint. So the cache is truncated to the common prefix
+    // rather than accepted or rejected whole — which is what makes it useful
+    // for a prompt that was edited rather than repeated exactly.
+    //
+    // The last prompt token is never restored: the forward pass has to run for
+    // at least one position to produce the logits that start generation.
+    let fingerprint = PromptCache::fingerprint(&config, cache.kind());
+    if let Some(path) = prompt_cache.as_deref() {
+        if let Some((saved_tokens, layers)) = PromptCache::load(path, fingerprint) {
+            let shared = common_prefix(&saved_tokens, &tokens).min(tokens.len().saturating_sub(1));
+            if shared > 0 && layers.len() == cache.layers() {
+                let mut ok = true;
+                for (layer, (k, v)) in layers.iter().enumerate() {
+                    if cache.restore_layer(layer, k, v).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    cache.set_positions(saved_tokens.len());
+                    cache.truncate_to(shared);
+                    pos = shared;
+                    bigtea_arch::info!(
+                        "prompt cache  reused {shared} of {} tokens from {path}",
+                        tokens.len()
+                    );
+                } else {
+                    // A shape that does not divide cleanly means the file was
+                    // written by a different build. Start over rather than
+                    // restoring part of it.
+                    cache.clear();
+                    bigtea_arch::info!("prompt cache  {path} does not match this cache shape");
+                }
+            }
+        }
+    }
+
+    for block in tokens[pos..].chunks(prefill_block) {
         logits = runner.forward_cached(&weights, &mut cache, block, pos)?;
         pos += block.len();
         debug_assert!(cache.is_consistent(), "kv cache layers fell out of step");
     }
+
+    if let Some(path) = prompt_cache.as_deref() {
+        if !prompt_cache_ro && !prompt_cache_all {
+            match PromptCache::save(path, fingerprint, &cache, &tokens) {
+                Ok(bytes) => bigtea_arch::info!(
+                    "prompt cache  wrote {:.1} MiB for {} tokens to {path}",
+                    bytes as f64 / (1 << 20) as f64,
+                    tokens.len()
+                ),
+                // Not fatal: a cache that cannot be written is a lost
+                // optimisation, not a failed run.
+                Err(e) => bigtea_arch::info!("prompt cache  could not write {path}: {e}"),
+            }
+        }
+    }
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
-    println!(
+    bigtea_arch::info!(
         "prefill    {prompt_len} tokens in {prefill_secs:.1}s ({:.2} tok/s)",
         prompt_len as f64 / prefill_secs.max(1e-9)
     );
@@ -1004,13 +1771,23 @@ fn run_streaming(
 
     // One iteration per exchange. A non-interactive run takes the `break` at
     // the bottom on its first pass, so its behaviour is exactly what it was.
+    // `--interactive-first`: the user speaks before the model does. Skipping
+    // the first generation rather than duplicating the turn-reading code below
+    // keeps one path for appending a turn to the cache.
+    let mut skip_generation = ui.interactive_first;
     loop {
         // Stop sequences are matched against the accumulated text, not the
         // token: a stop string can straddle a token boundary and per-token
         // matching would miss most of them. Reset per turn, or a stop string
         // from an earlier answer would end this one immediately.
         let mut generated_text = String::new();
-        for step in 0..n_predict {
+        let this_turn = if skip_generation {
+            skip_generation = false;
+            0
+        } else {
+            n_predict
+        };
+        for step in 0..this_turn {
             if logits.len() < vocab {
                 return Err(format!("logits too small: {} < {vocab}", logits.len()).into());
             }
@@ -1035,7 +1812,7 @@ fn run_streaming(
 
             // Only the new token needs computing; history lives in the cache.
             // Skipped on the last step — nothing would read those logits.
-            if step + 1 < n_predict {
+            if step + 1 < this_turn {
                 logits = runner.forward_cached(&weights, &mut cache, &[next], pos)?;
                 pos += 1;
             }
@@ -1077,6 +1854,21 @@ fn run_streaming(
         pos += next_tokens.len();
     }
 
+    // `--prompt-cache-all` extends the cache over what was generated too, so a
+    // continued conversation resumes instead of re-reading its own answer.
+    if let Some(path) = prompt_cache.as_deref() {
+        if prompt_cache_all && !prompt_cache_ro {
+            match PromptCache::save(path, fingerprint, &cache, &tokens) {
+                Ok(bytes) => bigtea_arch::info!(
+                    "prompt cache  wrote {:.1} MiB for {} tokens (prompt + generated) to {path}",
+                    bytes as f64 / (1 << 20) as f64,
+                    tokens.len()
+                ),
+                Err(e) => bigtea_arch::info!("prompt cache  could not write {path}: {e}"),
+            }
+        }
+    }
+
     let secs = gen_start.elapsed().as_secs_f64();
     let produced = tokens.len().saturating_sub(prompt_len);
     if ui.print_token_count {
@@ -1084,25 +1876,28 @@ fn run_streaming(
     }
     let _ = turns;
     println!("\n");
-    println!(
+    bigtea_arch::info!(
         "generated  {produced} tokens in {secs:.1}s ({:.2} tok/s)",
         produced as f64 / secs.max(1e-9)
     );
-    println!(
-        "kv cache   {} positions, {:.1} MiB",
+    bigtea_arch::info!(
+        "kv cache   {} positions, {:.1} MiB, {}",
         cache.len(),
-        cache.bytes() as f64 / (1 << 20) as f64
+        cache.bytes() as f64 / (1 << 20) as f64,
+        cache.kind().name()
     );
-    println!("streaming  {}", runner.stats);
+    if show_perf {
+        bigtea_arch::info!("streaming  {}", runner.stats);
+    }
     // What the tuner settled on. Printed even when it did not finish, because
     // "still tuning after N tokens" explains an odd tok/s that would otherwise
     // look like a regression.
     let (settled, done) = runner.generation_threads();
-    println!(
+    bigtea_arch::info!(
         "threads    generation used {settled}{}",
         if done { "" } else { " (still tuning)" }
     );
-    println!("total      {:.1}s", t0.elapsed().as_secs_f64());
+    bigtea_arch::info!("total      {:.1}s", t0.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -1122,6 +1917,16 @@ fn run(
     perplexity: Option<usize>,
     ui: Ui,
     system_prompt: Option<String>,
+    rope: RopeOverrides,
+    show_perf: bool,
+    dry_breakers: Vec<String>,
+    kv_type: bigtea_arch::KvType,
+    overrides: Vec<(String, bigtea_gguf::Value)>,
+    mlock: bool,
+    chat_template: Option<String>,
+    prompt_cache: Option<String>,
+    prompt_cache_all: bool,
+    prompt_cache_ro: bool,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -1137,7 +1942,15 @@ fn run(
     }
 
     // --- container ---------------------------------------------------------
-    let model = Model::open_split(path)?;
+    let mut model = Model::open_split(path)?;
+    // Applied before anything reads the metadata, and reported: a wrong
+    // override is indistinguishable from a wrong container unless the run says
+    // which one it used.
+    for (key, value) in &overrides {
+        bigtea_arch::info!("override   {key} = {value:?}");
+        model.override_metadata(key, value.clone());
+    }
+    let model = model;
 
     // Refuse an architecture nobody has checked, rather than answering wrongly
     // and confidently. Gemma-2 loads through the generic dense path with no
@@ -1187,8 +2000,10 @@ fn run(
     // DeepSeek-V4-Flash shares the residency and streaming machinery but almost
     // none of the graph, so it gets its own path rather than a config branch.
     if model.architecture() == "deepseek4" {
-        println!("model      {} ({})", model.architecture(), model.io_mode());
-        let tokenizer = Tokenizer::from_metadata(model.metadata())?;
+        bigtea_arch::info!("model      {} ({})", model.architecture(), model.io_mode());
+        let mut tokenizer = Tokenizer::from_metadata(model.metadata())?;
+        force_chat_template(&mut tokenizer, chat_template.as_deref())?;
+        let tokenizer = tokenizer;
         let prompt = &framed(
             &tokenizer,
             prompt,
@@ -1208,23 +2023,30 @@ fn run(
         return Ok(());
     }
 
-    let config = Qwen3Config::from_model(&model)?;
+    let mut config = Qwen3Config::from_model(&model)?;
+    rope.apply(&mut config);
+    let config = config;
     let arch = Qwen3Model::new(config.clone());
 
-    println!("model      {} ({})", model.architecture(), model.io_mode());
-    println!(
+    bigtea_arch::info!("model      {} ({})", model.architecture(), model.io_mode());
+    bigtea_arch::info!(
         "shape      {} layers, {} embd, {} heads ({} kv), head_dim {}",
-        config.n_layer, config.n_embd, config.n_head, config.n_head_kv, config.head_dim
+        config.n_layer,
+        config.n_embd,
+        config.n_head,
+        config.n_head_kv,
+        config.head_dim
     );
     if config.is_moe() {
-        println!(
+        bigtea_arch::info!(
             "experts    {} total, {} per token",
-            config.n_expert, config.n_expert_used
+            config.n_expert,
+            config.n_expert_used
         );
     } else {
-        println!("experts    none (dense)");
+        bigtea_arch::info!("experts    none (dense)");
     }
-    println!(
+    bigtea_arch::info!(
         "attention  {} rope, per-head QK norm {}",
         if config.rope_type == 0 {
             "NORM"
@@ -1237,19 +2059,61 @@ fn run(
         // Say it rather than let the user discover it in the output. Both RoPE
         // conventions run without error on either layout, so a wrong guess is
         // fluent nonsense and nothing downstream can detect it.
-        println!(
+        bigtea_arch::info!(
             "           NOTE: {:?} is not an architecture this build has verified.",
             model.architecture()
         );
-        println!("           NeoX rope and the tensor layout are assumed. If the output");
-        println!("           is fluent but wrong, that assumption is the first suspect.");
+        bigtea_arch::info!("           NeoX rope and the tensor layout are assumed. If the output");
+        bigtea_arch::info!("           is fluent but wrong, that assumption is the first suspect.");
     }
 
     // Fail on a missing tensor now, not at layer 37.
     arch.verify(&model)?;
 
     // --- tokenizer ---------------------------------------------------------
-    let tokenizer = Tokenizer::from_metadata(model.metadata())?;
+    let mut tokenizer = Tokenizer::from_metadata(model.metadata())?;
+    force_chat_template(&mut tokenizer, chat_template.as_deref())?;
+    let tokenizer = tokenizer;
+
+    // DRY's sequence breakers arrive as text and the sampler works in ids, so
+    // they can only be resolved once a vocabulary exists. Defaults are
+    // llama.cpp's: a newline, a quote, a colon and an asterisk — the marks that
+    // separate one structural unit from the next, and across which a "repeat"
+    // is usually just a list having a shape.
+    let mut sampler = sampler;
+    if sampler.dry_multiplier > 0.0 {
+        let wanted: Vec<String> = if dry_breakers.is_empty() {
+            ["\n", ":", "\"", "*"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            dry_breakers
+        };
+        for text in &wanted {
+            // BOS is dropped: `encode` prepends it for models that ask for one,
+            // and a breaker is a piece of text, not the start of a sequence.
+            // A breaker that is still not a single token cannot act as a
+            // barrier, so it is skipped rather than silently matching
+            // something else — "*" is one token in some vocabularies and part
+            // of a merge in others.
+            let ids: Vec<u32> = tokenizer
+                .encode(text)
+                .into_iter()
+                .filter(|id| Some(*id) != tokenizer.bos)
+                .collect();
+            if let [only] = ids[..] {
+                sampler.dry_sequence_breakers.push(only);
+            }
+        }
+        bigtea_arch::detail!(
+            "dry        {} sequence breakers resolved of {} asked for",
+            sampler.dry_sequence_breakers.len(),
+            wanted.len()
+        );
+    }
+    let sampler = sampler;
+
     let prompt = &framed(
         &tokenizer,
         prompt,
@@ -1257,7 +2121,7 @@ fn run(
         system_prompt.as_deref(),
     );
     let mut tokens: Vec<u32> = tokenizer.encode(prompt);
-    println!("prompt     {prompt:?} -> {} tokens", tokens.len());
+    bigtea_arch::info!("prompt     {prompt:?} -> {} tokens", tokens.len());
     if tokens.is_empty() {
         return Err("prompt encoded to zero tokens".into());
     }
@@ -1288,6 +2152,12 @@ fn run(
             stop,
             perplexity,
             ui,
+            show_perf,
+            kv_type,
+            mlock,
+            prompt_cache,
+            prompt_cache_all,
+            prompt_cache_ro,
             t0,
         );
     }
@@ -1317,7 +2187,7 @@ fn run(
         bound_bytes += data.len() as u64;
         weights.bind(&weight_ctx, "output.weight", loc.ty, &loc.dims, data)?;
     }
-    println!(
+    bigtea_arch::info!(
         "weights    {} tensors, {:.2} GiB bound in {:.1}s (zero-copy)",
         weights.len(),
         bound_bytes as f64 / GIB,
@@ -1329,7 +2199,7 @@ fn run(
     // bug rather than the 1.7x it is worth.
     let threads = bigtea_arch::configured_threads();
     let threads_batch = bigtea_arch::configured_threads_batch();
-    println!("threads    {threads} generating, {threads_batch} prefilling");
+    bigtea_arch::info!("threads    {threads} generating, {threads_batch} prefilling");
 
     // --- generate ----------------------------------------------------------
     println!("\n{prompt}");
@@ -1412,11 +2282,11 @@ fn run(
     let secs = gen_start.elapsed().as_secs_f64();
     let count = tokens.len() - tokenizer.encode(prompt).len();
     println!("\n");
-    println!(
+    bigtea_arch::info!(
         "generated  {count} tokens in {secs:.1}s ({:.2} tok/s)",
         count as f64 / secs.max(1e-9)
     );
-    println!("total      {:.1}s", t0.elapsed().as_secs_f64());
+    bigtea_arch::info!("total      {:.1}s", t0.elapsed().as_secs_f64());
     if produced.trim().is_empty() {
         println!("\n! produced no visible text -- check the forward pass");
     }
@@ -1460,7 +2330,7 @@ fn report_residency_shortfall(report: &bigtea_model::LoadReport, machine: &bigte
     } else {
         1e9
     };
-    println!(
+    bigtea_arch::info!(
         "           {:.2} GiB will be re-read from disk on EVERY token (~{:.1}s each)",
         missing as f64 / GIB,
         missing as f64 / rate
@@ -1468,11 +2338,11 @@ fn report_residency_shortfall(report: &bigtea_model::LoadReport, machine: &bigte
 
     let holders = bigtea_probe::processes::grouped(256 << 20);
     if holders.is_empty() {
-        println!("           nothing large is closeable; this model needs more RAM than this machine has");
+        bigtea_arch::info!("           nothing large is closeable; this model needs more RAM than this machine has");
         return;
     }
     let free: u64 = holders.iter().map(|(_, b, _)| *b).sum();
-    println!(
+    bigtea_arch::info!(
         "           closing these would free up to {:.2} GiB:",
         free as f64 / GIB
     );
@@ -1482,12 +2352,12 @@ fn report_residency_shortfall(report: &bigtea_model::LoadReport, machine: &bigte
         } else {
             String::new()
         };
-        println!("             {name:<28} {:.2} GiB{n}", *bytes as f64 / GIB);
+        bigtea_arch::info!("             {name:<28} {:.2} GiB{n}", *bytes as f64 / GIB);
     }
     if free >= missing {
-        println!("           that is enough to make the whole model resident.");
+        bigtea_arch::info!("           that is enough to make the whole model resident.");
     } else {
-        println!(
+        bigtea_arch::info!(
             "           still {:.2} GiB short after that — a smaller quant would fit.",
             (missing - free) as f64 / GIB
         );
@@ -1514,7 +2384,7 @@ fn run_deepseek4(
         return Err("empty prompt".into());
     }
 
-    println!(
+    bigtea_arch::info!(
         "shape      {} blocks, {} embd, {} heads, {} experts ({} used, {} shared)",
         config.n_layer,
         config.n_embd,
@@ -1523,7 +2393,7 @@ fn run_deepseek4(
         config.n_expert_used,
         config.n_expert_shared
     );
-    println!("prompt     {} tokens", tokens.len());
+    bigtea_arch::info!("prompt     {} tokens", tokens.len());
 
     // Hold the always-read weights in RAM. Without this every block re-reads
     // them from disk on every forward pass — 23% of a prefill, and the whole
@@ -1539,7 +2409,7 @@ fn run_deepseek4(
     let reserve = ((arena_mib as u64) << 20) + (512 << 20) + (768 << 20);
     let budget = machine.usable_ram_for_weights(reserve);
     let (mut resident, report) = ResidentSet::load(model, budget)?;
-    println!("resident   {report}");
+    bigtea_arch::info!("resident   {report}");
     report_residency_shortfall(&report, &machine);
 
     // Rearrange the always-read weights into the layout the CPU kernels want,
@@ -1556,13 +2426,15 @@ fn run_deepseek4(
     let repacked = bigtea_arch::RepackedDense::build(&mut resident, model)?;
     let (n_repacked, repacked_bytes, declined) = repacked.stats();
     if n_repacked > 0 {
-        println!(
+        bigtea_arch::info!(
             "repacked   {n_repacked} tensors, {:.2} GiB in the CPU kernels' layout, {:.1}s",
             repacked_bytes as f64 / GIB,
             repack_start.elapsed().as_secs_f64()
         );
         if declined > 0 {
-            println!("repacked   {declined} declined by ggml and left in their stored layout");
+            bigtea_arch::info!(
+                "repacked   {declined} declined by ggml and left in their stored layout"
+            );
         }
     }
 
@@ -1609,14 +2481,16 @@ fn run_deepseek4(
     let shortfall = report.skipped_over_budget;
     let expert_budget = match expert_cache_budget {
         Some(b) if b > 0 && shortfall > 0 => {
-            println!(
+            bigtea_arch::info!(
                 "cache      refusing {:.2} GiB for experts: {:.2} GiB of always-read",
                 b as f64 / GIB,
                 shortfall as f64 / GIB
             );
-            println!("cache      weights is still streaming, and a resident byte is read");
-            println!("cache      every token (100%) against ~13% for a cached expert.");
-            println!(
+            bigtea_arch::info!(
+                "cache      weights is still streaming, and a resident byte is read"
+            );
+            bigtea_arch::info!("cache      every token (100%) against ~13% for a cached expert.");
+            bigtea_arch::info!(
                 "cache      Free ~{:.1} GiB and it becomes worth having.",
                 shortfall as f64 / GIB
             );
@@ -1627,14 +2501,14 @@ fn run_deepseek4(
     };
     if expert_budget > 0 {
         fw = fw.with_expert_cache(expert_budget as usize);
-        println!(
+        bigtea_arch::info!(
             "cache      {:.2} GiB for routed experts, warmed from the prompt (not pinned)",
             expert_budget as f64 / GIB
         );
     } else if shortfall == 0 && expert_cache_budget.is_none() {
-        println!("cache      off. The always-read set fits, so --cache <GiB> is now");
-        println!("cache      worth measuring: a cached step reads 6 experts per layer,");
-        println!("cache      not the ~123 a long prefill does.");
+        bigtea_arch::info!("cache      off. The always-read set fits, so --cache <GiB> is now");
+        bigtea_arch::info!("cache      worth measuring: a cached step reads 6 experts per layer,");
+        bigtea_arch::info!("cache      not the ~123 a long prefill does.");
     }
     let fw = fw;
     if !fw.indexer_is_exact(tokens.len()) {
@@ -1645,7 +2519,7 @@ fn run_deepseek4(
             tokens.len()
         );
     }
-    println!("loaded     {:.1}s", t0.elapsed().as_secs_f64());
+    bigtea_arch::info!("loaded     {:.1}s", t0.elapsed().as_secs_f64());
 
     let t_prefill = std::time::Instant::now();
     let mut seq = tokens.clone();
@@ -1654,7 +2528,7 @@ fn run_deepseek4(
     let mut kv = bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
     let logits = bigtea_arch::forward(&fw, &mut kv, &seq, arena_mib << 20)?;
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
-    println!(
+    bigtea_arch::info!(
         "prefill    {} tokens in {prefill_secs:.1}s ({:.2} tok/s)",
         seq.len(),
         seq.len() as f64 / prefill_secs
@@ -1709,7 +2583,7 @@ fn run_deepseek4(
     // configuration it had, because the cached bytes were being paged out — so a
     // hit rate on its own is not evidence of anything.
     if let Some((stats, bytes)) = fw.cache_stats() {
-        println!(
+        bigtea_arch::info!(
             "cache      {:.1}% hits ({} of {}), {:.2} GiB resident of {:.2} GiB, \
              {} evictions, {:.1} GiB not read",
             stats.hit_rate() * 100.0,
