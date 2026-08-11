@@ -239,6 +239,58 @@ impl KvCache {
     ///
     /// A layer falling behind means some layer silently skipped its append,
     /// which would make attention read stale history for the rest of the run.
+    /// Number of layers, so a saved cache can be checked before it is trusted.
+    pub fn layers(&self) -> usize {
+        self.k.len()
+    }
+
+    /// Replace one layer's stored bytes — restoring a saved prompt cache.
+    ///
+    /// Rejects a length that is not a whole number of positions, because a
+    /// truncated restore would misalign every position after it and attention
+    /// would read across position boundaries with no error anywhere.
+    pub fn restore_layer(&mut self, layer: usize, k: &[u8], v: &[u8]) -> Result<(), KvError> {
+        let step = self.kind.bytes_for(self.per_position);
+        if layer >= self.k.len() || k.len() != v.len() || step == 0 || k.len() % step != 0 {
+            return Err(KvError::WrongSize {
+                expected: step,
+                got_k: k.len(),
+                got_v: v.len(),
+            });
+        }
+        self.k[layer] = k.to_vec();
+        self.v[layer] = v.to_vec();
+        Ok(())
+    }
+
+    /// Declare how many positions the restored bytes cover.
+    ///
+    /// Separate from [`Self::restore_layer`] for the same reason `advance` is
+    /// separate from `push`: the count is per cache, not per layer.
+    pub fn set_positions(&mut self, n: usize) {
+        self.n_positions = n;
+    }
+
+    /// Keep only the first `n` positions.
+    ///
+    /// A saved cache is reusable exactly as far as its tokens match the new
+    /// prompt; past the first difference every stored key is conditioned on
+    /// text that is no longer there. Cutting rather than discarding the whole
+    /// file is what makes a cache useful for a prompt that was *edited*.
+    pub fn truncate_to(&mut self, n: usize) {
+        if n >= self.n_positions {
+            return;
+        }
+        let keep = self.kind.bytes_for(self.per_position) * n;
+        for layer in self.k.iter_mut() {
+            layer.truncate(keep);
+        }
+        for layer in self.v.iter_mut() {
+            layer.truncate(keep);
+        }
+        self.n_positions = n;
+    }
+
     pub fn is_consistent(&self) -> bool {
         // In **bytes**, which is what the vectors now hold. Comparing against
         // the value count silently passed for F16 only because a length in

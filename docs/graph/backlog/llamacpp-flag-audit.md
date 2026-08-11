@@ -14,7 +14,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 
 | bucket | flags | state |
 |---|---:|---|
-| **have** | **78** | done |
+| **have** | **81** | done |
 | **samplers** | 22 | **21 done**; only `--backend-sampling` left, and it is a GPU concept |
 | interaction / prompt handling | 22 | **done 2026-08-11** — including a real REPL |
 | runtime / threading / memory | 31 | I/O mode + `--override-kv` done; most of the rest **refused**, see below |
@@ -23,7 +23,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 | **GPU** | 15 | **won't** — no backend to apply them to |
 | fetch / Hugging Face | 9 | partly covered by `bigtea-pull`, different spelling |
 | reasoning / speculative draft | 8 | gap |
-| KV cache type / prompt cache | 7 | **`--cache-type-k/v` done 2026-08-11**; prompt cache (5) left |
+| KV cache type / prompt cache | 7 | **done 2026-08-11** -- both halves |
 | chat template | 6 | 3 done; `--jinja`/`--chat-template-file` **won't**, see below |
 | LoRA / control vectors | 5 | gap |
 | grammar / JSON schema | 4 | gap |
@@ -312,6 +312,48 @@ $ ... --override-kv llama.rope.freq_base=float:1000
 A malformed spec **refuses the run** (exit 2) rather than being skipped: an
 override silently dropped is worse than none, because the user believes the
 container has been corrected.
+
+### Prompt cache - done 2026-08-11, and worth 19x on a repeated prompt
+
+`--prompt-cache FILE`, `--prompt-cache-all`, `--prompt-cache-ro`.
+
+Prefill is the expensive half for anything with a long prompt, and re-running
+the same prefix every invocation is the largest avoidable cost in an agent loop.
+
+```
+run 1  prompt cache  wrote 15.1 MiB for 482 tokens
+       prefill    482 tokens in 1.5s (318.59 tok/s)
+
+run 2  prompt cache  reused 481 of 482 tokens
+       prefill    482 tokens in 0.1s (6116.11 tok/s)
+```
+
+**Reuse stops at the first differing token.** Past it every stored key is
+conditioned on text that is no longer there, and attention would read it
+without complaint. So the cache is truncated to the common prefix rather than
+accepted or rejected whole -- which is what makes it useful for a prompt that
+was *edited* rather than repeated exactly:
+
+```
+$ bigtea-run <same model> -f edited.txt --prompt-cache pc.bin
+prompt cache  reused 115 of 121 tokens
+```
+
+The last prompt token is never restored: the forward pass has to run for at
+least one position to produce the logits generation starts from.
+
+**A fingerprint guards it.** Restoring keys computed by a different model, or
+under a different KV quantisation, is not an error anywhere downstream --
+attention reads numbers that mean nothing and the answer is fluent and wrong. So
+the file records the shape it was built with (layers, embedding, heads, kv
+heads, head_dim, vocab, KV type) and a mismatch discards it. Verified: the same
+cache offered to TinyLlama restores **nothing**.
+
+Correctness checked the only way that counts -- a reused cache must produce the
+**same text** as a cold run, and does.
+
+Failure never fails the run: an unreadable or unwritable cache is a lost
+optimisation, and is reported rather than raised.
 
 ### `--chat-template` - done 2026-08-11
 

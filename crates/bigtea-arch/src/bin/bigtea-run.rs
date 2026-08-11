@@ -283,6 +283,128 @@ fn unescape(text: &str) -> String {
     out
 }
 
+/// A saved KV cache, so a repeated prompt does not pay prefill twice.
+///
+/// # Why this earns its complexity
+///
+/// Prefill is the expensive half for anything with a long prompt: a system
+/// prompt plus a document is thousands of tokens of work before the first token
+/// of the answer. Re-running the same prefix every invocation is the single
+/// largest avoidable cost in an agent loop, and llama.cpp's `--prompt-cache`
+/// exists for exactly that.
+///
+/// # Format, and why every field is checked
+///
+/// ```text
+/// "BTPC" u32 version  u64 fingerprint  u32 kv_type  u32 layers
+/// u32 positions       u32 n_tokens     [u32; n_tokens] tokens
+/// per layer: u64 len, k bytes, u64 len, v bytes
+/// ```
+///
+/// The **fingerprint** is the shape the cache was built with. Restoring keys
+/// computed by a different model, or with a different KV quantisation, is not
+/// an error anywhere downstream — attention simply reads numbers that mean
+/// nothing, and the answer is fluent and wrong. So a mismatch discards the
+/// file rather than trying to use part of it.
+struct PromptCache;
+
+impl PromptCache {
+    const MAGIC: &'static [u8; 4] = b"BTPC";
+    const VERSION: u32 = 1;
+
+    /// Shape the cache depends on. Any change invalidates every saved file.
+    fn fingerprint(config: &Qwen3Config, kv: bigtea_arch::KvType) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64; // FNV-1a
+        for part in [
+            config.n_layer as u64,
+            config.n_embd as u64,
+            config.n_head as u64,
+            config.n_head_kv as u64,
+            config.head_dim as u64,
+            config.vocab_size as u64,
+            kv.ggml_type() as u64,
+        ] {
+            h ^= part;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Read a saved cache, returning its tokens and per-layer bytes.
+    ///
+    /// Any inconsistency returns `None`: a prompt cache is an optimisation, and
+    /// failing to use one must never fail the run.
+    #[allow(clippy::type_complexity)]
+    fn load(path: &str, want: u64) -> Option<(Vec<u32>, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let data = std::fs::read(path).ok()?;
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Option<&[u8]> {
+            let end = at.checked_add(n)?;
+            let out = data.get(at..end)?;
+            at = end;
+            Some(out)
+        };
+        if take(4)? != Self::MAGIC {
+            return None;
+        }
+        let u32_at = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        if u32_at(take(4)?) != Self::VERSION {
+            return None;
+        }
+        let fp = u64::from_le_bytes(take(8)?.try_into().ok()?);
+        if fp != want {
+            return None;
+        }
+        let _kv = u32_at(take(4)?);
+        let layers = u32_at(take(4)?) as usize;
+        let _positions = u32_at(take(4)?) as usize;
+        let n_tokens = u32_at(take(4)?) as usize;
+        let mut tokens = Vec::with_capacity(n_tokens);
+        for _ in 0..n_tokens {
+            tokens.push(u32_at(take(4)?));
+        }
+        let mut per_layer = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            let kn = u64::from_le_bytes(take(8)?.try_into().ok()?) as usize;
+            let k = take(kn)?.to_vec();
+            let vn = u64::from_le_bytes(take(8)?.try_into().ok()?) as usize;
+            let v = take(vn)?.to_vec();
+            per_layer.push((k, v));
+        }
+        Some((tokens, per_layer))
+    }
+
+    /// Write the cache covering `tokens`.
+    fn save(path: &str, fingerprint: u64, cache: &KvCache, tokens: &[u32]) -> std::io::Result<u64> {
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(Self::MAGIC);
+        out.extend_from_slice(&Self::VERSION.to_le_bytes());
+        out.extend_from_slice(&fingerprint.to_le_bytes());
+        out.extend_from_slice(&cache.kind().ggml_type().to_le_bytes());
+        out.extend_from_slice(&(cache.layers() as u32).to_le_bytes());
+        out.extend_from_slice(&(cache.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+        for t in tokens {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        for layer in 0..cache.layers() {
+            let k = cache.keys(layer);
+            let v = cache.values(layer);
+            out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            out.extend_from_slice(k);
+            out.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            out.extend_from_slice(v);
+        }
+        std::fs::write(path, &out)?;
+        Ok(out.len() as u64)
+    }
+}
+
+/// How many leading tokens two sequences share.
+fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
 /// Apply `--chat-template`, refusing a name this build does not implement.
 ///
 /// Both engine paths call it: the dense one and V4-Flash build their
@@ -629,6 +751,9 @@ fn main() -> ExitCode {
         eprintln!("  --override-kv K=T:V override one GGUF metadata entry");
         eprintln!("  --mlock             pin resident weights so the OS cannot page them out");
         eprintln!("  --chat-template N   force a chat template (chatml, llama3, gemma, ...)");
+        eprintln!("  --prompt-cache F    reuse a saved KV cache for a repeated prefix");
+        eprintln!("  --prompt-cache-all  also cache what was generated, not just the prompt");
+        eprintln!("  --prompt-cache-ro   read the cache but never write it");
         eprintln!("  -i, --interactive   keep the session open and take turns");
         eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
         eprintln!("  -st, --single-turn  one exchange, then exit");
@@ -709,6 +834,9 @@ fn main() -> ExitCode {
     let mut overrides: Vec<(String, bigtea_gguf::Value)> = Vec::new();
     let mut mlock = false;
     let mut chat_template: Option<String> = None;
+    let mut prompt_cache: Option<String> = None;
+    let mut prompt_cache_all = false;
+    let mut prompt_cache_ro = false;
     let mut show_perf = true;
     let mut system_prompt: Option<String> = None;
     let mut ctx_size: Option<usize> = None;
@@ -857,6 +985,20 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // Save and reuse the KV cache for a prompt prefix, so a repeated
+            // prompt does not pay prefill twice.
+            "--prompt-cache" => {
+                prompt_cache = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--prompt-cache-all" => {
+                prompt_cache_all = true;
+                i += 1;
+            }
+            "--prompt-cache-ro" => {
+                prompt_cache_ro = true;
+                i += 1;
+            }
             // Force a chat format. Two cases make this necessary rather than a
             // curiosity: a container with no template at all, and one whose
             // template this build does not recognise. Both otherwise fall back
@@ -1268,6 +1410,9 @@ fn main() -> ExitCode {
         overrides,
         mlock,
         chat_template,
+        prompt_cache,
+        prompt_cache_all,
+        prompt_cache_ro,
         ctx_size,
         stop,
         force,
@@ -1304,6 +1449,9 @@ fn run_streaming(
     show_perf: bool,
     kv_type: bigtea_arch::KvType,
     mlock: bool,
+    prompt_cache: Option<String>,
+    prompt_cache_all: bool,
+    prompt_cache_ro: bool,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -1481,10 +1629,67 @@ fn run_streaming(
     let prefill_start = std::time::Instant::now();
     let mut logits: Vec<f32> = Vec::new();
     let mut pos = 0usize;
-    for block in tokens.chunks(prefill_block) {
+
+    // Reuse as much of a saved cache as the prompts share.
+    //
+    // Reusable only up to the FIRST DIFFERING TOKEN: past it, every stored key
+    // is conditioned on text that is no longer there, and attention would read
+    // it without complaint. So the cache is truncated to the common prefix
+    // rather than accepted or rejected whole — which is what makes it useful
+    // for a prompt that was edited rather than repeated exactly.
+    //
+    // The last prompt token is never restored: the forward pass has to run for
+    // at least one position to produce the logits that start generation.
+    let fingerprint = PromptCache::fingerprint(&config, cache.kind());
+    if let Some(path) = prompt_cache.as_deref() {
+        if let Some((saved_tokens, layers)) = PromptCache::load(path, fingerprint) {
+            let shared = common_prefix(&saved_tokens, &tokens).min(tokens.len().saturating_sub(1));
+            if shared > 0 && layers.len() == cache.layers() {
+                let mut ok = true;
+                for (layer, (k, v)) in layers.iter().enumerate() {
+                    if cache.restore_layer(layer, k, v).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    cache.set_positions(saved_tokens.len());
+                    cache.truncate_to(shared);
+                    pos = shared;
+                    bigtea_arch::info!(
+                        "prompt cache  reused {shared} of {} tokens from {path}",
+                        tokens.len()
+                    );
+                } else {
+                    // A shape that does not divide cleanly means the file was
+                    // written by a different build. Start over rather than
+                    // restoring part of it.
+                    cache.clear();
+                    bigtea_arch::info!("prompt cache  {path} does not match this cache shape");
+                }
+            }
+        }
+    }
+
+    for block in tokens[pos..].chunks(prefill_block) {
         logits = runner.forward_cached(&weights, &mut cache, block, pos)?;
         pos += block.len();
         debug_assert!(cache.is_consistent(), "kv cache layers fell out of step");
+    }
+
+    if let Some(path) = prompt_cache.as_deref() {
+        if !prompt_cache_ro && !prompt_cache_all {
+            match PromptCache::save(path, fingerprint, &cache, &tokens) {
+                Ok(bytes) => bigtea_arch::info!(
+                    "prompt cache  wrote {:.1} MiB for {} tokens to {path}",
+                    bytes as f64 / (1 << 20) as f64,
+                    tokens.len()
+                ),
+                // Not fatal: a cache that cannot be written is a lost
+                // optimisation, not a failed run.
+                Err(e) => bigtea_arch::info!("prompt cache  could not write {path}: {e}"),
+            }
+        }
     }
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
     bigtea_arch::info!(
@@ -1579,6 +1784,21 @@ fn run_streaming(
         pos += next_tokens.len();
     }
 
+    // `--prompt-cache-all` extends the cache over what was generated too, so a
+    // continued conversation resumes instead of re-reading its own answer.
+    if let Some(path) = prompt_cache.as_deref() {
+        if prompt_cache_all && !prompt_cache_ro {
+            match PromptCache::save(path, fingerprint, &cache, &tokens) {
+                Ok(bytes) => bigtea_arch::info!(
+                    "prompt cache  wrote {:.1} MiB for {} tokens (prompt + generated) to {path}",
+                    bytes as f64 / (1 << 20) as f64,
+                    tokens.len()
+                ),
+                Err(e) => bigtea_arch::info!("prompt cache  could not write {path}: {e}"),
+            }
+        }
+    }
+
     let secs = gen_start.elapsed().as_secs_f64();
     let produced = tokens.len().saturating_sub(prompt_len);
     if ui.print_token_count {
@@ -1634,6 +1854,9 @@ fn run(
     overrides: Vec<(String, bigtea_gguf::Value)>,
     mlock: bool,
     chat_template: Option<String>,
+    prompt_cache: Option<String>,
+    prompt_cache_all: bool,
+    prompt_cache_ro: bool,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -1862,6 +2085,9 @@ fn run(
             show_perf,
             kv_type,
             mlock,
+            prompt_cache,
+            prompt_cache_all,
+            prompt_cache_ro,
             t0,
         );
     }
