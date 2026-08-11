@@ -69,8 +69,15 @@ fn rope_type_for(arch: &str) -> (i32, bool) {
 /// So the default is to refuse an architecture nobody has checked. `--force`
 /// runs it anyway, which is the right escape hatch for someone testing a new
 /// architecture — but it has to be asked for.
-pub const VERIFIED_ARCHITECTURES: &[&str] =
-    &["deepseek4", "gemma2", "llama", "phi3", "qwen3", "qwen3moe"];
+pub const VERIFIED_ARCHITECTURES: &[&str] = &[
+    "deepseek4",
+    "gemma2",
+    "llama",
+    "phi3",
+    "qwen2",
+    "qwen3",
+    "qwen3moe",
+];
 
 /// Whether this build has been run against `arch` and had its output checked.
 pub fn architecture_is_verified(arch: &str) -> bool {
@@ -132,6 +139,15 @@ pub struct Qwen3Config {
     /// rows are whole quantisation blocks, so three views cost nothing — but
     /// asking for `attn_q.weight` on such a container fails outright, which is
     /// what refused Phi-3 before this existed.
+    /// Q, K and V projections carry a bias vector.
+    ///
+    /// **Qwen2 has these and Qwen3 does not.** Ignoring them is not a missing
+    /// tensor and not an error — every attention score is simply shifted, and
+    /// Qwen2-0.5B answers "The capital of France is" with
+    /// `睢已经是成人istentation帮助企业 Hague(ord壑屁`. Detected from the
+    /// container rather than the architecture name, so a finetune that adds or
+    /// drops them is handled without a new arch.
+    pub attn_bias: bool,
     pub fused_qkv: bool,
     /// The FFN gate and up projections share one `ffn_up` tensor.
     ///
@@ -228,6 +244,7 @@ impl Qwen3Config {
             rope_type_is_known: rope_type_for(&arch).1,
             // Asked of the container, like `qk_norm`: a fusion is a fact about
             // this file, not about what it calls itself.
+            attn_bias: model.location("blk.0.attn_q.bias").is_some(),
             fused_qkv: model.location("blk.0.attn_qkv.weight").is_some(),
             fused_gate_up: model.location("blk.0.ffn_gate.weight").is_none()
                 && model.location("blk.0.ffn_up.weight").is_some(),
@@ -366,6 +383,11 @@ impl Qwen3Model {
             } else {
                 for suffix in ["attn_q.weight", "attn_k.weight", "attn_v.weight"] {
                     names.push(format!("blk.{il}.{suffix}"));
+                }
+                if c.attn_bias {
+                    for suffix in ["attn_q.bias", "attn_k.bias", "attn_v.bias"] {
+                        names.push(format!("blk.{il}.{suffix}"));
+                    }
                 }
             }
             // Only Qwen3 carries these. Listing them unconditionally is what
@@ -819,6 +841,7 @@ mod tests {
             qk_norm: true,
             rope_type: ROPE_TYPE_NEOX,
             rope_type_is_known: true,
+            attn_bias: false,
             fused_qkv: false,
             fused_gate_up: false,
             post_norms: false,

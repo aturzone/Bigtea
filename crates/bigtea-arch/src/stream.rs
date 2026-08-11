@@ -1349,6 +1349,13 @@ impl<'m> StreamingRunner<'m> {
                         (n_kv * head_dim, n_new),            // k normalised
                         (c.n_head as i64 * head_dim, n_new), // q roped
                         (n_kv * head_dim, n_new),            // k roped
+                        // The bias adds produce three more of the same shapes.
+                        // Unlisted, they are covered only by `arena_for`'s
+                        // doubling, which is how three arenas in this file were
+                        // found short already.
+                        (c.n_head as i64 * head_dim, n_new),
+                        (n_kv * head_dim, n_new),
+                        (n_kv * head_dim, n_new),
                     ],
                     32,
                 ))?;
@@ -1366,6 +1373,18 @@ impl<'m> StreamingRunner<'m> {
                 let q = ctx.mul_mat(&qw, &normed)?;
                 let k = ctx.mul_mat(&kw, &normed)?;
                 let v = ctx.mul_mat(&vw, &normed)?;
+                // Qwen2 carries a bias on each projection; Qwen3 does not.
+                // ggml broadcasts a `[n, 1]` addend across the columns, so the
+                // same vector applies to every position in the block.
+                let (q, k, v) = if c.attn_bias {
+                    (
+                        ctx.add(&q, &get(weights, format!("blk.{il}.attn_q.bias"))?)?,
+                        ctx.add(&k, &get(weights, format!("blk.{il}.attn_k.bias"))?)?,
+                        ctx.add(&v, &get(weights, format!("blk.{il}.attn_v.bias"))?)?,
+                    )
+                } else {
+                    (q, k, v)
+                };
 
                 let q = ctx.reshape_3d(&q, head_dim, c.n_head as i64, n_new)?;
                 let k = ctx.reshape_3d(&k, head_dim, n_kv, n_new)?;
