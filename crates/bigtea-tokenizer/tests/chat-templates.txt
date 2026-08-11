@@ -1,0 +1,60 @@
+# llama.cpp chat-template renderings, captured by
+# scripts/capture-chat-templates.py. Do not edit by hand.
+# model=Qwen2-0.5B-Instruct-Q4_K_M.gguf system='SYS' user='HI'
+# add_generation_prompt is on (llama.cpp's -st conversation default).
+# One record per template: NAME, then the rendering with newlines
+# escaped as \n so a record is exactly one line.
+bailing	<role>SYSTEM</role>SYS<role>HUMAN</role>HI<role>ASSISTANT</role>
+bailing-think	<role>SYSTEM</role>SYS<role>HUMAN</role>HI<role>ASSISTANT</role><think>
+bailing2	<role>SYSTEM</role>SYS<|role_end|><role>HUMAN</role>HI<|role_end|><role>ASSISTANT</role>
+chatglm3	[gMASK]sop<|system|>\n SYS<|user|>\n HI<|assistant|>
+chatglm4	[gMASK]<sop><|system|>\nSYS<|user|>\nHI<|assistant|>\n
+chatml	<|im_start|>system\nSYS<|im_end|>\n<|im_start|>user\nHI<|im_end|>\n<|im_start|>assistant\n
+command-r	<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>SYS<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>HI<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>
+deepseek	SYS### Instruction:\nHI\n### Response:\n
+deepseek-ocr	SYSHI
+deepseek2	SYS\n\nUser: HI\n\nAssistant:
+deepseek3	SYS\n\n<｜User｜>HI<｜Assistant｜>
+exaone-moe	<|system|>\nSYS<|endofturn|>\n<|user|>\nHI<|endofturn|>\n<|assistant|>\n
+exaone3	[|system|]SYS[|endofturn|]\n[|user|]HI\n[|assistant|]
+exaone4	[|system|]SYS[|endofturn|]\n[|user|]HI\n[|assistant|]
+falcon3	<|system|>\nSYS\n<|user|>\nHI\n<|assistant|>\n
+gemma	<start_of_turn>user\nSYS\n\nHI<end_of_turn>\n<start_of_turn>model\n
+gigachat	<s>SYS<|message_sep|>user<|role_sep|>HI<|message_sep|>available functions<|role_sep|>[]<|message_sep|>assistant<|role_sep|>
+glmedge	<|system|>\nSYS<|user|>\nHI<|assistant|>
+gpt-oss	<|start|>system<|message|>SYS<|end|><|start|>user<|message|>HI<|end|><|start|>assistant
+granite	<|start_of_role|>system<|end_of_role|>SYS<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>HI<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>
+granite-4.0	<|start_of_role|>system<|end_of_role|>SYS<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>HI<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>
+granite-4.1	<|start_of_role|>system<|end_of_role|>SYS<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>HI<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>
+grok-2	System: SYS<|separator|>\n\nHuman: HI<|separator|>\n\nAssistant:
+hunyuan-dense	SYS<｜hy_place��holder��no��3｜><｜hy_User｜>HI<｜hy_Assistant｜>
+hunyuan-moe	<|startoftext|>SYS<|extra_4|><|startoftext|>HI<|extra_0|>
+hunyuan-vl	<｜hy_begin��of��sentence｜>SYS<｜hy_place��holder��no��3｜>HI<｜hy_User｜>
+kimi-k2	<|im_system|>system<|im_middle|>SYS<|im_end|><|im_user|>user<|im_middle|>HI<|im_end|><|im_assistant|>assistant<|im_middle|>
+llama2	[INST] SYS\nHI [/INST]
+llama2-sys	[INST] <<SYS>>\nSYS\n<</SYS>>\n\nHI [/INST]
+llama2-sys-bos	[INST] <<SYS>>\nSYS\n<</SYS>>\n\nHI [/INST]
+llama2-sys-strip	[INST] <<SYS>>\nSYS\n<</SYS>>\n\nHI [/INST]
+llama3	<|start_header_id|>system<|end_header_id|>\n\nSYS<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHI<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
+llama4	<|header_start|>system<|header_end|>\n\nSYS<|eot|><|header_start|>user<|header_end|>\n\nHI<|eot|><|header_start|>assistant<|header_end|>\n\n
+megrez	<|role_start|>system<|role_end|>SYS<|turn_end|><|role_start|>user<|role_end|>HI<|turn_end|><|role_start|>assistant<|role_end|>
+minicpm	SYS<用户>HI<AI>
+mistral-v1	 [INST] SYS\n\nHI [/INST]
+mistral-v3	[INST] SYS\n\nHI[/INST]
+mistral-v3-tekken	[INST]SYS\n\nHI[/INST]
+mistral-v7	[SYSTEM_PROMPT] SYS[/SYSTEM_PROMPT][INST] HI[/INST]
+mistral-v7-tekken	[SYSTEM_PROMPT]SYS[/SYSTEM_PROMPT][INST]HI[/INST]
+monarch	system\nSYS</s>\n<s>user\nHI</s>\n<s>assistant\n
+openchat	SYS<|end_of_turn|>GPT4 Correct User: HI<|end_of_turn|>GPT4 Correct Assistant:
+orion	Human: SYS\n\nHI\n\nAssistant: </s>
+pangu-embedded	[unused9]系统：SYS[unused10][unused9]用户：HI[unused10][unused9]助手：
+phi3	<|system|>\nSYS<|end|>\n<|user|>\nHI<|end|>\n<|assistant|>\n
+phi4	<|im_start|>system<|im_sep|>SYS<|im_end|><|im_start|>user<|im_sep|>HI<|im_end|><|im_start|>assistant<|im_sep|>
+rwkv-world	System: SYS\n\nUser: HI\n\nAssistant:
+seed_oss	<seed:bos>system\nSYS<seed:eos><seed:bos>user\nHI<seed:eos><seed:bos>assistant\n
+smolvlm	<|im_start|>SYS\n\nUser: HI<end_of_utterance>\nAssistant:
+solar-open	<|begin|>system<|content|>SYS<|end|><|begin|>user<|content|>HI<|end|><|begin|>assistant
+vicuna	SYS\n\nUSER: HI\nASSISTANT:
+vicuna-orca	SYSTEM: SYS\nUSER: HI\nASSISTANT:
+yandex	 Пользователь: HI\n\n Ассистент:[SEP]
+zephyr	<|system|>\nSYS<|endoftext|>\n<|user|>\nHI<|endoftext|>\n<|assistant|>\n

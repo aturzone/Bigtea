@@ -1097,6 +1097,57 @@ drift**, so `build.rs` now scans `bigtea-run.rs` for the string literals its
 `match` arms are made of and generates the list: **119 long flags**, 0 phantom,
 0 missing.
 
+## Chat templates 25 -> 54, and 11 of the old ones were wrong (2026-08-11)
+
+llama.cpp knows 54 template names. Bigtea knew 25 — **and eleven of those
+rendered differently from the reference**, which nothing had ever checked.
+
+The oracle is `scripts/capture-chat-templates.py`: it runs llama.cpp with
+`--verbose-prompt` and reconstructs, token by token, the exact prompt it builds
+for every template it knows. That capture is a fixture in the repo and a test
+replays all of it. "Bigtea supports `gpt-oss`" now means **byte-identical to
+llama.cpp on a recorded command line**, not "it looked right".
+
+**52 of 54 match exactly.** The two skipped are Hunyuan variants whose bytes the
+capture model's tokenizer cannot round-trip; baking a corrupted expectation in
+would be worse than not comparing.
+
+### The eleven that were already wrong
+
+| family | what it did | what llama.cpp does |
+|---|---|---|
+| `llama2` | emitted the `<<SYS>>` block | plain — that block is `llama2-sys` |
+| `llama2-sys` | `<<SYS>>` *before* `[INST]` | `[INST] ` first, `<<SYS>>` inside it |
+| `falcon3` | shared RWKV-World's `System:` framing | `<\|system\|>`-shaped, nothing alike |
+| `zephyr` | the container's EOS | hardcodes `<\|endoftext\|>` |
+| `granite` (x3) | a newline after `<\|end_of_role\|>` | no newline |
+| `chatglm3` | no preamble, no space | `[gMASK]sop` and a space after the role |
+| `chatglm4` | no trailing newline | `<\|assistant\|>
+` |
+| `deepseek` | blank lines between turns | single newlines |
+| `minicpm` | labelled the system turn `<AI>` | emits it raw |
+| `monarch` | Bailing's `<role>HUMAN</role>` | `<s>role
+content</s>` — a different family |
+| `orion` | dropped the system turn's `Human: ` | opens `Human: ` on the system turn |
+
+`glmedge` was aliased to `chatglm4` and `bailing` to `monarch`; both are
+separate families, so those containers were fed two tokens at position 0 they
+were never trained to see.
+
+**A wrong template does not fail.** The model answers, fluently, having been
+handed a framing it has never seen — it comments on the question instead of
+answering it, or answers the system prompt. No test that checks "did it produce
+a string" can see that, which is why the expectation had to come from llama.cpp
+rather than from me.
+
+One place we deliberately differ, and it is recorded in the code: llama.cpp's
+Zephyr renderer hardcodes `<|endoftext|>` because its renderers have no
+vocabulary to read. **TinyLlama uses the Zephyr framing with `</s>`**, and its
+own Jinja template says `eos_token`, so the reference frames it with a token it
+has never seen. `eos_or` prefers the container's EOS when there is one and
+falls back to llama.cpp's literal when there is not — the fixture test passes
+`""` and so reproduces llama.cpp exactly.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
