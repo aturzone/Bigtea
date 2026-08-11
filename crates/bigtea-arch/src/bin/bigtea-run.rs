@@ -729,54 +729,6 @@ fn print_hparams(c: &Qwen3Config) {
     );
 }
 
-fn dense_arena_bytes(config: &Qwen3Config, n: i64) -> usize {
-    let n = n.max(1) as u64;
-    let layers = config.n_layer.max(1) as u64;
-    // **Per layer**, and that is the whole point. One graph spans every block in
-    // a single context, and `ggml` frees nothing inside a context, so all 36
-    // layers' intermediates are alive at once. Sizing this for one layer is what
-    // made a 651-token prompt abort.
-    let per_layer = {
-        // Attention scores and their softmax: n x n per head, twice.
-        let scores = n * n * config.n_head as u64 * 4 * 2;
-        // Activations, Q/K/V, the FFN intermediates: roughly a dozen tensors of
-        // n_embd x n, plus the wider FFN ones.
-        let activations = n * config.n_embd as u64 * 4 * 12 + n * config.n_ff as u64 * 4 * 3;
-        // 25% over the counted tensors. The count is a reading of the graph and
-        // the graph changes; being 0.2% short still aborts, and being 25% over
-        // only refuses slightly sooner.
-        (scores + activations) * 5 / 4
-    };
-    // The logits are one row now, not `n` of them — see `build_graph`.
-    let head = config.vocab_size as u64 * 4 * 2;
-    // `ggml_graph_compute_with_ctx` allocates the graph struct **and its
-    // per-thread work buffer** out of this same arena, so the tensor data is
-    // not the whole requirement. Sizing for the data alone left it 0.1% short,
-    // which is still an abort.
-    let data = per_layer * layers + head;
-    (data + data / 8 + (512 << 20)) as usize
-}
-
-/// The longest prompt this machine can prefill in one graph, for this model.
-///
-/// The dense path builds one graph over every layer, so its arena grows with
-/// the sequence and there is a length past which it does not fit. Saying so is
-/// the difference between a clear refusal and `GGML_ASSERT` killing the process
-/// with no message this code can catch.
-fn dense_max_tokens(config: &Qwen3Config, budget: u64) -> i64 {
-    let mut lo = 1i64;
-    let mut hi = 32_768i64;
-    while lo < hi {
-        let mid = (lo + hi + 1) / 2;
-        if dense_arena_bytes(config, mid) as u64 <= budget {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    lo
-}
-
 /// A bash completion script, generated from the parser's own flag list.
 ///
 /// Generated rather than written out, because a hand-maintained completion
@@ -3332,7 +3284,7 @@ fn run(
         chat || ui.conversation,
         system_prompt.as_deref(),
     );
-    let mut tokens: Vec<u32> = tokenizer.encode(prompt);
+    let tokens: Vec<u32> = tokenizer.encode(prompt);
     bigtea_arch::info!("prompt     {prompt:?} -> {} tokens", tokens.len());
     if tokens.is_empty() {
         return Err("prompt encoded to zero tokens".into());
@@ -3349,166 +3301,47 @@ fn run(
     // routed experts, so "streaming" reduces to exactly that.
     // `BIGTEA_UNCACHED=1` keeps the old stateless path reachable, so the gain
     // can be measured rather than asserted.
-    if std::env::var("BIGTEA_UNCACHED").is_err() {
-        return run_streaming(
-            &model,
-            config,
-            &arch,
-            &tokenizer,
-            tokens,
-            n_predict,
-            prefill_block,
-            cache_budget,
-            sampler,
-            ctx_size,
-            stop,
-            perplexity,
-            ui,
-            show_perf,
-            kv_type,
-            mlock,
-            prompt_cache,
-            prompt_cache_all,
-            prompt_cache_ro,
-            grammar,
-            warmup,
-            infill,
-            grammar_triggers,
-            fit,
-            shift,
-            t0,
-        );
-    }
-
-    // --- weights -----------------------------------------------------------
-    // Metadata only: the data pointers reference buffers we own, so this arena
-    // holds tensor structs rather than weights.
-    let names = arch.required_tensors();
-    let weight_ctx = Context::new_no_alloc(64 << 20)?;
-    let mut weights = WeightSet::new();
-
-    let load_start = std::time::Instant::now();
-    let mut bound_bytes = 0u64;
-    for name in &names {
-        let loc = model
-            .location(name)
-            .ok_or_else(|| format!("missing tensor {name}"))?
-            .clone();
-        let data = model.read_tensor(name)?;
-        bound_bytes += data.len() as u64;
-        weights.bind(&weight_ctx, name, loc.ty, &loc.dims, data)?;
-    }
-    // The output projection is tied to the embeddings unless shipped separately.
-    if model.location("output.weight").is_some() && weights.get("output.weight").is_none() {
-        let loc = model.location("output.weight").expect("checked").clone();
-        let data = model.read_tensor("output.weight")?;
-        bound_bytes += data.len() as u64;
-        weights.bind(&weight_ctx, "output.weight", loc.ty, &loc.dims, data)?;
-    }
-    bigtea_arch::info!(
-        "weights    {} tensors, {:.2} GiB bound in {:.1}s (zero-copy)",
-        weights.len(),
-        bound_bytes as f64 / GIB,
-        load_start.elapsed().as_secs_f64()
-    );
-
-    // Say which counts are in use and why. The generation default is a
-    // measurement, and an unexplained "2" on a 20-thread machine looks like a
-    // bug rather than the 1.7x it is worth.
-    let threads = bigtea_arch::configured_threads();
-    let threads_batch = bigtea_arch::configured_threads_batch();
-    bigtea_arch::info!("threads    {threads} generating, {threads_batch} prefilling");
-
-    // --- generate ----------------------------------------------------------
-    println!("\n{prompt}");
-
-    let mut produced = String::new();
-    let gen_start = std::time::Instant::now();
-
-    // Refuse a prompt this machine cannot prefill, with the numbers — rather
-    // than letting ggml abort partway through, which is a `GGML_ASSERT` and
-    // kills the process with nothing this code can catch or report.
-    {
-        let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
-        let budget = machine
-            .ram_available_bytes
-            .unwrap_or(4 << 30)
-            .saturating_sub(1 << 30);
-        let need = dense_arena_bytes(&config, (tokens.len() + n_predict) as i64) as u64;
-        if need > budget {
-            return Err(format!(
-                "this prompt is {} tokens and needs {:.2} GiB of compute arena, but only \
-                 {:.2} GiB is free.\n           The dense path builds one graph over all {} \
-                 layers and ggml frees nothing inside a context, so the arena grows with the \
-                 sequence.\n           The longest that fits here is about {} tokens. Close \
-                 some applications, or use a shorter prompt.",
-                tokens.len(),
-                need as f64 / GIB,
-                budget as f64 / GIB,
-                config.n_layer,
-                dense_max_tokens(&config, budget),
-            )
-            .into());
-        }
-    }
-
-    let mut sampler = Sampler::new(sampler);
-    let mut writer = TokenWriter::new();
-    for step in 0..n_predict {
-        let n = tokens.len() as i64;
-        // A fresh compute arena per token: intermediates are dead once the
-        // token is chosen, and reclaiming them keeps peak memory flat rather
-        // than growing with the sequence.
-        //
-        // Sized from the sequence, not fixed. A flat 2 GiB **aborted** on a
-        // 651-token prompt — `ggml_new_object: not enough space`, which is a
-        // `GGML_ASSERT` and kills the process rather than returning an error
-        // this code could report. Attention holds `n * n * n_head` floats for
-        // the scores and again for their softmax, so the requirement is
-        // quadratic in the sequence and a constant can only ever be wrong at
-        // some length.
-        let arena = dense_arena_bytes(&config, n);
-        let ctx = Context::new(arena)?;
-
-        let tok = ctx.new_i32_1d(n)?;
-        tok.set_i32(&tokens.iter().map(|&t| t as i32).collect::<Vec<_>>())?;
-        let pos = ctx.new_i32_1d(n)?;
-        pos.set_i32(&(0..n as i32).collect::<Vec<_>>())?;
-
-        let logits = arch.build_graph(&ctx, &weights, &tok, &pos, n)?;
-        ctx.compute(&logits, threads)?;
-
-        // The final position's row. Greedy is still the default -- see
-        // `SamplerConfig::default` -- so a wrong forward pass stays diagnosable
-        // unless the caller opts into sampling.
-        let all = logits.to_vec_f32();
-        let vocab = config.vocab_size as usize;
-        if all.len() < vocab {
-            return Err(format!("logits too small: {} < vocab {}", all.len(), vocab).into());
-        }
-        let last = &all[all.len() - vocab..];
-        let next = sampler.sample(last, &tokens);
-        if Some(next) == tokenizer.eos {
-            println!("\n[end of sequence at step {step}]");
-            break;
-        }
-        writer.push(&tokenizer, next);
-        produced.push_str(&tokenizer.decode(std::slice::from_ref(&next)));
-        tokens.push(next);
-    }
-
-    let secs = gen_start.elapsed().as_secs_f64();
-    let count = tokens.len() - tokenizer.encode(prompt).len();
-    println!("\n");
-    bigtea_arch::info!(
-        "generated  {count} tokens in {secs:.1}s ({:.2} tok/s)",
-        count as f64 / secs.max(1e-9)
-    );
-    bigtea_arch::info!("total      {:.1}s", t0.elapsed().as_secs_f64());
-    if produced.trim().is_empty() {
-        println!("\n! produced no visible text -- check the forward pass");
-    }
-    Ok(())
+    //
+    // The stateless path is GONE, not merely unused.
+    //
+    // `BIGTEA_UNCACHED=1` kept it reachable so the KV cache's gain could be
+    // measured rather than asserted. That measurement was made and recorded.
+    // What remained was a SECOND FORWARD IMPLEMENTATION of the same model, and
+    // it had silently missed four fixes: the Qwen2 QKV bias, the Gemma
+    // activation, the post-norms and the logit soft caps. `bigtea-serve` shared
+    // it and answered "The capital of France is" with
+    // `eos-羲esteopes哞ALTH autoFocus`.
+    //
+    // An env var is not a safety rail. It is a way for a knowingly-wrong path
+    // to survive every later fix, and this one survived four.
+    run_streaming(
+        &model,
+        config,
+        &arch,
+        &tokenizer,
+        tokens,
+        n_predict,
+        prefill_block,
+        cache_budget,
+        sampler,
+        ctx_size,
+        stop,
+        perplexity,
+        ui,
+        show_perf,
+        kv_type,
+        mlock,
+        prompt_cache,
+        prompt_cache_all,
+        prompt_cache_ro,
+        grammar,
+        warmup,
+        infill,
+        grammar_triggers,
+        fit,
+        shift,
+        t0,
+    )
 }
 
 /// Prefill DeepSeek-V4-Flash and time it.
