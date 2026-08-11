@@ -806,6 +806,49 @@ fn completion_bash() -> ExitCode {
 // being written.
 include!(concat!(env!("OUT_DIR"), "/flags.rs"));
 
+/// The fill-in-the-middle control tokens in this vocabulary.
+///
+/// Read from the vocabulary's own text rather than from metadata keys, because
+/// containers disagree about which keys they set (`tokenizer.ggml.fim_pre_id`
+/// is common but far from universal) while the token *text* is stable across
+/// every FIM model shipped so far. A model with no such tokens returns an empty
+/// list, and `--infill` then says `0` rather than pretending.
+///
+/// Suppressing these matters more than it looks: a FIM model that emits
+/// `<|fim_prefix|>` halfway through the span it is filling does not produce bad
+/// prose, it produces a **corrupted file**, because the caller splices the
+/// completion back between two halves that now contain a stray control token.
+fn infill_tokens(tokenizer: &Tokenizer) -> Vec<u32> {
+    const MARKERS: &[&str] = &[
+        "fim_prefix",
+        "fim_middle",
+        "fim_suffix",
+        "fim_pad",
+        "fim_rep",
+        "fim_sep",
+        "fim_pre",
+        "fim_suf",
+        "fim_mid",
+        "PRE",
+        "SUF",
+        "MID",
+        "EOT",
+    ];
+    (0..tokenizer.vocab_size() as u32)
+        .filter(|&id| {
+            let Some(t) = tokenizer.token_text(id) else {
+                return false;
+            };
+            // Control tokens only: a vocabulary entry that merely contains the
+            // letters "PRE" is an ordinary word, and suppressing it would quietly
+            // remove real vocabulary from every infill completion.
+            let bracketed = (t.starts_with("<|") && t.ends_with("|>"))
+                || (t.starts_with('<') && t.ends_with('>'));
+            bracketed && MARKERS.iter().any(|m| t.contains(m))
+        })
+        .collect()
+}
+
 /// The full option list. One place, so `--help`, `-h` and a bare
 /// invocation cannot drift apart.
 fn usage() -> ExitCode {
@@ -972,6 +1015,8 @@ fn main() -> ExitCode {
     let mut mlock = false;
     let mut prio: Option<u32> = None;
     let mut warmup = false;
+    let mut infill = false;
+    let mut grammar_triggers: Vec<String> = Vec::new();
     let mut chat_template: Option<String> = None;
     let mut model_flag: Option<String> = None;
     let mut grammar_src: Option<String> = None;
@@ -1070,6 +1115,25 @@ fn main() -> ExitCode {
                 sampler.mirostat = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0);
                 i += 2;
             }
+            // Adaptive-p: aim for a token of roughly this probability, with the
+            // target moving as it observes what it actually picked. Like
+            // mirostat it replaces the truncate-then-temperature tail rather
+            // than joining it, so the two cannot both be on.
+            "--adaptive-target" | "--adaptive-p" => {
+                sampler.adaptive_p = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0);
+                i += 2;
+            }
+            "--adaptive-decay" => {
+                sampler.adaptive_decay =
+                    rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.95);
+                i += 2;
+            }
+            // Fill-in-the-middle. The ids are resolved from the vocabulary
+            // after the tokenizer loads -- see `infill_tokens`.
+            "--infill" => {
+                infill = true;
+                i += 1;
+            }
             "--mirostat-ent" => {
                 sampler.mirostat_tau = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(5.0);
                 i += 2;
@@ -1141,6 +1205,25 @@ fn main() -> ExitCode {
             // --- constrained decoding ------------------------------------
             "--grammar" => {
                 grammar_src = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            // Lazy grammar: hold the constraint back until the model has
+            // written one of these, then apply it from that point on.
+            //
+            // This is what makes a grammar usable for tool calling. A model
+            // asked to "answer normally, or emit a JSON call" cannot do the
+            // first half under a JSON grammar -- the grammar forbids prose from
+            // the very first token, so the model never gets to choose. The
+            // trigger lets it choose, and constrains only what follows.
+            //
+            // Substrings, not regexes, and the help says so. llama.cpp's
+            // `--grammar-lazy-patterns` takes regexes; a half-implemented regex
+            // engine that silently mismatches would arm the grammar at the
+            // wrong moment, which is worse than not having the flag.
+            "--grammar-lazy" | "--grammar-trigger" => {
+                if let Some(t) = rest.get(i + 1) {
+                    grammar_triggers.push(t.clone());
+                }
                 i += 2;
             }
             "--grammar-file" => {
@@ -1726,6 +1809,8 @@ fn main() -> ExitCode {
         stop,
         force,
         warmup,
+        infill,
+        grammar_triggers,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -1764,6 +1849,8 @@ fn run_streaming(
     prompt_cache_ro: bool,
     grammar: Option<bigtea_grammar::Grammar>,
     warmup: bool,
+    infill: bool,
+    grammar_triggers: Vec<String>,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -2052,6 +2139,20 @@ fn run_streaming(
     let gen_start = std::time::Instant::now();
 
     let mut writer = TokenWriter::new();
+    // Two things the parser cannot know, because both need the vocabulary:
+    // which id is EOS (so `--ignore-eos` has something to suppress), and which
+    // ids are fill-in-the-middle markers.
+    let mut sampler_cfg = sampler_cfg;
+    if sampler_cfg.eos.is_none() {
+        sampler_cfg.eos = tokenizer.eos;
+    }
+    if infill {
+        sampler_cfg.infill_suppress = infill_tokens(tokenizer);
+        bigtea_arch::info!(
+            "infill     suppressing {} FIM control tokens",
+            sampler_cfg.infill_suppress.len()
+        );
+    }
     let mut sampler = Sampler::new(sampler_cfg);
 
     // Constrained decoding. The vocabulary is built once as token id -> the
@@ -2084,6 +2185,9 @@ fn run_streaming(
         // matching would miss most of them. Reset per turn, or a stop string
         // from an earlier answer would end this one immediately.
         let mut generated_text = String::new();
+        // A lazy grammar is off until a trigger appears; with no triggers the
+        // grammar is armed from the first token, which is the ordinary case.
+        let mut grammar_armed = grammar_triggers.is_empty();
         let this_turn = if skip_generation {
             skip_generation = false;
             0
@@ -2096,7 +2200,38 @@ fn run_streaming(
             }
             // The last token's row: a prefill returns logits for every position.
             let row = logits.len() - vocab;
+            // Lazy grammars stay off until the model writes a trigger. Once
+            // armed they never disarm: the point is to constrain the tail of
+            // the answer, and re-checking would let the grammar switch off
+            // again mid-structure.
+            if !grammar_armed
+                && !grammar_triggers.is_empty()
+                && grammar_triggers
+                    .iter()
+                    .any(|t| !t.is_empty() && generated_text.contains(t.as_str()))
+            {
+                grammar_armed = true;
+                bigtea_arch::info!(
+                    "grammar    armed after {} tokens",
+                    tokens.len().saturating_sub(prompt_len)
+                );
+            }
             if let (Some(c), Some(m)) = (constraint.as_ref(), matcher.as_ref()) {
+                if !grammar_armed {
+                    // Not yet triggered: sample unconstrained, and do NOT
+                    // advance the matcher below either, or the grammar would
+                    // be asked to parse the prose that preceded the trigger.
+                    let last = &logits[row..];
+                    let next = sampler.sample(last, &tokens);
+                    if Some(next) == tokenizer.eos {
+                        tokens.push(next);
+                        break;
+                    }
+                    writer.push_visible(tokenizer, next, &ui);
+                    tokens.push(next);
+                    generated_text.push_str(&tokenizer.decode(std::slice::from_ref(&next)));
+                    continue;
+                }
                 let mask = c.allowed_from(m);
                 // **An empty mask must never be sampled from.** Every token
                 // would be -inf, the argmax would be arbitrary, and generation
@@ -2272,6 +2407,8 @@ fn run(
     stop: Vec<String>,
     force: bool,
     warmup: bool,
+    infill: bool,
+    grammar_triggers: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -2516,6 +2653,8 @@ fn run(
             prompt_cache_ro,
             grammar,
             warmup,
+            infill,
+            grammar_triggers,
             t0,
         );
     }

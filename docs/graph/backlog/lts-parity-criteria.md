@@ -26,6 +26,7 @@ the real distance to "any model", and it is far larger than the performance gap.
 | quant types | all ggml can decode | same |
 | CLI flags | **119 long** (generated from the parser by `build.rs`, so it cannot drift from what is accepted) | **182** (counted, not estimated: `llamacpp-flag-audit.md`) |
 | chat templates | **54 names, 52 verified byte-identical** against a captured llama.cpp fixture | **54** (counted from `llama-chat.cpp`'s own table, not estimated) |
+| samplers | **20** | **20** (counted from `llama_sampler_init_*` in `llama.h`) |
 | backends | CPU | CPU, CUDA, Metal, Vulkan, ROCm, SYCL |
 
 ## A. Open any model — the biggest gap, and the cheapest wins in it

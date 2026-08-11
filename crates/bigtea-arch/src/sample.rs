@@ -82,6 +82,24 @@ impl SamplerStage {
 /// Which filters run, and how hard.
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
+    /// Adaptive-p: aim for a token whose probability is near this. Negative
+    /// disables, which is the default and matches llama.cpp.
+    ///
+    /// Unlike every other filter here it does **not** truncate. It rewrites the
+    /// logits so that tokens whose probability sits near a moving target score
+    /// highest, then samples from that. The target moves because it is fed the
+    /// probability of the token actually chosen, through an EMA — so it is a
+    /// feedback controller like mirostat, not a filter, and the two must not be
+    /// combined.
+    pub adaptive_p: f32,
+    /// EMA decay for adaptive-p; the history is roughly `1/(1-decay)` tokens.
+    pub adaptive_decay: f32,
+    /// Fill-in-the-middle: token ids that must never be sampled mid-infill.
+    ///
+    /// llama.cpp's `infill` sampler exists because a FIM model will happily
+    /// emit `<|fim_prefix|>` in the middle of the completion it is filling,
+    /// which corrupts the surrounding file rather than producing bad text.
+    pub infill_suppress: Vec<u32>,
     /// `0.0` means greedy — take the argmax and skip every filter.
     pub temperature: f32,
     /// Keep only the `k` highest-probability tokens. `0` disables.
@@ -165,6 +183,12 @@ impl Default for SamplerConfig {
     fn default() -> Self {
         // Greedy: identical to what the runner did before samplers existed.
         SamplerConfig {
+            // Negative: off. llama.cpp's own default, and adaptive-p is a
+            // feedback controller, so silently enabling it would change every
+            // existing seeded run.
+            adaptive_p: -1.0,
+            adaptive_decay: 0.95,
+            infill_suppress: Vec::new(),
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
@@ -203,6 +227,10 @@ impl SamplerConfig {
     /// different sampling settings measures the settings, not the engines.
     pub fn llamacpp_defaults() -> Self {
         SamplerConfig {
+            // Off, matching llama.cpp: adaptive-p is opt-in there too.
+            adaptive_p: -1.0,
+            adaptive_decay: 0.95,
+            infill_suppress: Vec::new(),
             temperature: 0.8,
             top_k: 40,
             top_p: 0.95,
@@ -255,6 +283,13 @@ impl SamplerConfig {
             && !self.ignore_eos
             && self.mirostat == 0
             && self.dry_multiplier == 0.0
+            // Both of these were the mistake this method has already made
+            // twice: a new knob that changes the output, not listed here, and
+            // therefore silently ignored at temperature 0 -- accepted, echoed
+            // in the header, doing nothing. `--mirostat 2` produced
+            // byte-identical output to greedy for a whole release that way.
+            && self.adaptive_p < 0.0
+            && self.infill_suppress.is_empty()
     }
 
     /// Whether any penalty is active, so a greedy-with-penalties path can
@@ -279,6 +314,10 @@ pub struct Sampler {
     /// controller rather than a filter: it observes how surprising the token it
     /// just picked was and moves the target for the next one.
     mu: f32,
+    /// Adaptive-p's EMA of the probabilities it actually picked: `weighted`
+    /// over `total`. Like `mu`, the only reason this sampler is stateful.
+    ap_weighted: f32,
+    ap_total: f32,
 }
 
 impl Sampler {
@@ -287,11 +326,19 @@ impl Sampler {
         // not degenerate: SplitMix64 from 0 is fine, but being explicit here
         // means a caller passing 0 still gets a usable stream.
         let state = config.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        // Seeded so the first token has a target to aim at rather than a
+        // division by zero; llama.cpp seeds the same two accumulators the same
+        // way in its `_reset`.
+        let decay = config.adaptive_decay.clamp(0.0, 0.99);
+        let ap_weighted = config.adaptive_p.max(0.0) / (1.0 - decay);
+        let ap_total = 1.0 / (1.0 - decay);
         Sampler {
             mu: 2.0 * config.mirostat_tau,
             config,
             state,
             candidates: Vec::new(),
+            ap_weighted,
+            ap_total,
         }
     }
 
@@ -309,6 +356,68 @@ impl Sampler {
     /// threshold is both simpler and what almost everyone runs. v1 here is
     /// v2's rule with v1's `m`-independent truncation, and it is documented as
     /// such rather than being claimed as an exact reimplementation.
+    /// llama.cpp's `adaptive-p`: aim for a token of a given probability.
+    ///
+    /// Every other filter here answers "which tokens may be chosen". This one
+    /// answers "how *likely* should the chosen token be", which is a different
+    /// question and is why it cannot be a chain stage. The transform is
+    /// llama.cpp's exactly — quadratic near the target for fine
+    /// differentiation, decaying to linear in the tails, with **unbounded
+    /// negative logits** so the softmax genuinely suppresses far-off tokens
+    /// rather than merely ranking them low.
+    ///
+    /// The target moves. After each pick the *original* probability of the
+    /// chosen token feeds an exponential moving average, and the next step aims
+    /// at `2*target - mean` — overshooting deliberately, so a run of
+    /// too-likely tokens is answered by aiming lower rather than by aiming at
+    /// the same place again.
+    fn sample_adaptive_p(&mut self) -> u32 {
+        // Constants are llama.cpp's; they are not tunable there either, and
+        // inventing different ones would silently change what the flag means.
+        const DISTRIBUTION_WIDTH: f32 = 0.3;
+        const PEAK_LOGIT_VALUE: f32 = 5.0;
+        const SHARPNESS: f32 = 10.0;
+
+        let target = self.config.adaptive_p.clamp(0.0, 1.0);
+        let mean = if self.ap_total == 0.0 {
+            target
+        } else {
+            self.ap_weighted / self.ap_total
+        };
+        let adapted = (2.0 * target - mean).clamp(0.0, 1.0);
+
+        // The pre-transform probabilities, kept because the EMA is fed the
+        // token's ORIGINAL likelihood -- feeding it the transformed one would
+        // make the controller chase its own output.
+        let original: Vec<f32> = self.candidates.iter().map(|c| c.1).collect();
+
+        for c in self.candidates.iter_mut() {
+            if c.1 == f32::NEG_INFINITY {
+                // Left where an earlier filter put it: a masked token must stay
+                // masked, and the transform would hand it a finite logit.
+                continue;
+            }
+            let dist = ((c.1 - adapted) / DISTRIBUTION_WIDTH).abs();
+            c.1 = PEAK_LOGIT_VALUE - SHARPNESS * dist * dist / (1.0 + dist);
+        }
+        softmax(&mut self.candidates);
+
+        let r = self.next_f32();
+        let mut acc = 0.0;
+        let mut idx = self.candidates.len().saturating_sub(1);
+        for (i, &(_, p)) in self.candidates.iter().enumerate() {
+            acc += p;
+            if r < acc {
+                idx = i;
+                break;
+            }
+        }
+        let decay = self.config.adaptive_decay.clamp(0.0, 0.99);
+        self.ap_weighted = original.get(idx).copied().unwrap_or(0.0) + decay * self.ap_weighted;
+        self.ap_total = 1.0 + decay * self.ap_total;
+        self.candidates.get(idx).map(|c| c.0).unwrap_or(0)
+    }
+
     fn sample_mirostat(&mut self) -> u32 {
         // Surprise in **bits**, matching tau's units. Using nats here is a
         // silent factor of ln(2) on every generation.
@@ -391,6 +500,19 @@ impl Sampler {
             }
         }
 
+        // Fill-in-the-middle guards. A FIM model will happily emit
+        // `<|fim_prefix|>` in the middle of the span it is filling, and the
+        // result is not bad prose -- it is a corrupted file, because the
+        // caller splices the completion back between two halves that now
+        // contain a stray control token. Suppressed on the raw logits for the
+        // same reason as `--ignore-eos`: it is a statement about what the model
+        // may say, not about how to sample what it says.
+        for &id in &self.config.infill_suppress {
+            if let Some(c) = self.candidates.get_mut(id as usize) {
+                c.1 = f32::NEG_INFINITY;
+            }
+        }
+
         apply_penalties(
             &mut self.candidates,
             history,
@@ -418,7 +540,12 @@ impl Sampler {
         // must not be short-circuited here. Without this it fell through to the
         // penalised argmax and `--mirostat 2` produced byte-identical output to
         // greedy — accepted, echoed, and doing nothing.
-        if self.config.temperature <= 0.0 && self.config.mirostat == 0 {
+        // `adaptive_p` joins mirostat here for the same reason: it supplies its
+        // own draw below and must not be short-circuited into an argmax.
+        if self.config.temperature <= 0.0
+            && self.config.mirostat == 0
+            && self.config.adaptive_p < 0.0
+        {
             return self
                 .candidates
                 .iter()
@@ -497,6 +624,17 @@ impl Sampler {
                     apply_temperature(&mut self.candidates, temp);
                 }
             }
+        }
+
+        // Adaptive-p replaces the final draw rather than joining the chain --
+        // it is llama.cpp's terminal sampler, in `dist`'s slot. Placing it
+        // BEFORE the truncations was the obvious reading and it is wrong: the
+        // transform hands every token whose probability is near the target the
+        // same peak logit, so on an untruncated 150k vocabulary it spread the
+        // mass over the whole dictionary and produced uniform garbage. It needs
+        // a candidate set that top-k/top-p have already cut down.
+        if self.config.adaptive_p >= 0.0 {
+            return self.sample_adaptive_p();
         }
 
         let r = self.next_f32();

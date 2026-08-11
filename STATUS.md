@@ -1148,6 +1148,44 @@ has never seen. `eos_or` prefers the container's EOS when there is one and
 falls back to llama.cpp's literal when there is not — the fixture test passes
 `""` and so reproduces llama.cpp exactly.
 
+## Samplers 16 -> 20: parity (2026-08-11)
+
+| sampler | what it is |
+|---|---|
+| `--adaptive-target` / `--adaptive-decay` | aim for a token of a given *probability*, with the target moving as it observes what it actually picked — a feedback controller like mirostat, not a filter |
+| `--infill` | suppress fill-in-the-middle control tokens |
+| `--grammar-lazy` | hold a grammar back until the model writes a trigger, then constrain everything after it |
+
+Bigtea now implements **20 of llama.cpp's 20** sampler entry points.
+
+**Adaptive-p was written in the wrong slot first**, and the mistake is worth
+recording because it looked plausible: it went next to mirostat, *before* the
+truncations, since both replace the temperature tail. The transform hands every
+token whose probability is near the target the same peak logit — so on an
+untruncated 150k vocabulary it spread the mass across the whole dictionary and
+produced `LOGGER冲突ユー ihm definit🏤谋划`. It is llama.cpp's **terminal**
+sampler, in `dist`'s slot, and needs a candidate set top-k and top-p have
+already cut down. Moved, it produces `in a magical world called Aylum, a
+mysterious dragon slayer`.
+
+`is_greedy()` gained both new knobs in the same commit. **That method has now
+been the bug twice** — a knob that changes the output but is not listed there is
+accepted, echoed in the header, and silently ignored at temperature 0.
+`--mirostat 2` produced byte-identical output to greedy for a whole release
+that way.
+
+`--grammar-lazy` takes **substrings, not regexes**, and the help says so.
+llama.cpp's `--grammar-lazy-patterns` takes regexes; a half-implemented regex
+engine that silently mismatches would arm the grammar at the wrong moment,
+which is worse than not having the flag. Verified three ways: a trigger that
+fires (`grammar armed after 1 tokens`, then JSON), one that never appears
+(prose throughout), and no trigger at all (armed from token 1).
+
+`--infill` resolves the FIM tokens **from the vocabulary's own text** rather
+than from metadata keys, because containers disagree about which keys they set
+while the token text is stable. Qwen3-4B: 4 tokens found. Qwen2-0.5B: 0, and it
+says `0` rather than pretending.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
