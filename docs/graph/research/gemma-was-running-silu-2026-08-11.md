@@ -129,3 +129,54 @@ which scale Gemma-2 was using were hours nobody with that output would have
 spent. It prints *derived* values — `attn_scale`, the per-layer RoPE bases,
 the windowed layer list — because a key read under the wrong name looks
 exactly like a key that was absent until you print the result.
+
+## The sweep the fix earned: `scripts/parity-check.sh`
+
+Since the list had one entry nobody had checked, every entry got checked. Three
+prompts, 32 tokens, `--temp 0`, both engines, seven containers:
+
+| container | architecture | result |
+|---|---|---|
+| tinyllama-1.1b-chat | `llama` (SPM) | 3/3 identical |
+| Llama-3.2-1B-Instruct | `llama` (BPE) | 2/3 identical, 1 unstable |
+| Phi-3-mini-4k-instruct | `phi3` | 2/3 identical, 1 unstable |
+| Qwen2-0.5B-Instruct | `qwen2` | 3/3 identical |
+| Qwen3-4B | `qwen3` | 3/3 identical |
+| gemma-2-2b-it | `gemma2` | 3/3 identical |
+| gemma-3-1b-it | `gemma3` | 3/3 identical |
+
+**19 of 21 exact, 0 failures, and the two exceptions are the interesting
+part.**
+
+### Greedy decoding is not stable under mathematical no-ops
+
+`def fibonacci(n):` on Llama-3.2-1B:
+
+```
+$ llama-completion ... -fa on      -> "the Fibonacci sequence up to the nth term."
+$ llama-completion ... -fa off     -> "the first n Fibonacci numbers."
+```
+
+`The capital of France is` on Phi-3-mini:
+
+```
+$ llama-completion ...             -> "Yes, that's correct. The capital of France is indeed Paris."
+$ llama-completion ... --no-repack -> "Paris is known for its rich history, iconic landmarks such as..."
+```
+
+**The reference disagrees with itself**, under flags that only reorder a sum.
+Those prompts sit on a near-tie: any implementation that accumulates in a
+different order lands on the other side and then writes a different paragraph.
+`-t` and `-b` do not move them, so this is not sloppiness — it is what a
+near-tie looks like.
+
+So "token-for-token identical to llama.cpp" is not always an achievable target,
+and treating every mismatch as a bug would have sent someone hunting two that
+do not exist. The script re-runs the reference under a second configuration
+before calling anything a failure, and reports `unstable` instead. **A test
+whose expected value is not reproducible in the reference must say so rather
+than fail.**
+
+This does not weaken the Gemma result: those were not near-ties. Gemma-2's
+first token differed *and* the reference was stable, and after the fix the
+match is exact on all three prompts.

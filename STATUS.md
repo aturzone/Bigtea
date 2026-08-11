@@ -990,6 +990,25 @@ read under the wrong name looks exactly like a key that was absent.
 
 Full account: `docs/graph/research/gemma-was-running-silu-2026-08-11.md`.
 
+### Every architecture re-checked, and greedy decoding is not always reproducible
+
+`scripts/parity-check.sh` diffs both engines on three prompts at `--temp 0`.
+Seven containers, six architectures: **19 of 21 exact, 0 failures.**
+
+The two exceptions are the finding. **llama.cpp disagrees with itself** on
+them — `def fibonacci(n):` on Llama-3.2-1B answers "up to the nth term" with
+`-fa on` and "the first n Fibonacci numbers" with `-fa off`; `The capital of
+France is` on Phi-3 changes under `--no-repack`. Both flags only reorder a sum.
+Those prompts sit on a near-tie, and any engine that accumulates differently
+lands on the other side and writes a different paragraph.
+
+So token-for-token identity is not always an achievable target. The script
+re-runs the reference under a second configuration before calling anything a
+failure and reports `unstable` instead — **a test whose expected value is not
+reproducible in the reference must say so rather than fail.** Gemma was not
+this: its reference was stable and we were wrong.
+
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
