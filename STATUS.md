@@ -881,6 +881,66 @@ gave **1.9232**, which looks spectacular and means nothing. Match the chunk size
 and the corpus or you are comparing windowings.
 `docs/graph/research/perplexity-2026-08-10.md`.
 
+## CLI parity with llama.cpp (2026-08-11) — 21 flags to 106, counted properly
+
+Full table and every refusal with its reason:
+`docs/graph/backlog/llamacpp-flag-audit.md`.
+
+llama.cpp has **182** long flags, counted from `llama-completion --help`. The
+parity doc had said "~100", which was a guess. Bigtea now accepts **106**.
+
+| bucket | | state |
+|---|---:|---|
+| samplers | 22 | **21 done** — only `--backend-sampling` (a GPU concept) left |
+| interaction | 22 | **done**, including a REPL and `--interactive-first` |
+| logging | 13 | **11 done**; status moved to **stderr** |
+| RoPE / YaRN | 15 | **9 done**, 6 refused |
+| KV type + prompt cache | 7 | **done** |
+| runtime / memory | 31 | I/O mode, `--override-kv`, `--mlock`; **most refused with reasons** |
+| GPU | 15 | **won't** — no backend to apply them to |
+| grammar / JSON schema | 4 | the r10 worktree session owns this |
+
+**Nothing is accepted that does nothing.** ~20 flags are refused outright with a
+written reason — `--keep` (no context shift), `--numa`, `--parallel`,
+`--cpu-mask`, `--defrag-thold`, `--swa-full`, `--jinja`, and the GPU set. That
+standard exists because `-t` was accepted, echoed and ignored for weeks.
+
+### What the flag work found, which is the point of doing it by hand
+
+Six flags were **accepted and silently did nothing** before being fixed:
+
+- `-t` reached one architecture of six. `-t 1` and `-t 20` gave *bit-identical*
+  phase timings. Connecting it was **1.66x**, and led to the MoE expert path
+  wanting **one** thread (**2.46x** on Qwen3-30B) and V4-Flash wanting four.
+- `--logit-bias` and `--ignore-eos` were skipped by the greedy short-circuit at
+  temperature 0, which is the default.
+- `--mirostat 2` produced **byte-identical output to greedy** — twice, through
+  two different early returns.
+- `--chat-template` landed on the deepseek4 path only, so it did nothing on
+  every model anyone would test it with.
+
+Each was invisible to a test that checks the process exits zero. They were found
+by running the flag and reading the *output* — or the token ids, when the header
+would have lied.
+
+### Two numbers of my own that were wrong
+
+- **The flag count** was measured from the help text for eight commits, which
+  lists each flag under one spelling. 81 was an undercount of 25. *Measure the
+  thing, not a description of the thing.*
+- **Batching the expert matmuls** was scoped at ~1.45x from a kernel benchmark,
+  built, and reverted: making the streamed experts contiguous costs what the
+  batched kernel saves. A kernel benchmark measures the kernel, not the data
+  movement needed to feed it.
+
+### Quality is measured now
+
+`--ppl-chunk N` reports perplexity with llama.cpp's windowing. Llama-3.2-1B
+**29.0909 vs 29.2456**; Qwen3-4B **33.6434 vs 34.0293** — 0.53% and 1.13% on two
+architectures and two tokenizer families. That same tool then measured the
+quantised KV cache: **q8_0 costs 0.64% of perplexity for roughly half the
+memory**.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
