@@ -155,6 +155,20 @@ pub struct Qwen3Config {
     /// layer is effectively full, which is why a short prompt cannot reveal a
     /// missing implementation — see the length guard in `Qwen3Config::verify`.
     pub sliding_window: u32,
+    /// How often a **full-attention** layer appears among the windowed ones.
+    ///
+    /// llama.cpp's `set_swa_pattern(n)`: layer `il` slides when
+    /// `il % n < n - 1`, so the last of every `n` sees everything. Gemma-2 is
+    /// 2 (alternating, starting windowed); **Gemma-3 is 6** — five local layers
+    /// to one global. Applying Gemma-2's period to Gemma-3 gives the wrong
+    /// attention on four layers in six, which is not an error and not a crash.
+    pub swa_period: u32,
+    /// RoPE frequency base for the **windowed** layers.
+    ///
+    /// Gemma-3 rotates its local layers at 10000 and its global ones at the
+    /// declared `rope.freq_base` (1e6). Using one base for both is fluent
+    /// nonsense — the rotation is wrong on every sliding layer.
+    pub rope_freq_base_swa: f32,
 }
 
 impl Qwen3Config {
@@ -238,6 +252,24 @@ impl Qwen3Config {
             attn_logit_softcap: model.arch_f32("attn_logit_softcapping").unwrap_or(0.0),
             final_logit_softcap: model.arch_f32("final_logit_softcapping").unwrap_or(0.0),
             sliding_window: model.arch_u64("attention.sliding_window").unwrap_or(0) as u32,
+            // Declared when a container bothers; otherwise per architecture,
+            // because nothing in the weights reveals it. 6 is Gemma-3's
+            // five-local-to-one-global; 2 is Gemma-2's alternation.
+            swa_period: model
+                .arch_u64("attention.sliding_window_pattern")
+                .map(|v| v as u32)
+                .unwrap_or(if arch == "gemma3" { 6 } else { 2 }),
+            // **Defaults to the ordinary base, not to llama.cpp's 10000.**
+            // Only Gemma-3 splits the two, and giving every windowed
+            // architecture a different base would silently re-rotate Gemma-2's
+            // sliding layers — a regression with no symptom but wrong output.
+            rope_freq_base_swa: model.arch_f32("rope.freq_base_swa").unwrap_or(
+                if arch == "gemma3" {
+                    10_000.0
+                } else {
+                    model.arch_f32("rope.freq_base").unwrap_or(10_000.0)
+                },
+            ),
         })
     }
 
@@ -258,6 +290,28 @@ impl Qwen3Config {
     /// would trace back to attention.
     pub fn correct_context_limit(&self) -> usize {
         usize::MAX
+    }
+
+    /// Whether layer `il` uses the sliding window rather than full attention.
+    ///
+    /// `il % swa_period < swa_period - 1`, which is llama.cpp's
+    /// `set_swa_pattern`. Gemma-2 (period 2) slides on even layers; Gemma-3
+    /// (period 6) slides on five of every six.
+    pub fn layer_is_windowed(&self, il: u32) -> bool {
+        self.sliding_window > 0 && self.swa_period > 0 && il % self.swa_period < self.swa_period - 1
+    }
+
+    /// The RoPE frequency base layer `il` rotates at.
+    ///
+    /// Only Gemma-3 currently differs between its windowed and full layers, but
+    /// this is driven by the two config values rather than by the name, so a
+    /// container that declares `rope.freq_base_swa` gets it for free.
+    pub fn rope_freq_base_for(&self, il: u32) -> f32 {
+        if self.layer_is_windowed(il) {
+            self.rope_freq_base_swa
+        } else {
+            self.rope_freq_base
+        }
     }
 
     /// Scale applied to attention scores before softmax.
@@ -826,6 +880,8 @@ mod tests {
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             sliding_window: 0,
+            swa_period: 2,
+            rope_freq_base_swa: 1_000_000.0,
         }
     }
 
@@ -872,6 +928,54 @@ mod tests {
         assert_eq!(rope_type_for("qwen3"), (ROPE_TYPE_NEOX, true));
         assert_eq!(rope_type_for("qwen3moe"), (ROPE_TYPE_NEOX, true));
         assert_eq!(rope_type_for("gemma2"), (ROPE_TYPE_NEOX, true));
+    }
+
+    /// Gemma-2 alternates 1:1; **Gemma-3 is five local to one global**. Using
+    /// Gemma-2's period on Gemma-3 gives the wrong attention on four layers in
+    /// six, and that is not an error — it is a slightly wrong answer.
+    #[test]
+    fn the_sliding_window_pattern_comes_from_the_period() {
+        let mut c = dense_config();
+        c.sliding_window = 512;
+
+        c.swa_period = 2;
+        let g2: Vec<bool> = (0..6).map(|il| c.layer_is_windowed(il)).collect();
+        assert_eq!(g2, [true, false, true, false, true, false]);
+
+        c.swa_period = 6;
+        let g3: Vec<bool> = (0..12).map(|il| c.layer_is_windowed(il)).collect();
+        assert_eq!(
+            g3,
+            [true, true, true, true, true, false, true, true, true, true, true, false]
+        );
+    }
+
+    /// No window means no windowed layers, whatever the period says.
+    #[test]
+    fn without_a_window_no_layer_slides() {
+        let mut c = dense_config();
+        c.sliding_window = 0;
+        c.swa_period = 6;
+        assert!((0..12).all(|il| !c.layer_is_windowed(il)));
+    }
+
+    /// Gemma-3 rotates its local layers at 10000 and its global ones at the
+    /// declared base. Everything else must keep **one** base for both, or
+    /// Gemma-2's sliding layers get silently re-rotated.
+    #[test]
+    fn only_a_split_base_splits_the_rotation() {
+        let mut c = dense_config();
+        c.sliding_window = 512;
+        c.swa_period = 6;
+        c.rope_freq_base = 1_000_000.0;
+
+        c.rope_freq_base_swa = 10_000.0;
+        assert_eq!(c.rope_freq_base_for(0), 10_000.0, "layer 0 slides");
+        assert_eq!(c.rope_freq_base_for(5), 1_000_000.0, "layer 5 is global");
+
+        // The default case: both bases equal, so the layer index cannot matter.
+        c.rope_freq_base_swa = c.rope_freq_base;
+        assert!((0..12).all(|il| c.rope_freq_base_for(il) == 1_000_000.0));
 
         // An architecture nobody has checked gets a default AND is flagged as a
         // guess, so the runner can say so rather than quietly being wrong.

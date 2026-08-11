@@ -1183,3 +1183,43 @@ property the whole design rests on: no two positions in one span share a slot.
 **Still stale, and not mine to change**: `bigtea-serve.rs` reports
 `context_limit() = 256` for deepseek4, so the server refuses sequences the engine
 now handles. One line, and it belongs to whoever owns that file.
+
+## R13 — Gemma-3: two real bugs fixed, and it is still NOT verified (2026-08-11)
+
+**`VERIFIED_ARCHITECTURES` is unchanged at six.** Gemma-3-1B loads with no
+missing tensor and answers "The capital of France is" with "Paris." — and still
+disagrees with llama.cpp on the next clause. Detail:
+`docs/graph/research/gemma3-not-verified-2026-08-11.md`.
+
+```
+llama.cpp   Paris.\n\nThe largest city in the world by
+Bigtea      Paris.\n\nIt's a city known for
+```
+
+Two genuine causes were found and fixed, and neither was enough:
+
+1. **The sliding-window layer pattern was hardcoded to Gemma-2's** `il % 2 == 0`.
+   Gemma-3 is **five local to one global**, not alternating, so four layers in
+   six had full attention where they should have been windowed. Now
+   `layer_is_windowed(il)` from a `swa_period` read from the container.
+2. **Gemma-3 rotates windowed and full layers at different RoPE bases** — 10000
+   local against the declared 1e6 global. One base for both left every sliding
+   layer rotated at 100x the right frequency, the same class of bug as the 1e6
+   default that broke Phi-3.
+
+`rope_freq_base_swa` deliberately defaults to the **ordinary** base rather than
+llama.cpp's 10000: only Gemma-3 splits them, and defaulting every windowed
+architecture to 10000 would silently re-rotate Gemma-2's sliding layers.
+
+Ruled out by inspection: soft-caps (Gemma-3 dropped them and the container
+declares neither), attention scale, `head_dim` (correctly read from
+`attention.key_length` = 256, not `n_embd/n_head` = 288), QK norm, post-norms,
+embedding scaling, RoPE convention. The remainder needs per-block element sums
+against llama.cpp — the method that settled the V4-Flash port — not more reading.
+
+**This is the fourth architecture to load cleanly and answer wrongly** (gemma2
+"himſelf", qwen2 CJK noise, and phi3 which failed loudly instead). The list
+means "checked against the reference", and Gemma-3 is not.
+
+Regression: gemma2, phi3, qwen3, llama and tinyllama all re-run and unchanged.
+410 workspace tests, clippy and fmt clean.

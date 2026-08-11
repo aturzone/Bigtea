@@ -1389,7 +1389,14 @@ impl<'m> StreamingRunner<'m> {
                     (q, k)
                 };
 
-                let rp = self.rope();
+                // Per layer, because Gemma-3's windowed layers rotate at a
+                // different frequency base (10000) than its full ones (1e6).
+                // One base for both leaves every sliding layer rotated wrongly,
+                // which no shape reveals.
+                let rp = RopeParams {
+                    freq_base: c.rope_freq_base_for(il),
+                    ..self.rope()
+                };
                 // NORM for llama/mistral, NeoX for qwen/phi/gemma. Both run
                 // without error on either layout and the wrong one is fluent
                 // nonsense, so it comes from the config rather than a constant.
@@ -1460,13 +1467,14 @@ impl<'m> StreamingRunner<'m> {
             }
             let arch = &self.arch;
             let out_w = get(weights, format!("blk.{il}.attn_output.weight"))?;
-            // Even layers slide, odd layers see everything — Gemma-2's pattern,
-            // and it starts with the window. Reversing it is not an error and
-            // not a crash; it is a model that answers slightly wrongly, so the
-            // ordering is checked against llama.cpp's output rather than
-            // reasoned about.
+            // Which layers slide comes from the config's period, not a
+            // constant: Gemma-2 alternates (period 2, starting windowed) and
+            // **Gemma-3 is five local to one global** (period 6). Reversing it
+            // or using the wrong period is not an error and not a crash; it is
+            // a model that answers slightly wrongly, so it is checked against
+            // llama.cpp's output rather than reasoned about.
             let layer_mask = match swa_mask.as_ref() {
-                Some(swa) if il % 2 == 0 => swa,
+                Some(swa) if c.layer_is_windowed(il) => swa,
                 _ => &mask,
             };
             let attn_result = (|| -> Result<(Vec<f32>, f64, f64)> {
@@ -1875,6 +1883,8 @@ mod tests {
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             sliding_window: 0,
+            swa_period: 2,
+            rope_freq_base_swa: 1_000_000.0,
         }
     }
 
