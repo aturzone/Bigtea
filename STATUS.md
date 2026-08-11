@@ -5,8 +5,12 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-11 · **Version**: v0.0.2 · **Branch**:
-`ticket/r11-grammar-cli`; `main` at `4c2de60` · **Open PRs**: none.
+**Last updated**: 2026-08-11 · **Version**: v0.0.2 · **Branch**: `main` at
+`8b4794e` · **Open PRs**: none, no ticket branches open.
+
+**#60 and #63 are merged and everything is on `main`, verified on `main`
+itself**: 423 tests, clippy `--workspace -D warnings` 0, fmt clean, and the
+parity sweep re-run after the merge. `VERIFIED_ARCHITECTURES` is **ten**.
 
 **Everything is merged.** PR #55 brought R3, R7, R8 and R9 into `main` in one
 merge — the KV cache, six architectures, four tokenizer families, 106 CLI flags,
@@ -1277,6 +1281,50 @@ The token is read and **never echoed, including on the failure path** — a
 failed download is exactly when output gets pasted into an issue.
 
 Flags recognised: **187** — 137 implemented, 50 declined. Tests **413 -> 420**.
+
+## Both branches merged, and one process rule tightened (2026-08-11)
+
+`main` carries the whole day. Two sessions, no collisions, three branches
+deleted after `git merge-base --is-ancestor` confirmed containment.
+
+### The rule that changed, and why it should have been obvious
+
+`starcoder2` was added to `VERIFIED_ARCHITECTURES` on a **3/3 parity pass while
+running the wrong pre-tokenizer**. It agreed on those three prompts only
+because its merge table differed from the model that failed. Three prompts were
+enough to certify an architecture and not enough to notice that its *input* was
+being split wrongly.
+
+So `parity-check.sh` runs **eight** prompts now, and its header states what a
+pass means: **evidence about these prompts, not about the architecture.** The
+five added are a numeric run, a list continuation, arithmetic, SQL and formal
+register — each stresses a different part of the vocabulary and a different
+part of the graph.
+
+It earned itself immediately: Gemma-3 has an eighth-prompt near-tie
+(`Q: What is 17 plus 25? A:`) that three prompts never reached, and Phi-3 has
+two. All are reported `unstable` — llama.cpp disagrees with itself on them —
+rather than passed or failed.
+
+**A single factual prompt is the weakest test available.** "The capital of
+France is Paris" survives a surprising amount of wrong arithmetic, because the
+answer is overdetermined by the training data. Both bugs found today —
+Gemma's activation and the pre-tokenizer — were caught by the *code* prompt.
+
+### What the merge brought in from the other session
+
+LayerNorm bound beside RMSNorm; the full bias set; **partial RoPE**, where
+`rope.dimension_count` had been ignored entirely and `head_dim` went in as
+`n_rot` unconditionally, over-rotating every container that declares the key;
+ungated FFN; and the pre-tokenizer default. Two traps worth carrying forward:
+
+- **A bias not in `required_tensors` is never loaded, and the graph silently
+  skips it.** `output_norm.bias` is the worst case — applied once, so it shifts
+  every logit equally and the text stays fluent.
+- **A missing `ffn_gate` means two different things.** Phi-3 *fuses* it into a
+  tensor twice `n_ff` wide; StarCoder2 has none. Testing for the tensor alone
+  made Phi-3 ungated and broke a verified architecture. `ne1 == 2*n_ff`
+  separates them.
 
 ## Known limitations
 
