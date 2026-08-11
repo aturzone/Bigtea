@@ -5,11 +5,16 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-10 · **Version**: v0.0.2 · **Branch**: `main` ·
-**Open PRs**: [#44](https://github.com/aturzone/Bigtea/pull/44) — R3, the KV
-cache. `ticket/r5-product` (release workflow, `bigtea-pull`, `bigtea-serve`) and
-`ticket/r7-factored-experts` (this session's measurements). **All unmerged, Atur
-merges.** PR #43 (R0/R0.1/R1) is **merged**.
+**Last updated**: 2026-08-11 · **Version**: v0.0.2 · **Branch**: `main` at
+`c7a5534` · **Open PRs**: none.
+
+**Everything is merged.** PR #55 brought R3, R7, R8 and R9 into `main` in one
+merge — the KV cache, six architectures, four tokenizer families, 106 CLI flags,
+weight repacking, the thread work and the first quality measurement this project
+has had. #44, #56 and #57 closed with it; their branches are deleted.
+
+In flight: `ticket/r10-grammar-and-overlap` — GBNF/JSON-schema constrained
+decoding as a new crate, then **R2** (overlap disk reads with compute).
 
 ---
 
