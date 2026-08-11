@@ -526,7 +526,7 @@ impl ChatFormat {
             ChatFormat::Orion => {
                 for m in messages {
                     match m.role.as_str() {
-                        "system" => out.push_str(&format!("{}", m.content)),
+                        "system" => out.push_str(&m.content),
                         "user" => out.push_str(&format!("Human: {}\n\nAssistant: ", m.content)),
                         _ => out.push_str(&format!("{}{eos}", m.content)),
                     }
@@ -642,8 +642,6 @@ mod tests {
             assert!(!out.is_empty(), "{n}: rendered nothing");
         }
     }
-
-    use super::*;
 
     fn convo() -> Vec<Message> {
         vec![
