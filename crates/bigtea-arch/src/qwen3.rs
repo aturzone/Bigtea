@@ -114,6 +114,7 @@ pub const VERIFIED_ARCHITECTURES: &[&str] = &[
     "qwen2",
     "qwen3",
     "qwen3moe",
+    "stablelm",
     "starcoder2",
 ];
 

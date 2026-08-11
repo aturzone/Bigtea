@@ -1328,3 +1328,41 @@ Regression sweep after these changes, `parity-check.sh` at 32 tokens: gemma2,
 gemma3, qwen3-4b, qwen2, tinyllama, starcoder2 all 3/3; llama32-1b and phi3 2/3
 plus one `unstable`, which is llama.cpp disagreeing with itself on a near-tie
 and is documented. 411 workspace tests, clippy and fmt clean.
+
+## StableLM verified — the absent pre-tokenizer was guessed (2026-08-11)
+
+**`VERIFIED_ARCHITECTURES` is ten.** `stablelm` added, 3/3 exact.
+
+The block had been right since LayerNorm landed; the last difference was the
+**tokenizer**, and the bug was ours and recent. When `tokenizer.ggml.pre` is
+**absent**, `Tokenizer::from_metadata` fell back to `"llama-bpe"`. llama.cpp
+falls back to its `LLAMA_VOCAB_PRE_TYPE_DEFAULT` GPT-2 rule.
+
+```
+llama-tokenize  "def fibonacci(n):"  ->  def / ' fibonacci' / ( / n / '):'   5
+bigtea, before                       ->                                      4
+bigtea, after                        ->                                      5
+```
+
+A6c refused every *unknown* `pre` **by name** and then quietly guessed the
+**absent** case — the same mistake one layer down from the one it fixed.
+
+**The default is structurally unlike the other variants**: four regexes applied
+in **sequence**, each splitting what the last produced, rather than one ordered
+alternation. The first pass cuts a run of punctuation out *whole and first*, so
+`(n):` becomes `(` `n` `):` before anything else runs. That single pass is the
+entire disagreement.
+
+**It also narrows a claim made an hour earlier.** `starcoder2` was verified 3/3
+while running this same wrong fallback — it declares no `pre` either, and only
+agreed because its merge table differs from StableLM's. It was re-run after the
+fix and is still 3/3, so the entry stands; but "verified" meant less than it
+looked at the time, and the re-run is what makes it mean what it says.
+
+Containers affected: any `gpt2`-BPE container omitting the key. Of those on
+disk, `stablelm` and `starcoder2`. Everything that declares its `pre` explicitly
+— qwen2, qwen3, llama32-1b, v4flash — is untouched and re-checked unchanged.
+
+Regression sweep after the fix: stablelm 3/3, starcoder2 3/3, qwen2 3/3,
+qwen3-4b 3/3, gemma2 3/3, llama32-1b 2/3 + one documented `unstable`.
+414 workspace tests, clippy and fmt clean.
