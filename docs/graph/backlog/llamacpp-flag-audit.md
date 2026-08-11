@@ -14,7 +14,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 
 | bucket | flags | state |
 |---|---:|---|
-| **have** | **72** | done |
+| **have** | **74** | done |
 | **samplers** | 22 | **21 done**; only `--backend-sampling` left, and it is a GPU concept |
 | interaction / prompt handling | 22 | **done 2026-08-11** — including a real REPL |
 | runtime / threading / memory | 31 | mostly gap; several are meaningless here |
@@ -23,7 +23,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 | **GPU** | 15 | **won't** — no backend to apply them to |
 | fetch / Hugging Face | 9 | partly covered by `bigtea-pull`, different spelling |
 | reasoning / speculative draft | 8 | gap |
-| KV cache type / prompt cache | 7 | gap; `--cache-type-k/v` is real and substantial |
+| KV cache type / prompt cache | 7 | **`--cache-type-k/v` done 2026-08-11**; prompt cache (5) left |
 | chat template | 6 | 2 done (detection), `--jinja` won't |
 | LoRA / control vectors | 5 | gap |
 | grammar / JSON schema | 4 | gap |
@@ -232,6 +232,52 @@ not.
 
 `--backend-sampling` is the one sampler flag left and it is **won't**: it moves
 sampling onto the GPU, and there is no GPU backend to move it to.
+
+## Done 2026-08-11 - `--cache-type-k/v`, a quantised KV cache
+
+`--cache-type-k`/`-ctk`, `--cache-type-v`/`-ctv`, taking `f16` (default) or
+`q8_0`. This is the one flag in the list that changes what the engine *is* able
+to do rather than how it is driven: the KV cache is the memory that grows with
+context, and it is the axis this project competes on.
+
+```
+$ bigtea-run <llama-3.2-1b> "The capital of France is" -n 10
+kv cache   15 positions, 0.5 MiB, f16
+
+$ bigtea-run <llama-3.2-1b> "The capital of France is" -n 10 -ctk q8_0 -ctv q8_0
+kv cache   15 positions, 0.2 MiB, q8_0
+```
+
+**And the quality cost is measured, not asserted** - which is what the
+perplexity work earlier today was for:
+
+| KV storage | perplexity | bytes/value |
+|---|---:|---:|
+| f16 | 29.0909 | 2.00 |
+| q8_0 | 28.9047 | 1.0625 |
+
+**0.64% apart on 189 scored tokens.** q8_0 landing slightly *lower* is noise at
+that sample size, not an improvement, and it must not be quoted as one.
+
+Three things that would have been silent:
+
+- **A block may not span two heads.** Quantisation runs row by row, where a row
+  is `head_dim`; a block straddling a head boundary applies one head's scale to
+  another head's values, which is fluent nonsense rather than an error.
+- **`head_dim` must be a multiple of 32**, or a row does not hold whole blocks.
+  Every architecture here uses 64, 128 or 256, but one that did not falls back
+  to f16 **and says so** rather than being misquantised.
+- **`is_consistent()` was counting values where the vectors now hold bytes.** It
+  passed under f16 by coincidence and failed immediately under q8_0 - the test
+  that caught it existed already and was checking the right thing.
+
+K and V share one type because ggml's banded attention asserts
+`k->type == v->type`; accepting different ones would work until that path was
+reached. Both spellings are accepted and the last wins.
+
+`q4_0` is **not** offered. ggml has the kernels, but the accuracy cost at 4 bits
+in attention is real and unmeasured here, and offering a type without the
+perplexity number beside it is the thing this audit exists to prevent.
 
 ## Next batches, in order
 2. **RoPE / context (15)** — `--rope-freq-base`, `--rope-freq-scale`,

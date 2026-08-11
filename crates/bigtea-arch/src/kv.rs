@@ -26,21 +26,121 @@
 /// rate. Attention also reads half as many bytes.
 pub struct KvCache {
     /// Per layer, laid out `[head_dim * n_kv_heads]` per position, appended.
-    /// Raw f16 bits, so they can be handed to a ggml F16 tensor unchanged.
-    k: Vec<Vec<u16>>,
-    v: Vec<Vec<u16>>,
+    /// Raw bytes in `kind`'s layout, handed to a ggml tensor unchanged.
+    k: Vec<Vec<u8>>,
+    v: Vec<Vec<u8>>,
     n_positions: usize,
     per_position: usize,
+    /// Storage type. Both halves share one, because ggml's banded attention
+    /// asserts `k->type == v->type` and splitting them would work right up
+    /// until someone used that path.
+    kind: KvType,
+    /// Row length in values -- `head_dim`. Q8_0 quantises per 32-value block
+    /// within a row, so this is needed to place the block boundaries.
+    row: usize,
+}
+
+/// How the cache stores a key or value -- llama.cpp's `--cache-type-k/v`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvType {
+    /// 2 bytes per value. What llama.cpp stores by default.
+    F16,
+    /// ~1.06 bytes per value: 32 int8 quants sharing one f16 scale.
+    ///
+    /// **Roughly half the memory**, which at long context comes straight off
+    /// the expert cache's budget where it buys hit rate. The cost is precision
+    /// in attention, and that is measurable rather than arguable -- the flag
+    /// audit carries a perplexity comparison.
+    Q8_0,
+}
+
+/// ggml's `block_q8_0`: one f16 scale then 32 int8 quants, 34 bytes.
+const QK8_0: usize = 32;
+const Q8_0_BLOCK_BYTES: usize = 2 + QK8_0;
+
+impl KvType {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "f16" | "fp16" => Some(KvType::F16),
+            "q8_0" | "q8" => Some(KvType::Q8_0),
+            _ => None,
+        }
+    }
+
+    /// The ggml type id, for building the tensor attention reads.
+    pub fn ggml_type(self) -> u32 {
+        match self {
+            KvType::F16 => 1,
+            KvType::Q8_0 => 8,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            KvType::F16 => "f16",
+            KvType::Q8_0 => "q8_0",
+        }
+    }
+
+    /// Bytes for `values` values, which must be a whole number of rows.
+    fn bytes_for(self, values: usize) -> usize {
+        match self {
+            KvType::F16 => values * 2,
+            KvType::Q8_0 => values / QK8_0 * Q8_0_BLOCK_BYTES,
+        }
+    }
+}
+
+/// Quantise one row into ggml's `block_q8_0` layout.
+///
+/// Per 32 values the scale is `max|x| / 127`, and each quant is `x / scale`
+/// rounded. 127 rather than 128 because the int8 range is asymmetric: using
+/// 128 makes the largest positive value in a block clip to -128.
+fn quantize_q8_0(src: &[f32], dst: &mut [u8]) {
+    for (bi, chunk) in src.chunks(QK8_0).enumerate() {
+        let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let at = bi * Q8_0_BLOCK_BYTES;
+        let mut half = [0u16; 1];
+        bigtea_ggml::f32_to_f16(&[d], &mut half);
+        dst[at..at + 2].copy_from_slice(&half[0].to_le_bytes());
+        for (i, &x) in chunk.iter().enumerate() {
+            dst[at + 2 + i] = ((x * id).round() as i8) as u8;
+        }
+    }
 }
 
 impl KvCache {
     pub fn new(n_layer: usize, n_kv_heads: usize, head_dim: usize) -> Self {
+        Self::with_type(n_layer, n_kv_heads, head_dim, KvType::F16)
+    }
+
+    /// A cache storing `kind`.
+    ///
+    /// Q8_0 needs `head_dim` to be a multiple of 32, or a row does not hold
+    /// whole blocks and the quantisation boundaries fall inside a head. Every
+    /// architecture here uses 64, 128 or 256; one that did not would be
+    /// silently misquantised, so this falls back to F16 rather than guessing.
+    pub fn with_type(n_layer: usize, n_kv_heads: usize, head_dim: usize, kind: KvType) -> Self {
+        let kind = if kind == KvType::Q8_0 && head_dim % QK8_0 != 0 {
+            KvType::F16
+        } else {
+            kind
+        };
         KvCache {
             k: vec![Vec::new(); n_layer],
             v: vec![Vec::new(); n_layer],
             n_positions: 0,
             per_position: n_kv_heads * head_dim,
+            kind,
+            row: head_dim,
         }
+    }
+
+    /// What this cache stores. `with_type` may have refused what was asked for.
+    pub fn kind(&self) -> KvType {
+        self.kind
     }
 
     /// Positions currently held.
@@ -59,9 +159,8 @@ impl KvCache {
 
     /// Total bytes held, for reporting against the RAM budget.
     pub fn bytes(&self) -> usize {
-        let f = std::mem::size_of::<u16>();
-        self.k.iter().map(|v| v.len() * f).sum::<usize>()
-            + self.v.iter().map(|v| v.len() * f).sum::<usize>()
+        self.k.iter().map(|v| v.len()).sum::<usize>()
+            + self.v.iter().map(|v| v.len()).sum::<usize>()
     }
 
     /// Append one position's keys and values for `layer`.
@@ -77,11 +176,31 @@ impl KvCache {
                 got_v: v.len(),
             });
         }
+        let step = self.kind.bytes_for(self.per_position);
         let at = self.k[layer].len();
-        self.k[layer].resize(at + self.per_position, 0);
-        self.v[layer].resize(at + self.per_position, 0);
-        bigtea_ggml::f32_to_f16(k, &mut self.k[layer][at..]);
-        bigtea_ggml::f32_to_f16(v, &mut self.v[layer][at..]);
+        self.k[layer].resize(at + step, 0);
+        self.v[layer].resize(at + step, 0);
+        match self.kind {
+            KvType::F16 => {
+                // Through a u16 view: `f32_to_f16` fills halves, and the bytes
+                // of those halves are what the tensor reads.
+                let mut halves = vec![0u16; self.per_position];
+                bigtea_ggml::f32_to_f16(k, &mut halves);
+                self.k[layer][at..at + step].copy_from_slice(as_bytes(&halves));
+                bigtea_ggml::f32_to_f16(v, &mut halves);
+                self.v[layer][at..at + step].copy_from_slice(as_bytes(&halves));
+            }
+            KvType::Q8_0 => {
+                // Row by row: a block may not span two heads, or one head's
+                // scale is applied to another head's values.
+                let row_bytes = self.kind.bytes_for(self.row);
+                for (r, (kr, vr)) in k.chunks(self.row).zip(v.chunks(self.row)).enumerate() {
+                    let lo = at + r * row_bytes;
+                    quantize_q8_0(kr, &mut self.k[layer][lo..lo + row_bytes]);
+                    quantize_q8_0(vr, &mut self.v[layer][lo..lo + row_bytes]);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -99,13 +218,13 @@ impl KvCache {
         self.n_positions += n;
     }
 
-    /// Raw f16 bits for a layer's keys, ready to fill an F16 tensor.
+    /// Raw bytes for a layer's keys, ready to fill a tensor of [`Self::kind`].
     pub fn keys(&self, layer: usize) -> &[u8] {
-        as_bytes(&self.k[layer])
+        &self.k[layer]
     }
 
     pub fn values(&self, layer: usize) -> &[u8] {
-        as_bytes(&self.v[layer])
+        &self.v[layer]
     }
 
     /// Drop everything, for starting a new sequence.
@@ -121,7 +240,11 @@ impl KvCache {
     /// A layer falling behind means some layer silently skipped its append,
     /// which would make attention read stale history for the rest of the run.
     pub fn is_consistent(&self) -> bool {
-        let expected = self.n_positions * self.per_position;
+        // In **bytes**, which is what the vectors now hold. Comparing against
+        // the value count silently passed for F16 only because a length in
+        // halves and a length in bytes happened to differ by exactly the
+        // factor this check never looked at.
+        let expected = self.kind.bytes_for(self.n_positions * self.per_position);
         self.k.iter().all(|v| v.len() == expected) && self.v.iter().all(|v| v.len() == expected)
     }
 }
@@ -253,6 +376,70 @@ mod tests {
         c.advance();
         // Layer 1 never received its position.
         assert!(!c.is_consistent(), "a lagging layer must be detected");
+    }
+
+    #[test]
+    fn q8_0_halves_the_bytes_and_survives_a_round_trip() {
+        // 2 bytes per value against 34 per 32 -- 1.0625, so a shade under half.
+        let mut f16 = KvCache::with_type(1, 2, 64, KvType::F16);
+        let mut q8 = KvCache::with_type(1, 2, 64, KvType::Q8_0);
+        let vals: Vec<f32> = (0..128).map(|i| (i as f32 - 64.0) / 40.0).collect();
+        f16.push(0, &vals, &vals).expect("push");
+        q8.push(0, &vals, &vals).expect("push");
+        f16.advance();
+        q8.advance();
+        assert_eq!(f16.bytes(), 128 * 2 * 2, "f16 is two bytes a value");
+        assert_eq!(q8.bytes(), 128 / 32 * 34 * 2, "q8_0 is 34 bytes per 32");
+        assert!(
+            q8.bytes() * 2 < f16.bytes() * 2 - 100,
+            "q8_0 must be smaller"
+        );
+        assert!(f16.is_consistent() && q8.is_consistent());
+
+        // Dequantise the first block by hand and check it tracks the input.
+        // The scale is max|x|/127 over the block, so the error per value is
+        // bounded by half a step -- if the block boundaries were misplaced this
+        // would be wildly off rather than subtly.
+        let bytes = q8.keys(0);
+        let d = half_from_bits(u16::from_le_bytes([bytes[0], bytes[1]]));
+        for i in 0..32 {
+            let got = (bytes[2 + i] as i8) as f32 * d;
+            assert!(
+                (got - vals[i]).abs() <= d,
+                "value {i}: {got} vs {} (step {d})",
+                vals[i]
+            );
+        }
+    }
+
+    /// Decode an f16 bit pattern for the assertion above.
+    fn half_from_bits(bits: u16) -> f32 {
+        let mut out = [0f32; 1];
+        bigtea_ggml::f16_to_f32(&[bits], &mut out);
+        out[0]
+    }
+
+    #[test]
+    fn q8_0_is_refused_when_a_row_is_not_whole_blocks() {
+        // head_dim 40 would put a block boundary inside a head, applying one
+        // head's scale to another's values. Falling back is the only safe
+        // answer, and it must be visible rather than silent.
+        let c = KvCache::with_type(1, 2, 40, KvType::Q8_0);
+        assert_eq!(c.kind(), KvType::F16);
+        // 64 divides 32, so this one is honoured.
+        let c = KvCache::with_type(1, 2, 64, KvType::Q8_0);
+        assert_eq!(c.kind(), KvType::Q8_0);
+    }
+
+    #[test]
+    fn cache_type_names_match_llamacpp() {
+        assert_eq!(KvType::parse("q8_0"), Some(KvType::Q8_0));
+        assert_eq!(KvType::parse("F16"), Some(KvType::F16));
+        assert_eq!(
+            KvType::parse("q4_0"),
+            None,
+            "unsupported must not be guessed"
+        );
     }
 
     #[test]

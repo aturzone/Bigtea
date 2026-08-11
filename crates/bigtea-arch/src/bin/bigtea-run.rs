@@ -348,12 +348,14 @@ fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool, system: Option<&str>)
 /// matches: it defaults to 512 and different windowing gives a different number
 /// on the same file and the same model. Compare the two only with the same
 /// `--ppl-chunk` and the same corpus, and say so when quoting.
+#[allow(clippy::too_many_arguments)]
 fn perplexity_run(
     runner: &mut bigtea_arch::StreamingRunner<'_>,
     weights: &WeightSet<'_>,
     config: &Qwen3Config,
     tokens: &[u32],
     chunk_size: usize,
+    kv_type: bigtea_arch::KvType,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let vocab = config.vocab_size as usize;
@@ -373,10 +375,11 @@ fn perplexity_run(
         if chunk.len() < chunk_size {
             break;
         }
-        let mut cache = KvCache::new(
+        let mut cache = KvCache::with_type(
             config.n_layer as usize,
             config.n_head_kv as usize,
             config.head_dim as usize,
+            kv_type,
         );
         // Every position is still *evaluated* — the context has to be built —
         // but only the second half is scored.
@@ -529,6 +532,7 @@ fn main() -> ExitCode {
         eprintln!("  --dry-penalty-last-n N  how far DRY looks back. 0 = all");
         eprintln!("  --dry-sequence-breaker S  a match may not cross this, repeatable");
         eprintln!("  --samplers SPEC     chain order, e.g. \"top_k;temperature;top_p\"");
+        eprintln!("  -ctk, -ctv TYPE     KV cache storage: f16 (default) or q8_0");
         eprintln!("  -i, --interactive   keep the session open and take turns");
         eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
         eprintln!("  -st, --single-turn  one exchange, then exit");
@@ -605,6 +609,7 @@ fn main() -> ExitCode {
     let mut logcfg = bigtea_arch::log::LogConfig::default();
     // Held as text until a tokenizer exists to turn them into ids.
     let mut dry_breakers: Vec<String> = Vec::new();
+    let mut kv_type = bigtea_arch::KvType::F16;
     let mut show_perf = true;
     let mut system_prompt: Option<String> = None;
     let mut ctx_size: Option<usize> = None;
@@ -753,6 +758,26 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // --- KV cache storage type ------------------------------------
+            // One type for both halves: ggml's banded attention asserts
+            // k->type == v->type, so accepting different ones would work until
+            // that path was reached. Both spellings are taken and the last
+            // wins, which is what a user passing `-ctk q8_0 -ctv q8_0` means.
+            "--cache-type-k" | "-ctk" | "--cache-type-v" | "-ctv" => {
+                match rest.get(i + 1).and_then(|v| bigtea_arch::KvType::parse(v)) {
+                    Some(t) => kv_type = t,
+                    None => {
+                        eprintln!(
+                            "bigtea-run: {}: unknown cache type {:?}",
+                            rest[i],
+                            rest.get(i + 1).cloned().unwrap_or_default()
+                        );
+                        eprintln!("  known: f16, q8_0");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
             // The chain order itself. Refused wholesale on an unknown name
             // rather than dropping that stage: a typo would otherwise remove a
             // filter the user is relying on, silently.
@@ -1098,6 +1123,7 @@ fn main() -> ExitCode {
         rope,
         show_perf,
         dry_breakers,
+        kv_type,
         ctx_size,
         stop,
         force,
@@ -1132,6 +1158,7 @@ fn run_streaming(
     perplexity: Option<usize>,
     ui: Ui,
     show_perf: bool,
+    kv_type: bigtea_arch::KvType,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -1235,15 +1262,32 @@ fn run_streaming(
     let _ = arch;
     let prompt_len = tokens.len();
 
-    let mut cache = KvCache::new(
+    let mut cache = KvCache::with_type(
         config.n_layer as usize,
         config.n_head_kv as usize,
         config.head_dim as usize,
+        kv_type,
     );
+    if cache.kind() != kv_type {
+        bigtea_arch::info!(
+            "kv cache   {} refused: head_dim {} is not a multiple of 32, using {}",
+            kv_type.name(),
+            config.head_dim,
+            cache.kind().name()
+        );
+    }
     let vocab = config.vocab_size as usize;
 
     if let Some(chunk_size) = perplexity {
-        return perplexity_run(&mut runner, &weights, &config, &tokens, chunk_size, t0);
+        return perplexity_run(
+            &mut runner,
+            &weights,
+            &config,
+            &tokens,
+            chunk_size,
+            kv_type,
+            t0,
+        );
     }
 
     // Prefill in blocks. Attention holds n_total * n_new * n_head floats for
@@ -1369,9 +1413,10 @@ fn run_streaming(
         produced as f64 / secs.max(1e-9)
     );
     bigtea_arch::info!(
-        "kv cache   {} positions, {:.1} MiB",
+        "kv cache   {} positions, {:.1} MiB, {}",
         cache.len(),
-        cache.bytes() as f64 / (1 << 20) as f64
+        cache.bytes() as f64 / (1 << 20) as f64,
+        cache.kind().name()
     );
     if show_perf {
         bigtea_arch::info!("streaming  {}", runner.stats);
@@ -1407,6 +1452,7 @@ fn run(
     rope: RopeOverrides,
     show_perf: bool,
     dry_breakers: Vec<String>,
+    kv_type: bigtea_arch::KvType,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -1621,6 +1667,7 @@ fn run(
             perplexity,
             ui,
             show_perf,
+            kv_type,
             t0,
         );
     }

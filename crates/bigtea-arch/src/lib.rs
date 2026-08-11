@@ -29,7 +29,7 @@ pub use deepseek4_forward::{
     routing_report, routing_weight_report, step, Deepseek4Cache, Deepseek4Forward, RepackedDense,
 };
 pub use expert_cache::{CacheStats, ExpertCache};
-pub use kv::{KvCache, KvError};
+pub use kv::{KvCache, KvError, KvType};
 pub use qwen3::{architecture_is_verified, Qwen3Config, Qwen3Model, VERIFIED_ARCHITECTURES};
 pub use sample::{neg_log_prob, Sampler, SamplerConfig, SamplerStage};
 pub use stream::{configured_threads, configured_threads_batch, StreamStats, StreamingRunner};
