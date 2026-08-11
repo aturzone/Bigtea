@@ -101,9 +101,16 @@ All 22 container-backed tests pass, at 2, 5, 165 and 258 tokens, which covers
 Raw, CSA and HCA: prompt length decides which attention builder runs, so a test
 at one length verifies a path it did not change.
 
-## Left stale, deliberately
+## Left stale, deliberately — and closed since
 
-`bigtea-serve.rs` still reports `context_limit() = 256` for deepseek4, so the
-**server refuses sequences the engine now handles**. That file belongs to
-another session and is not touched here. It is a one-line change and should
-follow.
+`bigtea-serve.rs` reported `context_limit() = 256` for deepseek4 when this was
+written, so the **server refused sequences the engine had started handling**.
+That file belonged to another session and was not touched here.
+
+**Closed 2026-08-11 in `9f024e7`, merged at `7a81502`.** It reports 897 — the
+per-pass cap, which is what the ring left as the only limit.
+
+Worth recording *how* that was nearly got wrong twice: this note outlived the
+fix, and a later session repeated "still reports 256" from the note rather than
+from the file. **A stale note reads exactly like a current fact.** Check the
+file.

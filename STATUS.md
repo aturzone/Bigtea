@@ -1854,9 +1854,14 @@ Raw, CSA and HCA, since prompt length decides which builder runs. `raw_span` is
 a pure function with unit tests covering wraparound, the batch limit and the
 property the whole design rests on: no two positions in one span share a slot.
 
-**Still stale, and not mine to change**: `bigtea-serve.rs` reports
+~~**Still stale, and not mine to change**: `bigtea-serve.rs` reports
 `context_limit() = 256` for deepseek4, so the server refuses sequences the engine
-now handles. One line, and it belongs to whoever owns that file.
+now handles. One line, and it belongs to whoever owns that file.~~
+
+**CLOSED 2026-08-11 in `9f024e7`, merged at `7a81502`** — it reports 897, the
+per-pass cap. Recorded because of *how* this nearly went wrong: the note above
+outlived the fix, and a later session repeated "still reports 256" from the note
+instead of reading the file. **A stale note reads exactly like a current fact.**
 
 ## StableLM and StarCoder2: one shared blocker (2026-08-11)
 
