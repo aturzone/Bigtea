@@ -1326,6 +1326,74 @@ ungated FFN; and the pre-tokenizer default. Two traps worth carrying forward:
   made Phi-3 ungated and broke a verified architecture. `ne1 == 2*n_ff`
   separates them.
 
+## `--check-tensors` and `--fit` (2026-08-11) — four more off the declined list
+
+### `--check-tensors`, and the two bugs it found in itself first
+
+Container parsing validates **structure**. All of it can be perfect while the
+numbers are ruined, and the symptom is not a crash: the first NaN reaching a
+softmax makes every probability NaN, `argmax` returns index 0, and the model
+emits one token forever. That reads as a broken *model*, so the search starts in
+the forward pass instead of in the file.
+
+Verified by corrupting 4 KiB of a known-good container at a known offset:
+
+```
+check      blk.12.ffn_up.weight: non-finite block scale at block 72335
+bigtea-run: 1 tensor(s) hold non-finite values. This container is damaged
+```
+
+The refusal this retracts claimed a values-level scan "would have to dequantise
+every tensor". Wrong: the **f16 block scales** are floats, need no
+dequantisation, and are exactly where a ruined quantise shows up.
+
+Two bugs, both caught only by running it against a container **known to be
+healthy**:
+
+1. **Q4_K and Q5_K carry their scales at the start of the block, not the tail.**
+   Packed 4-bit quants at offset 140 read as `inf`, so the validator called a
+   healthy Qwen2 container damaged. Worse: **the unit test asserted the tail
+   too** — written from the same assumption as the code, so it proved only that
+   the two agreed. Both now cite `ggml-common.h`.
+2. **The 8 MiB chunk was not a multiple of 144 or 210 bytes**, so every chunk
+   after the first began mid-block. It failed at `token_embd.weight` "block
+   246754" — exactly where chunk one ended.
+
+An unknown quant type is **counted as uninspectable, never guessed at**: reading
+the wrong two bytes as a scale invents failures, and a validator that cries wolf
+is worse than none.
+
+### `--fit`, `--fit-target`, `--fit-ctx`
+
+The one flag group where Bigtea should be *ahead* rather than level: llama.cpp
+asks "will this fit in device memory" from outside the engine, and owning
+residency is this project's whole design.
+
+| | effect, measured |
+|---|---|
+| default (`--fit on`, target 1024 MiB) | 7.46 GiB expert cache |
+| `--fit-target 6144` | **2.44 GiB** — the headroom moved and the cache gave way |
+| `--fit off` | fixed 1.00 GiB, machine-independent |
+| `--cache 3` + `--fit-target 6144` | **3.00 GiB** — an explicit argument still wins |
+
+`--fit` only ever adjusts arguments the user did **not** set, which is what
+makes llama.cpp's default-on safe to match. `--fit off` gives a fixed 1 GiB
+rather than everything free, because the point of turning fitting off is
+reproducibility and "all of RAM" is the least reproducible number available.
+
+The 2 GiB headroom this file hardcoded is now `--fit-target`, and the header
+prints which value it used — **a headroom you cannot see is a headroom you
+cannot argue with.**
+
+`--fit-ctx` reports the question this project exists to answer: *given this
+machine, how much context is there room for?* Its first version answered "0
+tokens" on a machine with 8 GiB free, because it subtracted the expert cache —
+which is by construction everything left after headroom. **The cache is elastic
+and the KV cache is not**, so the honest answer is what fits once the cache has
+shrunk to its floor: 568,519 tokens for Qwen2-0.5B.
+
+Flags: **140 implemented, 47 declined**, of 187 recognised.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

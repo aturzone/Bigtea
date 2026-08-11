@@ -806,6 +806,25 @@ fn completion_bash() -> ExitCode {
 // being written.
 include!(concat!(env!("OUT_DIR"), "/flags.rs"));
 
+/// llama.cpp's `--fit` group: adjust what the user did not set so the run fits.
+///
+/// The one flag group where this project should be ahead rather than level.
+/// llama.cpp asks "will this fit in device memory" from outside the engine;
+/// Bigtea owns residency, so it is the same question asked from inside.
+#[derive(Debug, Clone, Copy)]
+struct Fit {
+    /// Default **on**, matching llama.cpp. Safe as a default only because it
+    /// adjusts arguments the user left unset and nothing else.
+    on: bool,
+    /// Memory to leave free, in MiB. llama.cpp's default is 1024; this file
+    /// previously hardcoded 2048 with no way to move it.
+    target_mib: u64,
+    /// The smallest context `--fit` may settle on. Below this it reports that
+    /// the model does not fit rather than quietly running a context too short
+    /// to be useful -- llama.cpp's `--fit-ctx`, same reason.
+    min_ctx: usize,
+}
+
 /// llama.cpp flags this build declines, and why.
 ///
 /// # Why decline rather than ignore
@@ -1288,6 +1307,12 @@ fn main() -> ExitCode {
     let mut model_url: Option<String> = None;
     let mut offline = false;
     let mut check_tensors = false;
+    // llama.cpp defaults --fit to on; so does this. It only ever adjusts
+    // arguments the user did NOT set, which is what makes a default-on
+    // auto-configuration safe.
+    let mut fit = true;
+    let mut fit_target_mib: u64 = 1024;
+    let mut fit_ctx: usize = 4096;
     let mut chat_template: Option<String> = None;
     let mut model_flag: Option<String> = None;
     let mut grammar_src: Option<String> = None;
@@ -1667,6 +1692,54 @@ fn main() -> ExitCode {
             // and the first NaN reaching a softmax makes every probability NaN
             // -- argmax then returns index 0 and the model repeats one token
             // forever, which reads as a broken model rather than a broken file.
+            // --- fitting the machine ----------------------------------------
+            //
+            // This is the one flag group where Bigtea should be ahead rather
+            // than level: owning residency is the whole design, and `--fit` is
+            // llama.cpp asking the same question from the outside. It adjusts
+            // only arguments left unset, so `--cache`, `-c` and `-b` still win
+            // when given.
+            "-fit" | "--fit" => {
+                // llama.cpp takes an optional on|off; a bare --fit means on.
+                match rest.get(i + 1).map(String::as_str) {
+                    Some("on") => {
+                        fit = true;
+                        i += 2;
+                    }
+                    Some("off") => {
+                        fit = false;
+                        i += 2;
+                    }
+                    _ => {
+                        fit = true;
+                        i += 1;
+                    }
+                }
+            }
+            "-fitt" | "--fit-target" => {
+                // Comma-separated per device in llama.cpp; there is one device
+                // here, so the first value is taken and the rest ignored --
+                // said out loud rather than silently, because a user passing
+                // three numbers is describing a machine this build cannot use.
+                if let Some(v) = rest.get(i + 1) {
+                    let first = v.split(',').next().unwrap_or(v);
+                    if v.contains(',') {
+                        bigtea_arch::info!(
+                            "fit        --fit-target has one device here; using {first} MiB"
+                        );
+                    }
+                    if let Ok(m) = first.trim().parse::<u64>() {
+                        fit_target_mib = m;
+                    }
+                }
+                i += 2;
+            }
+            "-fitc" | "--fit-ctx" => {
+                if let Some(v) = rest.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                    fit_ctx = v;
+                }
+                i += 2;
+            }
             "--check-tensors" => {
                 check_tensors = true;
                 i += 1;
@@ -2202,6 +2275,11 @@ fn main() -> ExitCode {
         infill,
         grammar_triggers,
         check_tensors,
+        Fit {
+            on: fit,
+            target_mib: fit_target_mib,
+            min_ctx: fit_ctx,
+        },
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -2242,6 +2320,7 @@ fn run_streaming(
     warmup: bool,
     infill: bool,
     grammar_triggers: Vec<String>,
+    fit: Fit,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -2289,7 +2368,12 @@ fn run_streaming(
     // tok/s and 8 GiB gives 1.56. The two things that genuinely scale are the
     // KV cache, which grows with context, and the arenas, which grow with the
     // prefill block. Everything else is the OS.
-    const BASE_HEADROOM: u64 = 2 * (1 << 30);
+    // llama.cpp calls this the fit target and defaults it to 1024 MiB; this
+    // defaulted to 2 GiB because the number was chosen here for a machine that
+    // also runs a browser. `--fit-target` now moves it, and the header prints
+    // whichever it used -- a headroom you cannot see is a headroom you cannot
+    // argue with.
+    let base_headroom: u64 = fit.target_mib << 20;
     // Two bytes per value: the KV cache is f16.
     let kv_per_position =
         (config.n_layer as u64) * (config.n_head_kv as u64) * (config.head_dim as u64) * 2 * 2;
@@ -2297,26 +2381,75 @@ fn run_streaming(
     // Arenas scale with the block: activations, Q/K/V and the router, roughly
     // a dozen n_embd-by-block matrices, doubled by `arena_for`.
     let arena_estimate = (config.n_embd as u64) * (prefill_block as u64) * 4 * 24;
-    let headroom = BASE_HEADROOM + kv_estimate + arena_estimate;
+    let headroom = base_headroom + kv_estimate + arena_estimate;
 
-    let budget = match cache_budget {
-        Some(bytes) => bytes,
-        None => {
+    let budget = match (cache_budget, fit.on) {
+        // An explicit --cache always wins: --fit adjusts what was NOT set.
+        (Some(bytes), _) => bytes,
+        (None, true) => {
             let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
             machine
                 .ram_available_bytes
                 .map(|avail| avail.saturating_sub(headroom).max(1 << 30))
                 .unwrap_or(1 << 30)
         }
+        // `--fit off` means "do not look at the machine". A fixed 1 GiB rather
+        // than everything free, because the point of turning fitting off is
+        // reproducibility across machines, and "all of RAM" is the least
+        // reproducible number available.
+        (None, false) => 1 << 30,
     };
     let mut runner = StreamingRunner::new(model, config.clone(), budget as usize);
     bigtea_arch::info!(
-        "cache      {:.2} GiB for experts (headroom {:.2} GiB: {:.2} kv + {:.2} arenas + 2.00 os)",
+        "cache      {:.2} GiB for experts (headroom {:.2} GiB: {:.2} kv + {:.2} arenas + {:.2} fit-target){}",
         budget as f64 / GIB,
         headroom as f64 / GIB,
         kv_estimate as f64 / GIB,
-        arena_estimate as f64 / GIB
+        arena_estimate as f64 / GIB,
+        base_headroom as f64 / GIB,
+        if fit.on { "" } else { " [--fit off]" }
     );
+
+    // `--fit-ctx` is the floor `--fit` may settle on, and this is the one
+    // question this project is built to answer: given this machine, how much
+    // context is there room for? Reported rather than assumed, and only when
+    // `-c` was not given -- an explicit context is the user's decision.
+    //
+    // **The expert cache does not compete with the KV cache for this answer.**
+    // Subtracting `budget` gave "room for 0 tokens" on a machine with 8 GiB
+    // free, because `budget` is by construction everything left after headroom.
+    // The cache is elastic and shrinks to its 1 GiB floor; the KV cache is not.
+    // So the question is what fits once the cache has given up all it can.
+    if fit.on && ctx_size.is_none() && kv_per_position > 0 {
+        let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
+        if let Some(avail) = machine.ram_available_bytes {
+            const CACHE_FLOOR: u64 = 1 << 30;
+            let for_kv = avail
+                .saturating_sub(base_headroom)
+                .saturating_sub(arena_estimate)
+                .saturating_sub(CACHE_FLOOR);
+            let max_ctx = (for_kv / kv_per_position) as usize;
+            if max_ctx < fit.min_ctx {
+                // Not fatal: this run may need far less than the floor and be
+                // perfectly fine. Saying so beats silence and beats a refusal
+                // the user did not ask for.
+                bigtea_arch::info!(
+                    concat!(
+                        "fit        room for {} tokens of context, under the --fit-ctx floor ",
+                        "of {}; this run needs {}"
+                    ),
+                    max_ctx,
+                    fit.min_ctx,
+                    tokens.len() + n_predict
+                );
+            } else {
+                bigtea_arch::detail!(
+                    "fit        room for {max_ctx} tokens of context (floor {})",
+                    fit.min_ctx
+                );
+            }
+        }
+    }
 
     let ctx = Context::new_no_alloc(64 << 20)?;
     let mut weights = WeightSet::new();
@@ -2801,6 +2934,7 @@ fn run(
     infill: bool,
     grammar_triggers: Vec<String>,
     check_tensors: bool,
+    fit: Fit,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -3075,6 +3209,7 @@ fn run(
             warmup,
             infill,
             grammar_triggers,
+            fit,
             t0,
         );
     }

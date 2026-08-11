@@ -24,7 +24,7 @@ the real distance to "any model", and it is far larger than the performance gap.
 | architectures | **10** (`deepseek4`, `gemma2`, `gemma3`, `llama`, `phi3`, `qwen2`, `qwen3`, `qwen3moe`, `stablelm`, `starcoder2`) — each diffed against llama.cpp on **eight** prompts, because three certified `starcoder2` while its pre-tokenizer was wrong | ~100. Every entry is diffed against llama.cpp token for token; `gemma2` sat here for weeks without that and was **wrong** — see `../research/gemma-was-running-silu-2026-08-11.md` |
 | tokenizer families | **2** (`gpt2` BPE, `llama` SPM) | 6 (spm, bpe, wpm, ugm, rwkv, plamo2) |
 | quant types | all ggml can decode | same |
-| CLI flags | **187 recognised — 137 implemented, 50 declined with a reason.** Generated from the parser by `build.rs`, so it cannot drift from what is accepted | **182** (counted, not estimated: `llamacpp-flag-audit.md`) |
+| CLI flags | **187 recognised — 140 implemented, 47 declined with a reason.** Generated from the parser by `build.rs`, so it cannot drift from what is accepted | **182** (counted, not estimated: `llamacpp-flag-audit.md`) |
 | chat templates | **54 names, 52 verified byte-identical** against a captured llama.cpp fixture | **54** (counted from `llama-chat.cpp`'s own table, not estimated) |
 | samplers | **20** | **20** (counted from `llama_sampler_init_*` in `llama.h`) |
 | backends | CPU | CPU, CUDA, Metal, Vulkan, ROCm, SYCL |
