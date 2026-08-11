@@ -1,12 +1,14 @@
 ---
 topic: R2 — overlapping disk reads with compute on V4-Flash, re-scoped against the code on 2026-08-11
-status: scoped, not started
+status: DONE 2026-08-11 -- built, measured 1.07x prefill / 1.13x generation, on by default. Result: ../research/r2-overlap-2026-08-11.md
 links: [next-session-handoff.md, ../research/the-plateau-was-ours-2026-08-10.md]
 ---
 
-**Not implemented.** This node exists because scoping it surfaced a constraint
-that is not in the 2026-08-08 scoping and would cost the next session a wrong
-measurement to rediscover.
+**Implemented 2026-08-11.** The result, and the reason it reached a third of
+the ceiling rather than all of it, are in
+`../research/r2-overlap-2026-08-11.md`. This node is the scoping that preceded
+it; the handle-pool constraint below is the thing that had to be handled first,
+and it was.
 
 Ceiling ~1.4x: per block roughly **53 ms of read against 23 ms of compute**.
 

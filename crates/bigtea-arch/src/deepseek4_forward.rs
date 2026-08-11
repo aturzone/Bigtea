@@ -541,6 +541,81 @@ type ExpertStack = (SkewedBuf, Vec<u64>);
 /// pool size or two readers would collide on one handle again.
 const READERS: usize = 8;
 
+/// Reader slots handed to the **background** prefetch when R2 overlap is on.
+///
+/// # Why the pool has to be partitioned rather than shared
+///
+/// `read_range_into_via` requires concurrent readers to pass **distinct**
+/// slots: a synchronous handle is serialised by the OS, so two threads on one
+/// handle hold the drive at queue depth 1. That is the bug whose fix was worth
+/// 1.32x on expert reads, and a background prefetch that reused slots the
+/// foreground is already using would reintroduce it **by hand** — surfacing not
+/// as an error but as "overlap does not help".
+///
+/// So the eight slots are split: the foreground keeps [`foreground_readers`]
+/// of them and the prefetch gets the rest.
+///
+/// **The split is not free, and the cost is bandwidth rather than handles.**
+/// Measured on V4-Flash with 3.10 GiB streaming, one session:
+///
+/// ```text
+///                    dense    expert
+/// no overlap         2.56s     7.02s
+/// prefetch 2         0.02s     8.39s
+/// prefetch 4         0.04s     8.43s
+/// ```
+///
+/// Two readers hide the dense read as completely as four do, and four cost the
+/// experts no more than two — so the toll is the *drive*, not the pool split,
+/// and the smaller share is strictly better. `BIGTEA_PREFETCH_READERS`
+/// overrides it, because the right number depends on the drive.
+fn prefetch_readers() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BIGTEA_PREFETCH_READERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0 && *n < READERS)
+            .unwrap_or(2)
+    })
+}
+
+/// Set for the duration of a pass that is **actually** prefetching.
+///
+/// Not the same as [`prefetch_overlap`]. With the always-read set fully
+/// resident there is nothing to prefetch, and shrinking the foreground pool
+/// anyway would be a pure loss — the expert reads would give up handles to a
+/// thread that reads nothing. `forward` decides once per pass and sets this;
+/// `read_expert_slices` reads it.
+static PREFETCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Slots the foreground (expert slices, and the in-block dense fallback) may
+/// use. The whole pool unless a background prefetch is actually running.
+fn foreground_readers() -> usize {
+    if PREFETCHING.load(std::sync::atomic::Ordering::Relaxed) {
+        READERS - prefetch_readers()
+    } else {
+        READERS
+    }
+}
+
+/// Whether to read the next block's always-read weights while this one
+/// computes.
+///
+/// **On by default, and that default is a measurement** — see
+/// `docs/graph/research/r2-overlap-2026-08-11.md`. Worth ~1.09x on generation
+/// with 3.10 GiB of the always-read set still streaming, and switched off
+/// entirely when there is no shortfall, so the case it cannot help is a case it
+/// does not touch. `BIGTEA_PREFETCH_OVERLAP=0` disables it.
+fn prefetch_overlap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BIGTEA_PREFETCH_OVERLAP")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// The padded key window each half of the cache occupies.
 const N_KV: i64 = 256;
 
@@ -1833,13 +1908,19 @@ fn read_expert_slices(
     // Positioned reads need no locking in this code, but a synchronous handle is
     // serialised by the OS, so sharing one would leave the drive at queue depth
     // 1 no matter how many threads are spawned.
-    let mut slots: Vec<Vec<(&Job, &mut [u8])>> = (0..READERS).map(|_| Vec::new()).collect();
+    //
+    // Only the *foreground* share of the pool: with R2 overlap on, the last
+    // `prefetch_readers()` handles belong to the thread reading the next block's
+    // dense weights, and taking one of those back would put two threads on one
+    // handle — which does not fail, it just serialises them.
+    let readers = foreground_readers();
+    let mut slots: Vec<Vec<(&Job, &mut [u8])>> = (0..readers).map(|_| Vec::new()).collect();
     let mut cursors: Vec<&mut [u8]> = buffers.iter_mut().map(|(b, _)| &mut b[..]).collect();
     for (j, job) in jobs.iter().enumerate() {
         let cursor = std::mem::take(&mut cursors[job.name]);
         let (dst, rest) = cursor.split_at_mut(job.len);
         cursors[job.name] = rest;
-        slots[j % READERS].push((job, dst));
+        slots[j % readers].push((job, dst));
     }
 
     let copied: usize = std::thread::scope(|scope| {
@@ -2130,6 +2211,37 @@ fn prefetch_dense(
     fw: &Deepseek4Forward<'_>,
     names: &[String],
 ) -> Result<std::collections::HashMap<String, std::sync::Arc<SkewedBuf>>> {
+    prefetch_dense_via(fw, names, 0, foreground_readers())
+}
+
+/// Is any of a block's always-read weights going to be read from disk?
+///
+/// Probed on **block 1** rather than by asking the resident set globally: what
+/// matters is whether a *block* has missing tensors, and residency is filled
+/// largest-first over the whole model, so a global "something was skipped" can
+/// be true while every block this pass touches is fully resident. Block 0 is
+/// the wrong probe because it also carries `token_embd`.
+fn dense_shortfall(fw: &Deepseek4Forward<'_>) -> bool {
+    if fw.config.n_layer < 2 {
+        return false;
+    }
+    fw.block_tensor_names(1).iter().any(|n| {
+        fw.repacked.and_then(|r| r.get(n)).is_none()
+            && fw.resident.and_then(|r| r.get_shared(n)).is_none()
+    })
+}
+
+/// [`prefetch_dense`], over reader slots `base..base + count`.
+///
+/// The slot range is a parameter because the foreground and the R2 background
+/// prefetch must use **disjoint** handles — see [`prefetch_readers`].
+fn prefetch_dense_via(
+    fw: &Deepseek4Forward<'_>,
+    names: &[String],
+    base: usize,
+    count: usize,
+) -> Result<std::collections::HashMap<String, std::sync::Arc<SkewedBuf>>> {
+    let count = count.max(1);
     let missing: Vec<&String> = names
         .iter()
         .filter(|n| {
@@ -2148,12 +2260,12 @@ fn prefetch_dense(
     }
 
     let model = fw.model;
-    let chunks: Vec<Vec<&String>> = (0..READERS)
+    let chunks: Vec<Vec<&String>> = (0..count)
         .map(|s| {
             missing
                 .iter()
                 .skip(s)
-                .step_by(READERS)
+                .step_by(count)
                 .copied()
                 .collect::<Vec<_>>()
         })
@@ -2162,7 +2274,8 @@ fn prefetch_dense(
         let handles: Vec<_> = chunks
             .into_iter()
             .enumerate()
-            .map(|(slot, work)| {
+            .map(|(i, work)| {
+                let slot = base + i;
                 scope.spawn(move || {
                     let mut got = Vec::with_capacity(work.len());
                     for name in work {
@@ -2190,6 +2303,11 @@ fn prefetch_dense(
 /// one `ggml` context costs hundreds of megabytes each. Freeing weights *inside*
 /// a context instead would be unsound — every `compute` rebuilds the graph
 /// through its sources, so a dropped buffer reads freed memory successfully.
+// Eight, and the alternative is worse. Six of them are what a block *is* —
+// which layer, which tokens, where in the sequence, the arena, the streams in —
+// and bundling them into a struct would add a type whose only job is to be
+// unpacked immediately, on the one call site that exists.
+#[allow(clippy::too_many_arguments)]
 pub fn block(
     fw: &Deepseek4Forward<'_>,
     cache: &mut Deepseek4Cache,
@@ -2198,6 +2316,7 @@ pub fn block(
     pos0: i64,
     streams_in: Option<&[f32]>,
     arena: usize,
+    prefetched: Option<std::collections::HashMap<String, std::sync::Arc<SkewedBuf>>>,
 ) -> Result<Streams> {
     let config = fw.config.clone();
     let nt = tokens.len() as i64;
@@ -2212,7 +2331,13 @@ pub fn block(
         names.push("token_embd.weight".to_string());
     }
     let t_bind = std::time::Instant::now();
-    let prefetched = prefetch_dense(fw, &names)?;
+    // Already read, while the previous block computed. `bind_dense` falls back
+    // to reading anything the map is missing, so a partial or absent map is
+    // slower and never wrong.
+    let prefetched = match prefetched {
+        Some(p) => p,
+        None => prefetch_dense(fw, &names)?,
+    };
     let mut dense_bytes = 0u64;
     for name in &names {
         dense_bytes += bind_dense(fw, &wctx, &mut weights, name, &prefetched)?;
@@ -2414,10 +2539,81 @@ pub fn forward(
             limit: N_KV as usize,
         });
     }
-    let mut streams = block(fw, cache, 0, tokens, pos0, None, arena)?;
-    for il in 1..fw.config.n_layer {
-        streams = block(fw, cache, il, tokens, pos0, Some(&streams), arena)?;
+    // R2: read block N+1's always-read weights while block N computes.
+    //
+    // Routing is data-dependent — block N+1's *experts* are chosen from block
+    // N's output, so they cannot be known yet — but its **dense** tensors do not
+    // depend on routing at all. That makes this exact rather than speculative:
+    // a prefetch is never wrong, only wasted.
+    //
+    // It pays exactly when residency is short. `prefetch_dense` skips anything
+    // already resident and returns an empty map when fewer than two tensors are
+    // missing, so with the always-read set fully in RAM this costs one thread
+    // spawn per block and reads nothing. **Quote no number from it without the
+    // free RAM**; that is the axis these figures move along.
+    let n_layer = fw.config.n_layer;
+
+    // Decide once, because it decides how the reader pool is split for the
+    // whole pass. **With no shortfall there is nothing to prefetch**, and
+    // taking handles away from the expert reads to feed a thread that reads
+    // nothing is a pure loss — so in that case the overlap is not merely
+    // idle, it is off.
+    let overlap = prefetch_overlap() && dense_shortfall(fw);
+    PREFETCHING.store(overlap, std::sync::atomic::Ordering::Relaxed);
+    // Restores the flag however this function leaves, including on `?`.
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            PREFETCHING.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
+    let _clear = ClearOnDrop;
+
+    let mut streams: Option<Streams> = None;
+    let mut prefetched: Option<std::collections::HashMap<String, std::sync::Arc<SkewedBuf>>> = None;
+
+    for il in 0..n_layer {
+        let next: Option<Vec<String>> = if overlap && il + 1 < n_layer {
+            Some(fw.block_tensor_names(il + 1))
+        } else {
+            None
+        };
+
+        let (out, ahead) = std::thread::scope(|scope| {
+            let handle = next.as_ref().map(|names| {
+                scope.spawn(move || {
+                    // The tail of the pool, disjoint from what the expert reads
+                    // in `block` are using on this thread.
+                    prefetch_dense_via(fw, names, foreground_readers(), prefetch_readers())
+                })
+            });
+            let out = block(
+                fw,
+                cache,
+                il,
+                tokens,
+                pos0,
+                streams.as_deref(),
+                arena,
+                prefetched.take(),
+            );
+            let ahead = match handle.map(|h| h.join()) {
+                None => None,
+                Some(Ok(Ok(map))) => Some(map),
+                // An I/O error in the prefetch is not an error in the pass:
+                // `block` reads what it needs. Losing the optimisation is the
+                // right failure, and it must not be able to end a run.
+                Some(Ok(Err(_))) => None,
+                // A panic is a bug, not a slow disk. Do not swallow it.
+                Some(Err(payload)) => std::panic::resume_unwind(payload),
+            };
+            (out, ahead)
+        });
+        streams = Some(out?);
+        prefetched = ahead;
+    }
+
+    let streams = streams.expect("at least one block");
     cache.n_past += tokens.len();
     head(fw, &streams, arena)
 }

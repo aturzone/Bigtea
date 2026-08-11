@@ -1072,3 +1072,56 @@ model emits output that satisfies the grammar and violates the schema, and
 nothing downstream can tell.
 
 66 tests here; 255 pass in the ggml-free CI job, which now includes this crate.
+
+## R2 — reads now overlap compute: 1.13x on generation (2026-08-11)
+
+**Supersedes the `R2 | overlap I/O with compute | ready, but smaller than it
+looks` row in the table above.** Built, measured, and **on by default**. Detail:
+`docs/graph/research/r2-overlap-2026-08-11.md`.
+
+Block N+1's always-read weights are read **while block N computes**. Exact, not
+speculative: routing is data-dependent so N+1's *experts* cannot be known before
+N runs, but its **dense** tensors do not depend on routing at all.
+
+Four runs, one session, **free RAM matched to within 0.03 GiB** — the axis these
+figures drift along — with 3.10 GiB of the always-read set still streaming:
+
+| | free | prefill | generation | dense read | expert read |
+|---|---:|---:|---:|---:|---:|
+| overlap off | 7.10 GiB | 0.56 tok/s | 0.280 tok/s | **2.15 s** | 7.01 s |
+| overlap on | 7.13 | **0.60** | **0.316** | **0.02 s** | 8.13 s |
+| on, repeat | 7.11 | **0.60** | **0.317** | 0.02 s | 8.21 s |
+
+**1.07x prefill, 1.13x generation**, reproducible to the third decimal.
+
+**The dense read is now free — 2.15 s to 0.02 s across 86 block-passes — and the
+expert reads gave 1.16 s of it back.** That is why this is a third of the ~1.4x
+ceiling rather than all of it, and the reason is measured rather than guessed:
+
+| prefetch readers | dense | expert |
+|---:|---:|---:|
+| 0 (off) | 2.56 s | 7.02 s |
+| 2 | 0.02 s | 8.39 s |
+| 4 | 0.04 s | 8.43 s |
+
+Two handles hide the dense read as completely as four, and four cost the experts
+no more than two — so **the toll is the drive, not the pool split.** Both sets of
+reads compete for the same bandwidth, and moving bytes off the critical path
+does not make them free. This is `the-plateau-was-ours` read from the other side:
+there the ceiling was ours, here the drive is genuinely the limit.
+
+Two things that had to be right first:
+
+- **`read_range_into_via` requires distinct slots**, and `read_expert_slices`
+  already used all eight handles. A prefetch started naively would have
+  reintroduced by hand the queue-depth-1 bug whose fix was worth 1.32x — and it
+  would have shown up as "overlap does not help", not as an error. The pool is
+  partitioned: foreground `0..6`, prefetch `6..8`.
+- **With residency satisfied the overlap is off, not merely idle.** Shrinking the
+  foreground pool to feed a thread that reads nothing is a pure loss, so the
+  decision is made once per pass from whether block 1 has a non-resident tensor.
+
+All 21 container-backed V4-Flash tests pass with it active, including the
+element-sum comparisons against llama.cpp — the overlap changes *when* bytes are
+read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
+`BIGTEA_PREFETCH_READERS` tunes the split.
