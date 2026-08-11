@@ -22,7 +22,12 @@ USER_DEFINED token's raw `\n` was silently dropped by the byte decoder. Twelve
 models re-run, **eleven at 8/8** (Phi-3 6 ok + 2 reference-unstable), 426 tests.
 The rule those bugs cost: **"the reference disagrees with itself" is not a safe
 verdict** — it compares the reference to itself and cannot see that *our input*
-differed, and nine of eleven `unstable` verdicts this session were bugs. Details:
+differed, and nine of eleven `unstable` verdicts this session were bugs. The
+harness acted on it in `b2ad35f`: a mismatch now compares the **tokenized
+prompt** first and reports FAIL on a different count, which catches all three of
+those bugs in one test, and three near-ties in eight exits non-zero as a cluster.
+**All twelve models were re-swept under the stricter script with every result
+unchanged**, every model exiting 0. Details:
 `research/eight-prompts-found-three-bugs-2026-08-11.md`.
 
 **Everything is merged.** PR #55 brought R3, R7, R8 and R9 into `main` in one

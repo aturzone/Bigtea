@@ -133,6 +133,22 @@ of the `unstable` verdicts: `-fa off` sometimes stopped on EOS where the default
 run did not, so the reference "disagreed with itself" over a suffix neither
 model generated.
 
+## The harness acted on this, and the sweep was re-run under it
+
+**Update, same day.** `unstable` is no longer a verdict (`b2ad35f`). On a
+mismatch the script now compares the **tokenized prompt** first: different
+counts mean the two engines are not answering the same question, and it reports
+FAIL. **All three bugs above are in that class** — the check catches a missing
+BOS, a wrong pre-tokenizer and a byte-fallback that drops characters, in one
+test. It also counts near-ties, and three or more in eight exits non-zero,
+because one is ordinary and three is a bug nobody has found yet.
+
+All twelve models were re-swept under the stricter script. **Every result below
+is unchanged**, and every model exits 0. Phi-3's two survive both new checks:
+the prompts tokenize identically on both engines, and two is under the cluster
+threshold. So they are still the only unexplained near-ties here, and still
+unexamined.
+
 ## What did not need fixing
 
 Three of the four architectures added this session were near-misses at most:
