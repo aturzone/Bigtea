@@ -26,7 +26,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 | KV cache type / prompt cache | 7 | **done 2026-08-11** -- both halves |
 | chat template | 6 | 3 done; `--jinja`/`--chat-template-file` **won't**, see below |
 | LoRA / control vectors | 5 | gap |
-| grammar / JSON schema | 4 | gap |
+| grammar / JSON schema | 4 | **done 2026-08-11** — wired into the CLI, verified against llama.cpp |
 | meta (`--help`, `--version`) | 4 | 3 done |
 
 ### The count in this document was wrong for eight commits

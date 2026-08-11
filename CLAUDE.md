@@ -64,7 +64,8 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 ## Working rules
 
 - Git: remote `github.com/aturzone/Bigtea`. Push with the token from `C:\Projects\.env` inline in the URL, output redacted — never in git config, never echoed. Model/weight files stay gitignored.
-- Implementation goes on `ticket/<name>` branches + PR; Atur merges. Docs may go to main.
+- Implementation goes on `ticket/<name>` branches + PR. **Claude owns git end to end**: merge when CI is green, close what it supersedes, delete the branch, prune, and leave `main` verified. Docs may go to main.
+- **Git hygiene, each rule bought with a mistake.** Verify containment with `git merge-base --is-ancestor <branch> origin/main` *before* deleting, never from "it was merged". After merging, `git checkout main` is not enough — a local `main` with no upstream makes `git pull` a silent no-op and leaves a pre-merge tree; fast-forward from `origin/main` explicitly and check a file that only the merge added. Then **re-run tests on `main` itself**, not on the branch. GitHub parses only the *first* issue in `Closes #1, #2, #3`, so give every one its own `closes`. Never `git push -u` — it writes the token into `.git/config`.
 - Sync audit at phase boundaries only, not per commit.
 - **A competitive claim is not citable until the competitor's exact command line and its output are in a doc.** "llama.cpp can't do X" survived days on a misattributed error string because nobody ran the opposing command. Run it, paste it, flag it.
 - Keep this file under ~2000 tokens; tell Atur to prune rather than letting it bloat.

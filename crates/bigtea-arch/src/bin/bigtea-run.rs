@@ -740,6 +740,10 @@ fn usage() -> ExitCode {
     eprintln!("  --prompt-cache F    reuse a saved KV cache for a repeated prefix");
     eprintln!("  --prompt-cache-all  also cache what was generated, not just the prompt");
     eprintln!("  --prompt-cache-ro   read the cache but never write it");
+    eprintln!("  --grammar GBNF      constrain output to a GBNF grammar");
+    eprintln!("  --grammar-file F    ...read from a file");
+    eprintln!("  -j, --json-schema S constrain output to a JSON schema");
+    eprintln!("  --json-schema-file F  ...read from a file");
     eprintln!("  -i, --interactive   keep the session open and take turns");
     eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
     eprintln!("  -st, --single-turn  one exchange, then exit");
@@ -856,6 +860,8 @@ fn main() -> ExitCode {
     let mut mlock = false;
     let mut chat_template: Option<String> = None;
     let mut model_flag: Option<String> = None;
+    let mut grammar_src: Option<String> = None;
+    let mut schema_src: Option<String> = None;
     let mut prompt_cache: Option<String> = None;
     let mut prompt_cache_all = false;
     let mut prompt_cache_ro = false;
@@ -1018,6 +1024,41 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // --- constrained decoding ------------------------------------
+            "--grammar" => {
+                grammar_src = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--grammar-file" => {
+                match rest.get(i + 1).map(std::fs::read_to_string) {
+                    Some(Ok(text)) => grammar_src = Some(text),
+                    _ => {
+                        eprintln!(
+                            "bigtea-run: --grammar-file: cannot read {:?}",
+                            rest.get(i + 1).cloned().unwrap_or_default()
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "-j" | "--json-schema" => {
+                schema_src = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--json-schema-file" => {
+                match rest.get(i + 1).map(std::fs::read_to_string) {
+                    Some(Ok(text)) => schema_src = Some(text),
+                    _ => {
+                        eprintln!(
+                            "bigtea-run: --json-schema-file: cannot read {:?}",
+                            rest.get(i + 1).cloned().unwrap_or_default()
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
             // Save and reuse the KV cache for a prompt prefix, so a repeated
             // prompt does not pay prefill twice.
             "--prompt-cache" => {
@@ -1473,6 +1514,8 @@ fn main() -> ExitCode {
         prompt_cache,
         prompt_cache_all,
         prompt_cache_ro,
+        grammar_src,
+        schema_src,
         ctx_size,
         stop,
         force,
@@ -1512,6 +1555,7 @@ fn run_streaming(
     prompt_cache: Option<String>,
     prompt_cache_all: bool,
     prompt_cache_ro: bool,
+    grammar: Option<bigtea_grammar::Grammar>,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -1767,6 +1811,23 @@ fn run_streaming(
 
     let mut writer = TokenWriter::new();
     let mut sampler = Sampler::new(sampler_cfg);
+
+    // Constrained decoding. The vocabulary is built once as token id -> the
+    // bytes that token decodes to, which is what the grammar matches against.
+    //
+    // `allowed_from` with a matcher carried across tokens, not `allowed(prefix)`
+    // — the latter replays the whole generated prefix through the grammar on
+    // every single token, which is quadratic in the answer length.
+    let grammar_vocab: Option<Vec<Vec<u8>>> = grammar.as_ref().map(|_| {
+        (0..vocab)
+            .map(|id| tokenizer.decode_bytes(&[id as u32]))
+            .collect()
+    });
+    let constraint = match (&grammar, &grammar_vocab) {
+        (Some(g), Some(v)) => Some(bigtea_grammar::Constraint::new(g.clone(), v)),
+        _ => None,
+    };
+    let mut matcher = constraint.as_ref().map(|c| c.grammar().matcher());
     let mut turns = 0usize;
 
     // One iteration per exchange. A non-interactive run takes the `break` at
@@ -1792,7 +1853,37 @@ fn run_streaming(
                 return Err(format!("logits too small: {} < {vocab}", logits.len()).into());
             }
             // The last token's row: a prefill returns logits for every position.
-            let last = &logits[logits.len() - vocab..];
+            let row = logits.len() - vocab;
+            if let (Some(c), Some(m)) = (constraint.as_ref(), matcher.as_ref()) {
+                let mask = c.allowed_from(m);
+                // **An empty mask must never be sampled from.** Every token
+                // would be -inf, the argmax would be arbitrary, and generation
+                // would stop looking exactly like a clean EOS.
+                //
+                // But empty has two meanings and they are not the same event:
+                // a grammar that has *finished* admits nothing more, which is
+                // the successful ending; one that is *stuck* admits nothing
+                // because the text so far cannot be completed. Reporting the
+                // second as if it were the first is how a truncated answer
+                // passes for a complete one.
+                if mask.is_empty() {
+                    if m.is_complete() {
+                        bigtea_arch::detail!(
+                            "grammar    satisfied after {} tokens",
+                            tokens.len().saturating_sub(prompt_len)
+                        );
+                    } else {
+                        bigtea_arch::info!(
+                            "grammar    STUCK after {} tokens — no token can continue, and the \
+                             grammar is not satisfied. The answer is incomplete.",
+                            tokens.len().saturating_sub(prompt_len)
+                        );
+                    }
+                    break;
+                }
+                mask.apply(&mut logits[row..]);
+            }
+            let last = &logits[row..];
             let next = sampler.sample(last, &tokens);
             if Some(next) == tokenizer.eos {
                 tokens.push(next);
@@ -1800,6 +1891,12 @@ fn run_streaming(
             }
             writer.push_visible(tokenizer, next, &ui);
             tokens.push(next);
+            // Advance the grammar by what was actually emitted. Done after the
+            // EOS check above, so a stop token never has to parse.
+            if let Some(m) = matcher.as_mut() {
+                let text = tokenizer.decode(std::slice::from_ref(&next));
+                m.accept_str(&text);
+            }
             if !stop.is_empty() {
                 generated_text.push_str(&tokenizer.decode(std::slice::from_ref(&next)));
                 if stop
@@ -1927,6 +2024,8 @@ fn run(
     prompt_cache: Option<String>,
     prompt_cache_all: bool,
     prompt_cache_ro: bool,
+    grammar_src: Option<String>,
+    schema_src: Option<String>,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -1942,6 +2041,20 @@ fn run(
     }
 
     // --- container ---------------------------------------------------------
+    // Built before the model is opened: a malformed grammar should fail in
+    // milliseconds, not after a 17 GiB load.
+    let grammar = match (grammar_src.as_deref(), schema_src.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err("--grammar and --json-schema are alternatives; pass one".into());
+        }
+        (Some(src), None) => Some(bigtea_grammar::Grammar::parse(src)?),
+        (None, Some(src)) => Some(bigtea_grammar::Grammar::from_json_schema(src)?),
+        (None, None) => None,
+    };
+    if let Some(g) = &grammar {
+        bigtea_arch::info!("grammar    {} rules", g.rule_count());
+    }
+
     let mut model = Model::open_split(path)?;
     // Applied before anything reads the metadata, and reported: a wrong
     // override is indistinguishable from a wrong container unless the run says
@@ -2158,6 +2271,7 @@ fn run(
             prompt_cache,
             prompt_cache_all,
             prompt_cache_ro,
+            grammar,
             t0,
         );
     }
