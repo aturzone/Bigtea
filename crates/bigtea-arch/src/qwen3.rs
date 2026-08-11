@@ -40,9 +40,16 @@ const ROPE_TYPE_NORM: i32 = 0;
 /// and the runner says so out loud.
 fn rope_type_for(arch: &str) -> (i32, bool) {
     match arch {
-        "llama" | "llama4" | "baichuan" | "deci" | "mistral" => (ROPE_TYPE_NORM, true),
+        // `olmo` and `internlm2` were read straight out of llama.cpp's
+        // `llama_model_rope_type`, which lists both in the NORM branch beside
+        // `LLM_ARCH_LLAMA`. `olmo` was previously in the NEOX arm below **with
+        // `known = true`** — a guess wearing the label of a checked fact, and
+        // wrong. Nothing had ever been run against the reference for it.
+        "llama" | "llama4" | "baichuan" | "deci" | "mistral" | "olmo" | "internlm2" => {
+            (ROPE_TYPE_NORM, true)
+        }
         "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "phi3" | "gemma" | "gemma2" | "gemma3"
-        | "stablelm" | "olmo" | "starcoder2" => (ROPE_TYPE_NEOX, true),
+        | "stablelm" | "starcoder2" => (ROPE_TYPE_NEOX, true),
         _ => (ROPE_TYPE_NEOX, false),
     }
 }
@@ -105,11 +112,18 @@ fn ffn_act_for(arch: &str) -> FfnAct {
 /// So the default is to refuse an architecture nobody has checked. `--force`
 /// runs it anyway, which is the right escape hatch for someone testing a new
 /// architecture — but it has to be asked for.
+/// A name here is **not** a claim that every model calling itself that will
+/// run. `baichuan` covers a 7B this path is verified against and a 13B it
+/// refuses (see [`Qwen3Config::uses_alibi`]); membership means the eight-prompt
+/// diff was run against *a* container, and the refusals guard the rest.
 pub const VERIFIED_ARCHITECTURES: &[&str] = &[
+    "baichuan",
     "deepseek4",
     "gemma2",
     "gemma3",
+    "internlm2",
     "llama",
+    "olmo",
     "phi3",
     "qwen2",
     "qwen3",
@@ -195,6 +209,55 @@ pub struct Qwen3Config {
     /// Substituting one is not an error and not a crash — StableLM and
     /// StarCoder2 read as fluent CJK noise before this existed.
     pub layer_norm: bool,
+    /// Whether the norms have learned parameters at all.
+    ///
+    /// **OLMo has none**: llama.cpp builds every one of its norms as
+    /// `build_norm(x, NULL, NULL, LLM_NORM)` — centre, divide by the standard
+    /// deviation, and stop. The container holds no `attn_norm.weight`, no
+    /// `ffn_norm.weight` and no `output_norm.weight`, so the previous code
+    /// refused it up front with `container has no tensor "output_norm.weight"`.
+    /// That refusal was the *good* outcome; the danger is the opposite reading,
+    /// where an affine architecture loses a norm weight and quietly runs
+    /// non-parametric. Hence a flag rather than "apply the weight if you find
+    /// one": when this is true a missing weight is still `MissingTensor`.
+    pub norm_affine: bool,
+    /// Whether the norms carry a **shift** as well as a scale.
+    ///
+    /// Separate from [`layer_norm`](Self::layer_norm), and the separation is
+    /// the OLMo lesson: LayerNorm-ness and having-a-bias used to be the same
+    /// boolean, because every LayerNorm seen so far had one. OLMo is a
+    /// LayerNorm with neither parameter, so folding the two together made the
+    /// loader demand an `output_norm.bias` that cannot exist.
+    ///
+    /// It still gates `required_tensors`, which is what keeps the original
+    /// guarantee: if `blk.0` has a bias then every layer must list one, and a
+    /// bias that is not listed is never loaded and silently skipped.
+    pub norm_bias: bool,
+    /// Symmetric clamp on Q, K and V after projection; `0.0` means none.
+    ///
+    /// llama.cpp applies it inside `build_qkv`, after the bias and before the
+    /// reshape. Declared by MPT, DBRX and OLMo — the OLMo-1B container says
+    /// `0.0`, so this is implemented against the reference's *code* rather than
+    /// against a run, and the 7B is the container that would exercise it.
+    pub clamp_kqv: f32,
+    /// This model biases attention by distance instead of rotating — and
+    /// **nothing in the container says so.**
+    ///
+    /// llama.cpp reads it from the *layer count*: `baichuan.cpp` sets
+    /// `f_max_alibi_bias = 8.0` when `n_layer == 40`, which is the 13B. So one
+    /// architecture name covers a model this path runs correctly (the 7B,
+    /// verified) and one it cannot. [`Qwen3::verify`] refuses the second rather
+    /// than rotating keys that should not be rotated.
+    pub uses_alibi: bool,
+    /// The container ships `rope_freqs.weight`: **per-frequency RoPE divisors,
+    /// carried as a tensor rather than as metadata.**
+    ///
+    /// This is how llama.cpp represents `rope_scaling.rope_type = "llama3"` —
+    /// the low/high frequency factors are folded into `n_rot/2` numbers at
+    /// conversion time, and `ggml_rope_ext` takes them as `freq_factors`. The
+    /// metadata says `rope scaling = linear, freq_scale_train = 1`, which reads
+    /// exactly like a model that was never extended.
+    pub rope_freqs: bool,
     /// Biases on `attn_output`, `ffn_up` and `ffn_down`.
     ///
     /// Separate from [`attn_bias`](Self::attn_bias), which is Q/K/V: Qwen2 has
@@ -364,7 +427,18 @@ impl Qwen3Config {
             // A norm carrying a bias is a LayerNorm. Nothing else distinguishes
             // them, and the metadata key differs too:
             // `attention.layer_norm_epsilon` against `..._rms_epsilon`.
-            layer_norm: model.location("blk.0.attn_norm.bias").is_some(),
+            //
+            // A norm with **neither** weight nor bias is a LayerNorm too, and
+            // only a LayerNorm: llama.cpp's non-parametric form is `LLM_NORM`,
+            // and a parameterless RMSNorm exists nowhere in it. OLMo is that
+            // case, and reading it as RMSNorm would skip the centring.
+            layer_norm: model.location("blk.0.attn_norm.bias").is_some()
+                || model.location("blk.0.attn_norm.weight").is_none(),
+            norm_affine: model.location("blk.0.attn_norm.weight").is_some(),
+            norm_bias: model.location("blk.0.attn_norm.bias").is_some(),
+            clamp_kqv: model.arch_f32("attention.clamp_kqv").unwrap_or(0.0),
+            uses_alibi: arch == "baichuan" && need("block_count")? == 40,
+            rope_freqs: model.location("rope_freqs.weight").is_some(),
             ffn_bias: model.location("blk.0.ffn_down.bias").is_some(),
             attn_out_bias: model.location("blk.0.attn_output.bias").is_some(),
             // Declared by the containers that rotate only part of each head;
@@ -564,26 +638,40 @@ impl Qwen3Model {
     /// out at layer 37 that a tensor is missing is a poor way to learn it.
     pub fn required_tensors(&self) -> Vec<String> {
         let c = &self.config;
-        let mut names = vec![
-            "token_embd.weight".to_string(),
-            "output_norm.weight".to_string(),
-        ];
+        let mut names = vec!["token_embd.weight".to_string()];
+        // OLMo's norms have no parameters at all, so demanding these refuses a
+        // container that is perfectly loadable — which is exactly how it failed
+        // before: `container has no tensor "output_norm.weight"`.
+        if c.norm_affine {
+            names.push("output_norm.weight".to_string());
+        }
         // The final norm has a bias too on a LayerNorm architecture, and it is
         // the easiest of the lot to miss: it is applied once, so a wrong final
         // norm shifts every logit by the same vector and the text stays fluent.
-        if c.layer_norm {
+        if c.norm_bias {
             names.push("output_norm.bias".to_string());
         }
+        // Listed so that it is **loaded**. A tensor absent from here is never
+        // bound, `weights.get` returns `None`, and the graph carries on without
+        // it — which for RoPE divisors is a slightly wrong rotation, not an
+        // error. Asked of the container because only the extended Llama-3.x
+        // models carry one.
+        if c.rope_freqs {
+            names.push("rope_freqs.weight".to_string());
+        }
         for il in 0..c.n_layer {
-            for suffix in ["attn_norm.weight", "attn_output.weight", "ffn_norm.weight"] {
-                names.push(format!("blk.{il}.{suffix}"));
+            names.push(format!("blk.{il}.attn_output.weight"));
+            if c.norm_affine {
+                for suffix in ["attn_norm.weight", "ffn_norm.weight"] {
+                    names.push(format!("blk.{il}.{suffix}"));
+                }
             }
             // **A bias that is not listed here is never loaded**, and the graph
             // then silently skips it — `weights.get` returns `None` and the
             // shift is simply not applied. That is not a missing-tensor error;
             // it is a slightly wrong answer, which is how StableLM read after
             // LayerNorm landed but before this did.
-            if c.layer_norm {
+            if c.norm_bias {
                 for suffix in ["attn_norm.bias", "ffn_norm.bias"] {
                     names.push(format!("blk.{il}.{suffix}"));
                 }
@@ -647,6 +735,19 @@ impl Qwen3Model {
 
     /// Check the container has everything, before any weights are read.
     pub fn verify(&self, model: &Model) -> Result<()> {
+        // **ALiBi is not implemented, and the container never says so.**
+        // Baichuan-7B and Baichuan-13B hold the same tensor set under the same
+        // architecture name; llama.cpp picks positional encoding by layer
+        // count, giving the 40-layer 13B a linear attention bias and no RoPE at
+        // all. The 7B is verified here. The 13B would load, rotate keys it
+        // should not rotate, skip a bias it should apply, and answer fluently.
+        if self.config.uses_alibi {
+            return Err(ArchError::Unimplemented(
+                "this model uses ALiBi rather than RoPE (baichuan at 40 layers \
+                 is the 13B), and no ALiBi path exists — it would run and be \
+                 wrong rather than fail",
+            ));
+        }
         for name in self.required_tensors() {
             if model.location(&name).is_none() {
                 return Err(ArchError::MissingTensor(name));
@@ -923,9 +1024,14 @@ impl Qwen3Model {
         x: &Tensor<'a>,
         prefix: &str,
     ) -> Result<Tensor<'a>> {
-        let weight = weights
-            .get(&format!("{prefix}.weight"))
-            .ok_or_else(|| ArchError::MissingTensor(format!("{prefix}.weight")))?;
+        let weight = weights.get(&format!("{prefix}.weight"));
+        // Absent is only allowed where the config already established that this
+        // architecture's norms have no parameters. Otherwise it is the missing
+        // tensor it looks like — silently dropping a scale is exactly the class
+        // of bug that made StableLM read "almost right".
+        if weight.is_none() && self.config.norm_affine {
+            return Err(ArchError::MissingTensor(format!("{prefix}.weight")));
+        }
         let bias = weights.get(&format!("{prefix}.bias"));
         self.norm_mul(ctx, x, weight, bias)
     }
@@ -953,7 +1059,7 @@ impl Qwen3Model {
         x: &Tensor<'a>,
         weight: &Tensor<'a>,
     ) -> Result<Tensor<'a>> {
-        self.norm_mul(ctx, x, weight, None)
+        self.norm_mul(ctx, x, Some(weight), None)
     }
 
     /// Normalise, scale, and shift when the architecture has a shift.
@@ -966,7 +1072,7 @@ impl Qwen3Model {
         &self,
         ctx: &'a Context,
         x: &Tensor<'a>,
-        weight: &Tensor<'a>,
+        weight: Option<&Tensor<'a>>,
         bias: Option<&Tensor<'a>>,
     ) -> Result<Tensor<'a>> {
         let normed = if self.config.layer_norm {
@@ -974,7 +1080,13 @@ impl Qwen3Model {
         } else {
             ctx.rms_norm(x, self.config.rms_eps)?
         };
-        let scaled = ctx.mul(&normed, weight)?;
+        // Both are optional and independently so, which is the whole point:
+        // OLMo has neither, StableLM has both, Qwen has weight only. Three
+        // shapes, one expression.
+        let scaled = match weight {
+            Some(w) => ctx.mul(&normed, w)?,
+            None => normed,
+        };
         match bias {
             Some(b) => Ok(ctx.add(&scaled, b)?),
             None => Ok(scaled),
@@ -1150,6 +1262,11 @@ mod tests {
             rope_type_is_known: true,
             attn_bias: false,
             layer_norm: false,
+            norm_affine: true,
+            norm_bias: false,
+            clamp_kqv: 0.0,
+            uses_alibi: false,
+            rope_freqs: false,
             ffn_bias: false,
             attn_out_bias: false,
             n_rot: 16,
@@ -1166,6 +1283,60 @@ mod tests {
             swa_pattern: 0,
             rope_freq_base_swa: 10_000.0,
         }
+    }
+
+    /// A non-parametric-norm container asks for no norm weights at all.
+    ///
+    /// OLMo's norms are `build_norm(x, NULL, NULL, LLM_NORM)` there, so
+    /// `output_norm.weight` does not exist and demanding it refused a container
+    /// that runs — the first thing OLMo did here was fail on that exact name.
+    #[test]
+    fn a_non_parametric_norm_is_not_a_missing_tensor() {
+        let c = Qwen3Config {
+            norm_affine: false,
+            norm_bias: false,
+            layer_norm: true,
+            qk_norm: false,
+            ..dense_config()
+        };
+        let names = Qwen3Model::new(c).required_tensors();
+        for n in &names {
+            assert!(
+                !n.ends_with("_norm.weight") && !n.ends_with("_norm.bias"),
+                "asked for {n} from a model whose norms have no parameters"
+            );
+        }
+        // Everything else is still demanded, so this is not a blanket weakening.
+        assert!(names.contains(&"blk.0.attn_output.weight".to_string()));
+        assert!(names.contains(&"token_embd.weight".to_string()));
+
+        // And an affine architecture still gets the full list.
+        let affine = Qwen3Model::new(dense_config_no_qk_norm()).required_tensors();
+        assert!(affine.contains(&"output_norm.weight".to_string()));
+        assert!(affine.contains(&"blk.1.ffn_norm.weight".to_string()));
+    }
+
+    /// `rope_freqs.weight` has to be **listed** to be loaded.
+    ///
+    /// Llama-3.1/3.2/3.3 carry their RoPE scaling as this tensor and nothing in
+    /// the metadata says so — it reports `rope scaling = linear, freq_scale = 1`
+    /// either way. Unlisted, `weights.get` returns `None`, the rotation is
+    /// quietly the un-extended one, and Llama-3.2-1B scored 3 of 8 on parity
+    /// with four prompts blaming the reference for the disagreement.
+    #[test]
+    fn rope_freqs_is_required_when_the_container_has_one() {
+        let with = Qwen3Model::new(Qwen3Config {
+            rope_freqs: true,
+            ..dense_config()
+        })
+        .required_tensors();
+        assert!(with.contains(&"rope_freqs.weight".to_string()));
+
+        let without = Qwen3Model::new(dense_config()).required_tensors();
+        assert!(
+            !without.contains(&"rope_freqs.weight".to_string()),
+            "demanding it would refuse every model that is not an extended Llama-3"
+        );
     }
 
     /// The same model without per-head QK norm — a Llama-family container.
@@ -1251,6 +1422,16 @@ mod tests {
         assert_eq!(rope_type_for("qwen3"), (ROPE_TYPE_NEOX, true));
         assert_eq!(rope_type_for("qwen3moe"), (ROPE_TYPE_NEOX, true));
         assert_eq!(rope_type_for("gemma2"), (ROPE_TYPE_NEOX, true));
+
+        // `olmo` sat in the NeoX arm claiming `known = true` while llama.cpp
+        // lists `LLM_ARCH_OLMO` in the NORM branch beside `LLM_ARCH_LLAMA` —
+        // a guess wearing the label of a checked fact, since nothing had ever
+        // been run against the reference for it. These four are now diffed at
+        // eight prompts each.
+        assert_eq!(rope_type_for("olmo"), (ROPE_TYPE_NORM, true));
+        assert_eq!(rope_type_for("internlm2"), (ROPE_TYPE_NORM, true));
+        assert_eq!(rope_type_for("baichuan"), (ROPE_TYPE_NORM, true));
+        assert_eq!(rope_type_for("starcoder2"), (ROPE_TYPE_NEOX, true));
 
         // An architecture nobody has checked gets a default AND is flagged as a
         // guess, so the runner can say so rather than quietly being wrong.

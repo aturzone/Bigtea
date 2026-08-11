@@ -1388,6 +1388,22 @@ impl<'m> StreamingRunner<'m> {
                 } else {
                     (q, k, v)
                 };
+                // MPT, DBRX and OLMo declare `attention.clamp_kqv`, and
+                // llama.cpp clamps here — after the bias, before the reshape.
+                // Order matters: clamping before the bias would bound a
+                // different quantity. The OLMo-1B container declares 0.0, so
+                // this branch is written against the reference's code rather
+                // than exercised by a run.
+                let (q, k, v) = if c.clamp_kqv > 0.0 {
+                    let (lo, hi) = (-c.clamp_kqv, c.clamp_kqv);
+                    (
+                        ctx.clamp(&q, lo, hi)?,
+                        ctx.clamp(&k, lo, hi)?,
+                        ctx.clamp(&v, lo, hi)?,
+                    )
+                } else {
+                    (q, k, v)
+                };
 
                 let q = ctx.reshape_3d(&q, head_dim, c.n_head as i64, n_new)?;
                 let k = ctx.reshape_3d(&k, head_dim, n_kv, n_new)?;
@@ -1421,8 +1437,19 @@ impl<'m> StreamingRunner<'m> {
                 // `n_rot`, not `head_dim`: StableLM rotates 16 of its 64 and
                 // leaves the rest alone. Rotating all of them is not an error.
                 let n_rot = c.n_rot as i32;
-                let q = ctx.rope_ext(&q, &pos, None, n_rot, rope_type, 0, rp)?;
-                let k = ctx.rope_ext(&k, &pos, None, n_rot, rope_type, 0, rp)?;
+                // **Llama-3.1/3.2/3.3 ship their RoPE scaling as a tensor.**
+                // `rope_freqs.weight` is `n_rot/2` divisors, one per frequency,
+                // and `ggml_rope_ext` takes it where this used to pass `None`.
+                // Without it the low frequencies rotate as though the model had
+                // never been extended: short prompts still agree, longer ones
+                // drift, and on Llama-3.2-1B four of eight parity prompts read
+                // as "the reference disagrees with itself" while a fifth was a
+                // clean FAIL. Nothing in the metadata announces it — llama.cpp
+                // logs `create_tensor: loading tensor rope_freqs.weight` and
+                // that line is the only sign.
+                let freqs = weights.get("rope_freqs.weight");
+                let q = ctx.rope_ext(&q, &pos, freqs, n_rot, rope_type, 0, rp)?;
+                let k = ctx.rope_ext(&k, &pos, freqs, n_rot, rope_type, 0, rp)?;
 
                 // One compute materialises all three, which is what the comment
                 // here claimed while the code called `compute` once per tensor.
@@ -1882,6 +1909,11 @@ mod tests {
             rope_orig_ctx: 0,
             attn_bias: false,
             layer_norm: false,
+            norm_affine: true,
+            norm_bias: false,
+            clamp_kqv: 0.0,
+            uses_alibi: false,
+            rope_freqs: false,
             ffn_bias: false,
             attn_out_bias: false,
             n_rot: 16,

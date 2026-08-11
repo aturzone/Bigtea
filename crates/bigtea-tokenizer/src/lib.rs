@@ -289,18 +289,41 @@ impl Tokenizer {
                 Some(Value::Bool(v)) => *v,
                 _ => true,
             },
-            bos: id_of("tokenizer.ggml.bos_token_id"),
+            // 11 for a BPE vocabulary that names no BOS. That is not a guess:
+            // llama.cpp's `tokenizer_model == "gpt2"` branch sets
+            // `special_bos_id = special_eos_id = 11` before the container's own
+            // keys are read. **Falcon3 declares an EOS and no BOS**, so the
+            // default is what it runs on, and `add_bos` below is what makes it
+            // matter.
+            bos: id_of("tokenizer.ggml.bos_token_id").or(match kind {
+                Kind::Bpe => Some(11),
+                _ => None,
+            }),
             eos: id_of("tokenizer.ggml.eos_token_id"),
             // Llama-family containers frequently omit the flag and still expect
-            // BOS. Defaulting it on for SPM matches llama.cpp; for BPE the
-            // absent flag genuinely means "no".
+            // BOS. Defaulting it on for SPM matches llama.cpp; for BPE it
+            // depends on the **pre-tokenizer**, not on the vocabulary kind.
             add_bos: match meta.get("tokenizer.ggml.add_bos_token") {
                 Some(Value::Bool(v)) => *v,
                 // BERT containers declare neither flag and still expect the
                 // sequence wrapped in [CLS] .. [SEP] -- llama.cpp adds both
                 // unconditionally for WordPiece, and a missing [CLS] shifts
                 // every position by one.
-                _ => matches!(kind, Kind::Spm | Kind::Wpm),
+                //
+                // The `llama3`/`llama-bpe`/`falcon3` arm sets `add_bos = true`
+                // there too, and Falcon3 is the container that declares neither
+                // the flag nor a BOS id. Without both halves of this it saw a
+                // sequence one token shorter than the reference did, and then
+                // disagreed from the first generated token — on two prompts,
+                // while five more sat close enough to read as near-ties.
+                //
+                // `kind == Bpe` is load-bearing: `pre` is set to `LlamaBpe` as
+                // a placeholder for every non-BPE vocabulary, so testing it
+                // alone would switch BOS on for T5, which has none.
+                _ => {
+                    matches!(kind, Kind::Spm | Kind::Wpm)
+                        || (kind == Kind::Bpe && pre == PreTokenizer::LlamaBpe)
+                }
             },
             add_eos: match meta.get("tokenizer.ggml.add_eos_token") {
                 Some(Value::Bool(v)) => *v,
@@ -533,8 +556,41 @@ impl Tokenizer {
             }
             return bytes;
         }
-        let joined: String = ids.iter().filter_map(|&id| self.token_text(id)).collect();
-        bytes::decode(&joined)
+        self.bpe_decode_bytes(ids)
+    }
+
+    /// The BPE arm of llama.cpp's `token_to_piece`: **a USER_DEFINED token's
+    /// text is copied verbatim; only a NORMAL token goes through the byte
+    /// alphabet.**
+    ///
+    /// Falcon3 is why this is not one `bytes::decode` over the joined text.
+    /// Its newline is id 12, marked USER_DEFINED, and holds a *raw* `\n` rather
+    /// than the `Ċ` a GPT-2-family vocabulary usually spells it with.
+    /// `bytes::decode` drops every character outside that alphabet, so the
+    /// newline vanished and generation arrived as one run-on line —
+    /// `Paris.Q: What is…` where the reference had a paragraph. Nothing failed:
+    /// the ids were right and only the rendering was wrong, so it surfaced as a
+    /// parity mismatch rather than an error.
+    ///
+    /// Runs of NORMAL tokens are still decoded **together**, because one
+    /// character is often several byte tokens and decoding each alone would
+    /// drop the continuation bytes.
+    fn bpe_decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut run = String::new();
+        for &id in ids {
+            let Some(text) = self.token_text(id) else {
+                continue;
+            };
+            if self.user_defined.get(id as usize).copied().unwrap_or(false) {
+                out.extend(bytes::decode(&std::mem::take(&mut run)));
+                out.extend_from_slice(text.as_bytes());
+            } else {
+                run.push_str(text);
+            }
+        }
+        out.extend(bytes::decode(&run));
+        out
     }
 
     pub fn decode(&self, ids: &[u32]) -> String {
@@ -581,8 +637,7 @@ impl Tokenizer {
                 false => text,
             };
         }
-        let joined: String = ids.iter().filter_map(|&id| self.token_text(id)).collect();
-        String::from_utf8_lossy(&bytes::decode(&joined)).into_owned()
+        String::from_utf8_lossy(&self.bpe_decode_bytes(ids)).into_owned()
     }
 
     /// Greedy BPE: repeatedly merge the adjacent pair with the lowest rank.

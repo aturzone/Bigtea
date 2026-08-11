@@ -48,6 +48,14 @@ pub enum PreTokenizer {
     /// **four rules applied in sequence**, each splitting the pieces the last
     /// one produced, rather than one ordered alternation. See [`default_gpt2`].
     Default,
+    /// `gpt-2`, and also `mpt`, `olmo`, `jais`. **One** rule, not four.
+    ///
+    /// Easy to conflate with [`Default`](Self::Default), and this build did:
+    /// `from_name` mapped `"gpt2"` onto `Default`. They are separate entries in
+    /// llama.cpp — `LLAMA_VOCAB_PRE_TYPE_GPT2` is the single GPT-2 expression,
+    /// while the switch's `default:` arm wraps that same expression in three
+    /// more passes. Sharing a name in the source is not sharing a rule.
+    Gpt2,
 }
 
 /// A `tokenizer.ggml.pre` this build has not verified against a real container.
@@ -59,7 +67,8 @@ impl fmt::Display for UnknownPreTokenizer {
         write!(
             f,
             "tokenizer.ggml.pre = {:?} is not implemented (verified here: \
-             \"llama-bpe\"/\"llama3\", \"qwen2\", \"joyai-llm\", \"default\"). \
+             \"llama-bpe\"/\"llama3\", \"qwen2\", \"joyai-llm\", \"default\", \
+             \"gpt-2\"/\"mpt\"/\"olmo\"/\"jais\"). \
              The pre-tokenizer decides where BPE may merge, so guessing one \
              shifts every token boundary and the model answers fluently and \
              wrongly rather than failing — which is why this refuses instead. \
@@ -76,13 +85,20 @@ impl PreTokenizer {
     /// Resolve the metadata string, refusing anything untested.
     pub fn from_name(name: &str) -> Result<Self, UnknownPreTokenizer> {
         match name {
-            "llama-bpe" | "llama3" => Ok(PreTokenizer::LlamaBpe),
+            // `falcon3` is not a rule of its own: llama.cpp folds it into the
+            // same arm as `llama-bpe`, with the same `LLAMA_VOCAB_PRE_TYPE_LLAMA3`
+            // and the same `ignore_merges` / `add_bos`. Checked against
+            // Falcon3-1B-Instruct. `llama-v3` is the third alias in that arm.
+            "llama-bpe" | "llama3" | "llama-v3" | "falcon3" => Ok(PreTokenizer::LlamaBpe),
             "qwen2" => Ok(PreTokenizer::Qwen2),
             "joyai-llm" => Ok(PreTokenizer::JoyaiLlm),
             // **Also the absent case.** `Tokenizer::from_metadata` passes
             // "default" when the container declares no `tokenizer.ggml.pre`,
             // which is what llama.cpp does with a missing key.
-            "default" | "gpt-2" | "gpt2" => Ok(PreTokenizer::Default),
+            "default" => Ok(PreTokenizer::Default),
+            // These four share `LLAMA_VOCAB_PRE_TYPE_GPT2` there, and it is
+            // **not** the `default:` arm. Checked against OLMo-1B.
+            "gpt-2" | "gpt2" | "mpt" | "olmo" | "jais" => Ok(PreTokenizer::Gpt2),
             other => Err(UnknownPreTokenizer(other.to_string())),
         }
     }
@@ -91,7 +107,10 @@ impl PreTokenizer {
     fn max_digits(self) -> usize {
         match self {
             PreTokenizer::Qwen2 => 1,
-            PreTokenizer::LlamaBpe | PreTokenizer::JoyaiLlm | PreTokenizer::Default => 3,
+            PreTokenizer::LlamaBpe
+            | PreTokenizer::JoyaiLlm
+            | PreTokenizer::Default
+            | PreTokenizer::Gpt2 => 3,
         }
     }
 }
@@ -103,8 +122,105 @@ pub fn pre_tokenize(text: &str, pre: PreTokenizer) -> Vec<String> {
     match pre {
         PreTokenizer::JoyaiLlm => joyai(text),
         PreTokenizer::Default => default_gpt2(text),
+        PreTokenizer::Gpt2 => gpt2_rule(text),
         PreTokenizer::LlamaBpe | PreTokenizer::Qwen2 => gpt4_style(text, pre.max_digits()),
     }
+}
+
+/// `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)`
+///
+/// Transcribed from `unicode_regex_split_custom_gpt2`, not from the expression
+/// above — llama.cpp dispatches this exact regex string to a hand-written
+/// splitter, so **the C++ is the specification and the regex is a comment on
+/// it.** Two places where they differ and the code wins:
+///
+///   * the run of whitespace at the end has a `\s+` fallback the expression
+///     does not list, so a trailing run is emitted whole rather than dropped;
+///   * the contraction rule is **case-sensitive** here. `llama3` writes
+///     `(?i:'s|…)`, this one does not, so `'S` is punctuation-then-letter.
+///
+/// Reusing `gpt4_style` for this would have been close and wrong: it keeps a
+/// non-space lead character on a word (`[^\r\n\p{L}\p{N}]?\p{L}+` against
+/// ` ?\p{L}+`) and caps digit runs at three. Both differences are invisible in
+/// [`default_gpt2`], whose other three passes happen to undo them, and neither
+/// is invisible here, where this rule runs alone.
+fn gpt2_rule(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+
+    // `[^\s\p{L}\p{N}]`. Deliberately not [`is_other`], which also excludes
+    // control characters: llama.cpp tests `!(whitespace|letter|number)` plus
+    // "has any flag at all", and a control character has one.
+    fn is_sym(c: char) -> bool {
+        !c.is_whitespace() && !c.is_alphabetic() && !is_digit(c)
+    }
+
+    while i < n {
+        // `'s|'t|'re|'ve|'m|'ll|'d`, lower case only.
+        if chars[i] == '\'' && i + 1 < n {
+            let a = chars[i + 1];
+            if matches!(a, 's' | 't' | 'm' | 'd') {
+                out.push(chars[i..i + 2].iter().collect());
+                i += 2;
+                continue;
+            }
+            if i + 2 < n {
+                let b = chars[i + 2];
+                if (a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l') {
+                    out.push(chars[i..i + 3].iter().collect());
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+
+        // The three ` ?…+` rules share one shape: look past a single literal
+        // space, and if what follows is classified, take the space with it.
+        // A space followed by anything unclassified — another space, a
+        // newline, the end — falls through to the whitespace rules below.
+        let probe = i + usize::from(chars[i] == ' ');
+        let class: Option<fn(char) -> bool> = match chars.get(probe) {
+            Some(&c) if c.is_alphabetic() => Some(|c: char| c.is_alphabetic()),
+            // Unbounded, unlike `llama3`'s `\p{N}{1,3}`. `default_gpt2` chops
+            // the run in a later pass; standing alone this one does not.
+            Some(&c) if is_digit(c) => Some(is_digit),
+            Some(&c) if is_sym(c) => Some(is_sym),
+            _ => None,
+        };
+        if let Some(f) = class {
+            let mut j = probe;
+            while j < n && f(chars[j]) {
+                j += 1;
+            }
+            out.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+
+        let mut ws = 0;
+        while i + ws < n && chars[i + ws].is_whitespace() {
+            ws += 1;
+        }
+        // `\s+(?!\S)` — a run with something after it gives its last character
+        // back, because that character is the next piece's leading space.
+        if ws > 1 && i + ws < n {
+            let j = i + ws - 1;
+            out.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+        // The `\s+` fallback: a run at the very end, or a single space.
+        if ws > 0 {
+            out.push(chars[i..i + ws].iter().collect());
+            i += ws;
+            continue;
+        }
+        out.push(chars[i..i + 1].iter().collect());
+        i += 1;
+    }
+    out
 }
 
 /// llama.cpp's `LLAMA_VOCAB_PRE_TYPE_DEFAULT`, and therefore what an **absent**
@@ -138,12 +254,12 @@ fn default_gpt2(text: &str) -> Vec<String> {
     };
     let mut pieces = split_runs(text, is_punct_run);
 
-    // Pass 2: the GPT-2 rule. Digits group greedily here; passes 3 and 4 chop
-    // them, which is why `max_digits` is not applied yet.
-    pieces = pieces
-        .into_iter()
-        .flat_map(|p| gpt4_style(&p, usize::MAX))
-        .collect();
+    // Pass 2: the GPT-2 rule, and **the same code the `gpt-2` pre-tokenizer
+    // runs** — llama.cpp dispatches on the regex string, and this pass's string
+    // is byte-identical to `LLAMA_VOCAB_PRE_TYPE_GPT2`'s. This used to call
+    // `gpt4_style(_, usize::MAX)`, which is a different rule that the other
+    // three passes mostly hide; `gpt2_rule` says which differences.
+    pieces = pieces.into_iter().flat_map(|p| gpt2_rule(&p)).collect();
 
     // Pass 3: separate digit runs from anything still attached to them, then
     // pass 4: chop those runs into threes.
@@ -496,13 +612,48 @@ mod tests {
         }
     }
 
+    /// **`default` and `gpt2` are different rules**, and this test used to
+    /// assert they were the same one. llama.cpp's `LLAMA_VOCAB_PRE_TYPE_GPT2`
+    /// is the single GPT-2 expression; the switch's `default:` arm wraps that
+    /// expression in three more passes. The names being adjacent in the source
+    /// is not the rules being equal.
     #[test]
-    fn default_is_resolved_by_name_and_by_absence() {
+    fn default_and_gpt2_are_not_the_same_rule() {
         assert_eq!(
             PreTokenizer::from_name("default"),
             Ok(PreTokenizer::Default)
         );
-        assert_eq!(PreTokenizer::from_name("gpt2"), Ok(PreTokenizer::Default));
+        assert_eq!(PreTokenizer::from_name("gpt2"), Ok(PreTokenizer::Gpt2));
+        assert_eq!(PreTokenizer::from_name("olmo"), Ok(PreTokenizer::Gpt2));
+
+        // The `default:` arm's first pass cuts a punctuation run out whole, so
+        // it splits where the bare GPT-2 rule does not.
+        let text = "def fibonacci(n):";
+        assert_eq!(
+            pre_tokenize(text, PreTokenizer::Default),
+            vec!["def", " fibonacci", "(", "n", "):"]
+        );
+        assert_eq!(
+            pre_tokenize(text, PreTokenizer::Gpt2),
+            vec!["def", " fibonacci", "(", "n", "):"]
+        );
+        // …and on a number it is passes 3 and 4 that differ: the bare rule
+        // takes a digit run whole, the default chops it into threes.
+        assert_eq!(pre_tokenize("12345", PreTokenizer::Gpt2), vec!["12345"]);
+        assert_eq!(
+            pre_tokenize("12345", PreTokenizer::Default),
+            vec!["123", "45"]
+        );
+    }
+
+    /// `falcon3` is `llama-bpe` under another name — one arm in llama.cpp, one
+    /// `pre_type`, and the same `ignore_merges`/`add_bos`.
+    #[test]
+    fn falcon3_resolves_to_the_llama3_rule() {
+        assert_eq!(
+            PreTokenizer::from_name("falcon3"),
+            Ok(PreTokenizer::LlamaBpe)
+        );
     }
 
     fn assert_lossless(text: &str, pre: PreTokenizer) {

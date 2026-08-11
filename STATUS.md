@@ -6,11 +6,24 @@ closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
 **Last updated**: 2026-08-11 · **Version**: v0.0.2 · **Branch**: `main` at
-`8b4794e` · **Open PRs**: none, no ticket branches open.
+`f0c7a42` · **Open PRs**: `ticket/r14-architectures`.
 
 **#60 and #63 are merged and everything is on `main`, verified on `main`
 itself**: 423 tests, clippy `--workspace -D warnings` 0, fmt clean, and the
-parity sweep re-run after the merge. `VERIFIED_ARCHITECTURES` is **ten**.
+parity sweep re-run after the merge.
+
+**`VERIFIED_ARCHITECTURES` is thirteen** — `baichuan`, `internlm2` and `olmo`
+added on `ticket/r14-architectures`, each diffed at **eight** prompts. Widening
+the harness from three prompts to eight **found three bugs in code that had been
+on `main` for weeks**, two of them inside entries already listed as verified:
+Llama-3.1/3.2/3.3 rotated with the wrong RoPE (`rope_freqs.weight` was never
+read), Falcon3 was prefilled one token short (no BOS, no `add_bos_token`), and a
+USER_DEFINED token's raw `\n` was silently dropped by the byte decoder. Twelve
+models re-run, **eleven at 8/8** (Phi-3 6 ok + 2 reference-unstable), 426 tests.
+The rule those bugs cost: **"the reference disagrees with itself" is not a safe
+verdict** — it compares the reference to itself and cannot see that *our input*
+differed, and nine of eleven `unstable` verdicts this session were bugs. Details:
+`research/eight-prompts-found-three-bugs-2026-08-11.md`.
 
 **Everything is merged.** PR #55 brought R3, R7, R8 and R9 into `main` in one
 merge — the KV cache, six architectures, four tokenizer families, 106 CLI flags,
@@ -74,7 +87,7 @@ and is unchanged: prefill 1.25x behind, generation at parity. See below.
 
 | | Bigtea | llama.cpp | gap |
 |---|---:|---:|---|
-| architectures **diffed against the reference** | **8** | 141 declared | the big one |
+| architectures **diffed against the reference** | **13** | 141 declared | the big one |
 | chat templates | 26 | 54 | half |
 | CLI flags (long) | 119 | 182 | 63 |
 | tokenizer families | 4 | 6 | rwkv, plamo2 |
@@ -1959,3 +1972,91 @@ disk, `stablelm` and `starcoder2`. Everything that declares its `pre` explicitly
 Regression sweep after the fix: stablelm 3/3, starcoder2 3/3, qwen2 3/3,
 qwen3-4b 3/3, gemma2 3/3, llama32-1b 2/3 + one documented `unstable`.
 414 workspace tests, clippy and fmt clean.
+
+## Eight prompts instead of three: three bugs, two of them in "verified" code
+
+`ticket/r14-architectures`, 2026-08-11. Four architectures were on the list —
+olmo, falcon3, internlm2, baichuan. Three of them needed almost nothing. The
+harness change that preceded them is what earned the session.
+
+**`VERIFIED_ARCHITECTURES` is thirteen**: baichuan, deepseek4, gemma2, gemma3,
+internlm2, llama, olmo, phi3, qwen2, qwen3, qwen3moe, stablelm, starcoder2.
+
+### The three bugs, all pre-existing on `main`, all confirmed by stashing
+
+| bug | before | after |
+|---|---|---|
+| `rope_freqs.weight` never read (Llama-3.1/3.2/3.3) | 3 ok / 4 unstable / 1 FAIL | **8 ok** |
+| no BOS for a BPE container that declares none (Falcon3) | 1 ok / 5 unstable / 2 FAIL | **8 ok** |
+| USER_DEFINED token byte-decoded instead of copied | newlines vanished | **byte-exact** |
+
+The first is the serious one. Llama-3.1 onwards carry `rope_scaling = "llama3"`
+as a **tensor** — `rope_freqs.weight`, `n_rot/2` per-frequency divisors, handed
+to `ggml_rope_ext` as `freq_factors`. We passed `None`. The metadata reports
+`rope scaling = linear, freq_scale_train = 1` whether or not the tensor exists,
+so nothing announces it; llama.cpp's only sign is one debug line. `llama` has
+been in `VERIFIED_ARCHITECTURES` the whole time.
+
+It needed two changes, and the second is the trap: the tensor had to be added to
+`required_tensors()`, or it is **never loaded**, `weights.get` returns `None`,
+and the rotation is quietly the un-extended one. Same shape as StableLM's
+missing biases.
+
+### The rule those bugs cost
+
+**"The reference disagrees with itself" is not a safe verdict.** The harness
+re-runs a mismatch under `-fa off` and `--no-repack` and calls the prompt a
+near-tie if llama.cpp's answer moves. That compares the reference *to itself*. It
+cannot see that **our input differed** — and when it does, a near-tie is exactly
+the symptom, because the model is answering a slightly different question.
+
+**Nine of the eleven `unstable` verdicts in this session were bugs.** One near-tie
+in eight is ordinary; five is a bug not yet found.
+
+Also fixed in the harness: `llama-completion` prints ` [end of text]` on EOS and
+Bigtea prints no equivalent, so any model terminating early read as a FAIL whose
+two sides were identical (`bigtea: 42` vs `llama.cpp: 42 [end of text]`).
+
+### What the four architectures actually needed
+
+- **olmo** — one real feature: **non-parametric norms.** llama.cpp builds every
+  one as `build_norm(x, NULL, NULL, LLM_NORM)`, and the container holds no
+  `attn_norm.weight`, `ffn_norm.weight` or `output_norm.weight`. `layer_norm` and
+  `norm_bias` had to split into two booleans — they were one because every
+  LayerNorm so far had a bias, and OLMo made the loader demand an
+  `output_norm.bias` that cannot exist. Also: **`olmo` was listed as NeoX RoPE
+  with `known = true`** while llama.cpp lists it in the NORM branch. A guess
+  wearing the label of a checked fact.
+- **internlm2** — 8/8 first run; only needed the NORM RoPE entry.
+- **baichuan** — 8/8 on the 7B. **The 13B is now refused**: llama.cpp gives it
+  ALiBi by *layer count* (`n_layer == 40`), the two share a tensor set and an
+  architecture name, and the 13B would load, rotate keys it should not, and
+  answer fluently.
+- **falcon3** — **not a new architecture.** It converts to `llama`, and `falcon3`
+  is one more alias in llama.cpp's `llama-bpe` arm. Everything it exposed was in
+  shared code. Its container is also the reason `gpt-2` and `default` are now
+  separate pre-tokenizers here: they are separate entries in llama.cpp
+  (`PRE_TYPE_GPT2` is one regex, the `default:` arm wraps it in three more
+  passes) and `from_name` had mapped `gpt2` onto `default`.
+
+### Scoreboard, one session, one build, `parity-check.sh <model> 32`
+
+```
+OLMo-1B.Q4_K_M                    8 ok  NEW    Qwen2-0.5B-Instruct        8 ok
+internlm2-math-plus-1_8b.Q4_K     8 ok  NEW    Qwen3-4B                   8 ok
+baichuan2-7b-chat.Q4_K_M          8 ok  NEW    gemma-2-2b-it              8 ok
+Falcon3-1B-Instruct (arch llama)  8 ok         gemma-3-1b-it              8 ok
+stablelm-2-1_6b-chat              8 ok         Llama-3.2-1B-Instruct      8 ok  fixed
+starcoder2-3b                     8 ok         tinyllama-1.1b-chat        8 ok  fixed
+                                               Phi-3-mini-4k    6 ok, 2 unstable
+```
+
+426 workspace tests, clippy `--workspace --all-targets -D warnings` clean, fmt
+clean.
+
+**Not done**: the `clamp_kqv` path (MPT/DBRX/OLMo) is written against
+llama.cpp's code, not a run — OLMo-1B declares `0.0`. Phi-3's two unstable
+prompts are unexamined, and after nine `unstable` verdicts turned out to be bugs,
+"it was already like that" is a weak defence. Containers live at
+`C:/Projects/models/{olmo,internlm2,falcon3,baichuan}/` and are the only copies
+on this machine.
