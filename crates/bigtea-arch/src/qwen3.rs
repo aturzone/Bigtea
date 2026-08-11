@@ -165,6 +165,23 @@ pub struct Qwen3Config {
     pub attn_logit_softcap: f32,
     /// `tanh` soft cap on the final logits; `0.0` means none. Gemma-2 uses 30.
     pub final_logit_softcap: f32,
+    /// How often a **full-attention** layer appears among windowed ones.
+    ///
+    /// llama.cpp calls this the SWA pattern. `n` means layer `il` is windowed
+    /// when `il % n < n - 1`, so the last of every `n` is global. Gemma-2 is
+    /// **2** (alternating) and Gemma-3 is **6** (five local, one global).
+    ///
+    /// Getting it wrong windows the wrong layers, and **below the window
+    /// length every pattern is identical** — which is why a short prompt
+    /// cannot reveal the mistake and Gemma-3 answered plausibly and wrongly.
+    /// `0` or `1` means no windowing at all.
+    pub swa_pattern: u32,
+    /// RoPE base for the **windowed** layers, which is not the global one.
+    ///
+    /// Gemma-3 trains local layers at 10,000 and global layers at 1,000,000.
+    /// One base for the whole model is therefore wrong for five layers in six,
+    /// and wrong RoPE is fluent nonsense rather than an error.
+    pub rope_freq_base_swa: f32,
     /// Sliding-window attention width, `0` for full attention.
     ///
     /// Gemma-2 alternates full and windowed layers. Below the window every
@@ -255,6 +272,23 @@ impl Qwen3Config {
             attn_logit_softcap: model.arch_f32("attn_logit_softcapping").unwrap_or(0.0),
             final_logit_softcap: model.arch_f32("final_logit_softcapping").unwrap_or(0.0),
             sliding_window: model.arch_u64("attention.sliding_window").unwrap_or(0) as u32,
+            // Declared by the container when it knows; otherwise by
+            // architecture, because a wrong default here is silent.
+            swa_pattern: model
+                .arch_u64("attention.sliding_window_pattern")
+                .map(|v| v as u32)
+                .unwrap_or(match arch.as_str() {
+                    "gemma2" => 2,
+                    "gemma3" => 6,
+                    _ => 0,
+                }),
+            rope_freq_base_swa: model.arch_f32("rope.freq_base_swa").unwrap_or(
+                match arch.as_str() {
+                    // Gemma-3's local layers, which the container often omits.
+                    "gemma3" => 10_000.0,
+                    _ => model.arch_f32("rope.freq_base").unwrap_or(10_000.0),
+                },
+            ),
         })
     }
 
@@ -275,6 +309,27 @@ impl Qwen3Config {
     /// would trace back to attention.
     pub fn correct_context_limit(&self) -> usize {
         usize::MAX
+    }
+
+    /// Whether layer `il` uses the sliding window rather than full attention.
+    ///
+    /// One rule for every architecture with mixed attention, rather than a
+    /// hardcoded parity per model. Gemma-2 (`n = 2`) gives even layers, which
+    /// is what the previous `il % 2 == 0` did; Gemma-3 (`n = 6`) gives five in
+    /// six, which that rule got wrong for a third of the model.
+    pub fn is_swa_layer(&self, il: u32) -> bool {
+        self.sliding_window > 0
+            && self.swa_pattern > 1
+            && il % self.swa_pattern < self.swa_pattern - 1
+    }
+
+    /// The RoPE base layer `il` was trained with.
+    pub fn rope_base_for(&self, il: u32) -> f32 {
+        if self.is_swa_layer(il) {
+            self.rope_freq_base_swa
+        } else {
+            self.rope_freq_base
+        }
     }
 
     /// Scale applied to attention scores before softmax.
@@ -849,6 +904,8 @@ mod tests {
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             sliding_window: 0,
+            swa_pattern: 0,
+            rope_freq_base_swa: 10_000.0,
         }
     }
 

@@ -1028,9 +1028,14 @@ impl<'m> StreamingRunner<'m> {
 
     /// RoPE parameters this architecture uses.
     pub fn rope(&self) -> RopeParams {
+        self.rope_for(0)
+    }
+
+    /// RoPE parameters for one layer. Only the base varies.
+    pub fn rope_for(&self, il: u32) -> RopeParams {
         let c = &self.arch.config;
         RopeParams {
-            freq_base: c.rope_freq_base,
+            freq_base: c.rope_base_for(il),
             freq_scale: c.rope_freq_scale,
             ext_factor: c.rope_ext_factor,
             attn_factor: c.rope_attn_factor,
@@ -1408,7 +1413,9 @@ impl<'m> StreamingRunner<'m> {
                     (q, k)
                 };
 
-                let rp = self.rope();
+                // Per layer, not per model: Gemma-3's windowed layers are
+                // trained at a different RoPE base from its global ones.
+                let rp = self.rope_for(il);
                 // NORM for llama/mistral, NeoX for qwen/phi/gemma. Both run
                 // without error on either layout and the wrong one is fluent
                 // nonsense, so it comes from the config rather than a constant.
@@ -1485,7 +1492,7 @@ impl<'m> StreamingRunner<'m> {
             // ordering is checked against llama.cpp's output rather than
             // reasoned about.
             let layer_mask = match swa_mask.as_ref() {
-                Some(swa) if il % 2 == 0 => swa,
+                Some(swa) if c.is_swa_layer(il) => swa,
                 _ => &mask,
             };
             let attn_result = (|| -> Result<(Vec<f32>, f64, f64)> {
@@ -1895,6 +1902,8 @@ mod tests {
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             sliding_window: 0,
+            swa_pattern: 0,
+            rope_freq_base_swa: 10_000.0,
         }
     }
 

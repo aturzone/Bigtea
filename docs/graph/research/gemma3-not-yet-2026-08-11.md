@@ -57,3 +57,36 @@ attention will need.
 
 **Do not add `gemma3` to `VERIFIED_ARCHITECTURES` until the continuation matches
 llama.cpp for at least 32 tokens**, not 4.
+
+## Update: the pattern is fixed, and gemma3 still does not match
+
+`Qwen3Config` now carries `swa_pattern` and `rope_freq_base_swa`, and
+`is_swa_layer(il)` / `rope_base_for(il)` replace the hardcoded `il % 2 == 0`.
+Gemma-2 is pattern 2, Gemma-3 pattern 6 — one rule for both, and **Gemma-2's
+output is byte-identical before and after**, at 10 tokens and at 5201 (above its
+window, which is the case that can actually tell).
+
+The container supplies what was expected:
+
+```
+gemma3.attention.sliding_window = 512
+gemma3.rope.freq_base           = 1000000.0
+```
+
+with no `sliding_window_pattern` and no `rope.freq_base_swa`, so the
+architecture defaults (6 and 10,000) apply. **Gemma-3 still diverges**, so at
+least one more thing differs. Remaining suspects, in the order worth checking:
+
+1. **RoPE scaling applied to the global layers only.** Gemma-3 scales the 1M
+   base on its global layers and not its local ones; a single scale for the
+   model is wrong for one layer in six.
+2. **`query_pre_attn_scalar`.** Gemma-3 divides Q by `sqrt(query_pre_attn_scalar)`
+   rather than by `sqrt(head_dim)`. They coincide at 256 for the 1B and do
+   **not** coincide for the 4B and 27B, so a check that passes here would still
+   be wrong at the next size.
+3. **The final norm before the output projection**, which Gemma-3 places
+   differently from Gemma-2.
+
+The infrastructure is worth having regardless: every later architecture with
+mixed local/global attention needs exactly this, and it is now one rule rather
+than a parity hardcoded per model.
