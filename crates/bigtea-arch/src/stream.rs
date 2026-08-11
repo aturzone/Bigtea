@@ -1369,11 +1369,9 @@ impl<'m> StreamingRunner<'m> {
                 let pos = ctx.new_i32_1d(n_new)?;
                 pos.set_i32(&positions)?;
 
-                let normed = self.arch.norm_scaled(
-                    &ctx,
-                    &xt,
-                    &get(weights, format!("blk.{il}.attn_norm.weight"))?,
-                )?;
+                let normed =
+                    self.arch
+                        .norm_named(&ctx, weights, &xt, &format!("blk.{il}.attn_norm"))?;
                 let (qw, kw, vw) = self.arch.qkv_weights(&ctx, weights, il)?;
                 let q = ctx.mul_mat(&qw, &normed)?;
                 let k = ctx.mul_mat(&kw, &normed)?;
@@ -1420,8 +1418,11 @@ impl<'m> StreamingRunner<'m> {
                 // without error on either layout and the wrong one is fluent
                 // nonsense, so it comes from the config rather than a constant.
                 let rope_type = c.rope_type;
-                let q = ctx.rope_ext(&q, &pos, None, head_dim as i32, rope_type, 0, rp)?;
-                let k = ctx.rope_ext(&k, &pos, None, head_dim as i32, rope_type, 0, rp)?;
+                // `n_rot`, not `head_dim`: StableLM rotates 16 of its 64 and
+                // leaves the rest alone. Rotating all of them is not an error.
+                let n_rot = c.n_rot as i32;
+                let q = ctx.rope_ext(&q, &pos, None, n_rot, rope_type, 0, rp)?;
+                let k = ctx.rope_ext(&k, &pos, None, n_rot, rope_type, 0, rp)?;
 
                 // One compute materialises all three, which is what the comment
                 // here claimed while the code called `compute` once per tensor.
@@ -1531,6 +1532,10 @@ impl<'m> StreamingRunner<'m> {
                 let out =
                     arch.attention_flash(&ctx, &q, &k_all, &v_all, n_new, n_total, layer_mask)?;
                 let out = ctx.mul_mat(&out_w, &out)?;
+                // StarCoder2 carries a bias here; most architectures do not.
+                let out =
+                    self.arch
+                        .add_bias(&ctx, weights, out, &format!("blk.{il}.attn_output"))?;
                 let t = std::time::Instant::now();
                 ctx.compute(&out, threads)?;
                 Ok((out.to_vec_f32(), kv_secs, t.elapsed().as_secs_f64()))
@@ -1593,11 +1598,9 @@ impl<'m> StreamingRunner<'m> {
                 let ctx = Context::new(arena_for(&shapes, 24))?;
                 let xt = ctx.new_f32_2d(n_embd, n_new)?;
                 xt.set_f32(&ffn_input)?;
-                let normed = self.arch.norm_scaled(
-                    &ctx,
-                    &xt,
-                    &get(weights, format!("blk.{il}.ffn_norm.weight"))?,
-                )?;
+                let normed =
+                    self.arch
+                        .norm_named(&ctx, weights, &xt, &format!("blk.{il}.ffn_norm"))?;
                 if !c.is_moe() {
                     // Dense: no router at all. The FFN is one gate/up/down
                     // triple on resident weights, so it runs here rather than
@@ -1653,13 +1656,7 @@ impl<'m> StreamingRunner<'m> {
         ))?;
         let xt = ctx.new_f32_2d(n_embd, 1)?;
         xt.set_f32(&x[last..])?;
-        let normed = self.arch.norm_scaled(
-            &ctx,
-            &xt,
-            weights
-                .get("output_norm.weight")
-                .ok_or_else(|| ArchError::MissingTensor("output_norm.weight".into()))?,
-        )?;
+        let normed = self.arch.norm_named(&ctx, weights, &xt, "output_norm")?;
         let out_name = if weights.get("output.weight").is_some() {
             "output.weight"
         } else {
@@ -1771,13 +1768,7 @@ impl<'m> StreamingRunner<'m> {
         let ctx = Context::new(1 << 30)?;
         let xt = ctx.new_f32_2d(n_embd, n_tokens)?;
         xt.set_f32(&x)?;
-        let normed = self.arch.norm_scaled(
-            &ctx,
-            &xt,
-            weights
-                .get("output_norm.weight")
-                .ok_or_else(|| ArchError::MissingTensor("output_norm.weight".into()))?,
-        )?;
+        let normed = self.arch.norm_named(&ctx, weights, &xt, "output_norm")?;
         let out_name = if weights.get("output.weight").is_some() {
             "output.weight"
         } else {
@@ -1890,6 +1881,10 @@ mod tests {
             rope_beta_slow: 1.0,
             rope_orig_ctx: 0,
             attn_bias: false,
+            layer_norm: false,
+            ffn_bias: false,
+            attn_out_bias: false,
+            n_rot: 16,
             n_expert: 4,
             n_expert_used: 2,
             n_ff_expert: 16,

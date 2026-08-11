@@ -73,6 +73,7 @@ extern "C" {
         b: *mut ggml_tensor,
     ) -> *mut ggml_tensor;
     fn ggml_rms_norm(ctx: *mut ggml_context, a: *mut ggml_tensor, eps: f32) -> *mut ggml_tensor;
+    fn ggml_norm(ctx: *mut ggml_context, a: *mut ggml_tensor, eps: f32) -> *mut ggml_tensor;
     fn ggml_soft_max(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     fn ggml_fp32_to_fp16_row(src: *const f32, dst: *mut u16, n: i64);
     fn ggml_fp16_to_fp32_row(src: *const u16, dst: *mut f32, n: i64);
@@ -486,6 +487,22 @@ impl Context {
     pub fn rms_norm<'a>(&'a self, a: &Tensor<'a>, eps: f32) -> Result<Tensor<'a>, GgmlError> {
         // SAFETY: as above.
         self.tensor(unsafe { ggml_rms_norm(self.raw.as_ptr(), a.raw.as_ptr(), eps) })
+    }
+
+    /// LayerNorm: subtract the mean, divide by the standard deviation.
+    ///
+    /// **Not interchangeable with [`rms_norm`](Self::rms_norm).** RMSNorm
+    /// divides by the root-mean-square and never centres; LayerNorm centres
+    /// first. Substituting one for the other is not an error and not a crash —
+    /// it is fluent noise, which is exactly how StableLM and StarCoder2 read
+    /// before this existed.
+    ///
+    /// The scale and shift are separate: `ggml` returns the normalised tensor
+    /// and the caller multiplies by `weight` and adds `bias`. A LayerNorm
+    /// *always* has a bias, which is the tell in a container.
+    pub fn norm<'a>(&'a self, a: &Tensor<'a>, eps: f32) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_norm(self.raw.as_ptr(), a.raw.as_ptr(), eps) })
     }
 
     pub fn soft_max<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {

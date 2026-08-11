@@ -1279,3 +1279,52 @@ and starcoder, so building it once moves the count by more than these two.
 
 Ruled out: the tokenizer (both declare `gpt2`, supported) and the RoPE
 convention (both NeoX, already mapped). The failure is entirely in the block.
+
+## StarCoder2 verified; StableLM is one tokenizer line away (2026-08-11)
+
+**`VERIFIED_ARCHITECTURES` is nine** — `starcoder2` added, 3/3 exact on
+`parity-check.sh`. StableLM is **not** added; its block is right and the
+remaining difference is in the tokenizer.
+
+What the dense path gained, all detected from the container rather than by name:
+
+- **LayerNorm.** `bigtea-ggml` now binds `ggml_norm` beside `ggml_rms_norm`.
+  A norm carrying a bias *is* a LayerNorm — RMSNorm never centres and has no
+  shift — and substituting one was the fluent CJK noise both models produced.
+- **The full bias set.** `attn_output`, `ffn_up`, `ffn_down` and the norms,
+  on top of the Q/K/V biases.
+- **Partial RoPE.** `rope.dimension_count` was **ignored entirely**;
+  `head_dim` went in as `n_rot` unconditionally. StableLM rotates 16 of its 64.
+  This was a real bug beyond StableLM — any container declaring the key was
+  over-rotated.
+- **Ungated FFN.** `down(gelu(up(x)))` when there is no `ffn_gate`.
+
+**Two traps, both caught by the reference and not by an error:**
+
+1. **A bias that is not in `required_tensors` is never loaded**, and the graph
+   then silently skips it — `weights.get` returns `None` and the shift is simply
+   not applied. StableLM read *almost* right for exactly this reason. The
+   easiest to miss is `output_norm.bias`: applied once, so a wrong final norm
+   shifts every logit by the same vector and the text stays fluent.
+2. **A missing `ffn_gate` means two different things.** Phi-3 fuses gate and up
+   into one tensor twice `n_ff` wide; StarCoder2 has no gate at all. Testing for
+   the tensor alone made Phi-3 ungated and **broke a verified architecture** —
+   caught by the regression sweep, which is why it runs. The shape separates
+   them.
+
+**StableLM: the block is correct, the tokenizer is not.** Two of three prompts
+match exactly; `def fibonacci(n):` tokenizes to **4 tokens where llama.cpp makes
+5**, so the prompt differs before a single weight is read. The cause is ours and
+recent: `tokenizer.ggml.pre` is **absent** in that container, and
+`Tokenizer::from_metadata` falls back to `"llama-bpe"` where llama.cpp's default
+is the plain GPT-2 rule. A6c refused every unknown `pre` **by name** and then
+guessed the absent case, which is the same mistake one layer down.
+
+The fix is a `default` GPT-2 variant in `pretok.rs` plus one line in
+`crates/bigtea-tokenizer/src/lib.rs` — a file another session owns, so it is
+reported rather than taken.
+
+Regression sweep after these changes, `parity-check.sh` at 32 tokens: gemma2,
+gemma3, qwen3-4b, qwen2, tinyllama, starcoder2 all 3/3; llama32-1b and phi3 2/3
+plus one `unstable`, which is llama.cpp disagreeing with itself on a near-tie
+and is documented. 411 workspace tests, clippy and fmt clean.
