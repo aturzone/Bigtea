@@ -1234,7 +1234,7 @@ What is declined, and the honest reason:
 
 | group | why |
 |---|---|
-| 15 GPU flags | **no GPU backend exists.** `bigtea-probe` detects the card and nothing uses it; a VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer |
+| 15 GPU flags | **no GPU backend exists.** `bigtea-probe` detects the card and nothing uses it; a VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer (`weights.rs:286`). Scoped 2026-08-11 in `research/gpu-tier-smallest-honest-slice-2026-08-11.md`: this machine has **no CUDA toolkit at all**, and dense-layers-in-VRAM is a 1.10x ceiling on the model where it fits and doesn't fit on the model where it would matter |
 | 4 draft-model flags | speculative decoding measured ~1.4x here, not the literature's 2.2x, and is a net loss below ~0.75 acceptance |
 | 5 adapter flags | LoRA and control vectors are real work not yet done, and a silently unapplied LoRA is a model answering as though never fine-tuned |
 | 6 Jinja / chat-parsing | no Jinja engine. Templates are matched by family and verified byte-identical to llama.cpp for 52 of 54 names; a half-implemented Jinja would silently produce the wrong framing |
@@ -2060,3 +2060,52 @@ prompts are unexamined, and after nine `unstable` verdicts turned out to be bugs
 "it was already like that" is a weak defence. Containers live at
 `C:/Projects/models/{olmo,internlm2,falcon3,baichuan}/` and are the only copies
 on this machine.
+
+## The GPU tier, scoped before any code — and the guessed slice does not survive
+
+`research/gpu-tier-smallest-honest-slice-2026-08-11.md`, 2026-08-11. Written as
+a scoping node on instruction, with no GPU code attached.
+
+**The hypothesis was "N dense layers resident in VRAM, experts still streamed to
+host". Measured, it fails twice.**
+
+| model | always-read (dense) | routed experts | verdict |
+|---|---:|---:|---|
+| DeepSeek-V4-Flash-UD-Q4_K_XL | **7.38 GiB** | 137.06 GiB | **does not fit** 6.0 GiB of VRAM |
+| Qwen3-30B-A3B-Q4_K_M | 0.93 GiB | 16.35 GiB | fits, with nothing worth moving |
+
+For V4-Flash the dense half is larger than the card, so that variant needs a
+mixed-device graph and a `ggml_backend_sched` — the *largest* possible first
+slice. For Qwen3-30B it fits with 5 GiB spare, but of 5.4 s accounted in a
+measured run the entire dense path is **9%** (disk 52%, expert compute 37%). A
+**1.10x ceiling**, below the 1.4x already unclaimed in R2's overlap.
+
+Moving the *expert* matmuls instead addresses 37% but pushes ~1.15 GiB/token
+over PCIe — the same shape this project already built and reverted (contiguous
+experts, ~1.02 GB/token, byte-identical output, **1.34 → 1.27 tok/s**), with a
+bus added.
+
+**Blocker (a) is worse than this file recorded.** It is not "needs a
+CUDA-enabled ggml": there is **no CUDA toolkit on this machine at all** —
+`nvcc` absent, no `ggml-cuda.a` — only a CUDA-capable driver (610.74).
+
+**Blocker (b) is one line.** `crates/bigtea-ggml/src/weights.rs:286` writes a
+host pointer into `tensor->data`. `ggml-cuda` cannot be handed one; a device
+tensor is filled by a copy. So a GPU path is a second `bind_shared` plus a
+scheduler, not a flag.
+
+**The slice that does survive: VRAM as a read cache in front of the disk,
+computing nothing.** It never binds a device tensor, so blocker (b) is
+sidestepped rather than solved; it needs the CUDA runtime rather than a second
+ggml build; and its failure mode is *slower*, not *wrong*, which is the only GPU
+change with that property. It pays where VRAM is a meaningful fraction of the
+expert bank — 31% of Qwen3-30B's 16.35 GiB, **3.6% of V4-Flash's 137 GiB** — so
+the 20–70 GiB class, not the model this project talks about most.
+
+**Recommended next action is not a GPU ticket.** Sweep tok/s against host cache
+size first: the VRAM tier's value is a point on a curve that does not exist yet,
+and if the curve has already flattened, the tier is dead for the same reason the
+byte-reduction roadmap closed. That sweep needs no toolkit and no new code.
+
+PCIe bandwidth in that node is labelled arithmetic, not measurement — it cannot
+be measured until the toolkit is installed.
