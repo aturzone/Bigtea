@@ -48,7 +48,10 @@ pub enum ArchError {
     Ggml(bigtea_ggml::GgmlError),
     /// The KV cache rejected an append — see [`kv::KvError`].
     Kv(kv::KvError),
-    /// More tokens than the attention window this architecture can hold.
+    /// More tokens in **one pass** than the raw latent ring can hold at once.
+    ///
+    /// No longer a limit on the sequence: `limit` is the largest batch, and a
+    /// longer prompt is chunked rather than refused.
     ContextTooLong {
         tokens: usize,
         limit: usize,
@@ -72,10 +75,11 @@ impl fmt::Display for ArchError {
             ArchError::Unimplemented(what) => write!(f, "not implemented: {what}"),
             ArchError::ContextTooLong { tokens, limit } => write!(
                 f,
-                "prompt is {tokens} tokens; this path holds {limit}. \
-                 DeepSeek-V4-Flash builds its attention cache for the whole \
-                 sequence at once, so {limit} is the ceiling until the KV cache \
-                 lands. Shorten the prompt, or use -f with a smaller file."
+                "{tokens} tokens in one pass; this path takes {limit} at a time. \
+                 This is a limit on the batch, not on the sequence -- \
+                 DeepSeek-V4-Flash holds its raw latents in a ring, so the \
+                 conversation may be far longer than {limit}. Prefill in blocks \
+                 of {limit} or fewer (-b)."
             ),
         }
     }
