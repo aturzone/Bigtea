@@ -1472,6 +1472,31 @@ in that slot — the failure mode that would look like plausible text.
 
 Flags: **150 implemented, 44 declined**, of 194 recognised. Tests **438**.
 
+## `unstable` was a verdict; it is a suspicion now (2026-08-11)
+
+The parity harness re-ran the reference under `-fa off` and `--no-repack` and,
+when llama.cpp disagreed with itself, called the prompt a near-tie and moved on.
+**Nine of eleven `unstable` verdicts in one session turned out to be bugs** —
+Llama-3.2 rotating with the wrong RoPE, Falcon3 prefilled a token short.
+
+The flaw is structural, not a threshold: **that re-check compares the reference
+to itself, and cannot see that OUR INPUT differed.** When the input differs, a
+near-tie is exactly the symptom — the model is answering a slightly different
+question and lands on the other side of whatever was close.
+
+Two changes:
+
+1. **On a mismatch, the tokenized prompt is compared.** Different token counts
+   mean the two engines are not answering the same question, and it is reported
+   as a **FAILURE** rather than a tie. One check catches the whole class: a
+   missing BOS, a wrong pre-tokenizer, a byte-fallback that drops characters.
+2. **Near-ties are counted, and three is a cluster.** One in eight is ordinary;
+   three is a bug nobody has found yet, and the script exits non-zero saying so
+   rather than printing eight reassuring lines.
+
+Phi-3's two survive both checks — identical tokenization, below the cluster
+threshold — which is the answer the harness should have been giving all along.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
