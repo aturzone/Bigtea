@@ -179,3 +179,41 @@ anyone**, and it is the cheapest work on this page.
 The open question for Atur: **is the goal to win a benchmark, or to be the thing
 someone installs?** They are different projects, and the second one is closer,
 cheaper, and unclaimed.
+
+## What the BIG BANG is, and what it is not (2026-08-11)
+
+**3288 MB/token is a property of this design, not a law of nature.** Every
+"20 tok/s needs 79 MB/token, we read 3288, therefore 42x" statement in these
+docs describes *the current way of running the model*. It is the size of the
+problem. It is not permission to stop.
+
+The measurements that close doors are the ones that say a *specific idea*
+failed:
+
+- pinning a hot set (per-prompt, 37.5% vs 25% random)
+- factorising the expert bank (full-rank; 20.4% vs 16.6% for noise)
+- dropping the router tail (the 6th expert still carries 8.8%)
+- batching the expert matmuls (the copy costs what the kernel saves)
+- overlapping reads with compute (1.13x; the bandwidth came straight back)
+
+Those are closed. **What is not closed is the question they were all answers
+to:** how do the active weights stop coming from disk on every token?
+
+Directions that have not been tried and are not refuted by anything above:
+
+1. **A device tier.** VRAM as a second residency level, not a backend swap.
+   The engine already owns residency; it does not yet own a second kind of
+   memory to place things in.
+2. **The tok/s-versus-RAM frontier.** Nobody has published it. `mmap` cannot be
+   told to use exactly N GiB, so only an engine that owns residency can sweep
+   it — which is this one. The answer to *"given your machine, the largest
+   model at the speed you want"* is a product, not a benchmark.
+3. **Changing what a token has to read at all** — speculation, caching across
+   turns, or a residency policy informed by the *conversation* rather than the
+   prompt. `U(n) ~ 6*n^0.667` says a batch reads far fewer distinct experts per
+   token than a single step does; nothing has exploited that from the
+   *generation* side.
+
+The rule for anyone reading this later: **a closed door is a specific idea that
+was measured and failed. A wall is not a door.** Do not cite 42x as a reason
+not to try something new; cite it as the bar the new thing has to clear.
