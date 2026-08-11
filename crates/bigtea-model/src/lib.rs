@@ -34,6 +34,7 @@ pub mod catalogue;
 mod discover;
 pub mod download;
 mod resident;
+pub mod validate;
 
 pub use discover::discover_shards;
 pub use resident::{LoadReport, ResidentSet, SkipReason, Skipped};

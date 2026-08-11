@@ -1287,6 +1287,7 @@ fn main() -> ExitCode {
     let mut hf_token: Option<String> = None;
     let mut model_url: Option<String> = None;
     let mut offline = false;
+    let mut check_tensors = false;
     let mut chat_template: Option<String> = None;
     let mut model_flag: Option<String> = None;
     let mut grammar_src: Option<String> = None;
@@ -1660,6 +1661,15 @@ fn main() -> ExitCode {
                     }
                 }
                 return ExitCode::SUCCESS;
+            }
+            // Read every tensor and check its values are finite. Structure is
+            // validated when the container opens; this is about the numbers,
+            // and the first NaN reaching a softmax makes every probability NaN
+            // -- argmax then returns index 0 and the model repeats one token
+            // forever, which reads as a broken model rather than a broken file.
+            "--check-tensors" => {
+                check_tensors = true;
+                i += 1;
             }
             "--mmap" => {
                 std::env::set_var("BIGTEA_IO", "buffered");
@@ -2191,6 +2201,7 @@ fn main() -> ExitCode {
         warmup,
         infill,
         grammar_triggers,
+        check_tensors,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -2789,6 +2800,7 @@ fn run(
     warmup: bool,
     infill: bool,
     grammar_triggers: Vec<String>,
+    check_tensors: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -2824,6 +2836,34 @@ fn run(
         model.override_metadata(key, value.clone());
     }
     let model = model;
+
+    // Values, not structure. Before the architecture check, because a container
+    // whose numbers are ruined should say so rather than first being told its
+    // architecture is unverified -- the second message would send someone
+    // looking in the wrong place.
+    if check_tensors {
+        let t = std::time::Instant::now();
+        let report = bigtea_model::validate::check(&model, 8);
+        bigtea_arch::info!(
+            "check      {} in {:.1}s",
+            bigtea_model::validate::summary(&report),
+            t.elapsed().as_secs_f64()
+        );
+        if !report.ok() {
+            for (name, why) in &report.problems {
+                bigtea_arch::info!("check      {name}: {why}");
+            }
+            return Err(format!(
+                concat!(
+                    "{} tensor(s) hold non-finite values. This container is damaged -- ",
+                    "re-download it. Running anyway produces NaN logits, which look like ",
+                    "a broken model rather than a broken file."
+                ),
+                report.problems.len()
+            )
+            .into());
+        }
+    }
 
     // Refuse an architecture nobody has checked, rather than answering wrongly
     // and confidently. Gemma-2 loads through the generic dense path with no
