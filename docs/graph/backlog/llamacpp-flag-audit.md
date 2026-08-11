@@ -14,7 +14,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 
 | bucket | flags | state |
 |---|---:|---|
-| **have** | **76** | done |
+| **have** | **77** | done |
 | **samplers** | 22 | **21 done**; only `--backend-sampling` left, and it is a GPU concept |
 | interaction / prompt handling | 22 | **done 2026-08-11** — including a real REPL |
 | runtime / threading / memory | 31 | I/O mode + `--override-kv` done; most of the rest **refused**, see below |
@@ -313,6 +313,35 @@ A malformed spec **refuses the run** (exit 2) rather than being skipped: an
 override silently dropped is worse than none, because the user believes the
 container has been corrected.
 
+### `--mlock` - done 2026-08-11, and it is not one call
+
+Bigtea's whole design is deciding what stays in RAM. That decision is undone if
+the OS pages the resident set out, and this project has **measured** the
+consequence: past ~6 GiB the expert cache reached a 71% hit rate while being the
+slowest configuration tested, because the hits were page faults in disguise.
+
+On Windows `VirtualLock` alone is not enough. A process may only lock up to its
+working-set maximum, which defaults to a few megabytes, so locking a gigabyte
+fails with `ERROR_WORKING_SET_QUOTA` (1453) unless `SetProcessWorkingSetSize`
+raised the ceiling first. **A `--mlock` that called only `VirtualLock` would
+look implemented, return an error nobody checks, and lock nothing** — which is
+why this was deferred a tick rather than shipped quickly.
+
+```
+$ bigtea-run <llama-3.2-1b> ... --mlock
+mlock      0.31 GiB pinned in physical memory; 0.44 GiB of repacked weights
+           are in ggml arena and not covered
+resident   146 tensors, 0.74 GiB
+```
+
+**The line says what is not covered**, because 0.31 against a resident 0.74
+otherwise reads as a bug. Repacked tensors live inside ggml own arena and this
+code has no address for them. A partial lock stated plainly beats a total that
+quietly means something else.
+
+Failure is counted, not fatal: a partially locked residency still helps, and the
+run says how much did not take and why.
+
 ### Refused, with reasons - most of the runtime bucket
 
 These are declined rather than accepted-and-ignored. That is the whole point of
@@ -320,7 +349,6 @@ this audit, and the standard `-t` failed for weeks.
 
 | flag | why |
 |---|---|
-| `--mlock` | **wanted, not yet done.** Needs `SetProcessWorkingSetSize` before `VirtualLock` on Windows or the lock silently fails, which is the exact no-op being avoided. Scoped as the next runtime item |
 | `--numa` | no NUMA-aware allocation to select between |
 | `--parallel` | one sequence at a time by design: one weight set, one KV cache |
 | `--cpu-mask`, `--cpu-range`, `--cpu-strict`, `--poll`, `--prio` | no thread-affinity or scheduler layer; `-t`/`-tb` are the levers that exist |

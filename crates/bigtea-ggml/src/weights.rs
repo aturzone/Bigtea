@@ -139,6 +139,15 @@ impl<'ctx> WeightSet<'ctx> {
         self.bind_shared(ctx, name, ty, dims, Arc::new(data))
     }
 
+    /// Every bound buffer, for a caller that needs the memory itself rather
+    /// than the tensors pointing at it — `--mlock` is the only one so far.
+    ///
+    /// Returns the buffers, not the repacked allocations: those live inside
+    /// `ggml`'s own arena and are not addressable from here.
+    pub fn bound_slices(&self) -> Vec<&[u8]> {
+        self._buffers.iter().map(|b| b.as_bytes()).collect()
+    }
+
     /// How many tensors were rearranged, and the bytes they occupy.
     pub fn repacked(&self) -> (usize, usize) {
         (self._repacked.len(), self.repacked_bytes)

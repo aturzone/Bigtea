@@ -283,6 +283,38 @@ fn unescape(text: &str) -> String {
     out
 }
 
+/// Pin every resident tensor in physical memory.
+///
+/// The ceiling is raised **once, for the whole set**, before any tensor is
+/// locked: doing it per tensor would raise the quota N times and still fail on
+/// the first large one, since the quota is a total rather than a per-call
+/// limit.
+///
+/// A failure is counted rather than aborting. A partially locked residency is
+/// still better than none, and the caller reports how much actually took.
+fn lock_resident(weights: &WeightSet<'_>) -> bigtea_io::lock::LockReport {
+    let mut report = bigtea_io::lock::LockReport::default();
+    let slices = weights.bound_slices();
+    let total: u64 = slices.iter().map(|s| s.len() as u64).sum();
+    if let Err(e) = bigtea_io::lock::reserve_working_set(total) {
+        report.failed_bytes = total;
+        report.reason = e;
+        return report;
+    }
+    for bytes in slices {
+        match bigtea_io::lock::lock_bytes(bytes) {
+            Ok(()) => report.locked_bytes += bytes.len() as u64,
+            Err(e) => {
+                report.failed_bytes += bytes.len() as u64;
+                if report.reason.is_empty() {
+                    report.reason = e;
+                }
+            }
+        }
+    }
+    report
+}
+
 /// Parse `key=type:value` for `--override-kv`.
 ///
 /// llama.cpp's spelling exactly, because muscle memory is the point of
@@ -566,6 +598,7 @@ fn main() -> ExitCode {
         eprintln!("  --no-direct-io      read through the page cache (also --no-mmap)");
         eprintln!("  --direct-io         bypass the page cache (default)");
         eprintln!("  --override-kv K=T:V override one GGUF metadata entry");
+        eprintln!("  --mlock             pin resident weights so the OS cannot page them out");
         eprintln!("  -i, --interactive   keep the session open and take turns");
         eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
         eprintln!("  -st, --single-turn  one exchange, then exit");
@@ -644,6 +677,7 @@ fn main() -> ExitCode {
     let mut dry_breakers: Vec<String> = Vec::new();
     let mut kv_type = bigtea_arch::KvType::F16;
     let mut overrides: Vec<(String, bigtea_gguf::Value)> = Vec::new();
+    let mut mlock = false;
     let mut show_perf = true;
     let mut system_prompt: Option<String> = None;
     let mut ctx_size: Option<usize> = None;
@@ -792,6 +826,12 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // Pin the resident set in physical memory. Bigtea decides what
+            // stays in RAM; that decision is undone if the OS pages it out.
+            "--mlock" => {
+                mlock = true;
+                i += 1;
+            }
             // --- I/O mode and metadata overrides --------------------------
             "--direct-io" => {
                 std::env::set_var("BIGTEA_IO", "direct");
@@ -1186,6 +1226,7 @@ fn main() -> ExitCode {
         dry_breakers,
         kv_type,
         overrides,
+        mlock,
         ctx_size,
         stop,
         force,
@@ -1221,6 +1262,7 @@ fn run_streaming(
     ui: Ui,
     show_perf: bool,
     kv_type: bigtea_arch::KvType,
+    mlock: bool,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -1294,6 +1336,39 @@ fn run_streaming(
     let mut weights = WeightSet::new();
     let load_start = std::time::Instant::now();
     let resident = runner.load_resident(&ctx, &mut weights)?;
+    if mlock {
+        let report = lock_resident(&weights);
+        if report.ok() {
+            // Says what is NOT covered, because the number is smaller than the
+            // resident line above and the difference looks like a bug. Repacked
+            // tensors live in `ggml`'s own arena, which this code has no
+            // address for — a partial lock stated plainly beats a total that
+            // quietly means something else.
+            let (n_repacked, repacked) = weights.repacked();
+            bigtea_arch::info!(
+                "mlock      {:.2} GiB pinned in physical memory{}",
+                report.locked_bytes as f64 / GIB,
+                if n_repacked > 0 {
+                    format!(
+                        "; {:.2} GiB of repacked weights are in ggml's arena and not covered",
+                        repacked as f64 / GIB
+                    )
+                } else {
+                    String::new()
+                }
+            );
+        } else {
+            // Loud, and not fatal. A partial lock still helps, but a user who
+            // asked for this must not believe it happened when it did not.
+            bigtea_arch::info!(
+                "mlock      FAILED for {:.2} GiB of {:.2}: {}",
+                report.failed_bytes as f64 / GIB,
+                (report.locked_bytes + report.failed_bytes) as f64 / GIB,
+                report.reason
+            );
+        }
+    }
+
     let (n_repacked, repacked_bytes) = weights.repacked();
     bigtea_arch::info!(
         "resident   {} tensors, {:.2} GiB in {:.1}s (experts stream on demand)",
@@ -1516,6 +1591,7 @@ fn run(
     dry_breakers: Vec<String>,
     kv_type: bigtea_arch::KvType,
     overrides: Vec<(String, bigtea_gguf::Value)>,
+    mlock: bool,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -1739,6 +1815,7 @@ fn run(
             ui,
             show_perf,
             kv_type,
+            mlock,
             t0,
         );
     }
