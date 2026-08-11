@@ -283,6 +283,35 @@ fn unescape(text: &str) -> String {
     out
 }
 
+/// Apply `--chat-template`, refusing a name this build does not implement.
+///
+/// Both engine paths call it: the dense one and V4-Flash build their
+/// tokenizers separately, and a flag honoured on only one of them is the
+/// failure `-t` had for weeks.
+fn force_chat_template(
+    tokenizer: &mut Tokenizer,
+    name: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(name) = name else {
+        return Ok(());
+    };
+    match bigtea_tokenizer::ChatFormat::from_name(name) {
+        Some(fmt) => {
+            bigtea_arch::info!("chat       forced to the {} template", fmt.name());
+            tokenizer.set_chat_format(fmt);
+            Ok(())
+        }
+        // Refused rather than falling back to the generic framing: a template
+        // silently not applied is a model answering the wrong question
+        // fluently, which is this project's most expensive failure.
+        None => Err(format!(
+            "--chat-template: unknown template {name:?}. Known: {}",
+            bigtea_tokenizer::ChatFormat::known_names().join(", ")
+        )
+        .into()),
+    }
+}
+
 /// Pin every resident tensor in physical memory.
 ///
 /// The ceiling is raised **once, for the whole set**, before any tensor is
@@ -599,6 +628,7 @@ fn main() -> ExitCode {
         eprintln!("  --direct-io         bypass the page cache (default)");
         eprintln!("  --override-kv K=T:V override one GGUF metadata entry");
         eprintln!("  --mlock             pin resident weights so the OS cannot page them out");
+        eprintln!("  --chat-template N   force a chat template (chatml, llama3, gemma, ...)");
         eprintln!("  -i, --interactive   keep the session open and take turns");
         eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
         eprintln!("  -st, --single-turn  one exchange, then exit");
@@ -678,6 +708,7 @@ fn main() -> ExitCode {
     let mut kv_type = bigtea_arch::KvType::F16;
     let mut overrides: Vec<(String, bigtea_gguf::Value)> = Vec::new();
     let mut mlock = false;
+    let mut chat_template: Option<String> = None;
     let mut show_perf = true;
     let mut system_prompt: Option<String> = None;
     let mut ctx_size: Option<usize> = None;
@@ -826,6 +857,15 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // Force a chat format. Two cases make this necessary rather than a
+            // curiosity: a container with no template at all, and one whose
+            // template this build does not recognise. Both otherwise fall back
+            // to a plain framing the model was never trained on, and answer
+            // fluently and wrongly.
+            "--chat-template" => {
+                chat_template = rest.get(i + 1).cloned();
+                i += 2;
+            }
             // Pin the resident set in physical memory. Bigtea decides what
             // stays in RAM; that decision is undone if the OS pages it out.
             "--mlock" => {
@@ -1227,6 +1267,7 @@ fn main() -> ExitCode {
         kv_type,
         overrides,
         mlock,
+        chat_template,
         ctx_size,
         stop,
         force,
@@ -1592,6 +1633,7 @@ fn run(
     kv_type: bigtea_arch::KvType,
     overrides: Vec<(String, bigtea_gguf::Value)>,
     mlock: bool,
+    chat_template: Option<String>,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -1666,7 +1708,9 @@ fn run(
     // none of the graph, so it gets its own path rather than a config branch.
     if model.architecture() == "deepseek4" {
         bigtea_arch::info!("model      {} ({})", model.architecture(), model.io_mode());
-        let tokenizer = Tokenizer::from_metadata(model.metadata())?;
+        let mut tokenizer = Tokenizer::from_metadata(model.metadata())?;
+        force_chat_template(&mut tokenizer, chat_template.as_deref())?;
+        let tokenizer = tokenizer;
         let prompt = &framed(
             &tokenizer,
             prompt,
@@ -1734,7 +1778,9 @@ fn run(
     arch.verify(&model)?;
 
     // --- tokenizer ---------------------------------------------------------
-    let tokenizer = Tokenizer::from_metadata(model.metadata())?;
+    let mut tokenizer = Tokenizer::from_metadata(model.metadata())?;
+    force_chat_template(&mut tokenizer, chat_template.as_deref())?;
+    let tokenizer = tokenizer;
 
     // DRY's sequence breakers arrive as text and the sampler works in ids, so
     // they can only be resolved once a vocabulary exists. Defaults are

@@ -105,6 +105,8 @@ pub struct Tokenizer {
     /// The raw Jinja template, kept so the chat format can be identified and
     /// so a caller can print it when the format is not recognised.
     chat_template: Option<String>,
+    /// Set by `--chat-template`, and it wins over detection.
+    chat_override: Option<ChatFormat>,
     /// The id for text the vocabulary cannot represent. WordPiece has no byte
     /// fallback, so without this an unknown word would silently disappear.
     unk: Option<u32>,
@@ -270,6 +272,8 @@ impl Tokenizer {
                 Some(Value::Bool(v)) => *v,
                 _ => matches!(kind, Kind::Spm | Kind::Ugm),
             },
+            // Detection until `--chat-template` says otherwise.
+            chat_override: None,
             unk: id_of("tokenizer.ggml.unknown_token_id"),
             wpm_spelling,
             pre,
@@ -346,7 +350,19 @@ impl Tokenizer {
 
     /// Which chat framing this container asks for.
     pub fn chat_format(&self) -> ChatFormat {
-        ChatFormat::detect(self.chat_template())
+        self.chat_override
+            .unwrap_or_else(|| ChatFormat::detect(self.chat_template()))
+    }
+
+    /// Force a chat format, ignoring what the container declares.
+    ///
+    /// `--chat-template`. Two cases make this necessary rather than a
+    /// curiosity: a container with no template at all (many base-model
+    /// conversions), and one whose template this build does not recognise, both
+    /// of which otherwise fall back to a plain framing the model was never
+    /// trained on.
+    pub fn set_chat_format(&mut self, format: ChatFormat) {
+        self.chat_override = Some(format);
     }
 
     /// Render messages into the prompt string this model was trained on.

@@ -14,7 +14,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 
 | bucket | flags | state |
 |---|---:|---|
-| **have** | **77** | done |
+| **have** | **78** | done |
 | **samplers** | 22 | **21 done**; only `--backend-sampling` left, and it is a GPU concept |
 | interaction / prompt handling | 22 | **done 2026-08-11** — including a real REPL |
 | runtime / threading / memory | 31 | I/O mode + `--override-kv` done; most of the rest **refused**, see below |
@@ -24,7 +24,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 | fetch / Hugging Face | 9 | partly covered by `bigtea-pull`, different spelling |
 | reasoning / speculative draft | 8 | gap |
 | KV cache type / prompt cache | 7 | **`--cache-type-k/v` done 2026-08-11**; prompt cache (5) left |
-| chat template | 6 | 2 done (detection), `--jinja` won't |
+| chat template | 6 | 3 done; `--jinja`/`--chat-template-file` **won't**, see below |
 | LoRA / control vectors | 5 | gap |
 | grammar / JSON schema | 4 | gap |
 | meta (`--help`, `--version`) | 4 | 3 done |
@@ -312,6 +312,34 @@ $ ... --override-kv llama.rope.freq_base=float:1000
 A malformed spec **refuses the run** (exit 2) rather than being skipped: an
 override silently dropped is worse than none, because the user believes the
 container has been corrected.
+
+### `--chat-template` - done 2026-08-11
+
+Forces one of the nine known formats, overriding what the container declares.
+Two cases make it necessary rather than a curiosity: a container with **no**
+template (common in base-model conversions) and one whose template this build
+does not recognise. Both otherwise fall back to a plain framing the model was
+never trained on, and the model answers fluently and wrongly.
+
+Proven by the token stream rather than the header, on TinyLlama:
+
+```
+zephyr (detected)  23 tokens: [1, 529, 29989, 1792, 29989, 29958, ...]   <|user|>
+chatml (forced)    33 tokens: [1, 529, 29989, 326, 29918, 2962, ...]     <|im_start|>
+```
+
+An unknown name **refuses the run** and lists the nine, rather than falling back
+to generic framing.
+
+Applied on **both** engine paths. The dense path and V4-Flash build their
+tokenizers separately, and a flag honoured on only one of them is exactly the
+failure `-t` had for weeks — so it is one helper called twice, not two copies.
+
+**`--chat-template-file` and `--jinja` are refused.** They supply a Jinja
+template to be *evaluated*; this build identifies a format by matching the
+template text and then renders with its own code. Accepting a file and matching
+it against the same nine patterns would honour some files and silently ignore
+others, which is worse than declining.
 
 ### `--mlock` - done 2026-08-11, and it is not one call
 

@@ -121,6 +121,34 @@ impl ChatFormat {
         }
     }
 
+    /// Look a format up by the name [`Self::name`] prints.
+    ///
+    /// The inverse of `name`, for `--chat-template`. `None` for anything
+    /// unrecognised so the caller can refuse rather than quietly falling back
+    /// to the generic framing, which is how a model ends up answering the
+    /// wrong question fluently.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "chatml" => ChatFormat::ChatMl,
+            "llama3" => ChatFormat::Llama3,
+            "llama2" => ChatFormat::Llama2,
+            "mistral" => ChatFormat::Mistral,
+            "zephyr" => ChatFormat::Zephyr,
+            "phi3" => ChatFormat::Phi3,
+            "gemma" => ChatFormat::Gemma,
+            "vicuna" => ChatFormat::Vicuna,
+            "alpaca" => ChatFormat::Alpaca,
+            _ => return None,
+        })
+    }
+
+    /// Every name `from_name` accepts, for an error message that lists them.
+    pub fn known_names() -> &'static [&'static str] {
+        &[
+            "chatml", "llama3", "llama2", "mistral", "zephyr", "phi3", "gemma", "vicuna", "alpaca",
+        ]
+    }
+
     /// Whether this build actually recognised the template.
     pub fn is_known(&self) -> bool {
         !matches!(self, ChatFormat::Generic)
