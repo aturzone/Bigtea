@@ -66,6 +66,40 @@ pub enum ChatFormat {
     /// `### Instruction:` / `### Response:` — Alpaca and DeepSeek-Coder.
     Alpaca,
     /// Nothing matched. Framed plainly, and the caller should say it is a guess.
+    /// DeepSeek v1: `### Instruction:` / `### Response:` with its own markers.
+    DeepSeek,
+    /// DeepSeek v2: `User: ` / `Assistant: ` with an EOS between turns.
+    DeepSeek2,
+    /// DeepSeek v3: `<｜User｜>` / `<｜Assistant｜>` — full-width bars, and
+    /// they are not the ASCII `|`. A near-miss here is a token the model has
+    /// never seen in that position.
+    DeepSeek3,
+    /// Command-R: `<|START_OF_TURN_TOKEN|><|USER_TOKEN|>`.
+    CommandR,
+    /// ChatGLM 3: `<|user|>` without the newline Zephyr uses.
+    ChatGlm3,
+    /// ChatGLM 4 / GLM-Edge: `[gMASK]<sop>` preamble then `<|role|>`.
+    ChatGlm4,
+    /// Mistral v7: `[SYSTEM_PROMPT]` and a space after `[INST]`.
+    MistralV7,
+    /// Falcon 3 and similar: plain `User:`/`Assistant:` with double newlines.
+    Falcon3,
+    /// OpenChat: `GPT4 Correct User:` … `<|end_of_turn|>`.
+    OpenChat,
+    /// Orion: `Human: ` … `Assistant: ` with EOS after the assistant turn.
+    Orion,
+    /// MiniCPM: `<用户>` … `<AI>`.
+    MiniCpm,
+    /// Granite: `<|start_of_role|>user<|end_of_role|>`.
+    Granite,
+    /// EXAONE 3: `[|user|]` … `[|assistant|]`.
+    Exaone3,
+    /// Phi-4: `<|im_sep|>` rather than a newline after the role.
+    Phi4,
+    /// RWKV-World: `User: ` … `Assistant:` with double newlines.
+    RwkvWorld,
+    /// Monarch/Bailing: `<role>HUMAN</role>` … `<role>ASSISTANT</role>`.
+    Monarch,
     Generic,
 }
 
@@ -79,7 +113,33 @@ impl ChatFormat {
         let Some(t) = template else {
             return ChatFormat::Generic;
         };
-        if t.contains("<|im_start|>") {
+        // Order matters and is most-specific-first: several of these share a
+        // marker with another, and a looser rule placed earlier silently wins.
+        // `<|im_sep|>` before `<|im_start|>` is the clearest case — Phi-4 has
+        // both, and matching ChatML first renders it with a newline where the
+        // model was trained on a separator token.
+        if t.contains("<|im_sep|>") {
+            ChatFormat::Phi4
+        } else if t.contains("<\u{ff5c}User\u{ff5c}>") || t.contains("<\u{ff5c}Assistant\u{ff5c}>")
+        {
+            ChatFormat::DeepSeek3
+        } else if t.contains("<|START_OF_TURN_TOKEN|>") {
+            ChatFormat::CommandR
+        } else if t.contains("[gMASK]") {
+            ChatFormat::ChatGlm4
+        } else if t.contains("<|start_of_role|>") {
+            ChatFormat::Granite
+        } else if t.contains("[|assistant|]") {
+            ChatFormat::Exaone3
+        } else if t.contains("<\u{7528}\u{6237}>") {
+            ChatFormat::MiniCpm
+        } else if t.contains("GPT4 Correct") {
+            ChatFormat::OpenChat
+        } else if t.contains("<role>HUMAN</role>") {
+            ChatFormat::Monarch
+        } else if t.contains("[SYSTEM_PROMPT]") {
+            ChatFormat::MistralV7
+        } else if t.contains("<|im_start|>") {
             ChatFormat::ChatMl
         } else if t.contains("<|start_header_id|>") {
             ChatFormat::Llama3
@@ -101,6 +161,21 @@ impl ChatFormat {
             ChatFormat::Alpaca
         } else if t.contains("ASSISTANT:") || t.contains("USER:") {
             ChatFormat::Vicuna
+        } else if t.contains("### Response:") {
+            ChatFormat::DeepSeek
+        } else if t.contains("Assistant: ") && t.contains("User: ") {
+            // DeepSeek 2 and RWKV-World differ only in the blank line between
+            // turns, which is the sort of thing that is invisible when reading
+            // and decisive when tokenised.
+            if t.contains("\n\n") {
+                ChatFormat::RwkvWorld
+            } else {
+                ChatFormat::DeepSeek2
+            }
+        } else if t.contains("Human: ") {
+            ChatFormat::Orion
+        } else if t.contains("User:") && t.contains("Falcon") {
+            ChatFormat::Falcon3
         } else {
             ChatFormat::Generic
         }
@@ -117,6 +192,22 @@ impl ChatFormat {
             ChatFormat::Gemma => "gemma",
             ChatFormat::Vicuna => "vicuna",
             ChatFormat::Alpaca => "alpaca",
+            ChatFormat::DeepSeek => "deepseek",
+            ChatFormat::DeepSeek2 => "deepseek2",
+            ChatFormat::DeepSeek3 => "deepseek3",
+            ChatFormat::CommandR => "command-r",
+            ChatFormat::ChatGlm3 => "chatglm3",
+            ChatFormat::ChatGlm4 => "chatglm4",
+            ChatFormat::MistralV7 => "mistral-v7",
+            ChatFormat::Falcon3 => "falcon3",
+            ChatFormat::OpenChat => "openchat",
+            ChatFormat::Orion => "orion",
+            ChatFormat::MiniCpm => "minicpm",
+            ChatFormat::Granite => "granite",
+            ChatFormat::Exaone3 => "exaone3",
+            ChatFormat::Phi4 => "phi4",
+            ChatFormat::RwkvWorld => "rwkv-world",
+            ChatFormat::Monarch => "monarch",
             ChatFormat::Generic => "generic",
         }
     }
@@ -138,6 +229,22 @@ impl ChatFormat {
             "gemma" => ChatFormat::Gemma,
             "vicuna" => ChatFormat::Vicuna,
             "alpaca" => ChatFormat::Alpaca,
+            "deepseek" => ChatFormat::DeepSeek,
+            "deepseek2" => ChatFormat::DeepSeek2,
+            "deepseek3" => ChatFormat::DeepSeek3,
+            "command-r" => ChatFormat::CommandR,
+            "chatglm3" => ChatFormat::ChatGlm3,
+            "chatglm4" | "glmedge" => ChatFormat::ChatGlm4,
+            "mistral-v7" => ChatFormat::MistralV7,
+            "falcon3" => ChatFormat::Falcon3,
+            "openchat" => ChatFormat::OpenChat,
+            "orion" => ChatFormat::Orion,
+            "minicpm" => ChatFormat::MiniCpm,
+            "granite" => ChatFormat::Granite,
+            "exaone3" => ChatFormat::Exaone3,
+            "phi4" => ChatFormat::Phi4,
+            "rwkv-world" => ChatFormat::RwkvWorld,
+            "monarch" | "bailing" => ChatFormat::Monarch,
             _ => return None,
         })
     }
@@ -145,7 +252,31 @@ impl ChatFormat {
     /// Every name `from_name` accepts, for an error message that lists them.
     pub fn known_names() -> &'static [&'static str] {
         &[
-            "chatml", "llama3", "llama2", "mistral", "zephyr", "phi3", "gemma", "vicuna", "alpaca",
+            "chatml",
+            "llama3",
+            "llama2",
+            "mistral",
+            "mistral-v7",
+            "zephyr",
+            "phi3",
+            "phi4",
+            "gemma",
+            "vicuna",
+            "alpaca",
+            "deepseek",
+            "deepseek2",
+            "deepseek3",
+            "command-r",
+            "chatglm3",
+            "chatglm4",
+            "falcon3",
+            "openchat",
+            "orion",
+            "minicpm",
+            "granite",
+            "exaone3",
+            "rwkv-world",
+            "monarch",
         ]
     }
 
@@ -277,6 +408,190 @@ impl ChatFormat {
                     out.push_str("### Response:\n");
                 }
             }
+            ChatFormat::DeepSeek => {
+                for m in messages {
+                    match m.role.as_str() {
+                        "system" => out.push_str(&format!("{}\n\n", m.content)),
+                        "user" => out.push_str(&format!("### Instruction:\n{}\n\n", m.content)),
+                        _ => out.push_str(&format!("### Response:\n{}\n<|EOT|>\n", m.content)),
+                    }
+                }
+                if add_generation_prompt {
+                    out.push_str("### Response:\n");
+                }
+            }
+            ChatFormat::DeepSeek2 => {
+                for m in messages {
+                    match m.role.as_str() {
+                        "system" => out.push_str(&format!("{}\n\n", m.content)),
+                        "user" => out.push_str(&format!("User: {}\n\n", m.content)),
+                        _ => out.push_str(&format!("Assistant: {}{eos}", m.content)),
+                    }
+                }
+                if add_generation_prompt {
+                    out.push_str("Assistant:");
+                }
+            }
+            ChatFormat::DeepSeek3 => {
+                // Full-width bars U+FF5C, not ASCII `|`. Getting this wrong is
+                // a token the model has never seen in that position.
+                for m in messages {
+                    match m.role.as_str() {
+                        "system" => out.push_str(&format!("{}\n\n", m.content)),
+                        "user" => out.push_str(&format!("<\u{ff5c}User\u{ff5c}>{}", m.content)),
+                        _ => out.push_str(&format!(
+                            "<\u{ff5c}Assistant\u{ff5c}>{}<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>",
+                            m.content
+                        )),
+                    }
+                }
+                if add_generation_prompt {
+                    out.push_str("<\u{ff5c}Assistant\u{ff5c}>");
+                }
+            }
+            ChatFormat::CommandR => {
+                for m in messages {
+                    let tag = match m.role.as_str() {
+                        "system" => "SYSTEM_TOKEN",
+                        "user" => "USER_TOKEN",
+                        _ => "CHATBOT_TOKEN",
+                    };
+                    out.push_str(&format!(
+                        "<|START_OF_TURN_TOKEN|><|{tag}|>{}<|END_OF_TURN_TOKEN|>",
+                        m.content.trim()
+                    ));
+                }
+                if add_generation_prompt {
+                    out.push_str("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>");
+                }
+            }
+            ChatFormat::ChatGlm3 => {
+                for m in messages {
+                    out.push_str(&format!("<|{}|>\n{}", m.role, m.content));
+                }
+                if add_generation_prompt {
+                    out.push_str("<|assistant|>");
+                }
+            }
+            ChatFormat::ChatGlm4 => {
+                out.push_str("[gMASK]<sop>");
+                for m in messages {
+                    out.push_str(&format!("<|{}|>\n{}", m.role, m.content));
+                }
+                if add_generation_prompt {
+                    out.push_str("<|assistant|>");
+                }
+            }
+            ChatFormat::MistralV7 => {
+                // A space after [INST] and before [/INST]; Mistral v7 is
+                // whitespace-sensitive where v1 is not.
+                for m in messages {
+                    match m.role.as_str() {
+                        "system" => {
+                            out.push_str(&format!("[SYSTEM_PROMPT] {}[/SYSTEM_PROMPT]", m.content))
+                        }
+                        "user" => out.push_str(&format!("[INST] {}[/INST]", m.content)),
+                        _ => out.push_str(&format!(" {}{eos}", m.content)),
+                    }
+                }
+            }
+            ChatFormat::Falcon3 | ChatFormat::RwkvWorld => {
+                for m in messages {
+                    match m.role.as_str() {
+                        "system" => out.push_str(&format!("System: {}\n\n", m.content)),
+                        "user" => out.push_str(&format!("User: {}\n\n", m.content)),
+                        _ => out.push_str(&format!("Assistant: {}\n\n", m.content)),
+                    }
+                }
+                if add_generation_prompt {
+                    out.push_str("Assistant:");
+                }
+            }
+            ChatFormat::OpenChat => {
+                for m in messages {
+                    match m.role.as_str() {
+                        "system" => out.push_str(&format!("{}<|end_of_turn|>", m.content)),
+                        "user" => out
+                            .push_str(&format!("GPT4 Correct User: {}<|end_of_turn|>", m.content)),
+                        _ => out.push_str(&format!(
+                            "GPT4 Correct Assistant: {}<|end_of_turn|>",
+                            m.content
+                        )),
+                    }
+                }
+                if add_generation_prompt {
+                    out.push_str("GPT4 Correct Assistant:");
+                }
+            }
+            ChatFormat::Orion => {
+                for m in messages {
+                    match m.role.as_str() {
+                        "system" => out.push_str(&format!("{}", m.content)),
+                        "user" => out.push_str(&format!("Human: {}\n\nAssistant: ", m.content)),
+                        _ => out.push_str(&format!("{}{eos}", m.content)),
+                    }
+                }
+            }
+            ChatFormat::MiniCpm => {
+                for m in messages {
+                    match m.role.as_str() {
+                        "user" => out.push_str(&format!("<\u{7528}\u{6237}>{}", m.content.trim())),
+                        _ => out.push_str(&format!("<AI>{}", m.content.trim())),
+                    }
+                }
+                if add_generation_prompt {
+                    out.push_str("<AI>");
+                }
+            }
+            ChatFormat::Granite => {
+                for m in messages {
+                    out.push_str(&format!(
+                        "<|start_of_role|>{}<|end_of_role|>\n{}<|end_of_text|>\n",
+                        m.role, m.content
+                    ));
+                }
+                if add_generation_prompt {
+                    out.push_str("<|start_of_role|>assistant<|end_of_role|>\n");
+                }
+            }
+            ChatFormat::Exaone3 => {
+                for m in messages {
+                    match m.role.as_str() {
+                        "system" => {
+                            out.push_str(&format!("[|system|]{}[|endofturn|]\n", m.content))
+                        }
+                        "user" => out.push_str(&format!("[|user|]{}\n", m.content)),
+                        _ => out.push_str(&format!("[|assistant|]{}[|endofturn|]\n", m.content)),
+                    }
+                }
+                if add_generation_prompt {
+                    out.push_str("[|assistant|]");
+                }
+            }
+            ChatFormat::Phi4 => {
+                for m in messages {
+                    out.push_str(&format!(
+                        "<|im_start|>{}<|im_sep|>{}<|im_end|>",
+                        m.role, m.content
+                    ));
+                }
+                if add_generation_prompt {
+                    out.push_str("<|im_start|>assistant<|im_sep|>");
+                }
+            }
+            ChatFormat::Monarch => {
+                for m in messages {
+                    let role = match m.role.as_str() {
+                        "user" => "HUMAN",
+                        "system" => "SYSTEM",
+                        _ => "ASSISTANT",
+                    };
+                    out.push_str(&format!("<role>{role}</role>{}", m.content));
+                }
+                if add_generation_prompt {
+                    out.push_str("<role>ASSISTANT</role>");
+                }
+            }
             ChatFormat::Generic => {
                 // Plain and readable. Not a guess at a family — a deliberate
                 // neutral framing, so a caller can report that the template was
@@ -295,6 +610,39 @@ impl ChatFormat {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn every_known_name_round_trips() {
+        // `from_name` and `name` must agree, or `--chat-template granite`
+        // reports a different template than it applied.
+        for n in ChatFormat::known_names() {
+            let f = ChatFormat::from_name(n)
+                .unwrap_or_else(|| panic!("known_names lists {n:?} but from_name rejects it"));
+            // glmedge and bailing are accepted aliases, so the canonical name
+            // may differ -- but it must itself round-trip.
+            let canon = f.name();
+            assert_eq!(
+                ChatFormat::from_name(canon),
+                Some(f),
+                "{n:?} -> {canon:?} does not round-trip"
+            );
+            assert!(f.is_known(), "{n:?} resolved to Generic");
+        }
+    }
+
+    #[test]
+    fn every_format_renders_something_with_the_role_in_it() {
+        // A variant added to the enum but forgotten in `apply` would fall
+        // through to a catch-all and silently render the wrong framing.
+        for n in ChatFormat::known_names() {
+            let f = ChatFormat::from_name(n).expect("known");
+            let out = f.apply(&[Message::new("user", "PING")], "</s>", true);
+            assert!(out.contains("PING"), "{n}: content dropped: {out:?}");
+            assert!(!out.is_empty(), "{n}: rendered nothing");
+        }
+    }
+
     use super::*;
 
     fn convo() -> Vec<Message> {

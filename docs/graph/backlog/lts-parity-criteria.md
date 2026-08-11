@@ -25,7 +25,7 @@ the real distance to "any model", and it is far larger than the performance gap.
 | tokenizer families | **2** (`gpt2` BPE, `llama` SPM) | 6 (spm, bpe, wpm, ugm, rwkv, plamo2) |
 | quant types | all ggml can decode | same |
 | CLI flags | **106** (counted from the parser, not the help text) | **182** (counted, not estimated: `llamacpp-flag-audit.md`) |
-| chat templates | **9 families** | ~40 |
+| chat templates | **25 families** | 56 (counted from `llama-chat.cpp`) |
 | backends | CPU | CPU, CUDA, Metal, Vulkan, ROCm, SYCL |
 
 ## A. Open any model — the biggest gap, and the cheapest wins in it
