@@ -48,7 +48,7 @@ jobs:
 
       - name: The ggml-free crates build, test and lint
         run: |
-          CRATES="-p bigtea-gguf -p bigtea-probe -p bigtea-plan -p bigtea-io -p bigtea-model -p bigtea-tokenizer -p bigtea-ggml"
+          CRATES="-p bigtea-gguf -p bigtea-probe -p bigtea-plan -p bigtea-io -p bigtea-model -p bigtea-tokenizer -p bigtea-grammar -p bigtea-ggml"
           cargo build $CRATES
           cargo test $CRATES
           cargo clippy $CRATES --all-targets -- -D warnings

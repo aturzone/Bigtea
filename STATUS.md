@@ -1033,3 +1033,100 @@ nothing in the compute path touches it.
   Never in git config, never echoed. Model files stay gitignored.
 - Graph docs live in `docs/graph/`; read `INDEX.md`, then only the 2–3 nodes a
   task links to. Any node change updates its INDEX line in the same commit.
+
+## R10.1 — constrained decoding: GBNF and JSON schema (2026-08-11)
+
+`crates/bigtea-grammar` (new, **no dependencies at all** — not ggml, not even
+the tokenizer) parses GBNF, compiles it to a stack matcher, and turns the bytes
+generated so far into the token ids that may legally come next. Detail:
+`docs/graph/research/gbnf-grammars-2026-08-11.md`.
+
+Unlocks 4 of the 182 flags: `--grammar`, `--grammar-file`, `--json-schema`,
+`--json-schema-file`. **The library is done; the CLI wiring is not** —
+`sample.rs` and `bigtea-run.rs` belong to another session, so the hook stops at
+one function:
+
+```rust
+constraint.allowed(generated_so_far).apply(&mut logits);
+```
+
+**Verified against llama.cpp, not against expectations.** A grammar that accepts
+everything passes any test that only checks acceptance, so the accepted text is
+llama.cpp's own output under the same grammar at `--temp 0`, and every case
+also checks a rejection that is a one-character edit of it.
+
+| grammar | llama.cpp's output | ours |
+|---|---|---|
+| `json.gbnf` | `{"name":"John","age":30,...}` | accepted, complete |
+| `--json-schema` person | `{"name":"John","age":30}` | accepted, complete |
+| `--json-schema` array | `{"city": "New York", "scores": [1, 2, 3, 4, 5] }` | accepted, complete |
+
+Two bugs, one found by a unit test and one only findable this way:
+
+1. **Only the first alternative of the root rule was explored.** A rule is
+   entered through a `RuleRef`, which fans out over alternatives; the root has
+   none pointing at it. `root ::= "cat" | "car"` took `cat` and refused `car`.
+2. **Three of the eight grammars llama.cpp ships did not parse.** `json.gbnf`,
+   `json_arr.gbnf` and `c.gbnf` put the rule body on the line after `::=`.
+   A test that walks the whole `grammars/` directory found it on its first run.
+
+Everything unimplemented is **refused by name, never ignored** — token literals
+(`<think>`), `allOf`, `pattern`, `minimum`, `additionalProperties: true` and the
+rest. Ignoring a schema keyword yields a grammar *looser* than asked for, so the
+model emits output that satisfies the grammar and violates the schema, and
+nothing downstream can tell.
+
+66 tests here; 255 pass in the ggml-free CI job, which now includes this crate.
+
+## R2 — reads now overlap compute: 1.13x on generation (2026-08-11)
+
+**Supersedes the `R2 | overlap I/O with compute | ready, but smaller than it
+looks` row in the table above.** Built, measured, and **on by default**. Detail:
+`docs/graph/research/r2-overlap-2026-08-11.md`.
+
+Block N+1's always-read weights are read **while block N computes**. Exact, not
+speculative: routing is data-dependent so N+1's *experts* cannot be known before
+N runs, but its **dense** tensors do not depend on routing at all.
+
+Four runs, one session, **free RAM matched to within 0.03 GiB** — the axis these
+figures drift along — with 3.10 GiB of the always-read set still streaming:
+
+| | free | prefill | generation | dense read | expert read |
+|---|---:|---:|---:|---:|---:|
+| overlap off | 7.10 GiB | 0.56 tok/s | 0.280 tok/s | **2.15 s** | 7.01 s |
+| overlap on | 7.13 | **0.60** | **0.316** | **0.02 s** | 8.13 s |
+| on, repeat | 7.11 | **0.60** | **0.317** | 0.02 s | 8.21 s |
+
+**1.07x prefill, 1.13x generation**, reproducible to the third decimal.
+
+**The dense read is now free — 2.15 s to 0.02 s across 86 block-passes — and the
+expert reads gave 1.16 s of it back.** That is why this is a third of the ~1.4x
+ceiling rather than all of it, and the reason is measured rather than guessed:
+
+| prefetch readers | dense | expert |
+|---:|---:|---:|
+| 0 (off) | 2.56 s | 7.02 s |
+| 2 | 0.02 s | 8.39 s |
+| 4 | 0.04 s | 8.43 s |
+
+Two handles hide the dense read as completely as four, and four cost the experts
+no more than two — so **the toll is the drive, not the pool split.** Both sets of
+reads compete for the same bandwidth, and moving bytes off the critical path
+does not make them free. This is `the-plateau-was-ours` read from the other side:
+there the ceiling was ours, here the drive is genuinely the limit.
+
+Two things that had to be right first:
+
+- **`read_range_into_via` requires distinct slots**, and `read_expert_slices`
+  already used all eight handles. A prefetch started naively would have
+  reintroduced by hand the queue-depth-1 bug whose fix was worth 1.32x — and it
+  would have shown up as "overlap does not help", not as an error. The pool is
+  partitioned: foreground `0..6`, prefetch `6..8`.
+- **With residency satisfied the overlap is off, not merely idle.** Shrinking the
+  foreground pool to feed a thread that reads nothing is a pure loss, so the
+  decision is made once per pass from whether block 1 has a non-resident tensor.
+
+All 21 container-backed V4-Flash tests pass with it active, including the
+element-sum comparisons against llama.cpp — the overlap changes *when* bytes are
+read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
+`BIGTEA_PREFETCH_READERS` tunes the split.
