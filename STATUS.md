@@ -1223,3 +1223,33 @@ means "checked against the reference", and Gemma-3 is not.
 
 Regression: gemma2, phi3, qwen3, llama and tinyllama all re-run and unchanged.
 410 workspace tests, clippy and fmt clean.
+
+## StableLM and StarCoder2: one shared blocker, not two quirks (2026-08-11)
+
+Both downloaded, run and diagnosed. **Neither is verified**, and both fail for
+the same reason: `docs/graph/backlog/layernorm-and-biases.md`.
+
+```
+stablelm -> ��地なutorsemie路emieemieا起
+```
+
+The qwen2 signature. Two causes, shared:
+
+1. **`bigtea-ggml` has no LayerNorm.** It binds `ggml_rms_norm` and not
+   `ggml_norm`. LayerNorm subtracts the mean and carries a **bias**; RMSNorm
+   does neither. The tell is `attn_norm.bias` in the container, and the metadata
+   key being `attention.layer_norm_epsilon` rather than `..._rms_epsilon`.
+2. **No bias support anywhere in the dense path.** Both models put biases on
+   Q/K/V; StarCoder2 also on `attn_output`, `ffn_up` and `ffn_down`.
+
+Two extras beyond that: StableLM rotates only **16 of its 64** head dimensions
+(`rope.dimension_count = 16`, partial RoPE — we pass `head_dim` unconditionally),
+and StarCoder2's FFN is **not gated** (no `ffn_gate`; plain MLP with GELU).
+
+**This is the right unit of work as a feature, not as two models.** LayerNorm
+plus biases is the shared shape of falcon, gpt2, gptneox, bloom, phi2 and
+starcoder as well, so building it once moves the architecture count by more than
+the models anyone would verify in a sitting.
+
+Ruled out: the tokenizer (both are `gpt2`, supported) and the RoPE convention
+(both NeoX, already mapped). The failure is entirely in the block.
