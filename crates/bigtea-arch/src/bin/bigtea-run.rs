@@ -1005,16 +1005,6 @@ const REFUSED: &[(&str, bool, &str)] = &[
     ),
     ("--poll-batch", true, "ggml owns its threadpool here"),
     (
-        "--cpu-mask",
-        true,
-        "no thread-affinity layer; `--prio` is the scheduling lever that exists",
-    ),
-    ("--cpu-mask-batch", true, "no thread-affinity layer"),
-    ("--cpu-range", true, "no thread-affinity layer"),
-    ("--cpu-range-batch", true, "no thread-affinity layer"),
-    ("--cpu-strict", true, "no thread-affinity layer"),
-    ("--cpu-strict-batch", true, "no thread-affinity layer"),
-    (
         "--load-mode",
         true,
         "`--direct-io` / `--no-direct-io` are the two modes that exist",
@@ -1307,6 +1297,8 @@ fn main() -> ExitCode {
     let mut model_url: Option<String> = None;
     let mut offline = false;
     let mut check_tensors = false;
+    let mut cpu_mask: Option<u64> = None;
+    let mut cpu_strict = false;
     // llama.cpp defaults --fit to on; so does this. It only ever adjusts
     // arguments the user did NOT set, which is what makes a default-on
     // auto-configuration safe.
@@ -1692,6 +1684,60 @@ fn main() -> ExitCode {
             // and the first NaN reaching a softmax makes every probability NaN
             // -- argmax then returns index 0 and the model repeats one token
             // forever, which reads as a broken model rather than a broken file.
+            // --- CPU affinity ------------------------------------------------
+            //
+            // Refused earlier on the premise that there is "no thread-affinity
+            // layer" here. That premise was wrong in the same way `--prio`'s
+            // and `--warmup`'s were: PROCESS affinity is one syscall and every
+            // thread ggml spawns inherits it, so Bigtea does not need to own a
+            // threadpool to pin one.
+            //
+            // What it genuinely cannot do is a DIFFERENT mask for prefill and
+            // generation, because ggml owns the pool. The `-batch` variants
+            // therefore share the mask and the runner says so, rather than
+            // taking a second one and dropping it.
+            "-C" | "--cpu-mask" | "-Cb" | "--cpu-mask-batch" => {
+                let Some(v) = rest.get(i + 1) else {
+                    eprintln!("bigtea-run: {} needs a hex mask, e.g. 0xff", rest[i]);
+                    return ExitCode::from(2);
+                };
+                match bigtea_io::lock::parse_cpu_mask(v) {
+                    Some(m) => cpu_mask = Some(cpu_mask.map_or(m, |old| old | m)),
+                    None => {
+                        eprintln!("bigtea-run: {}: {v:?} is not a hex mask", rest[i]);
+                        eprintln!("  A mask read wrongly pins to the wrong cores, which looks");
+                        eprintln!("  like a slowdown rather than a bad argument, so it refuses.");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "-Cr" | "--cpu-range" | "-Crb" | "--cpu-range-batch" => {
+                let Some(v) = rest.get(i + 1) else {
+                    eprintln!("bigtea-run: {} needs a range, e.g. 0-3", rest[i]);
+                    return ExitCode::from(2);
+                };
+                match bigtea_io::lock::parse_cpu_range(v) {
+                    Some(m) => cpu_mask = Some(cpu_mask.map_or(m, |old| old | m)),
+                    None => {
+                        eprintln!("bigtea-run: {}: {v:?} is not a CPU range", rest[i]);
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            // llama.cpp's strict mode means "use exactly these CPUs". Here the
+            // mask is already exact -- an inherited process affinity cannot be
+            // exceeded -- so this only controls whether the default thread
+            // count is cut to the mask's width.
+            "--cpu-strict" | "--cpu-strict-batch" => {
+                cpu_strict = rest
+                    .get(i + 1)
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .map(|v| v != 0)
+                    .unwrap_or(true);
+                i += 2;
+            }
             // --- fitting the machine ----------------------------------------
             //
             // This is the one flag group where Bigtea should be ahead rather
@@ -2233,6 +2279,34 @@ fn main() -> ExitCode {
     bigtea_arch::log::configure(logcfg);
     // After the log is configured so the outcome is reported through it, and
     // before the model opens so the load itself runs at the asked-for priority.
+    // Before the model opens, so the load runs under the same mask.
+    if let Some(mask) = cpu_mask {
+        match bigtea_io::lock::set_affinity(mask) {
+            Ok(n) => {
+                bigtea_arch::info!("affinity   {n} CPUs (mask {mask:#x})");
+                // With `--cpu-strict`, the default thread count follows the
+                // mask. Without it, ggml still sees the machine's full core
+                // count and oversubscribes the CPUs it is allowed -- which is
+                // llama.cpp's behaviour too, and is why the flag exists.
+                if cpu_strict {
+                    // BOTH counts, not just generation. Leaving prefill at the
+                    // machine's core count put 20 threads on a 4-CPU mask --
+                    // oversubscription is exactly what strict mode exists to
+                    // prevent, and half-applying it is worse than not offering
+                    // it, because the header then reads as though it worked.
+                    if threads.is_none() {
+                        threads = Some(n as usize);
+                    }
+                    if threads_batch.is_none() {
+                        threads_batch = Some(n as usize);
+                    }
+                    bigtea_arch::info!("affinity   --cpu-strict: both thread counts set to {n}");
+                }
+            }
+            // Not fatal: the process still runs, on the CPUs it already had.
+            Err(e) => bigtea_arch::info!("affinity   not applied: {e}"),
+        }
+    }
     if let Some(level) = prio {
         match bigtea_io::lock::set_priority(level) {
             Ok(name) => bigtea_arch::info!("priority   {name}"),

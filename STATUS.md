@@ -1394,6 +1394,45 @@ shrunk to its floor: 568,519 tokens for Qwen2-0.5B.
 
 Flags: **140 implemented, 47 declined**, of 187 recognised.
 
+## CPU affinity: six more off the declined list, and the mask reaches the metal
+
+`--cpu-mask`, `--cpu-range`, `--cpu-strict` and their three `-batch` variants.
+The proof they work is not that they parse:
+
+```
+--cpu-mask 0xf      prefill 151 tokens in 1.2s (122.85 tok/s)
+--cpu-mask 0xfffff  prefill 151 tokens in 0.5s (303.19 tok/s)
+```
+
+**2.5x from the mask alone** — the flag reaches the hardware, which is exactly
+what `-t` failed to do for weeks while being accepted and echoed.
+
+I refused these earlier for "no thread-affinity layer". **That premise was
+wrong in the same way `--prio`'s and `--warmup`'s were**: process affinity is
+one syscall, and every thread ggml spawns inherits it. Bigtea does not need to
+own a threadpool to pin one. Three refusals in a row have now turned out to
+rest on a wrong premise rather than a real limit — the pattern is refusing on
+*architecture* ("we have no X layer") when the flag only needs a *syscall*.
+
+What it genuinely cannot do is a different mask for prefill and generation,
+since ggml owns the pool. The `-batch` variants share the mask and the runner
+says so, rather than taking a second one and dropping it.
+
+### Two things the tests caught before the hardware did
+
+**`5` means different CPUs to the two flags.** It is CPUs 0 and 2 as a hex
+mask and CPU 5 as a range — which is *why* llama.cpp carries two flags. My one
+heuristic parser guessed hex and would have pinned `--cpu-range 5` to two cores
+instead of one, silently. Split into `parse_cpu_mask` and `parse_cpu_range`.
+
+**`--cpu-strict` capped generation threads and not prefill**, so a 4-CPU mask
+still ran 20 prefill threads. Oversubscription is the thing strict mode exists
+to prevent, and half-applying it is worse than not offering it — the header
+then reads as though it worked. Both counts now follow the mask, and an
+explicit `-t`/`-tb` still wins over both.
+
+Flags: **147 implemented, 44 declined**, of 191 recognised. Tests **435**.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

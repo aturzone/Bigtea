@@ -133,6 +133,93 @@ pub fn set_priority(level: u32) -> Result<&'static str, String> {
     Ok(name)
 }
 
+/// Parse `--cpu-mask`: a hex bitmask, with or without `0x`.
+///
+/// **Separate from [`parse_cpu_range`] on purpose.** llama.cpp carries two
+/// flags because the spellings are genuinely ambiguous: `5` is CPUs 0 and 2 as
+/// a mask and CPU 5 as a range. A single heuristic parser guessed hex here and
+/// pinned a `--cpu-range 5` run to two cores instead of one -- caught by this
+/// module's own test, which is the only reason the ambiguity was noticed.
+pub fn parse_cpu_mask(spec: &str) -> Option<u64> {
+    let spec = spec.trim();
+    let hex = spec.strip_prefix("0x").or_else(|| spec.strip_prefix("0X"));
+    u64::from_str_radix(hex.unwrap_or(spec), 16)
+        .ok()
+        .filter(|&m| m != 0)
+}
+
+/// Parse `--cpu-range`: `0-3`, `5`, `0-1,4-5`.
+///
+/// Returns `None` for anything it does not understand, because a mask read
+/// wrongly pins to the wrong cores -- which looks like a mysterious slowdown
+/// rather than a bad argument.
+pub fn parse_cpu_range(spec: &str) -> Option<u64> {
+    let mut mask = 0u64;
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        let (lo, hi) = match part.split_once('-') {
+            Some((a, b)) => (a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?),
+            None => {
+                let n = part.parse::<u32>().ok()?;
+                (n, n)
+            }
+        };
+        if lo > hi || hi >= 64 {
+            return None;
+        }
+        for cpu in lo..=hi {
+            mask |= 1u64 << cpu;
+        }
+    }
+    (mask != 0).then_some(mask)
+}
+
+/// Restrict this process to the CPUs in `mask`.
+///
+/// # Why this exists after being refused
+///
+/// It was declined on the premise that there is "no thread-affinity layer"
+/// here. That premise was wrong in the same way `--prio`'s and `--warmup`'s
+/// were: **process affinity is one syscall and applies to every thread ggml
+/// spawns**, because a thread inherits its process's affinity. Bigtea does not
+/// need to own a threadpool to pin one.
+///
+/// What it genuinely cannot do is llama.cpp's *per-threadpool* masks — a
+/// different set for prefill and generation — since ggml owns the pool. So the
+/// batch variants take the same mask and the runner says so rather than
+/// accepting a second one and dropping it.
+#[cfg(windows)]
+pub fn set_affinity(mask: u64) -> Result<u32, String> {
+    // SAFETY: a plain Win32 call on the current process.
+    unsafe {
+        if ffi::SetProcessAffinityMask(ffi::GetCurrentProcess(), mask as usize) == 0 {
+            return Err(format!(
+                "SetProcessAffinityMask({mask:#x}) failed ({}) -- the mask must be a subset \
+                 of the CPUs this process is already allowed",
+                ffi::GetLastError()
+            ));
+        }
+    }
+    Ok(mask.count_ones())
+}
+
+#[cfg(not(windows))]
+pub fn set_affinity(mask: u64) -> Result<u32, String> {
+    // glibc's cpu_set_t is 1024 bits; only the first 64 are addressed here,
+    // which covers every machine this runner targets and is honest about it.
+    let mut set = [0u64; 16];
+    set[0] = mask;
+    // SAFETY: `set` is 128 bytes, the size glibc expects for cpu_set_t.
+    let rc = unsafe { ffi::sched_setaffinity(0, core::mem::size_of_val(&set), set.as_ptr()) };
+    if rc != 0 {
+        return Err(format!("sched_setaffinity({mask:#x}) failed"));
+    }
+    Ok(mask.count_ones())
+}
+
 /// Pin `bytes` in physical memory.
 ///
 /// The slice must stay alive and unmoved for as long as the lock matters —
@@ -186,6 +273,7 @@ mod ffi {
         pub fn SetProcessWorkingSetSize(h: isize, min: usize, max: usize) -> i32;
         pub fn VirtualLock(addr: *const c_void, size: usize) -> i32;
         pub fn SetPriorityClass(h: isize, class: u32) -> i32;
+        pub fn SetProcessAffinityMask(h: isize, mask: usize) -> i32;
         pub fn GetLastError() -> u32;
     }
 }
@@ -196,12 +284,49 @@ mod ffi {
     unsafe extern "C" {
         pub fn mlock(addr: *const c_void, len: usize) -> i32;
         pub fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+        pub fn sched_setaffinity(pid: i32, len: usize, set: *const u64) -> i32;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hex_mask_parses_with_or_without_the_prefix() {
+        assert_eq!(parse_cpu_mask("0xff"), Some(0xff));
+        assert_eq!(parse_cpu_mask("ff"), Some(0xff));
+        assert_eq!(parse_cpu_mask("0X0F"), Some(0x0f));
+    }
+
+    #[test]
+    fn a_range_becomes_the_bits_it_names() {
+        assert_eq!(parse_cpu_range("0-3"), Some(0b1111));
+        assert_eq!(parse_cpu_range("0-1,4-5"), Some(0b110011));
+    }
+
+    #[test]
+    fn the_same_text_means_different_cpus_to_the_two_flags() {
+        // The reason llama.cpp has two flags, and the reason one heuristic
+        // parser was wrong: `5` is CPUs 0 and 2 as a mask, CPU 5 as a range.
+        // Guessing between them pins to the wrong cores silently.
+        assert_eq!(parse_cpu_mask("5"), Some(0b101));
+        assert_eq!(parse_cpu_range("5"), Some(1 << 5));
+    }
+
+    #[test]
+    fn nonsense_is_refused_rather_than_read_as_zero() {
+        for bad in ["", "  ", "zz", "0x0"] {
+            assert_eq!(parse_cpu_mask(bad), None, "mask {bad:?} should be refused");
+        }
+        for bad in ["", "  ", "zz", "3-1", "0-99", "1-", "-"] {
+            assert_eq!(
+                parse_cpu_range(bad),
+                None,
+                "range {bad:?} should be refused"
+            );
+        }
+    }
 
     #[test]
     fn an_empty_slice_locks_trivially() {
