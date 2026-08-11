@@ -237,10 +237,20 @@ fn serve(path: &str, port: u16, cache_gib: f64) -> Result<(), Box<dyn std::error
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "bigtea-model".to_string())
         });
+    // The SAME forward the CLI uses, and that is the whole point of this
+    // change. The old dense path here called `arch.build_graph` -- a second
+    // implementation that never received the QKV bias, the Gemma activation,
+    // the post-norms or the soft caps, all of which live in `stream.rs`. Qwen2
+    // through this server produced fluent nonsense while `bigtea-run` on the
+    // same container was byte-identical to llama.cpp.
+    //
+    // A second code path is a second place for every fix to be missing from.
+    let runner = bigtea_arch::StreamingRunner::new(&model, config.clone(), 1 << 30);
     let engine = Engine::Dense {
-        arch: &arch,
+        runner: std::cell::RefCell::new(runner),
         weights: &weights,
         name: &name,
+        config: config.clone(),
     };
     run_loop(engine, &tokenizer, port, t0)
 }
@@ -509,21 +519,31 @@ fn error_json(message: &str) -> String {
 /// split `bigtea-run` makes. Serving only V4-Flash was a real limitation: the
 /// server is the part an editor or agent talks to, and refusing every Llama and
 /// Qwen container made it useless for the models people actually run.
+// The two variants differ in size by more than clippy likes, and boxing the
+// larger would put an allocation on a value that lives for the whole process
+// and is constructed exactly once.
+#[allow(clippy::large_enum_variant)]
 enum Engine<'a> {
     Deepseek4 {
         fw: &'a Deepseek4Forward<'a>,
         config: &'a Deepseek4Config,
     },
-    /// Dense Llama/Qwen. Regenerates over the whole sequence per token, exactly
-    /// as `bigtea-run` does on this path: every pass is stateless and identical
-    /// to a prefill, so there is no cache to get subtly wrong. These models are
-    /// small enough that the quadratic term is not what limits them.
+    /// Dense Llama/Qwen, through the SAME `StreamingRunner` the CLI uses.
+    ///
+    /// It used to call `arch.build_graph` -- a second forward implementation
+    /// that never received the QKV bias, the Gemma activation, the post-norms
+    /// or the soft caps, because all of those landed in `stream.rs`. Qwen2
+    /// through this server produced fluent nonsense while `bigtea-run` on the
+    /// same container was byte-identical to llama.cpp. A second code path is a
+    /// second place for every fix to be missing from.
     Dense {
-        arch: &'a Qwen3Model,
+        /// Interior mutability because `run_loop` holds the engine by shared
+        /// reference and a cached forward pass is inherently stateful. One
+        /// request is served at a time, so there is no contention to lose.
+        runner: std::cell::RefCell<bigtea_arch::StreamingRunner<'a>>,
         weights: &'a WeightSet<'a>,
-        /// What to report as the model id. Clients key off this, so it comes
-        /// from the container rather than being a constant.
         name: &'a str,
+        config: Qwen3Config,
     },
 }
 
@@ -561,8 +581,9 @@ impl Engine<'_> {
 /// carry between calls, so the state lives here rather than in `generate`.
 enum State {
     Deepseek4(Deepseek4Cache),
-    /// The dense path keeps nothing: each call rebuilds over the full sequence.
-    Dense,
+    /// The dense path now keeps a KV cache, like the CLI. Rebuilding over the
+    /// whole sequence per token was quadratic AND used the unfixed graph.
+    Dense(bigtea_arch::KvCache),
 }
 
 /// Everything a request asks for beyond the messages themselves.
@@ -571,6 +592,12 @@ struct Params {
     sampler: SamplerConfig,
     stop: Vec<String>,
     stream: bool,
+    /// From OpenAI's `response_format`. `None` means unconstrained.
+    ///
+    /// This is the field that makes a local model usable by an agent: without
+    /// it, "reply with JSON" is a request the model may decline, and the caller
+    /// finds out by failing to parse the answer.
+    grammar: Option<bigtea_grammar::Grammar>,
 }
 
 impl Params {
@@ -623,6 +650,7 @@ impl Params {
             sampler,
             stop: extract_string_array(body, "stop"),
             stream: extract_bool(body, "stream").unwrap_or(false),
+            grammar: response_format_grammar(body),
         }
     }
 }
@@ -714,12 +742,41 @@ fn run_prompt(
         Engine::Deepseek4 { config, .. } => {
             State::Deepseek4(Deepseek4Cache::new(config.n_layer, config.kv_lora_rank))
         }
-        Engine::Dense { .. } => State::Dense,
+        Engine::Dense { config, .. } => State::Dense(bigtea_arch::KvCache::new(
+            config.n_layer as usize,
+            config.n_head_kv as usize,
+            config.head_dim as usize,
+        )),
     };
-    let logits = advance(engine, &mut state, &seq, true)?;
+    let mut logits = advance(engine, &mut state, &seq, true)?;
 
     let mut sampler = Sampler::new(params.sampler.clone());
     let mut history: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+
+    // `response_format`. The vocabulary is built once as token id -> the bytes
+    // that token decodes to, which is what the grammar matches against; the
+    // matcher is carried across tokens rather than re-parsing the text so far,
+    // because `allowed(prefix)` is quadratic in the answer's length and an
+    // agent's structured reply is exactly where that shows.
+    // The vocabulary outlives the constraint that borrows it, which is why it
+    // is bound here rather than inside the closure.
+    let vocab: Vec<Vec<u8>> = params
+        .grammar
+        .as_ref()
+        .map(|_| {
+            (0..tokenizer.vocab_size() as u32)
+                .map(|id| tokenizer.decode(&[id]).into_bytes())
+                .collect()
+        })
+        .unwrap_or_default();
+    let constraint = params
+        .grammar
+        .as_ref()
+        .map(|g| bigtea_grammar::Constraint::new(g.clone(), &vocab));
+    let mut matcher = constraint.as_ref().map(|c| c.grammar().matcher());
+    let mut grammar_done = false;
+
+    apply_grammar(&constraint, &matcher, &mut logits, &mut grammar_done);
     let mut next = sampler.sample(&logits, &history) as i32;
 
     let mut out = String::new();
@@ -765,8 +822,22 @@ fn run_prompt(
         if produced >= params.max_tokens {
             break;
         }
+        // Advance the grammar by what was actually emitted, then stop if it
+        // can accept nothing more -- a satisfied grammar is a finished answer.
+        if let Some(m) = matcher.as_mut() {
+            m.accept_str(&tokenizer.decode(&[next as u32]));
+        }
+        if grammar_done {
+            finish = Finish::Stop;
+            break;
+        }
         seq.push(next);
-        let logits = advance(engine, &mut state, &seq, false)?;
+        let mut logits = advance(engine, &mut state, &seq, false)?;
+        apply_grammar(&constraint, &matcher, &mut logits, &mut grammar_done);
+        if grammar_done {
+            finish = Finish::Stop;
+            break;
+        }
         next = sampler.sample(&logits, &history) as i32;
     }
 
@@ -785,6 +856,12 @@ fn run_prompt(
 /// path is incremental — its KV cache means a step feeds one token — while the
 /// dense path rebuilds over the whole sequence every time, so it needs `seq`
 /// rather than the last token.
+/// The server carries token ids as `i32` (the OpenAI shape); the engine wants
+/// `u32`. Converted at the boundary rather than changing either side.
+fn seq_u32(seq: &[i32]) -> Vec<u32> {
+    seq.iter().map(|&t| t as u32).collect()
+}
+
 fn advance(
     engine: &Engine<'_>,
     state: &mut State,
@@ -803,31 +880,22 @@ fn advance(
                 Ok(bigtea_arch::step(fw, kv, last, arena)?)
             }
         }
-        (Engine::Dense { arch, weights, .. }, _) => {
-            let n = seq.len() as i64;
-            let c = &arch.config;
-            // Arena scales with the sequence: attention holds n x n scores per
-            // head, and ggml aborts rather than erroring when it runs short.
-            let arena = bigtea_ggml::arena_for(
-                &[(c.n_embd as i64, n), (c.vocab_size as i64, n)],
-                64 + (n as usize / 8),
-            )
-            .max(256 << 20);
-            let ctx = Context::new(arena)?;
-            let tok = ctx.new_i32_1d(n)?;
-            tok.set_i32(seq)?;
-            let pos = ctx.new_i32_1d(n)?;
-            pos.set_i32(&(0..n as i32).collect::<Vec<_>>())?;
-            let logits = arch.build_graph(&ctx, weights, &tok, &pos, n)?;
-            let threads = bigtea_arch::configured_threads();
-            ctx.compute(&logits, threads)?;
-            let all = logits.to_vec_f32();
-            // Only the final position predicts the next token.
-            let vocab = c.vocab_size as usize;
-            Ok(match all.len() >= vocab {
-                true => all[all.len() - vocab..].to_vec(),
-                false => all,
-            })
+        (
+            Engine::Dense {
+                runner, weights, ..
+            },
+            State::Dense(kv),
+        ) => {
+            // `first` prefills the whole prompt; every step after feeds exactly
+            // the token just chosen, because the cache holds the rest.
+            let mut r = runner.borrow_mut();
+            if first {
+                Ok(r.forward_cached(weights, kv, seq_u32(seq).as_slice(), 0)?)
+            } else {
+                let last = *seq.last().expect("non-empty sequence") as u32;
+                let pos = kv.len();
+                Ok(r.forward_cached(weights, kv, &[last], pos)?)
+            }
         }
         _ => Err("engine and state disagree -- this is a bug".into()),
     }
@@ -954,6 +1022,126 @@ fn read_json_string(s: &str) -> Result<(String, usize), Box<dyn std::error::Erro
     Err("unterminated string in request body".into())
 }
 
+/// Mask the logits to what the grammar allows, and say when it is finished.
+///
+/// # Why an empty mask cannot simply be sampled from
+///
+/// Every token would be `-inf`, the argmax would be arbitrary, and the answer
+/// would end looking exactly like a clean stop. Empty has two meanings and they
+/// are not the same event: a grammar that has been SATISFIED admits nothing
+/// more, which is success; one that is STUCK admits nothing because the text so
+/// far cannot be completed, which is a truncated answer. Reporting the second as
+/// the first is how a client receives half a JSON object and a `"stop"` reason.
+fn apply_grammar(
+    constraint: &Option<bigtea_grammar::Constraint>,
+    matcher: &Option<bigtea_grammar::Matcher>,
+    logits: &mut [f32],
+    done: &mut bool,
+) {
+    let (Some(c), Some(m)) = (constraint.as_ref(), matcher.as_ref()) else {
+        return;
+    };
+    let mask = c.allowed_from(m);
+    if mask.is_empty() {
+        if !m.is_complete() {
+            bigtea_arch::info!(
+                "serve      grammar STUCK -- no token can continue and it is not satisfied; \
+                 the response is incomplete"
+            );
+        }
+        *done = true;
+        return;
+    }
+    mask.apply(logits);
+}
+
+/// Turn OpenAI's `response_format` into a grammar.
+///
+/// Two shapes are standard and both are honoured:
+///
+/// ```json
+/// {"response_format": {"type": "json_object"}}
+/// {"response_format": {"type": "json_schema", "json_schema": {"schema": { ... }}}}
+/// ```
+///
+/// # Why a malformed schema is not silently dropped
+///
+/// A `response_format` that fails to compile and is then ignored produces free
+/// text where the caller is parsing JSON. That failure surfaces in the client,
+/// several layers from its cause, and looks like the model disobeying rather
+/// than the server discarding the request. So a schema that will not compile is
+/// reported here and the request is refused.
+fn response_format_grammar(body: &str) -> Option<bigtea_grammar::Grammar> {
+    let at = body.find("\"response_format\"")?;
+    let rest = &body[at..];
+    // The `type` nearest the key. Crude, and deliberately so: this server
+    // parses JSON by scanning rather than carrying a parser, and a nested
+    // `"type"` inside the schema itself is exactly why the FIRST one after
+    // `response_format` is the one taken.
+    let ty = extract_string(rest, "type")?;
+    match ty.as_str() {
+        // Any JSON value. llama.cpp's `--json-schema '{}'` compiles to the
+        // same thing, so the two agree on what "json_object" means.
+        "json_object" => bigtea_grammar::Grammar::from_json_schema("{}").ok(),
+        "json_schema" => {
+            // The schema sits under `json_schema.schema` in the OpenAI shape.
+            // Taken as a raw substring rather than re-serialised: re-encoding
+            // a schema through a scanner would change it, and a changed schema
+            // is a changed contract.
+            let schema = raw_object_after(rest, "\"schema\"")?;
+            match bigtea_grammar::Grammar::from_json_schema(&schema) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    bigtea_arch::info!("serve      response_format schema rejected: {e}");
+                    None
+                }
+            }
+        }
+        other => {
+            bigtea_arch::info!("serve      response_format type {other:?} not recognised");
+            None
+        }
+    }
+}
+
+/// The balanced `{...}` that follows `key`, as raw text.
+///
+/// Brace counting rather than parsing, and it respects strings and escapes --
+/// a schema containing `"pattern": "\\}"` would otherwise close the object
+/// early and hand the grammar compiler a truncated document.
+fn raw_object_after(body: &str, key: &str) -> Option<String> {
+    let at = body.find(key)? + key.len();
+    let start = body[at..].find('{')? + at;
+    let bytes = body.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(body[start..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn extract_int(body: &str, key: &str) -> Option<i64> {
     let at = body.find(&format!("\"{key}\""))?;
     let after = &body[at + key.len() + 2..];
@@ -1009,6 +1197,34 @@ fn extract_bool(body: &str, key: &str) -> Option<bool> {
 
 /// Read `"stop"`, which the OpenAI API allows as a string **or** an array of
 /// strings. Both spellings are common in the wild, so both are accepted.
+/// The string value of `key`, scanning rather than parsing.
+///
+/// This server carries no JSON parser on purpose; every reader here is a scan.
+/// Returns the FIRST match after the caller's slice start, which is what makes
+/// `response_format_grammar` able to take the `type` nearest its own key rather
+/// than a `"type"` nested inside a schema.
+fn extract_string(body: &str, key: &str) -> Option<String> {
+    let at = body.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = &body[at..];
+    let colon = rest.find(':')? + 1;
+    let open = rest[colon..].find('"')? + colon + 1;
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in rest[open..].chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    None
+}
+
 fn extract_string_array(body: &str, key: &str) -> Vec<String> {
     let needle = format!("\"{key}\"");
     let Some(at) = body.find(&needle) else {
