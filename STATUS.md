@@ -1130,3 +1130,56 @@ All 21 container-backed V4-Flash tests pass with it active, including the
 element-sum comparisons against llama.cpp — the overlap changes *when* bytes are
 read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
 `BIGTEA_PREFETCH_READERS` tunes the split.
+
+## R12 — the 256-token V4-Flash context cap is gone (2026-08-11)
+
+**Supersedes the "V4-Flash is capped at 256 tokens of context" entry under Known
+limitations.** Issue #46. Detail:
+`docs/graph/research/ring-wraparound-2026-08-11.md`.
+
+The raw KV latents were `kv_lora_rank * 256` per layer **indexed by absolute
+position**, so position 256 wrote past the end. They now live in a 1024-slot
+ring; the compressed half grows. The container declares
+`context_length = 1048576` — the cap was ours.
+
+**The only limit left is on one pass: 897 tokens**, which chunking satisfies
+(`-b` defaults to 256). The error reports the batch limit rather than a sequence
+limit, because chunking is what a caller can act on.
+
+Why a ring is exact, and where it would not be:
+
+| structure | indexed by | fix |
+|---|---|---|
+| `raw` | absolute position | **ring**, `position % 1024` — sound only because raw attention is *sliding* (`attention.sliding_window = 128`), so a position older than the window can never be read again |
+| `comp` | **block** index | **grows; cannot be a ring** — the compressed half is visibility-limited, not windowed, so every complete block behind a token stays reachable |
+| compressor input ring | `pos0`-relative | already correct, untouched |
+
+`sliding_window = 0` would mean full causal attention, where a ring would
+silently drop keys still in scope; that case is refused rather than served.
+
+The ring size is the **window plus the batch**, not the window: a pass's
+*earliest* query still reaches `window - 1` behind `pos0`. Measuring from the
+last query instead would drop exactly the keys the first rows of a prefill need.
+45 MB across 43 layers, against 11 MB before.
+
+The mask was rewritten with it, as the cache's own comment said it would have to
+be — the key axis is no longer the slot index but a gathered run of absolute
+positions, and handing the mask slot indices would attend to whatever `p % 1024`
+held.
+
+Verified with the R3 equivalence harness past the old cap — `prefill(0..=257)`
+against `prefill(0..257)` + `step(257)`:
+
+```
+past 256: argmax 91 agrees; sums 350740.59 vs 352047.19 (0.373% apart)
+```
+
+Not bit-identical, deliberately: routing flips on near ties when the batch shape
+changes. 22 container-backed tests pass at 2, 5, 165 and 258 tokens — which is
+Raw, CSA and HCA, since prompt length decides which builder runs. `raw_span` is
+a pure function with unit tests covering wraparound, the batch limit and the
+property the whole design rests on: no two positions in one span share a slot.
+
+**Still stale, and not mine to change**: `bigtea-serve.rs` reports
+`context_limit() = 256` for deepseek4, so the server refuses sequences the engine
+now handles. One line, and it belongs to whoever owns that file.

@@ -3839,31 +3839,117 @@ fn the_expert_cache_does_not_change_the_answer() {
     );
 }
 
-/// **Too long a prompt must fail with a message, not a panic.**
+/// **Too large a single pass must fail with a message, not a panic.**
 ///
-/// `attention` builds one F16 cache of `kv_lora_rank * N_KV` and indexes it by
-/// absolute position, so before this check a 388-token prompt read weights for
-/// eight seconds and then panicked with `range end index 198656 out of range
-/// for slice of length 131072`. That is 512 x 388 against 512 x 256 — arithmetic
-/// a user cannot be expected to do. The refusal happens before any weight is
-/// read, so it is also fast.
+/// The limit used to be on the *sequence*: `raw` was `kv_lora_rank * 256`
+/// indexed by absolute position, so a 388-token prompt read weights for eight
+/// seconds and then panicked with `range end index 198656 out of range for
+/// slice of length 131072`.
+///
+/// The ring removed that. What remains is a bound on **one pass** — its
+/// earliest query still reaches `window - 1` positions behind `pos0`, so
+/// `window + nt - 1` positions must be live at once against a ring of 1024.
+/// Past that the ring would wrap over rows the same pass is about to read,
+/// which is not an error, just attention over whatever those slots held before.
+///
+/// The number reported is the **batch** limit, because chunking the prompt is
+/// what a caller can actually do about it.
 #[test]
 #[ignore = "opens the 144 GB container (reads metadata only)"]
-fn a_prompt_longer_than_the_window_is_refused_not_a_panic() {
+fn a_single_pass_larger_than_the_ring_is_refused_not_a_panic() {
     let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
+    // The ring's soundness rests on this being non-zero. If the container ever
+    // stops declaring a window, raw attention is full causal and a ring cannot
+    // serve it — so this assertion is load-bearing, not decoration.
+    assert_eq!(config.sliding_window, 128, "V4-Flash declares a 128 window");
     let fw = bigtea_arch::Deepseek4Forward::new(&model, config);
 
-    let too_long: Vec<i32> = (0..400).map(|i| i % 1000).collect();
+    let too_long: Vec<i32> = (0..1200).map(|i| i % 1000).collect();
     match bigtea_arch::prefill(&fw, &too_long, 1024 << 20) {
         Err(bigtea_arch::ArchError::ContextTooLong { tokens, limit }) => {
-            assert_eq!(tokens, 400);
-            assert_eq!(limit, 256);
+            assert_eq!(tokens, 1200);
+            // 1024 - 128 + 1.
+            assert_eq!(limit, 897, "the batch limit, not a sequence limit");
         }
         Err(other) => panic!("wrong error: {other}"),
-        Ok(_) => panic!("400 tokens should not have been accepted"),
+        Ok(_) => panic!("1200 tokens in one pass should not have been accepted"),
     }
+}
+
+/// **The 256-token cap is gone, and the ring is correct on the other side.**
+///
+/// This is the ticket. Position 256 used to write past the end of `raw`; it now
+/// wraps, and the mask has to map the gathered span back to absolute positions
+/// for the answer to survive. A mistake there does not fail — it attends to
+/// whatever `p % 1024` happened to hold, which reads as fluent nonsense.
+///
+/// Proven with the same equivalence harness as the rest of R3, because it needs
+/// no new capture: `prefill(0..=n)` is already verified against llama.cpp's
+/// element sums, so it is a trustworthy reference for `prefill(0..n) + step(n)`.
+///
+/// **Deliberately not bit-identical**, for the reason the other equivalence
+/// tests give: routing flips on near ties when the batch shape changes, so
+/// argmax plus a tolerance is the correct assertion and equality would fail on
+/// correct code.
+///
+/// Two passes over 258 tokens, so this is the slowest test here — and there is
+/// no cheaper end-to-end proof, because the bug it guards only exists past
+/// position 256.
+#[test]
+#[ignore = "reads weights from a 144 GB container, two passes over 258 tokens"]
+fn past_the_old_256_cap_a_cached_step_agrees_with_a_full_prefill() {
+    let _heavy = heavy();
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+    let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());
+    let arena = 1024 << 20;
+
+    // 258 crosses the old cap. It does not wrap the 1024-slot ring — the
+    // absolute-to-slot mapping is what breaks at 256, and the wrap itself is
+    // covered exhaustively by the ring-arithmetic unit tests, which cost
+    // nothing. Reaching 1024 here would mean a third of an hour of expert reads.
+    let tokens: Vec<i32> = (0..258).map(|i| (i * 7) % 900 + 10).collect();
+    let n = tokens.len() - 1;
+    assert!(n >= 256, "this test is pointless below the old cap");
+
+    let full = bigtea_arch::prefill(&fw, &tokens, arena).expect("full prefill past 256");
+
+    let mut cache = bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
+    let _ = bigtea_arch::forward(&fw, &mut cache, &tokens[..n], arena).expect("partial prefill");
+    assert_eq!(cache.n_past(), n);
+    let stepwise = bigtea_arch::step(&fw, &mut cache, tokens[n], arena).expect("cached step");
+    assert_eq!(cache.n_past(), n + 1);
+
+    assert_eq!(full.len(), stepwise.len(), "logit count");
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+            .expect("logits")
+            .0
+    };
+    assert_eq!(
+        argmax(&full),
+        argmax(&stepwise),
+        "past position 256 a cached step chose a different token than the full \
+         prefill — the ring's slot mapping is wrong, and on this architecture \
+         that reads as fluent nonsense rather than an error"
+    );
+    let sum_full: f32 = full.iter().sum();
+    let sum_step: f32 = stepwise.iter().sum();
+    let drift = (sum_step - sum_full).abs() / sum_full.abs().max(1.0);
+    assert!(
+        drift < 0.02,
+        "logit sum moved {:.3}% ({sum_full:.2} -> {sum_step:.2}) past the old cap",
+        drift * 100.0
+    );
+    eprintln!(
+        "  past 256: argmax {} agrees; sums {sum_full:.2} vs {sum_step:.2} ({:.3}% apart)",
+        argmax(&full),
+        drift * 100.0
+    );
 }
 
 /// **A cached step must agree with a full prefill.**
