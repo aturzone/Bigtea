@@ -262,6 +262,7 @@ extern "C" {
         ids: *mut ggml_tensor,
     ) -> *mut ggml_tensor;
 
+    fn ggml_tanh(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     fn ggml_soft_max_ext(
         ctx: *mut ggml_context,
         a: *mut ggml_tensor,
@@ -679,6 +680,11 @@ impl Context {
         v: &Tensor<'a>,
         mask: &Tensor<'a>,
         scale: f32,
+        // Gemma-2 caps attention logits at 50 before the softmax; 0.0 means no
+        // cap, which is every other architecture here. It has to reach the
+        // fused kernel rather than be applied afterwards -- the logits do not
+        // exist outside it.
+        logit_softcap: f32,
     ) -> Result<Tensor<'a>, GgmlError> {
         // SAFETY: all four tensors live in this context; ggml validates the
         // shape relationships and returns null on a mismatch.
@@ -691,7 +697,7 @@ impl Context {
                 mask.raw.as_ptr(),
                 scale,
                 0.0, // max_bias: ALiBi, which this architecture does not use
-                0.0, // logit_softcap: unused
+                logit_softcap,
             )
         })
     }
@@ -717,7 +723,9 @@ impl Context {
         sinks: &Tensor<'a>,
         scale: f32,
     ) -> Result<Tensor<'a>, GgmlError> {
-        let out = self.flash_attn_ext(q, k, v, mask, scale)?;
+        // Sinks and Gemma soft-capping have never co-occurred; 0.0 is correct
+        // for every architecture that uses this path.
+        let out = self.flash_attn_ext(q, k, v, mask, scale, 0.0)?;
         // SAFETY: both nodes live in this context, and `out` is the tensor
         // ggml just returned from `flash_attn_ext`, which is what this expects.
         unsafe { ggml_flash_attn_ext_add_sinks(out.raw.as_ptr(), sinks.raw.as_ptr()) };
@@ -833,6 +841,30 @@ impl Context {
                 mask.raw.as_ptr(),
             )
         })
+    }
+
+    /// Hyperbolic tangent, elementwise.
+    ///
+    /// Needed for Gemma's soft-capping: `tanh(x / cap) * cap` bounds a tensor
+    /// smoothly instead of clipping it. Gemma-2 caps attention logits at 50 and
+    /// final logits at 30, and without it the model produces fluent nonsense
+    /// rather than any error.
+    pub fn tanh<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: valid context and tensor from it.
+        self.tensor(unsafe { ggml_tanh(self.raw.as_ptr(), a.raw.as_ptr()) })
+    }
+
+    /// Gemma's soft cap: `tanh(x / cap) * cap`, a smooth bound on magnitude.
+    ///
+    /// A `cap` of zero means "no capping" and returns the tensor unchanged,
+    /// which is what a container that declares no soft-capping wants.
+    pub fn softcap<'a>(&'a self, a: &Tensor<'a>, cap: f32) -> Result<Tensor<'a>, GgmlError> {
+        if cap <= 0.0 {
+            return Ok(*a);
+        }
+        let scaled = self.scale(a, 1.0 / cap)?;
+        let t = self.tanh(&scaled)?;
+        self.scale(&t, cap)
     }
 
     pub fn scale<'a>(&'a self, a: &Tensor<'a>, s: f32) -> Result<Tensor<'a>, GgmlError> {
@@ -1056,6 +1088,39 @@ impl Context {
     ///
     /// Nothing has been computed before this call — the tensors describe a
     /// plan, not values.
+    /// Evaluate several outputs in **one** graph.
+    ///
+    /// `compute` re-evaluates the whole ancestor graph of its output, so
+    /// computing `q`, then `k`, then `v` — which share a normalisation — does
+    /// that normalisation three times, and pays three graph builds and three
+    /// threadpool cycles for it. At one token those fixed costs are the
+    /// dominant term: the matmuls are matrix-*vector* products and tiny.
+    ///
+    /// `ggml_build_forward_expand` accepts several roots on one graph, so this
+    /// is the same work with the sharing preserved.
+    pub fn compute_many(&self, outputs: &[&Tensor<'_>], threads: usize) -> Result<(), GgmlError> {
+        if outputs.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: valid context; the graph lives in the same arena.
+        let graph = unsafe { ggml_new_graph(self.raw.as_ptr()) };
+        if graph.is_null() {
+            return Err(GgmlError::ArenaExhausted);
+        }
+        for out in outputs {
+            // SAFETY: `graph` is non-null and every output was built here.
+            unsafe { ggml_build_forward_expand(graph, out.raw.as_ptr()) };
+        }
+        // SAFETY: graph and context match.
+        let status = unsafe {
+            ggml_graph_compute_with_ctx(self.raw.as_ptr(), graph, threads.max(1) as c_int)
+        };
+        if status != 0 {
+            return Err(GgmlError::ComputeFailed(status));
+        }
+        Ok(())
+    }
+
     pub fn compute(&self, output: &Tensor<'_>, threads: usize) -> Result<(), GgmlError> {
         // SAFETY: valid context; the returned graph lives in the same arena.
         let graph = unsafe { ggml_new_graph(self.raw.as_ptr()) };
@@ -1225,6 +1290,12 @@ impl Tensor<'_> {
     /// not take ownership and will not keep the memory alive — a dangling
     /// pointer here reads freed memory *successfully*, yielding plausible
     /// numbers instead of a crash.
+    /// The raw `ggml_tensor`, for the repack path which must call into
+    /// `ggml-backend` with it.
+    pub(crate) fn as_ptr(&self) -> *mut std::ffi::c_void {
+        self.raw.as_ptr().cast()
+    }
+
     pub(crate) unsafe fn set_data_ptr(&self, ptr: *mut std::os::raw::c_void) {
         (*(self.raw.as_ptr() as *mut crate::weights::RawTensor)).data = ptr;
     }

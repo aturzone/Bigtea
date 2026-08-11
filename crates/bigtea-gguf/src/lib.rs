@@ -35,6 +35,9 @@ pub enum Error {
     BadMagic { found: u32 },
     /// A GGUF version this parser does not implement.
     UnsupportedVersion(u32),
+    /// The version field looks byte-swapped, which means the file was written
+    /// on a machine of the opposite endianness.
+    ByteOrderMismatch { found: u32 },
     /// The file ended in the middle of a field.
     Truncated {
         needed: usize,
@@ -50,6 +53,13 @@ pub enum Error {
     /// A declared count is implausible — treated as corruption rather than
     /// trusted, since these drive allocations.
     ImplausibleCount { what: &'static str, value: u64 },
+    /// The same metadata key appeared twice. Keeping either one silently would
+    /// mean the file decides which, and two readers could disagree.
+    DuplicateKey(String),
+    /// A metadata key was the empty string.
+    EmptyKey,
+    /// Two tensors share a name, so a lookup by name is ambiguous.
+    DuplicateTensor(String),
 }
 
 impl fmt::Display for Error {
@@ -59,7 +69,18 @@ impl fmt::Display for Error {
                 f,
                 "not a GGUF file (magic was {found:#010x}, expected {MAGIC:#010x})"
             ),
-            Error::UnsupportedVersion(v) => write!(f, "unsupported GGUF version {v}"),
+            Error::UnsupportedVersion(v) => write!(
+                f,
+                "unsupported GGUF version {v} (this reader implements 2 and 3; \
+                 GGUFv1 was withdrawn and llama.cpp refuses it too)"
+            ),
+            Error::ByteOrderMismatch { found } => write!(
+                f,
+                "GGUF version reads as {found}, which is a small version number \
+                 with its bytes reversed -- the file was written big-endian and \
+                 this machine is little-endian (or the reverse). The container is \
+                 not corrupt; it is the wrong byte order for this host."
+            ),
             Error::Truncated {
                 needed,
                 available,
@@ -71,6 +92,15 @@ impl fmt::Display for Error {
             Error::UnknownValueType(t) => write!(f, "unknown metadata value type {t}"),
             Error::UnknownTensorType(t) => write!(f, "unknown tensor type {t}"),
             Error::BadUtf8 => write!(f, "string field was not valid UTF-8"),
+            Error::DuplicateKey(k) => write!(
+                f,
+                "metadata key {k:?} appears more than once; the container does not \n                 say which value is meant"
+            ),
+            Error::EmptyKey => f.write_str("a metadata key is the empty string"),
+            Error::DuplicateTensor(name) => write!(
+                f,
+                "two tensors are both named {name:?}, so looking one up by name \n                 is ambiguous"
+            ),
             Error::ImplausibleCount { what, value } => {
                 write!(
                     f,

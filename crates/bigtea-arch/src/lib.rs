@@ -17,15 +17,22 @@ mod deepseek4;
 mod deepseek4_forward;
 mod expert_cache;
 mod kv;
+pub mod log;
 mod qwen3;
+pub mod sample;
+pub mod spectrum;
 mod stream;
 
 pub use deepseek4::{AttentionKind, Deepseek4Config, Deepseek4Model};
-pub use deepseek4_forward::{prefill, routing_next_pass, routing_report, Deepseek4Forward};
+pub use deepseek4_forward::{
+    forward, prefill, routing_last_token, routing_last_token_reset, routing_next_pass,
+    routing_report, routing_weight_report, step, Deepseek4Cache, Deepseek4Forward, RepackedDense,
+};
 pub use expert_cache::{CacheStats, ExpertCache};
-pub use kv::{KvCache, KvError};
-pub use qwen3::{Qwen3Config, Qwen3Model};
-pub use stream::{StreamStats, StreamingRunner};
+pub use kv::{KvCache, KvError, KvType};
+pub use qwen3::{architecture_is_verified, Qwen3Config, Qwen3Model, VERIFIED_ARCHITECTURES};
+pub use sample::{neg_log_prob, Sampler, SamplerConfig, SamplerStage};
+pub use stream::{configured_threads, configured_threads_batch, StreamStats, StreamingRunner};
 
 use std::fmt;
 
@@ -46,6 +53,8 @@ pub enum ArchError {
         tokens: usize,
         limit: usize,
     },
+    /// A path that is deliberately refused rather than silently approximated.
+    Unimplemented(&'static str),
 }
 
 impl fmt::Display for ArchError {
@@ -60,6 +69,7 @@ impl fmt::Display for ArchError {
             ArchError::Model(e) => write!(f, "{e}"),
             ArchError::Ggml(e) => write!(f, "{e}"),
             ArchError::Kv(e) => write!(f, "{e}"),
+            ArchError::Unimplemented(what) => write!(f, "not implemented: {what}"),
             ArchError::ContextTooLong { tokens, limit } => write!(
                 f,
                 "prompt is {tokens} tokens; this path holds {limit}. \

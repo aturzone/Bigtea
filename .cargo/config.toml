@@ -1,0 +1,16 @@
+# Link against MSYS2's startup files rather than the ones rustup ships.
+#
+# rustup's `x86_64-pc-windows-gnu` toolchain bundles its own `crt2.o` from an
+# older mingw-w64. MSYS2's runtime moved on (gcc 16.1.0 dropped
+# `_gnu_exception_handler`, `__mingw_oldexcpt_handler` and the `__mingw_initlts*`
+# symbols from `libmingwex`), so the bundled `crt2.o` now fails to link against
+# the system libraries with a wall of "undefined reference" — for code that
+# compiles cleanly. Nothing in this repository causes it and nothing in this
+# repository can fix it in source.
+#
+# `link-self-contained=no` tells rustc to use the system startup files, which
+# match the system libraries by construction. This is only needed on the GNU
+# Windows target: the MSVC, Linux and macOS targets are untouched, which is why
+# it is scoped to a target rather than set globally.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-self-contained=no"]

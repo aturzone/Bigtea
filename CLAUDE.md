@@ -14,7 +14,8 @@
 ```
 # ggml must be built first; point GGML_LIB_DIR at ggml-base.a, ggml-cpu.a, ggml.a
 export GGML_LIB_DIR=C:/Projects/llamacpp-unsloth/build/ggml/src   # PowerShell: $env:GGML_LIB_DIR=...
-cargo test --release          # 168 tests (+16 container-backed, --ignored)
+cargo test --release          # 224 tests
+cargo test --release --test deepseek4_forward -- --ignored   # 19 V4-Flash, needs the container
 cargo build --release
 ./target/release/bigtea-run <model.gguf> "prompt" -n 16
 ./target/release/bigtea-probe --quick          # RAM/disk/GPU + what to close
@@ -29,7 +30,7 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 
 ## Facts that cost time to rediscover
 
-- **ggml aborts** (`GGML_ASSERT`) when its arena is exhausted — no error to catch. Size arenas up front.
+- **ggml aborts** (`GGML_ASSERT`) when its arena is exhausted — no error to catch. Size arenas up front. **This also kills a whole test binary**: the 19 V4-Flash tests each allocate GB-sized arenas and, run in parallel, exhausted memory and aborted the process — reported as `process didn't exit successfully`, not as a failing test, with every later result lost. They hold a shared `heavy()` lock now, so plain `--ignored` works.
 - **ggml `ne[0]` is the fastest dimension.** Reading shapes as row-major transposes every matrix and yields confident nonsense.
 - **Weights are bound zero-copy** (`no_alloc` + data pointer). A copy would need 2× the model and not fit.
 - **Missing causal mask → repeated tokens**, not an error. Masked positions need `-inf`, not `0`.
@@ -48,8 +49,17 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 - **Prompt length decides which code paths run.** V4-Flash's compressed attention builders are guarded on their caches being non-empty, so the *same layer* runs different attention at different lengths: at 2 tokens all 43 blocks fall back to the Raw path, at 5 CSA fires, at 165 HCA fires, and the sparse indexer selects nothing until >2048. A shorter capture can reach *further* than a longer one. See `v4flash-compressed-attention.md`.
 - **GGUF pads tensor data to `general.alignment` (32), not to a disk sector.** So tensors start mid-sector and a conventionally *aligned* buffer can never receive a direct transfer — every byte bounces. Skew the destination to `file_offset % 4096` instead (`SkewedBuf`): 0.80 → 1.58 GiB/s, 0.09% copied.
 - **`compute()` re-evaluates the whole ancestor graph.** Calling it per intermediate *re-does* the work each time, plus a graph build and threadpool cycle. 24 calls per block became 6 — **1.9x**. Invisible on prefill (big matmuls bury it), dominant at one token. Compute only before a `to_vec_*`/`set_*`.
-- **Threads are not the lever.** 4/12/20 threads all cost the same on a V4-Flash prefill; 1 thread is 4.7x *slower*. Threadpool-churn was the obvious explanation and was wrong.
-- **Every arena must scale with the prefill block.** Fixed-size arenas abort once the block grows; ggml asks and dies rather than returning an error.
+- **Threads are two levers pulling opposite ways, and `-t` reached only one architecture.** Generation saturates DRAM and wants **2-4** threads; prefill is compute-bound and wants **all** of them (Qwen3-4B: gen 7.64 @2 vs 4.49 @20; prefill 47.4 @4 vs 81.5 @20). Hence `-t` *and* `-tb`, picked by the step's token count. The old "threads are not the lever" reading came from a sweep whose knob was disconnected — `-t` set `BIGTEA_THREADS`, which only `deepseek4_forward.rs` read, so `-t 1` and `-t 20` gave *bit-identical* phase timings. **A disconnected knob is indistinguishable from a flat response; check the knob moves something first.** Fixing it was 1.66x/1.69x.
+- **V4-Flash needs the same split, and the old "threads are not the lever" note was measured too short.** At 5 tokens a V4-Flash prefill is almost all disk, so 4/12/20 did cost the same; **at 180 tokens it is 2.24 (4 threads) against 2.89 (all)**. Generation is the opposite — `-t 4` beat `-t 20` in two back-to-back sessions, 0.380/0.296 and 0.196/0.177. **Absolute V4-Flash numbers drift a lot with page-cache state; only compare within one session.**
+- **The MoE expert path wants ONE thread — 2.4x on Qwen3-30B** (2.88 tok/s at 1 vs 1.21 at 20; expert compute 2.2s → 5.2s). A layer's graph holds 24 matrix-vector products of 768x2048; split 20 ways that is ~38 rows per thread per barrier, and the threads cost more than the work. **llama.cpp peaks at 4 threads where we peak at 1**, so its expert path parallelises and ours does not — batching the expert matmuls is the lead for the remaining 1.60x.
+- **A kernel benchmark measures the kernel, not the data movement needed to feed it.** `bigtea-kernelbench` put the batched `mul_mat_id` expert form at 11.17 GiB/s with 2.86x thread scaling — real, but it binds the model's *already-stacked* tensor zero-copy. On the streaming path the selected experts are unrelated `Arc<[u8]>`, and making them contiguous costs ~1.02 GB/token, which is what the kernel saves. Built, byte-identical output, **1.34 → 1.27 tok/s, reverted.** The version that pays needs the experts resident. Also: `Arc::from(Box<[u8]>)` **reallocates and copies** — hand `bind` the `Vec<u8>` instead (`WeightBytes` covers any `Deref<Target=[u8]>`); that mistake alone cost 12s of a 27s run.
+- **Do not calibrate on a proxy.** A 150 ms DRAM-saturation benchmark picked 6/8/12/12/4/6 on six identical runs while the true optimum was 2-4, and its spread was worse than the bad default it replaced — a pure read has no per-node barrier, a ggml graph does. Tune on real generated tokens instead. A proxy corrected until it agrees with the objective *is* the objective, measured badly.
+- **Concurrent readers need a file handle EACH.** A Windows handle without `FILE_FLAG_OVERLAPPED` is synchronous and the OS serialises reads on it, so N threads on one handle hold the drive at queue depth 1. The old "no gain past 4 readers, the drive does 2.37 GiB/s" was this artefact: same reads, 4 threads, **2.01 GiB/s shared vs 2.65 per-handle**, and per-handle beats the "sequential ceiling". `Shard` now pools 8 handles.
+- **The expert matmul is 3% of a token, not the floor.** 3.02 ms per block = 0.13 s/token, at 24.7 GiB/s — *above* single-threaded memcpy, i.e. already at DRAM speed. **76% of a token is disk.** Compute also scales as ~`n^0.49` in the batch, not linearly, so batched/speculative passes are cheaper than a linear model predicts.
+- **Every arena must scale with the prefill block.** Fixed-size arenas abort once the block grows; ggml asks and dies rather than returning an error. **`available` in that message is the pool's total size, not the remainder** — read it as the remainder and you go looking at whichever arena was nearly full instead of the one that was too small. Divide `needed` by the tensor size instead: `56,624,208 ≈ 3 × 18,874,368` said "this arena budgeted one and allocated three" immediately. And **`arena_for` doubles its total, which hides an undercount until the block grows enough to eat it** — list every tensor a branch can allocate, for that branch.
+- **V4-Flash has no redundancy left to harvest — four probes, four negatives.** Experts are 9.1% internally negligible; the expert *bank* is full-rank (a rank-512 shared basis holds 20.4% of its energy against **16.6% for random noise**, `bigtea-spectrum`); the router's tail is not small (33.5/20.6/15.0/12.1/10.1/**8.8**%, so 3-of-6 discards 31% of the mass); and a pinned hot set scores 37.5% vs 25.0% random. **3.21 GiB/token is what the model costs, not an artefact.** Do not re-propose factorisation, contextual sparsity, or pinning.
+- **Speculative decoding is ~1.4x here, not 2.2x.** The literature assumes the verify pass costs what a single-token pass costs; here it costs more, because more tokens select more distinct experts (`U(n)≈6·n^0.667`). Below α≈0.75 it is a net *loss*, and the optimum draft is short.
+- **Windows: `.cargo/config.toml` sets `link-self-contained=no`.** MSYS2 gcc 16.1.0 dropped symbols rustup's bundled `crt2.o` still references, so every link fails with "undefined reference" on code that compiles. Do not delete it.
 
 ## Working rules
 
@@ -67,11 +77,14 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 
 **R0 done 2026-08-08** (`routing-skew-is-per-prompt-2026-08-08.md`): the router is genuinely skewed — top-8 takes 5-7x a uniform router — but **the hot set is per-prompt and must be warmed, not pinned.** Pinned from one prompt it covers 61.3% of another on the same subject, 37.5% across subjects, against 25.0% for a *random* cache. This corrected four v0.0.2 figures, killed the "prune the model to its hot set" plan, and reshaped R1.
 
-1. **R0.1 — does prompt routing predict *generated*-token routing?** Gates R1's worth: the answer sits between 1.60 and 7.76 tok/s.
-2. **R1 expert cache**, frequency-gated (the policy in `stream.rs`, never wired into the deepseek4 path). Size from the probe; the cache must own its memory.
-3. **KV cache** — a single-token pass costs 4.0s, which is what a cached step will cost; today each token re-runs the whole sequence. ~33 MB for 43 layers. A wrong cache gives fluent nonsense, so it needs an oracle at two consecutive positions.
-4. **Overlap reads with compute** — 2.3s I/O vs 1.0s compute, strictly serial. Layers 0-2 route by token id, so their experts are knowable before any compute runs.
-5. Then T1-T5 of `lts-0-0-0.md`: `bigtea pull`, quant selection, self-configuration, OpenAI-compatible server, prebuilt binaries.
+**R0.1, R1, R3 done. R5 started** — `bigtea-pull`, `bigtea-serve` (OpenAI-compatible, verified against the live model), release workflow.
+
+**2026-08-10** (`v4flash-has-no-slack-2026-08-10.md`): the byte-reduction roadmap is closed. 20 tok/s needs 79 MB/token; V4-Flash reads 3288. Everything still alive multiplies to **3.1x** against a **42x** gap, and the two ideas that could have closed it were measured and failed. **20 tok/s is not a code problem** — it needs the active weights to stop coming from disk.
+
+1. **The tok/s-versus-RAM frontier for a 144 GB model** — never published by anyone, and only an engine that owns residency can sweep it (`mmap` cannot be told to use exactly N GiB). Answers the product question honestly: *given your machine, the largest model at the speed you want.*
+2. **Overlap reads with compute** — ~53 ms read vs ~23 ms compute per block, ceiling ~1.4x.
+3. **Ring wraparound** to lift the 256-token context ceiling (#46).
+4. Finish R5/T1-T5 of `lts-0-0-0.md`: quant selection, self-configuration, prebuilt binaries.
 
 **No GPU code exists** — `bigtea-probe` detects the card, nothing uses it. A VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer.
 

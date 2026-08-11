@@ -296,6 +296,228 @@ fn dump_routing(log: &[Vec<Vec<u32>>], path: &str) -> std::io::Result<()> {
     out.flush()
 }
 
+/// The experts the **last token of a batch** selected, per layer.
+///
+/// The routing histogram cannot answer R3's question. It aggregates over every
+/// token in the pass, so "did a cached step route the same way as a full
+/// prefill" gets lost in the tokens they share. This records only the final
+/// token's six-of-256, which is the one token both paths end on and therefore
+/// the only fair comparison.
+///
+/// Enabled by `BIGTEA_ROUTING_LAST` so it costs nothing in a normal run.
+static LAST_ROUTING: std::sync::OnceLock<std::sync::Mutex<Vec<Vec<i32>>>> =
+    std::sync::OnceLock::new();
+
+fn last_routing() -> &'static std::sync::Mutex<Vec<Vec<i32>>> {
+    LAST_ROUTING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn record_last_token(il: u32, n_used: usize, ids: &[i32]) {
+    // `ids` is `n_used` per token, token-major, so the final token's selections
+    // are the last `n_used` entries.
+    let Some(tail) = ids.len().checked_sub(n_used) else {
+        return;
+    };
+    let mut log = last_routing().lock().expect("last-token routing");
+    while log.len() <= il as usize {
+        log.push(Vec::new());
+    }
+    log[il as usize] = ids[tail..].to_vec();
+}
+
+/// Per-layer expert ids chosen by the last token of the most recent pass.
+pub fn routing_last_token() -> Vec<Vec<i32>> {
+    last_routing().lock().expect("last-token routing").clone()
+}
+
+/// Forget the recorded selections, so two passes can be compared cleanly.
+pub fn routing_last_token_reset() {
+    last_routing().lock().expect("last-token routing").clear();
+}
+
+/// How the renormalised router weight is spread across the six chosen experts.
+///
+/// # The question it answers
+///
+/// Every selected expert costs the same bytes to stream — 4.2 MiB — but they do
+/// not contribute equally: the output is `Σ w_i · expert_i(x)` with `w`
+/// renormalised over the six. If the top two carry most of the mass, the tail
+/// is being paid for in full and returned at a discount, and **dropping it is a
+/// byte reduction available at every batch size, cache state and RAM budget** —
+/// the only lever measured so far with that property.
+///
+/// Accumulated as `[layer][rank]` sums of the weights sorted descending, plus a
+/// count, so the report is a mean profile rather than one token's accident.
+/// Sorting here rather than trusting selection order is deliberate: `top_k` does
+/// not return indices in score order, and a profile built on that assumption
+/// would look flat for a reason that has nothing to do with the model.
+///
+/// Enabled by `BIGTEA_ROUTING_WEIGHTS`, because reading the weights needs a
+/// `compute()` that would otherwise re-evaluate the ancestor graph for nothing.
+type WeightProfile = (Vec<Vec<f64>>, u64);
+static ROUTING_WEIGHTS: std::sync::OnceLock<std::sync::Mutex<WeightProfile>> =
+    std::sync::OnceLock::new();
+
+fn routing_weights() -> &'static std::sync::Mutex<WeightProfile> {
+    ROUTING_WEIGHTS.get_or_init(|| std::sync::Mutex::new((Vec::new(), 0)))
+}
+
+fn record_routing_weights(il: u32, n_used: usize, weights: &[f32]) {
+    let mut log = routing_weights().lock().expect("routing weights");
+    while log.0.len() <= il as usize {
+        log.0.push(vec![0.0; n_used]);
+    }
+    let mut tokens = 0u64;
+    for row in weights.chunks_exact(n_used) {
+        let mut sorted: Vec<f32> = row.to_vec();
+        sorted.sort_by(|a, b| b.partial_cmp(a).expect("finite router weight"));
+        for (slot, v) in log.0[il as usize].iter_mut().zip(&sorted) {
+            *slot += *v as f64;
+        }
+        tokens += 1;
+    }
+    // Counted once, on the first layer, so the divisor is tokens and not
+    // tokens x layers.
+    if il == 0 {
+        log.1 += tokens;
+    }
+}
+
+/// Print the mean router-weight profile, and what dropping the tail would save.
+///
+/// Prints nothing unless `BIGTEA_ROUTING_WEIGHTS` is set.
+pub fn routing_weight_report(expert_gib_per_token: f64) {
+    if std::env::var("BIGTEA_ROUTING_WEIGHTS").is_err() {
+        return;
+    }
+    let log = routing_weights().lock().expect("routing weights");
+    let (profile, tokens) = (&log.0, log.1);
+    if profile.is_empty() || tokens == 0 {
+        return;
+    }
+    let n_used = profile[0].len();
+    // Mean over layers and tokens: one profile for the model, since the
+    // decision — how many experts to read — is made the same way in every layer.
+    let mut mean = vec![0.0f64; n_used];
+    for layer in profile.iter() {
+        for (m, v) in mean.iter_mut().zip(layer) {
+            *m += v / (tokens as f64 * profile.len() as f64);
+        }
+    }
+    let total: f64 = mean.iter().sum();
+
+    println!();
+    println!(
+        "router weight profile  ({tokens} tokens, {} layers)",
+        profile.len()
+    );
+    println!(
+        "{:>5}  {:>8}  {:>10}  {:>10}  {:>12}",
+        "KEEP", "WEIGHT", "CUMULATIVE", "GiB/token", "SPEEDUP"
+    );
+    let mut acc = 0.0;
+    for (i, w) in mean.iter().enumerate() {
+        acc += w;
+        let keep = i + 1;
+        let gib = expert_gib_per_token * keep as f64 / n_used as f64;
+        println!(
+            "{keep:>5}  {:>7.1}%  {:>9.1}%  {gib:>10.2}  {:>11.2}x",
+            w / total * 100.0,
+            acc / total * 100.0,
+            n_used as f64 / keep as f64
+        );
+    }
+    println!();
+    println!("CUMULATIVE is the share of router weight kept, NOT the share of");
+    println!("output preserved -- a dropped expert's contribution is its weight");
+    println!("times its output, and the outputs are not equal. This bounds the");
+    println!("idea; it does not decide it. Perplexity does.");
+}
+
+/// Attention state that must survive from one forward pass to the next.
+///
+/// # Why this exists
+///
+/// Without it, generating token *n* re-runs the whole prompt: every published
+/// V4-Flash generation figure so far is the cost of re-prefilling the sequence,
+/// not the cost of a token. It is also what makes the expert cache pay — a pass
+/// over 166 tokens reads **122.8 distinct experts per layer (~66 GiB)**, and a
+/// single-token step reads **6 (3.21 GiB)**. Nothing of that size is cacheable
+/// until a step stops re-reading the sequence.
+///
+/// # Three structures, not two
+///
+/// The compressor's input ring is the one that is easy to miss, and missing it
+/// does not fail — it summarises the wrong span, fluently. On a *prefill* the
+/// previous window's rows are inside the batch being processed, so
+/// [`compressor`] can front-pad with `state_rows` zeros and never read a ring.
+/// In incremental decode those rows are in the past, and the zeros would be a
+/// lie.
+///
+/// Roughly 24 MB across 43 layers. Memory is not the constraint here;
+/// correctness is.
+pub struct Deepseek4Cache {
+    /// Raw KV latents, F16, `kv_lora_rank * N_KV` per layer.
+    ///
+    /// **Slot index is the absolute position**, which is what lets the mask stay
+    /// simple arithmetic — and what a ring with wraparound would break, so the
+    /// mask and any future ring must be rewritten together.
+    raw: Vec<Vec<u16>>,
+    /// Compressed summaries, F16, `kv_lora_rank * N_KV` per layer. Slot index is
+    /// the **block** index, not the position.
+    comp: Vec<Vec<u16>>,
+    /// The compressor's input ring, per layer: the last `state_rows` rows of the
+    /// `kv` and `score` projections, interleaved as `(kv, score)`.
+    ///
+    /// **This is the piece that is easy to miss.** On a prefill the previous
+    /// window's rows are inside the batch being processed, so [`compressor`] can
+    /// front-pad `state_rows` zeros and never read a ring — which is why the
+    /// zeros were correct until now. In incremental decode those rows are in the
+    /// past, and the zeros would summarise the wrong span **without failing**.
+    ///
+    /// Sized lazily: `state_rows * wide` depends on whether the layer's
+    /// compressor overlaps, which is a property of the layer.
+    ring: Vec<(Vec<f32>, Vec<f32>)>,
+    /// Whether a layer's compressed half holds anything yet. The compressed
+    /// builders are guarded on this, so the same layer takes a different path
+    /// early in a sequence than later.
+    comp_len: Vec<i64>,
+    /// How many tokens this cache already describes: the absolute position the
+    /// next step occupies.
+    n_past: usize,
+}
+
+impl Deepseek4Cache {
+    pub fn new(n_layer: u32, kv_lora_rank: u32) -> Self {
+        let per_layer = kv_lora_rank as usize * N_KV as usize;
+        Deepseek4Cache {
+            raw: vec![vec![0u16; per_layer]; n_layer as usize],
+            comp: vec![vec![0u16; per_layer]; n_layer as usize],
+            ring: vec![(Vec::new(), Vec::new()); n_layer as usize],
+            comp_len: vec![0; n_layer as usize],
+            n_past: 0,
+        }
+    }
+
+    /// Absolute position the next token will occupy.
+    pub fn n_past(&self) -> usize {
+        self.n_past
+    }
+
+    /// Forget everything, so the same cache can start a new sequence.
+    pub fn clear(&mut self) {
+        for layer in self.raw.iter_mut().chain(self.comp.iter_mut()) {
+            layer.fill(0);
+        }
+        for (kv, sc) in self.ring.iter_mut() {
+            kv.clear();
+            sc.clear();
+        }
+        self.comp_len.fill(0);
+        self.n_past = 0;
+    }
+}
+
 /// One expert tensor's selected slices, packed, with the shape to bind them as.
 ///
 /// The dims are not the tensor's: the last is the number of slices actually
@@ -304,9 +526,20 @@ type ExpertStack = (SkewedBuf, Vec<u64>);
 
 /// Concurrent readers for a layer's expert slices.
 ///
-/// Four, measured: 1.59 GiB/s with one reader, 1.99 with four, and no further
-/// gain at eight. The drive does 2.37 GiB/s sequential.
-const READERS: usize = 4;
+/// Was four, because "no further gain at eight" — which was true, and was an
+/// artefact of all four sharing one **synchronous** file handle, where the OS
+/// serialises reads and the drive never leaves queue depth 1. With a handle per
+/// reader ([`bigtea_model`]'s pool) the curve keeps climbing to eight:
+///
+/// ```text
+/// threads      one shared handle      one handle each
+///       4           2.01 GiB/s             2.65 GiB/s
+///       8           2.05                   2.69
+/// ```
+///
+/// Eight is where the per-handle curve flattens, and it must not exceed the
+/// pool size or two readers would collide on one handle again.
+const READERS: usize = 8;
 
 /// The padded key window each half of the cache occupies.
 const N_KV: i64 = 256;
@@ -316,18 +549,266 @@ const N_KV: i64 = 256;
 /// A constant here was a guess. `compute(&t, 0)` runs on **one** thread — the
 /// count is floored at 1, not defaulted to all cores — so the number has to be
 /// passed explicitly, and once it is passed explicitly it deserves to be
-/// measured rather than assumed. `BIGTEA_THREADS` exists to measure it; the
-/// default is chosen in `bigtea-run`, not here.
+/// measured rather than assumed. `BIGTEA_THREADS` (i.e. `-t`) overrides it.
+///
+/// **Generation and prefill want opposite counts here, exactly as they do on
+/// the dense path.** Both measured on V4-Flash:
+///
+/// ```text
+/// generation (-n 4)      threads      1      2      4      8     20
+///                        tok/s      0.331  0.378  0.380  0.346  0.296
+///
+/// prefill (180 tokens)   threads                   4            20
+///                        tok/s                   2.54          3.27
+/// ```
+///
+/// So a single-token step loses **1.28x** at every core, and a prefill loses
+/// **1.29x** at four. One number cannot serve both, and capping this function
+/// was tried first and would have traded one regression for the other.
+///
+/// A single-token step is a stack of matrix-vector products, and past a handful
+/// of threads the per-node barrier costs more than the work it splits.
+/// Qwen3-30B-A3B is the extreme case at **2.4x**, where the expert matmuls want
+/// exactly one thread. A prefill block multiplies many columns at once and
+/// scales with cores.
+///
+/// **This retires a claim that was in `CLAUDE.md`**: "4/12/20 threads all cost
+/// the same on a V4-Flash prefill". That held at 5 tokens, where the pass is
+/// almost entirely disk. At 180 it is 2.54 against 3.27.
+/// Both counts are resolved **once**. `threads()` is called at every
+/// `ctx.compute`, which is thousands of times per token, and the first version
+/// of this split called `std::env::var` on each one — that locks the process
+/// environment and allocates a `String`. It cost more than the split saved:
+/// generation went to 0.267 tok/s, *below* the 0.296 it was meant to fix. The
+/// per-call work is now an atomic load and a branch.
 fn threads() -> usize {
     use std::sync::OnceLock;
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("BIGTEA_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&t: &usize| t > 0)
-            .unwrap_or(12)
-    })
+    static GEN: OnceLock<usize> = OnceLock::new();
+    static BAT: OnceLock<usize> = OnceLock::new();
+    if BATCH.load(std::sync::atomic::Ordering::Relaxed) > 1 {
+        *BAT.get_or_init(|| env_threads("BIGTEA_THREADS_BATCH").unwrap_or_else(all_cores))
+    } else {
+        // Cap at 4: the dense path measures its own peak per model with
+        // `ThreadTuner`, and this file has no equivalent, so it takes the shape
+        // of the curve rather than its exact peak. Erring low is cheap here —
+        // one thread costs 13% — and erring high cost 1.28x.
+        *GEN.get_or_init(|| env_threads("BIGTEA_THREADS").unwrap_or_else(|| all_cores().min(4)))
+    }
+}
+
+/// Tokens in the pass currently being evaluated, set once by [`forward`].
+///
+/// The alternative is threading `n_tokens` through ten call sites across as
+/// many functions, none of which otherwise care. This engine evaluates one pass
+/// at a time — `bigtea-serve` serialises requests because the model has one KV
+/// cache — so a process-wide value is accurate rather than merely convenient.
+static BATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+fn all_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+}
+
+fn env_threads(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&t| t > 0)
+}
+
+/// The dense tensors it is **safe** to rearrange, named one at a time.
+///
+/// # Why this is an allow-list and not an exclusion list
+///
+/// The dense path excludes three known-bad uses and repacks the rest, which is
+/// right there because a new tensor arriving in a llama-family container is
+/// almost certainly an ordinary `mul_mat` weight. Here the default has to be
+/// the other way round.
+///
+/// Repacking interleaves rows. Every use except "first operand of `mul_mat`,
+/// two-dimensional" reads the bytes by position — and **not one of them
+/// fails**: `get_rows` returns the wrong row, a `view_1d` at a byte offset
+/// returns the wrong slice, a `reshape_3d` cuts the matrix in the wrong places.
+/// All three produce numbers, and numbers become fluent text. This
+/// architecture's graph has four such uses among twenty-odd tensors, so
+/// guessing from the name would be wrong roughly a fifth of the time, silently.
+///
+/// The audit behind the list, by what each tensor is actually passed to:
+///
+/// | tensor | use | repack |
+/// |---|---|---|
+/// | `token_embd` | `get_rows` by token id | **no** |
+/// | `attn_compressor_ape` | `get_rows` by within-block position | **no** |
+/// | `ffn_gate_tid2eid` | `get_rows` by token id | **no** |
+/// | `*_hc_scale`, `*_hc_base` | `view_1d` at a byte offset | **no** |
+/// | `attn_output_a` | `reshape_3d` into a grouped `mul_mat` | **no** |
+/// | `attn_sinks` | sinks argument of `flash_attn_ext` | **no** |
+/// | `*_norm` | `mul`, elementwise | no — and F32, so nothing to pack |
+/// | `blk.*.ffn_*_exps` | **routed, streamed from disk** | **never** |
+/// | the fourteen below | `mul_mat(w, x)`, 2-D | **yes** |
+///
+/// The routed experts are the load-bearing exclusion. They are bound zero-copy
+/// from a pointer into the mapped container, one slice at a time, and never go
+/// near [`bind_dense`] — that is what lets a 144 GB model run on a 15.7 GiB
+/// machine at all. Repacking them would need the whole bank in RAM, which is
+/// the thing this engine exists to avoid.
+const REPACKABLE_DENSE: [&str; 14] = [
+    "hc_attn_fn",
+    "hc_ffn_fn",
+    "attn_q_a",
+    "attn_q_b",
+    "attn_kv",
+    // `attn_output_a` is deliberately absent — see the table above.
+    "attn_output_b",
+    "ffn_gate_inp",
+    "ffn_gate_shexp",
+    "ffn_up_shexp",
+    "ffn_down_shexp",
+    "attn_compressor_kv",
+    "attn_compressor_gate",
+    "output_hc_fn",
+    "output",
+];
+
+/// Whether `name` is one of the tensors [`REPACKABLE_DENSE`] allows.
+///
+/// Matches the suffix after the block prefix, so `blk.7.attn_kv.weight` and the
+/// un-prefixed `output.weight` are both recognised — and
+/// `blk.7.attn_kv_a_norm.weight` is not, because the comparison is on the whole
+/// suffix rather than a prefix of it.
+fn is_repackable_dense(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".weight") else {
+        return false;
+    };
+    let suffix = match stem.strip_prefix("blk.") {
+        Some(rest) => match rest.split_once('.') {
+            Some((n, suffix)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => suffix,
+            _ => return false,
+        },
+        None => stem,
+    };
+    REPACKABLE_DENSE.contains(&suffix)
+}
+
+/// Always-read weights rearranged into the CPU kernels' layout, once, at load.
+///
+/// # Why this is not simply `bind_repacked` inside [`bind_dense`]
+///
+/// Repacking is worth **1.42x on prefill** on the dense path, where
+/// `load_resident` builds one `WeightSet` that lives for the session. V4-Flash
+/// owns an arena **per block** — chaining 43 blocks into one `ggml` context
+/// costs hundreds of megabytes each — so it builds a fresh context and a fresh
+/// `WeightSet` for every block of every pass. Rearranging inside that loop
+/// would re-do the whole always-read set 43 times per token: not a smaller win,
+/// a large loss.
+///
+/// So the rearrangement happens once, here, and each block binds the result by
+/// pointing a fresh tensor at bytes that are already in the right order.
+///
+/// # Why only tensors that are already resident
+///
+/// The rearranged copy lives in memory this process owns. Repacking a tensor
+/// that was **not** resident would quietly spend RAM the residency budget had
+/// already decided it did not have — and that budget exists because
+/// over-committing makes the OS swap, which is slower than the streaming it
+/// replaces.
+///
+/// For one that *is* resident the exchange is even: the original is taken out
+/// of the set and dropped as soon as the rearranged copy exists, so the peak is
+/// one tensor rather than a second whole set.
+pub struct RepackedDense {
+    tensors: std::collections::HashMap<String, std::sync::Arc<bigtea_ggml::Repacked>>,
+    bytes: usize,
+    declined: usize,
+}
+
+impl RepackedDense {
+    /// Rearrange every resident tensor the allow-list permits.
+    ///
+    /// Takes each one out of `resident` as it goes, so the two copies never
+    /// coexist beyond the tensor being converted. `BIGTEA_NO_REPACK` returns an
+    /// empty set, which is the same switch the dense path reads.
+    pub fn build(resident: &mut ResidentSet, model: &Model) -> Result<Self> {
+        let mut tensors = std::collections::HashMap::new();
+        let mut bytes = 0usize;
+        let mut declined = 0usize;
+        if std::env::var("BIGTEA_NO_REPACK").is_ok() {
+            return Ok(RepackedDense {
+                tensors,
+                bytes,
+                declined,
+            });
+        }
+        // Only what is actually in RAM is a candidate, so the set walks itself.
+        let names = resident.names();
+        for name in &names {
+            if !is_repackable_dense(name) {
+                continue;
+            }
+            let Some(loc) = model.location(name) else {
+                continue;
+            };
+            let (ty, dims) = (loc.ty, loc.dims.clone());
+            let (ne0, ne1) = match dims.as_slice() {
+                [a] => (*a as i64, 1i64),
+                [a, b] => (*a as i64, *b as i64),
+                // Nothing in the allow-list is higher rank, and guessing how to
+                // flatten one would be exactly the silent mistake the list is
+                // here to prevent.
+                _ => continue,
+            };
+            if !bigtea_ggml::is_repackable(ty, ne0, ne1) {
+                continue;
+            }
+            // Only if it is already in RAM — see the type's docs.
+            let Some(original) = resident.take(name) else {
+                continue;
+            };
+            match bigtea_ggml::Repacked::new(ty, ne0, ne1, &original[..]) {
+                Ok(Some(repacked)) => {
+                    bytes += repacked.bytes();
+                    tensors.insert(name.clone(), std::sync::Arc::new(repacked));
+                    // `original` is dropped here: the rearranged bytes replace
+                    // it, and holding both is what this design exists to avoid.
+                    drop(original);
+                }
+                // ggml declined after the shape check said it might not. Put it
+                // back rather than leaving it to stream from disk every token.
+                Ok(None) => {
+                    declined += 1;
+                    resident.put_back(name.clone(), original);
+                }
+                Err(e) => {
+                    resident.put_back(name.clone(), original);
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(RepackedDense {
+            tensors,
+            bytes,
+            declined,
+        })
+    }
+
+    fn get(&self, name: &str) -> Option<std::sync::Arc<bigtea_ggml::Repacked>> {
+        self.tensors.get(name).cloned()
+    }
+
+    /// How many tensors were rearranged, the bytes they hold, and how many
+    /// `ggml` declined after the shape check said it might not.
+    pub fn stats(&self) -> (usize, usize, usize) {
+        (self.tensors.len(), self.bytes, self.declined)
+    }
+
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
 }
 
 /// One block's forward pass, and the state it threads.
@@ -338,6 +819,10 @@ pub struct Deepseek4Forward<'m> {
     /// is correct but costs 23% of a prefill and would cost it again on every
     /// generated token.
     resident: Option<&'m ResidentSet>,
+    /// Always-read weights already rearranged into the CPU kernels' layout.
+    /// Consulted **before** `resident`, because a repacked tensor was taken out
+    /// of that set and only exists here.
+    repacked: Option<&'m RepackedDense>,
     /// Routed expert slices held across blocks and tokens. `None` streams every
     /// slice from disk on every use.
     ///
@@ -353,6 +838,7 @@ impl<'m> Deepseek4Forward<'m> {
             model,
             config,
             resident: None,
+            repacked: None,
             cache: None,
         }
     }
@@ -360,6 +846,17 @@ impl<'m> Deepseek4Forward<'m> {
     /// Serve always-read weights from `resident` instead of from disk.
     pub fn with_resident(mut self, resident: &'m ResidentSet) -> Self {
         self.resident = Some(resident);
+        self
+    }
+
+    /// Serve the tensors in `repacked` from their rearranged copies.
+    ///
+    /// Must be the same [`RepackedDense`] that was built from this forward's
+    /// `ResidentSet`: `build` **removes** what it rearranges, so without this
+    /// those tensors would fall back to streaming from disk on every block of
+    /// every token — correct, and far slower than not repacking at all.
+    pub fn with_repacked(mut self, repacked: &'m RepackedDense) -> Self {
+        self.repacked = Some(repacked);
         self
     }
 
@@ -602,6 +1099,7 @@ fn q_and_kv<'c>(
     il: u32,
     attn_norm: &Tensor<'c>,
     nt: i64,
+    pos0: i64,
 ) -> Result<(Tensor<'c>, Tensor<'c>)> {
     let config = &fw.config;
     let head = config.kv_lora_rank as i64;
@@ -612,8 +1110,11 @@ fn q_and_kv<'c>(
     let hs = head as usize * f32_size;
     let (rope, rope_orig) = fw.rope(il);
 
+    // Absolute positions. RoPE is applied *before* a value enters the cache, so
+    // a cached entry must never be rotated again — which is why this is the
+    // token's real position and not its index within the batch.
     let pos = ctx.new_i32_1d(nt)?;
-    pos.set_i32(&(0..nt as i32).collect::<Vec<i32>>())?;
+    pos.set_i32(&(pos0 as i32..(pos0 + nt) as i32).collect::<Vec<i32>>())?;
 
     let qr = ctx.mul_mat(
         weights
@@ -688,6 +1189,93 @@ fn q_and_kv<'c>(
     Ok((q_full, kv_full))
 }
 
+/// What one pass through a compressed layer produces:
+/// `(ring kv before this batch, ring score before, this batch's kv, its score)`.
+///
+/// The "before" halves are what the batch front-pads with; returning them rather
+/// than re-reading the cache is what stops a batch summarising itself.
+type CompressorRows = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// The `kv` and `score` projections a compressed layer needs, and the ring slide.
+///
+/// Split out of [`compressor`] because it must run on **every** pass through a
+/// compressed layer, while the summary itself is only built when a block
+/// completes. A step that completes no block still contributes its row to the
+/// window that the *next* completed block will summarise; skipping it would
+/// leave a hole in the ring, and a hole does not fail — it summarises the wrong
+/// span.
+///
+/// Returns the ring contents *as they were before this batch*, because that is
+/// what the batch must front-pad with. Sliding first and reading second would
+/// let a batch summarise itself.
+#[allow(clippy::too_many_arguments)]
+fn compressor_project<'c>(
+    fw: &Deepseek4Forward<'_>,
+    ctx: &'c Context,
+    weights: &WeightSet<'c>,
+    il: u32,
+    attn_norm: &Tensor<'c>,
+    nt: i64,
+    pos0: i64,
+    overlap: bool,
+    cache: &mut Deepseek4Cache,
+) -> Result<CompressorRows> {
+    let config = &fw.config;
+    let head = config.kv_lora_rank as i64;
+    let ratio = config.compress_block(il).expect("compressed layer");
+    let wide = if overlap { 2 * head } else { head };
+    let state_rows = if overlap { 8 } else { ratio };
+
+    let kv = ctx.mul_mat(
+        weights
+            .get(&format!("blk.{il}.attn_compressor_kv.weight"))
+            .expect("bound"),
+        attn_norm,
+    )?;
+    let score = ctx.mul_mat(
+        weights
+            .get(&format!("blk.{il}.attn_compressor_gate.weight"))
+            .expect("bound"),
+        attn_norm,
+    )?;
+    // The gate's position embedding is indexed by the token's offset *within its
+    // block*: `(pos0 + p) % ratio`, which equals `p % ratio` only at pos0 = 0.
+    let pos_t = ctx.new_i32_1d(nt)?;
+    pos_t.set_i32(
+        &(0..nt)
+            .map(|p| ((pos0 + p) % ratio) as i32)
+            .collect::<Vec<i32>>(),
+    )?;
+    let ape = ctx.get_rows(
+        weights
+            .get(&format!("blk.{il}.attn_compressor_ape.weight"))
+            .expect("bound"),
+        &pos_t,
+    )?;
+    let score = ctx.add(&score, &ape)?;
+    ctx.compute(&kv, threads())?;
+    ctx.compute(&score, threads())?;
+
+    let kv_vals = kv.to_vec_f32();
+    let score_vals = score.to_vec_f32();
+
+    let (ring_kv, ring_sc) = &mut cache.ring[il as usize];
+    let prev_kv = ring_kv.clone();
+    let prev_sc = ring_sc.clone();
+
+    ring_kv.extend_from_slice(&kv_vals);
+    ring_sc.extend_from_slice(&score_vals);
+    let keep = (state_rows * wide) as usize;
+    if ring_kv.len() > keep {
+        ring_kv.drain(..ring_kv.len() - keep);
+    }
+    if ring_sc.len() > keep {
+        ring_sc.drain(..ring_sc.len() - keep);
+    }
+
+    Ok((prev_kv, prev_sc, kv_vals, score_vals))
+}
+
 /// The overlap compressor (CSA) or the plain one (HCA), for a prefill.
 ///
 /// Both summarise completed blocks of raw KV into one entry each. They differ
@@ -712,52 +1300,41 @@ fn compressor<'c>(
     il: u32,
     attn_norm: &Tensor<'c>,
     nt: i64,
+    pos0: i64,
     overlap: bool,
+    cache: &mut Deepseek4Cache,
 ) -> Result<Tensor<'c>> {
     let config = &fw.config;
     let head = config.kv_lora_rank as i64;
     let ratio = config.compress_block(il).expect("compressed layer");
-    let n_blocks = nt / ratio;
+    // Blocks are absolute. `b0` is the first block this batch completes and `b1`
+    // one past the last; at pos0 = 0 that is `0..nt / ratio`, exactly what this
+    // used to compute. A step summarises only the block it finishes, and the
+    // rows of that block come partly from the ring and partly from the batch.
+    let b0 = pos0 / ratio;
+    let b1 = (pos0 + nt) / ratio;
+    let n_blocks = b1 - b0;
     let wide = if overlap { 2 * head } else { head };
     let n_read = ratio * n_blocks;
     let state_rows = if overlap { 8 } else { ratio };
 
-    let kv = ctx.mul_mat(
-        weights
-            .get(&format!("blk.{il}.attn_compressor_kv.weight"))
-            .expect("bound"),
-        attn_norm,
-    )?;
-    let score = ctx.mul_mat(
-        weights
-            .get(&format!("blk.{il}.attn_compressor_gate.weight"))
-            .expect("bound"),
-        attn_norm,
-    )?;
-    // The gate's position embedding is indexed by the token's offset *within its
-    // block*, not by its absolute position.
-    let pos_t = ctx.new_i32_1d(nt)?;
-    pos_t.set_i32(&(0..nt).map(|p| (p % ratio) as i32).collect::<Vec<i32>>())?;
-    let ape = ctx.get_rows(
-        weights
-            .get(&format!("blk.{il}.attn_compressor_ape.weight"))
-            .expect("bound"),
-        &pos_t,
-    )?;
-    let score = ctx.add(&score, &ape)?;
-    ctx.compute(&kv, threads())?;
-    ctx.compute(&score, threads())?;
+    let (prev_kv, prev_sc, kv_vals, score_vals) =
+        compressor_project(fw, ctx, weights, il, attn_norm, nt, pos0, overlap, cache)?;
 
     let pad = if overlap { 1 } else { 0 };
     let total = state_rows + nt + pad;
-    let kv_vals = kv.to_vec_f32();
-    let score_vals = score.to_vec_f32();
-    let mut kv_buf = vec![0.0f32; (state_rows * wide) as usize];
+    // Front-pad from the ring. At pos0 == 0 the ring is empty and this is the
+    // block of zeros the verified prefill path has always used, so prefill stays
+    // bit-identical; past that, these are the real preceding rows.
+    let need = (state_rows * wide) as usize;
+    let mut kv_buf = vec![0.0f32; need.saturating_sub(prev_kv.len())];
+    kv_buf.extend_from_slice(&prev_kv);
     kv_buf.extend_from_slice(&kv_vals);
     kv_buf.extend(std::iter::repeat_n(0.0f32, (pad * wide) as usize));
     let kv_state = ctx.new_f32_2d(wide, total)?;
     kv_state.set_f32(&kv_buf)?;
-    let mut sc_buf = vec![0.0f32; (state_rows * wide) as usize];
+    let mut sc_buf = vec![0.0f32; need.saturating_sub(prev_sc.len())];
+    sc_buf.extend_from_slice(&prev_sc);
     sc_buf.extend_from_slice(&score_vals);
     // -inf so the softmax ignores the padding rather than averaging it in.
     sc_buf.extend(std::iter::repeat_n(
@@ -768,24 +1345,33 @@ fn compressor<'c>(
     score_state.set_f32(&sc_buf)?;
 
     let zero_row = (state_rows + nt) as i32;
+    // The combined buffer is `state_rows` ring rows followed by this batch, so
+    // absolute position `q` sits at `state_rows + (q - pos0)`. That is only
+    // `state_rows + q` when pos0 is zero.
+    //
+    // The reach backwards is what fixes `state_rows`: the overlap half of block
+    // `b0` reads from `b0 * ratio - ratio`, and with `b0 * ratio >= pos0 - ratio
+    // + 1` that is at worst `pos0 - 2 * ratio + 1` — which is why 8 rows are kept
+    // for a ratio of 4, and why a smaller ring would read past the front.
+    let row_of = |q: i64| (state_rows + q - pos0) as i32;
     let mut idxs: Vec<i32> = Vec::new();
     if overlap {
-        for b in 0..n_blocks {
+        for b in b0..b1 {
             for j in 0..ratio {
                 let p = b * ratio - ratio + j;
-                idxs.push(if p < 0 {
-                    zero_row
-                } else {
-                    (state_rows + p) as i32
-                });
+                idxs.push(if p < 0 { zero_row } else { row_of(p) });
             }
         }
     }
-    for b in 0..n_blocks {
+    for b in b0..b1 {
         for j in 0..ratio {
-            idxs.push((state_rows + b * ratio + j) as i32);
+            idxs.push(row_of(b * ratio + j));
         }
     }
+    debug_assert!(
+        idxs.iter().all(|&i| i >= 0 && i <= zero_row),
+        "compressor gathered outside the ring+batch buffer: pos0 {pos0}, blocks          {b0}..{b1}, state_rows {state_rows}"
+    );
     let idx_t = ctx.new_i32_1d(idxs.len() as i64)?;
     idx_t.set_i32(&idxs)?;
 
@@ -844,11 +1430,7 @@ fn compressor<'c>(
         n_nope as usize * f32_size,
     )?;
     let comp_pos = ctx.new_i32_1d(n_blocks)?;
-    comp_pos.set_i32(
-        &(0..n_blocks)
-            .map(|b| (b * ratio) as i32)
-            .collect::<Vec<i32>>(),
-    )?;
+    comp_pos.set_i32(&(b0..b1).map(|b| (b * ratio) as i32).collect::<Vec<i32>>())?;
     let (rope, rope_orig) = fw.rope(il);
     let pe = ctx.rope_ext(
         &pe_in,
@@ -886,6 +1468,9 @@ fn attention<'c>(
     kv_full: &Tensor<'c>,
     comp: Option<&Tensor<'c>>,
     nt: i64,
+    pos0: i64,
+    comp_block0: i64,
+    cache: &mut Deepseek4Cache,
 ) -> Result<Tensor<'c>> {
     let config = &fw.config;
     let head = config.kv_lora_rank as i64;
@@ -895,36 +1480,61 @@ fn attention<'c>(
     let n_nope = config.n_rot_none() as i64;
     let f32_size = std::mem::size_of::<f32>();
 
+    // Write this batch's latents into the persistent cache at their absolute
+    // slots, then attend over the whole of it. A prefill starts at slot 0 and
+    // fills 0..nt; a step at position p writes one row at p and reads 0..=p.
+    // **There is deliberately no separate uncached path**: a `pos0 == 0` branch
+    // that every existing test took would leave the incremental one unexercised,
+    // and a wrong cache here returns fluent nonsense rather than an error.
     let kv_vals = kv_full.to_vec_f32();
-    let mut cache = vec![0u16; (head * N_KV) as usize];
-    bigtea_ggml::f32_to_f16(&kv_vals, &mut cache[..kv_vals.len()]);
-    let n_kv = match comp {
-        None => N_KV,
-        Some(c) => {
-            let cv = c.to_vec_f32();
-            let mut ch = vec![0u16; (head * N_KV) as usize];
-            bigtea_ggml::f32_to_f16(&cv, &mut ch[..cv.len()]);
-            cache.extend_from_slice(&ch);
-            2 * N_KV
-        }
+    let raw = &mut cache.raw[il as usize];
+    let at = (pos0 * head) as usize;
+    bigtea_ggml::f32_to_f16(&kv_vals, &mut raw[at..at + kv_vals.len()]);
+
+    let mut packed: Vec<u16> = raw.clone();
+    if let Some(c) = comp {
+        // The compressor returns only the blocks **this batch completed**, so
+        // they append at their absolute index. Writing them from block 0 —
+        // which was right while every pass started at position 0 — would make
+        // a step overwrite the sequence's history with its own single block.
+        let cv = c.to_vec_f32();
+        let store = &mut cache.comp[il as usize];
+        let at = (comp_block0 * head) as usize;
+        bigtea_ggml::f32_to_f16(&cv, &mut store[at..at + cv.len()]);
+        cache.comp_len[il as usize] = comp_block0 + cv.len() as i64 / head;
+    }
+
+    // The compressed half is present whenever the **sequence** has summaries, not
+    // only when this batch produced some. Three steps in four complete no block,
+    // and attending over the raw window alone on those would discard everything
+    // the sequence had already compressed — silently, and only on the cached path.
+    let has_comp = cache.comp_len[il as usize] > 0;
+    let n_kv = if has_comp {
+        packed.extend_from_slice(&cache.comp[il as usize]);
+        2 * N_KV
+    } else {
+        N_KV
     };
     let k = ctx.new_f16_3d(head, n_kv, 1)?;
-    let bytes: Vec<u8> = cache.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let bytes: Vec<u8> = packed.iter().flat_map(|h| h.to_le_bytes()).collect();
     k.set_bytes(&bytes)?;
 
     let ratio = config.compress_block(il).unwrap_or(1);
     let window = config.sliding_window as i64;
     let mut mask = vec![0u8; (n_kv * nt) as usize * 2];
     for query in 0..nt {
+        // The key axis is indexed by absolute position, so the query must be too
+        // — otherwise a step at position 40 would mask everything before it.
+        let q_abs = pos0 + query;
         let row = (query * n_kv) as usize * 2;
         for key in 0..N_KV {
-            if key > query || (window > 0 && query - key >= window) {
+            if key > q_abs || (window > 0 && q_abs - key >= window) {
                 let at = row + key as usize * 2;
                 mask[at..at + 2].copy_from_slice(&F16_NEG_INF);
             }
         }
-        if comp.is_some() {
-            for blk in ((query + 1) / ratio)..N_KV {
+        if has_comp {
+            for blk in ((q_abs + 1) / ratio)..N_KV {
                 let at = row + (N_KV + blk) as usize * 2;
                 mask[at..at + 2].copy_from_slice(&F16_NEG_INF);
             }
@@ -955,7 +1565,7 @@ fn attention<'c>(
         n_nope as usize * f32_size,
     )?;
     let pos = ctx.new_i32_1d(nt)?;
-    pos.set_i32(&(0..nt as i32).collect::<Vec<i32>>())?;
+    pos.set_i32(&(pos0 as i32..(pos0 + nt) as i32).collect::<Vec<i32>>())?;
     let (rope, rope_orig) = fw.rope(il);
     let o_pe = ctx.rope_ext_back(
         &o_pe_in,
@@ -1092,6 +1702,9 @@ fn moe_routing<'c>(
     if std::env::var("BIGTEA_ROUTING").is_ok() {
         record_routing(il, n_expert as usize, &ids);
     }
+    if std::env::var("BIGTEA_ROUTING_LAST").is_ok() {
+        record_last_token(il, n_used as usize, &ids);
+    }
 
     // Renormalised over the selected six only, then scaled. The divisor is
     // clamped at the smallest F16 normal, not at an epsilon.
@@ -1099,6 +1712,10 @@ fn moe_routing<'c>(
     let w2 = ctx.reshape_2d(&w, n_used, nt)?;
     let sum = ctx.clamp(&ctx.sum_rows(&w2)?, 6.103_515_6e-5, f32::INFINITY)?;
     let w_norm = ctx.div(&w2, &sum)?;
+    if std::env::var("BIGTEA_ROUTING_WEIGHTS").is_ok() {
+        ctx.compute(&w_norm, threads())?;
+        record_routing_weights(il, n_used as usize, &w_norm.to_vec_f32());
+    }
     let w3 = ctx.reshape_3d(&w_norm, 1, n_used, nt)?;
     let w_scaled = ctx.scale(&w3, config.expert_weights_scale)?;
     Ok((w_scaled, ids))
@@ -1212,8 +1829,10 @@ fn read_expert_slices(
         }
     }
 
-    // Hand each reader disjoint destination spans. Positioned reads carry their
-    // own offset, so concurrent reads through one handle need no locking.
+    // Hand each reader disjoint destination spans *and its own file handle*.
+    // Positioned reads need no locking in this code, but a synchronous handle is
+    // serialised by the OS, so sharing one would leave the drive at queue depth
+    // 1 no matter how many threads are spawned.
     let mut slots: Vec<Vec<(&Job, &mut [u8])>> = (0..READERS).map(|_| Vec::new()).collect();
     let mut cursors: Vec<&mut [u8]> = buffers.iter_mut().map(|(b, _)| &mut b[..]).collect();
     for (j, job) in jobs.iter().enumerate() {
@@ -1226,13 +1845,19 @@ fn read_expert_slices(
     let copied: usize = std::thread::scope(|scope| {
         let handles: Vec<_> = slots
             .into_iter()
-            .map(|work| {
+            .enumerate()
+            .map(|(slot, work)| {
                 scope.spawn(move || {
                     let mut copied = 0usize;
                     for (job, dst) in work {
                         match &job.src {
                             Src::Disk { offset } => {
-                                copied += model.read_range_into(&names[job.name], *offset, dst)?;
+                                copied += model.read_range_into_via(
+                                    &names[job.name],
+                                    *offset,
+                                    dst,
+                                    slot,
+                                )?;
                             }
                             Src::Memory(bytes) => dst.copy_from_slice(bytes),
                         }
@@ -1460,20 +2085,103 @@ fn bind_dense<'c>(
     wctx: &'c Context,
     weights: &mut WeightSet<'c>,
     name: &str,
+    prefetched: &std::collections::HashMap<String, std::sync::Arc<SkewedBuf>>,
 ) -> Result<u64> {
     let loc = fw.model.location(name).expect("present").clone();
-    match fw.resident.and_then(|r| r.get_shared(name)) {
-        Some(shared) => {
-            weights.bind_shared(wctx, name, loc.ty, &loc.dims, shared)?;
-            Ok(0)
-        }
-        None => {
-            let data = fw.model.read_tensor_shared(name)?;
-            let n = data.len() as u64;
-            weights.bind_shared(wctx, name, loc.ty, &loc.dims, data)?;
-            Ok(n)
-        }
+    // Repacked first. `RepackedDense::build` takes what it rearranges out of
+    // the resident set, so for those tensors this is the only place the bytes
+    // exist — checking residency first would find nothing and stream from disk.
+    if let Some(repacked) = fw.repacked.and_then(|r| r.get(name)) {
+        weights.bind_repacked_shared(wctx, name, repacked)?;
+        return Ok(0);
     }
+    if let Some(shared) = fw.resident.and_then(|r| r.get_shared(name)) {
+        weights.bind_shared(wctx, name, loc.ty, &loc.dims, shared)?;
+        return Ok(0);
+    }
+    // Read by `prefetch_dense` on several handles at once; falling back here
+    // keeps the function correct if the prefetch was skipped or failed.
+    let data = match prefetched.get(name) {
+        Some(d) => d.clone(),
+        None => fw.model.read_tensor_shared(name)?,
+    };
+    let n = data.len() as u64;
+    weights.bind_shared(wctx, name, loc.ty, &loc.dims, data)?;
+    Ok(n)
+}
+
+/// Read a block's non-resident always-read tensors in parallel, before binding.
+///
+/// # Why this is separate from binding
+///
+/// When the always-read set does not fit, every one of these is re-read on every
+/// token — 147 MiB per block, **2.1 s per token** measured on a machine 3.1 GiB
+/// short. That path read one tensor at a time through one file handle, which is
+/// the worst case for an NVMe: serialised by the OS *and* at queue depth 1.
+///
+/// Binding cannot be parallelised — `ggml` contexts are not thread-safe and the
+/// graph must be built in order — but reading can. So the reads are hoisted out,
+/// spread across the shard's handle pool, and the bind loop that follows finds
+/// its bytes already in memory.
+///
+/// Resident tensors are skipped entirely: `get_shared` is a refcount bump, and
+/// prefetching them would read what is already in RAM.
+fn prefetch_dense(
+    fw: &Deepseek4Forward<'_>,
+    names: &[String],
+) -> Result<std::collections::HashMap<String, std::sync::Arc<SkewedBuf>>> {
+    let missing: Vec<&String> = names
+        .iter()
+        .filter(|n| {
+            // A repacked tensor is in RAM too — it is simply held elsewhere,
+            // having been taken out of the resident set. Without this it would
+            // look absent and be re-read from disk on every block of every
+            // token, which is the exact cost repacking was meant to avoid.
+            fw.repacked.and_then(|r| r.get(n)).is_none()
+                && fw.resident.and_then(|r| r.get_shared(n)).is_none()
+        })
+        .collect();
+    if missing.len() < 2 {
+        // One tensor has nothing to overlap with, and the common case — a fully
+        // resident set — has none at all.
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let model = fw.model;
+    let chunks: Vec<Vec<&String>> = (0..READERS)
+        .map(|s| {
+            missing
+                .iter()
+                .skip(s)
+                .step_by(READERS)
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let out = std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .enumerate()
+            .map(|(slot, work)| {
+                scope.spawn(move || {
+                    let mut got = Vec::with_capacity(work.len());
+                    for name in work {
+                        let loc = model.location(name).expect("present");
+                        let mut buf =
+                            SkewedBuf::new(loc.size as usize, SkewedBuf::skew_for(loc.file_offset));
+                        model.read_range_into_via(name, 0, &mut buf[..], slot)?;
+                        got.push((name.clone(), std::sync::Arc::new(buf)));
+                    }
+                    Ok::<_, crate::ArchError>(got)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("dense prefetch thread did not panic"))
+            .collect::<Result<Vec<_>>>()
+    })?;
+    Ok(out.into_iter().flatten().collect())
 }
 
 /// One whole block, in its own arena, streams in and streams out as floats.
@@ -1484,8 +2192,10 @@ fn bind_dense<'c>(
 /// through its sources, so a dropped buffer reads freed memory successfully.
 pub fn block(
     fw: &Deepseek4Forward<'_>,
+    cache: &mut Deepseek4Cache,
     il: u32,
     tokens: &[i32],
+    pos0: i64,
     streams_in: Option<&[f32]>,
     arena: usize,
 ) -> Result<Streams> {
@@ -1502,9 +2212,10 @@ pub fn block(
         names.push("token_embd.weight".to_string());
     }
     let t_bind = std::time::Instant::now();
+    let prefetched = prefetch_dense(fw, &names)?;
     let mut dense_bytes = 0u64;
     for name in &names {
-        dense_bytes += bind_dense(fw, &wctx, &mut weights, name)?;
+        dense_bytes += bind_dense(fw, &wctx, &mut weights, name, &prefetched)?;
     }
     let dense_secs = t_bind.elapsed().as_secs_f64();
 
@@ -1519,25 +2230,63 @@ pub fn block(
 
     let t_phase = std::time::Instant::now();
     let e = entry(fw, &ctx, &weights, il, streams, nt)?;
-    let (q, kv) = q_and_kv(fw, &ctx, &weights, il, &e.attn_norm, nt)?;
+    let (q, kv) = q_and_kv(fw, &ctx, &weights, il, &e.attn_norm, nt, pos0)?;
     let qkv_secs = t_phase.elapsed().as_secs_f64();
 
     // Which attention runs is decided by the block's compression ratio *and*
     // whether a block has completed yet: below the first boundary a compressed
     // layer falls back to Raw, exactly as llama.cpp's guards do.
     let kind = config.attention_kind_from_ratio(il).expect("known ratio");
-    let fired = config.compress_block(il).is_some_and(|r| nt / r > 0);
+    // "Does this batch complete a block?" — absolute, not relative. `nt / r` is
+    // zero for any single-token step, so a step would never build a summary and,
+    // worse, would tell `attention` there was no compressed half at all.
+    let fired = config
+        .compress_block(il)
+        .is_some_and(|r| (pos0 + nt) / r > pos0 / r);
+    // The compressor front-pads `state_rows` zeros in place of a persistent ring,
+    // which is exact only while the previous window is inside this batch. On an
+    // incremental step it is in the past, and those zeros would summarise the
+    // wrong span **without failing**. Refuse rather than return fluent nonsense;
+    // the ring is the next piece of R3.
     let comp = match (kind, fired) {
         (AttentionKind::Raw, _) | (_, false) => None,
-        (AttentionKind::CompressedSparse, true) => {
-            Some(compressor(fw, &ctx, &weights, il, &e.attn_norm, nt, true)?)
-        }
-        (AttentionKind::HeavilyCompressed, true) => {
-            Some(compressor(fw, &ctx, &weights, il, &e.attn_norm, nt, false)?)
-        }
+        (AttentionKind::CompressedSparse, true) => Some(compressor(
+            fw,
+            &ctx,
+            &weights,
+            il,
+            &e.attn_norm,
+            nt,
+            pos0,
+            true,
+            cache,
+        )?),
+        (AttentionKind::HeavilyCompressed, true) => Some(compressor(
+            fw,
+            &ctx,
+            &weights,
+            il,
+            &e.attn_norm,
+            nt,
+            pos0,
+            false,
+            cache,
+        )?),
     };
     let t_phase = std::time::Instant::now();
-    let attn_out = attention(fw, &ctx, &weights, il, &q, &kv, comp.as_ref(), nt)?;
+    let attn_out = attention(
+        fw,
+        &ctx,
+        &weights,
+        il,
+        &q,
+        &kv,
+        comp.as_ref(),
+        nt,
+        pos0,
+        pos0 / config.compress_block(il).unwrap_or(1),
+        cache,
+    )?;
     let attn_secs = t_phase.elapsed().as_secs_f64();
 
     let t_phase = std::time::Instant::now();
@@ -1582,14 +2331,21 @@ pub fn head(fw: &Deepseek4Forward<'_>, streams: &[f32], arena: usize) -> Result<
     let ctx = Context::new(arena)?;
     let wctx = Context::new_no_alloc(8 << 20)?;
     let mut weights = WeightSet::new();
-    for name in [
+    let names: Vec<String> = [
         "output_hc_fn.weight",
         "output_hc_scale.weight",
         "output_hc_base.weight",
         "output_norm.weight",
         "output.weight",
-    ] {
-        bind_dense(fw, &wctx, &mut weights, name)?;
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    // The head runs once per pass, but `output.weight` alone is large enough
+    // that reading it beside the others is worth the same parallelism.
+    let prefetched = prefetch_dense(fw, &names)?;
+    for name in &names {
+        bind_dense(fw, &wctx, &mut weights, name, &prefetched)?;
     }
 
     let hc = config.hc_mult as i64;
@@ -1630,16 +2386,59 @@ pub fn prefill(fw: &Deepseek4Forward<'_>, tokens: &[i32], arena: usize) -> Resul
             limit: N_KV as usize,
         });
     }
-    let mut streams = block(fw, 0, tokens, None, arena)?;
-    for il in 1..fw.config.n_layer {
-        streams = block(fw, il, tokens, Some(&streams), arena)?;
+    let mut cache = Deepseek4Cache::new(fw.config.n_layer, fw.config.kv_lora_rank);
+    forward(fw, &mut cache, tokens, arena)
+}
+
+/// One forward pass over `tokens`, appended to whatever `cache` already holds.
+///
+/// This is the single implementation behind both [`prefill`] and [`step`]: a
+/// prefill is this against an empty cache, and a step is this with one token
+/// against a full one. Keeping them one path is deliberate — a separate
+/// uncached route would be the one every existing test took, leaving the
+/// incremental one unexercised until a user found it.
+pub fn forward(
+    fw: &Deepseek4Forward<'_>,
+    cache: &mut Deepseek4Cache,
+    tokens: &[i32],
+    arena: usize,
+) -> Result<Vec<f32>> {
+    // Every `threads()` call below this point reads it. See `threads`: a
+    // one-token step and a prefill block want opposite counts, and this is the
+    // single funnel both `prefill` and `step` pass through.
+    BATCH.store(tokens.len(), std::sync::atomic::Ordering::Relaxed);
+    let pos0 = cache.n_past as i64;
+    if pos0 as usize + tokens.len() > N_KV as usize {
+        return Err(crate::ArchError::ContextTooLong {
+            tokens: pos0 as usize + tokens.len(),
+            limit: N_KV as usize,
+        });
     }
+    let mut streams = block(fw, cache, 0, tokens, pos0, None, arena)?;
+    for il in 1..fw.config.n_layer {
+        streams = block(fw, cache, il, tokens, pos0, Some(&streams), arena)?;
+    }
+    cache.n_past += tokens.len();
     head(fw, &streams, arena)
+}
+
+/// Advance one token, reusing everything the cache already holds.
+///
+/// Costs one forward pass over a **single** token instead of over the whole
+/// sequence. Both the arithmetic and the disk traffic collapse: a step selects
+/// 6 distinct experts per layer where a 166-token pass selects 122.8.
+pub fn step(
+    fw: &Deepseek4Forward<'_>,
+    cache: &mut Deepseek4Cache,
+    token: i32,
+    arena: usize,
+) -> Result<Vec<f32>> {
+    forward(fw, cache, &[token], arena)
 }
 
 #[cfg(test)]
 mod routing_tests {
-    use super::{pool_passes, record_into};
+    use super::{is_repackable_dense, pool_passes, record_into};
 
     /// Selections land in the newest pass, and pooling sums every pass.
     ///
@@ -1655,6 +2454,116 @@ mod routing_tests {
         assert_eq!(log[0][0], vec![0, 2, 1, 0], "pass 0 keeps only its own");
         assert_eq!(log[1][0], vec![0, 0, 1, 1], "pass 1 starts from zero");
         assert_eq!(pool_passes(&log)[0], vec![0, 2, 2, 1]);
+    }
+
+    /// The four uses that read repacked bytes **by position**, and produce
+    /// confident nonsense rather than an error when they get them. This is the
+    /// list the allow-list exists to enforce; a regression here is not a failing
+    /// forward pass, it is a fluent wrong answer.
+    #[test]
+    fn tensors_read_by_position_are_never_repackable() {
+        for name in [
+            // `get_rows` — a repacked tensor's rows are interleaved, so row 5
+            // is not where row 5 was.
+            "token_embd.weight",
+            "blk.0.attn_compressor_ape.weight",
+            "blk.12.ffn_gate_tid2eid.weight",
+            // `view_1d` at a byte offset, into the unpacked layout.
+            "blk.3.hc_attn_scale.weight",
+            "blk.3.hc_attn_base.weight",
+            "blk.3.hc_ffn_scale.weight",
+            "blk.3.hc_ffn_base.weight",
+            "output_hc_scale.weight",
+            "output_hc_base.weight",
+            // `reshape_3d` into a grouped `mul_mat`, which cuts the matrix in
+            // places the interleave has moved.
+            "blk.7.attn_output_a.weight",
+            // The sinks argument of `flash_attn_ext`, not a matmul weight.
+            "blk.7.attn_sinks.weight",
+        ] {
+            assert!(!is_repackable_dense(name), "{name} must never be repacked");
+        }
+    }
+
+    /// The routed experts are the exclusion that matters most: they stream from
+    /// disk zero-copy, one slice at a time, and that is what lets a 144 GB model
+    /// run on a 15.7 GiB machine. Repacking them would need the whole bank in
+    /// RAM — the exact thing this engine exists to avoid.
+    #[test]
+    fn routed_experts_are_never_repackable() {
+        for name in [
+            "blk.5.ffn_gate_exps.weight",
+            "blk.5.ffn_up_exps.weight",
+            "blk.5.ffn_down_exps.weight",
+        ] {
+            assert!(
+                !is_repackable_dense(name),
+                "{name} streams; never repack it"
+            );
+        }
+    }
+
+    /// The shared expert is *not* routed — it runs for every token and is part
+    /// of the always-read set, so it is both repackable and one of the largest
+    /// wins available. The names differ by three characters (`shexp` against
+    /// `exps`), which is exactly the kind of near-miss a substring rule gets
+    /// wrong in one direction or the other.
+    #[test]
+    fn shared_experts_are_repackable_but_routed_ones_are_not() {
+        assert!(is_repackable_dense("blk.5.ffn_gate_shexp.weight"));
+        assert!(is_repackable_dense("blk.5.ffn_up_shexp.weight"));
+        assert!(is_repackable_dense("blk.5.ffn_down_shexp.weight"));
+        assert!(!is_repackable_dense("blk.5.ffn_gate_exps.weight"));
+    }
+
+    #[test]
+    fn plain_matmul_weights_are_repackable() {
+        for name in [
+            "blk.0.attn_q_a.weight",
+            "blk.41.attn_q_b.weight",
+            "blk.9.attn_kv.weight",
+            "blk.9.attn_output_b.weight",
+            "blk.9.ffn_gate_inp.weight",
+            "blk.9.attn_compressor_kv.weight",
+            "blk.9.attn_compressor_gate.weight",
+            "blk.9.hc_attn_fn.weight",
+            "blk.9.hc_ffn_fn.weight",
+            "output_hc_fn.weight",
+            "output.weight",
+        ] {
+            assert!(
+                is_repackable_dense(name),
+                "{name} is a plain mul_mat weight"
+            );
+        }
+    }
+
+    /// The suffix is matched whole, not as a prefix. `attn_kv` is repackable and
+    /// `attn_kv_a_norm` is not, and a `starts_with` rule would take both — the
+    /// norm is F32 so `is_repackable` would decline it today, but that is luck
+    /// rather than intent and would stop holding on a quantised norm.
+    #[test]
+    fn a_longer_name_that_starts_with_an_allowed_one_is_not_allowed() {
+        assert!(is_repackable_dense("blk.2.attn_kv.weight"));
+        assert!(!is_repackable_dense("blk.2.attn_kv_a_norm.weight"));
+        assert!(!is_repackable_dense("blk.2.attn_q_a_norm.weight"));
+        assert!(!is_repackable_dense("blk.2.attn_norm.weight"));
+        assert!(!is_repackable_dense("blk.2.ffn_norm.weight"));
+        assert!(!is_repackable_dense("blk.2.attn_compressor_norm.weight"));
+    }
+
+    /// Names that are not `blk.<digits>.<suffix>` or a known global must not be
+    /// coaxed into matching — a bias is not a weight, and a non-numeric segment
+    /// is not a block.
+    #[test]
+    fn malformed_and_unknown_names_are_refused() {
+        assert!(!is_repackable_dense("blk.3.exp_probs_b.bias"));
+        assert!(!is_repackable_dense("attn_kv.weight.extra"));
+        assert!(!is_repackable_dense("blk.x.attn_kv.weight"));
+        assert!(!is_repackable_dense("blk..attn_kv.weight"));
+        assert!(!is_repackable_dense("blk.attn_kv.weight"));
+        assert!(!is_repackable_dense("attn_kv"));
+        assert!(!is_repackable_dense(""));
     }
 
     /// The property R0.1 rests on: because the model is causal, a later pass

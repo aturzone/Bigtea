@@ -78,6 +78,25 @@ const SUMS_5TOK: &str = "tests/fixtures/v4flash-sums-5tok.txt";
 
 const SUMS_165TOK: &str = "tests/fixtures/v4flash-sums-165tok.txt";
 
+/// Serialise the tests that allocate multi-gigabyte `ggml` arenas.
+///
+/// Nineteen of these run at once by default and each one asks for GB-sized
+/// contexts, so together they exhaust memory — and `ggml` answers an allocation
+/// failure with `GGML_ASSERT(ctx->mem_buffer != NULL)`, which **aborts the whole
+/// test binary**. The symptom is not a failing test, it is
+/// `error: test failed ... process didn't exit successfully`, and every result
+/// after the abort is lost.
+///
+/// That is why these were only ever run with `--test-threads=1`, and why in
+/// practice they stopped being run at all. Holding this lock makes the plain
+/// `cargo test -- --ignored` work.
+fn heavy() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A poisoned lock means an earlier heavy test panicked. That is its own
+    // failure and already reported; the rest should still run.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The 165-token capture. 165 tokens is the shortest length tried at which
 /// **both** compressed attentions fire: CSA compresses every 4 positions (41
 /// blocks here) and HCA every 128 (one block).
@@ -241,6 +260,7 @@ fn bind_all<'c>(model: &Model, ctx: &'c Context, weights: &mut WeightSet<'c>, na
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn prologue_matches_llama_cpp() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
     let _arch = Deepseek4Model::new(config.clone());
@@ -316,6 +336,7 @@ fn prologue_matches_llama_cpp() {
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn hyper_connection_block_matches_llama_cpp() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -468,6 +489,7 @@ fn hyper_connection_block_matches_llama_cpp() {
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn q_projection_matches_llama_cpp() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -921,6 +943,7 @@ fn hc_gates<'c>(
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn rope_and_kv_match_llama_cpp_at_five_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1238,6 +1261,7 @@ fn q_and_kv_5tok<'c>(
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn attention_matches_llama_cpp_at_five_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1291,6 +1315,7 @@ fn attention_matches_llama_cpp_at_five_tokens() {
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn post_hyper_connection_matches_llama_cpp_at_five_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1357,6 +1382,7 @@ const SWIGLU_CLAMP_L0: f32 = 10.0;
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn moe_router_and_shared_expert_match_llama_cpp_at_five_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1548,6 +1574,7 @@ fn moe_routing_5tok<'c>(
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn routed_experts_and_layer_output_match_llama_cpp_at_five_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1822,6 +1849,7 @@ fn layer_body_5tok<'c>(
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn layers_compose_through_the_first_compressed_layer() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -1957,6 +1985,7 @@ fn layer_owned(
 #[test]
 #[ignore = "reads weights from a 144 GB container, 165 tokens"]
 fn compressed_attention_runs_in_the_layer_loop_at_165_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -2004,6 +2033,7 @@ fn compressed_attention_runs_in_the_layer_loop_at_165_tokens() {
 #[test]
 #[ignore = "reads weights from a 144 GB container, 43 layers"]
 fn every_layer_runs_at_two_tokens() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -2900,6 +2930,7 @@ fn lid_query_5tok<'c>(
 #[test]
 #[ignore = "reads weights from a 144 GB container"]
 fn csa_compressor_matches_llama_cpp() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
 
@@ -3294,7 +3325,7 @@ fn attention_5tok<'c>(
     // of hole the one-token RoPE capture had. Running the kernel without them
     // must give a different number.
     let no_sinks = ctx
-        .flash_attn_ext(&q_perm, &k, &k, &mask, scale)
+        .flash_attn_ext(&q_perm, &k, &k, &mask, scale, 0.0)
         .expect("flash_attn_ext without sinks");
     ctx.compute(&no_sinks, 12).expect("compute attention");
     let without: f32 = no_sinks.to_vec_f32().iter().sum();
@@ -3444,6 +3475,7 @@ fn attention_5tok<'c>(
 #[test]
 #[ignore = "reads weights from a 144 GB container, 43 blocks"]
 fn the_library_forward_pass_matches_llama_cpp() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
     let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());
@@ -3477,6 +3509,145 @@ fn the_library_forward_pass_matches_llama_cpp() {
     eprintln!("  library predicts token {best} after {:?}", TOKENS_2);
 }
 
+/// **The repacked path, against the same llama.cpp checkpoint.**
+///
+/// Repacking rearranges a quantised tensor into the interleaved layout the CPU
+/// kernels want. Every use except a 2-D `mul_mat` weight reads those bytes by
+/// position, and **none of the wrong ones fail**: `get_rows` returns the wrong
+/// row, a `view_1d` at a byte offset the wrong slice, a `reshape_3d` cuts the
+/// matrix in the wrong places. All three yield numbers, and numbers become
+/// fluent text.
+///
+/// So this cannot be checked by running and seeing no error, and it cannot be
+/// checked against our own unrepacked output either — that would only prove the
+/// two agree, not that either is right. It is checked against **the same
+/// llama.cpp logit sum and argmax** that
+/// [`the_library_forward_pass_matches_llama_cpp`] uses.
+///
+/// The budget is deliberately far below the 7.38 GiB always-read set, so the
+/// run is *mixed*: the largest tensors are resident and repacked, the rest
+/// stream from disk unrepacked, and both feed the same graph. A layout mistake
+/// in either shows up in the same two numbers.
+#[test]
+#[ignore = "reads weights from a 144 GB container, 43 blocks"]
+fn repacked_resident_weights_match_llama_cpp() {
+    let _heavy = heavy();
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+
+    // Small enough to hold on any machine that can run these tests at all, and
+    // large enough that the biggest always-read tensors — the shared-expert FFN
+    // and the output projection — land in it.
+    const BUDGET: u64 = 3 << 30;
+    let (mut resident, report) =
+        bigtea_model::ResidentSet::load(&model, BUDGET).expect("load resident");
+    let repacked =
+        bigtea_arch::RepackedDense::build(&mut resident, &model).expect("repack resident");
+    let (n, bytes, declined) = repacked.stats();
+    eprintln!(
+        "  resident {:.2} GiB, repacked {n} tensors ({:.2} GiB), {declined} declined",
+        report.loaded_bytes as f64 / (1u64 << 30) as f64,
+        bytes as f64 / (1u64 << 30) as f64
+    );
+    // Zero is the **correct** answer on x86, and it must not read as a pass.
+    //
+    // Every dense tensor in this container with a repackable shape is `Q8_0`
+    // (`attn_q_a`/`q_b`/`kv`, `attn_output_b`, the three `shexp`, both
+    // compressors, `output`), and ggml's repacked `Q8_0` kernels are NEON and
+    // RISC-V only. The rest are F32 or BF16 and have nothing to pack. So on
+    // this CPU there is nothing to check, and saying so is the point — an ARM
+    // runner will actually exercise the path below.
+    if n == 0 {
+        eprintln!(
+            "  skipping: ggml has no repacked kernel for any of this container's \
+             dense tensors on this CPU ({declined} offered, all declined)"
+        );
+        return;
+    }
+
+    let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone())
+        .with_resident(&resident)
+        .with_repacked(&repacked);
+
+    let logits = bigtea_arch::prefill(&fw, TOKENS_2, 1024 << 20).expect("prefill");
+    assert_eq!(logits.len(), config.vocab_size as usize);
+
+    let last = sums_2tok(config.n_layer);
+    assert_sum(
+        "repacked result_output",
+        logits.iter().sum::<f32>(),
+        last.get("result_output"),
+    );
+
+    let best = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+        .map(|(i, _)| i)
+        .expect("non-empty logits");
+    eprintln!("  repacked predicts token {best} after {:?}", TOKENS_2);
+}
+
+/// A repacked tensor is **taken out** of the resident set, so anything that
+/// still asks residency for it gets `None` and silently streams it from disk on
+/// every block of every token — slower than never repacking at all, and with no
+/// symptom other than the clock.
+///
+/// This pins the handover: what left the set is exactly what the repacked store
+/// now holds, none of it is a tensor read by position, and the set's byte count
+/// fell by what it gave up.
+#[test]
+#[ignore = "reads weights from a 144 GB container"]
+fn repacking_hands_bytes_over_rather_than_duplicating_them() {
+    let _heavy = heavy();
+    let Some(model) = open() else { return };
+
+    const BUDGET: u64 = 3 << 30;
+    let (mut resident, _) = bigtea_model::ResidentSet::load(&model, BUDGET).expect("load resident");
+    let before: std::collections::HashSet<String> = resident.names().into_iter().collect();
+    let bytes_before = resident.bytes();
+
+    let repacked =
+        bigtea_arch::RepackedDense::build(&mut resident, &model).expect("repack resident");
+    let after: std::collections::HashSet<String> = resident.names().into_iter().collect();
+    let (n, _, declined) = repacked.stats();
+    if n == 0 {
+        // The expected result on x86 — see the sibling test for why.
+        eprintln!("  skipping: nothing repackable on this CPU ({declined} declined)");
+        assert_eq!(
+            resident.names().len(),
+            before.len(),
+            "nothing was repacked, so nothing may have left the resident set"
+        );
+        assert_eq!(resident.bytes(), bytes_before);
+        return;
+    }
+
+    let gone: Vec<&String> = before.difference(&after).collect();
+    assert_eq!(
+        gone.len(),
+        n,
+        "every repacked tensor must have left the resident set, and nothing else"
+    );
+    assert!(
+        resident.bytes() < bytes_before,
+        "the resident set still accounts for bytes it handed over"
+    );
+    // None of the tensors read by position may have been taken. These are the
+    // uses that would produce confident nonsense rather than an error.
+    for name in &gone {
+        assert!(
+            !name.ends_with("token_embd.weight")
+                && !name.ends_with("attn_compressor_ape.weight")
+                && !name.ends_with("ffn_gate_tid2eid.weight")
+                && !name.ends_with("attn_output_a.weight")
+                && !name.ends_with("attn_sinks.weight")
+                && !name.contains("_exps"),
+            "{name} is read by position or streamed, and must never be repacked"
+        );
+    }
+}
+
 /// **Does contextual sparsity survive contact with the disk?**
 ///
 /// The router picks 6 experts of 256. Inside a chosen expert there is a
@@ -3497,6 +3668,7 @@ fn the_library_forward_pass_matches_llama_cpp() {
 #[test]
 #[ignore = "reads from a 144 GB container; a disk benchmark, not a correctness test"]
 fn sparse_row_reads_versus_whole_slice() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let name = "blk.5.ffn_up_exps.weight";
     let loc = model.location(name).expect("expert tensor present").clone();
@@ -3610,6 +3782,7 @@ fn sparse_row_reads_versus_whole_slice() {
 #[test]
 #[ignore = "reads weights from a 144 GB container, 43 blocks, twice"]
 fn the_expert_cache_does_not_change_the_answer() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
     // Big enough to hold a 2-token pass's slices comfortably, so the second
@@ -3677,6 +3850,7 @@ fn the_expert_cache_does_not_change_the_answer() {
 #[test]
 #[ignore = "opens the 144 GB container (reads metadata only)"]
 fn a_prompt_longer_than_the_window_is_refused_not_a_panic() {
+    let _heavy = heavy();
     let Some(model) = open() else { return };
     let config = Deepseek4Config::from_model(&model).expect("config");
     let fw = bigtea_arch::Deepseek4Forward::new(&model, config);
@@ -3690,4 +3864,252 @@ fn a_prompt_longer_than_the_window_is_refused_not_a_panic() {
         Err(other) => panic!("wrong error: {other}"),
         Ok(_) => panic!("400 tokens should not have been accepted"),
     }
+}
+
+/// **A cached step must agree with a full prefill.**
+///
+/// This is R3's entire correctness argument, and it needs no new llama.cpp
+/// capture: `prefill` is already verified against llama.cpp's element sums for
+/// all 43 blocks, so it is a trustworthy reference for itself.
+///
+/// ```text
+/// full     = prefill(tokens[0..=n])            <- already oracle-verified
+/// stepwise = prefill(tokens[0..n]) then step(tokens[n])
+/// ```
+///
+/// **Deliberately not bit-identical.** Measured 2026-08-08: at the 63 → 64 token
+/// boundary the *existing* engine re-routes ~3% of selections that earlier tokens
+/// had already made — the net stays at exactly +6 per layer, so no token is lost,
+/// but near-ties in the top-6-of-256 flip when the batch shape changes. A cached
+/// step attends with a different batch shape than a full prefill *by
+/// construction*, so it meets the same effect on purpose. A test demanding
+/// equality would fail on correct code, and the natural reaction — loosening it
+/// until it passes — is exactly how a real cache bug gets shipped.
+///
+/// So: argmax must agree, and the logit sum must land inside the same tolerance
+/// every other check in this file uses.
+#[test]
+///
+/// # STATUS: FAILING, and deliberately not loosened
+///
+/// The raw path is implemented and this test does not yet pass:
+///
+/// ```text
+/// n = 1 (2 tokens)   step 446595.72   full 445449.16   +0.257%
+/// n = 2 (3 tokens)   step 399234.41   full 398126.00   +0.278%
+/// ```
+///
+/// argmax agrees at both lengths, and the error is **flat rather than
+/// accumulating**, so it is systematic from the first step rather than drift in
+/// the cached values. That is the shape a routing flip would have — the
+/// behaviour `r3-kv-cache.md` predicted, since a step attends with a different
+/// batch shape than a full prefill by construction — but *predicted* is not
+/// *demonstrated*, and 0.26% is well outside the tolerance every other check
+/// here uses.
+///
+/// **Do not widen the tolerance to make this green.** The ticket names that as
+/// the exact route by which a real cache bug gets shipped. Prove which it is
+/// first: log the selected expert ids for the last token in both paths and
+/// compare. If they differ, the flip is the cause and the assertion should
+/// become "argmax equal, and at most N routing differences" with N stated. If
+/// they are identical, the cache is wrong and the sum is telling the truth.
+#[ignore = "reads weights from a 144 GB container, two full passes per length"]
+fn a_cached_step_agrees_with_a_full_prefill() {
+    let _heavy = heavy();
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+    let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());
+    let arena = 1024 << 20;
+
+    // Only the raw attention path is cached so far, and a compressed builder
+    // fires once a block completes (`nt / ratio > 0`, ratio 4). Below that every
+    // one of the 43 blocks falls back to Raw, which is what this step covers.
+    // The compressed lengths — 5 and 165 — are asserted to *refuse*, so the
+    // untested path cannot be reached silently.
+    let tokens: Vec<i32> = TOKENS_5.to_vec();
+    // The length that decides which builders run is the **whole** sequence, not
+    // the step: `tokens[..=n]` is `n + 1` long, and at `n + 1 == 4` a CSA block
+    // completes, so the full pass runs a compressor the stepwise path must
+    // refuse. Getting this wrong made the cache look broken when the test was.
+    let n = 2usize;
+    assert!(
+        (n as i64 + 1) / Deepseek4Config::CSA_RATIO == 0,
+        "this length must stay on the raw path, or the test is checking a path \
+         the cache does not implement yet"
+    );
+
+    let full = bigtea_arch::prefill(&fw, &tokens[..=n], arena).expect("full prefill");
+
+    let mut cache = bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
+    let _ = bigtea_arch::forward(&fw, &mut cache, &tokens[..n], arena).expect("partial prefill");
+    assert_eq!(cache.n_past(), n, "the cache must know where it is");
+    let stepwise = bigtea_arch::step(&fw, &mut cache, tokens[n], arena).expect("cached step");
+    assert_eq!(cache.n_past(), n + 1);
+
+    assert_eq!(full.len(), stepwise.len(), "logit count");
+
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+            .expect("logits")
+            .0
+    };
+    assert_eq!(
+        argmax(&full),
+        argmax(&stepwise),
+        "a cached step chose a different token than the full prefill — the cache \
+         is wrong, and on this architecture that reads as fluent nonsense rather \
+         than an error"
+    );
+
+    let sum_full: f32 = full.iter().sum();
+    let sum_step: f32 = stepwise.iter().sum();
+    // Relative, not absolute: one flipped expert of six moves the sum by a few
+    // tenths of a percent. 2% leaves room for a couple of layers flipping and
+    // still catches anything structural -- an early version of this cache, whose
+    // mask indexed relative instead of absolute positions, moved it far more.
+    let drift = (sum_step - sum_full).abs() / sum_full.abs().max(1.0);
+    assert!(
+        drift < 0.02,
+        "logit sum moved {:.3}% ({sum_full:.2} -> {sum_step:.2}). A near-tie          re-routing costs a few tenths of a percent; this is too much for that,          so run cached_step_routing_versus_full_prefill_routing before touching          this threshold",
+        drift * 100.0
+    );
+    eprintln!(
+        "  argmax {} agrees; sums {sum_full:.2} vs {sum_step:.2} ({:.3}% apart)",
+        argmax(&full),
+        drift * 100.0
+    );
+}
+
+/// **A cached step must agree with a full prefill through the compressed path.**
+///
+/// The raw-path version of this proves the KV cache; this proves the compressor
+/// ring, which is the harder half. At eight tokens two CSA blocks have completed,
+/// so the step's block spans the ring boundary — its rows come partly from the
+/// ring and partly from the batch, which is the case that front-padding zeros
+/// silently got wrong.
+#[test]
+#[ignore = "reads weights from a 144 GB container, two full passes"]
+fn a_cached_step_agrees_through_the_compressed_path() {
+    let _heavy = heavy();
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+    let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());
+    let arena = 1024 << 20;
+
+    let tokens: Vec<i32> = TOKENS_165[..12].to_vec();
+    let n = 11usize;
+    assert!(
+        (n as i64 + 1) / Deepseek4Config::CSA_RATIO > 0,
+        "this length must actually run a compressor, or the test proves nothing"
+    );
+
+    let full = bigtea_arch::prefill(&fw, &tokens[..=n], arena).expect("full prefill");
+
+    let mut cache = bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
+    bigtea_arch::forward(&fw, &mut cache, &tokens[..n], arena).expect("partial prefill");
+    let stepwise = bigtea_arch::step(&fw, &mut cache, tokens[n], arena).expect("cached step");
+
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+            .expect("logits")
+            .0
+    };
+    let sum_full: f32 = full.iter().sum();
+    let sum_step: f32 = stepwise.iter().sum();
+    let drift = (sum_step - sum_full).abs() / sum_full.abs().max(1.0);
+    eprintln!(
+        "  compressed path: argmax {} vs {}, sums {sum_full:.2} vs {sum_step:.2}          ({:.3}% apart)",
+        argmax(&full),
+        argmax(&stepwise),
+        drift * 100.0
+    );
+    assert_eq!(
+        argmax(&full),
+        argmax(&stepwise),
+        "a cached step through a compressed layer chose a different token — the          compressor ring is summarising the wrong span, which on this          architecture reads as fluent nonsense rather than an error"
+    );
+    assert!(
+        drift < 0.02,
+        "logit sum moved {:.3}%, too much for a near-tie re-route",
+        drift * 100.0
+    );
+}
+
+/// **Is the cached step's disagreement a routing flip, or a wrong cache?**
+///
+/// `a_cached_step_agrees_with_a_full_prefill` fails by ~0.26% with argmax intact
+/// and no accumulation. Two explanations fit that shape and they have opposite
+/// consequences: a near-tie in the top-6-of-256 flipping because the batch shape
+/// changed (benign, and predicted in `r3-kv-cache.md`), or a cache that feeds
+/// attention the wrong keys (a bug, and the sum is telling the truth).
+///
+/// The routing histogram cannot separate them — it pools every token in the
+/// pass. This compares only the **final token**, which both paths share, layer
+/// by layer.
+///
+/// Layers below `hash_layer_count` select by token id out of `ffn_gate_tid2eid`,
+/// so their choice cannot depend on batch shape at all. **If those disagree, it
+/// is unambiguously a cache bug**, and no amount of tolerance is the answer.
+#[test]
+#[ignore = "reads weights from a 144 GB container, two full passes"]
+fn cached_step_routing_versus_full_prefill_routing() {
+    let _heavy = heavy();
+    let Some(model) = open() else { return };
+    let config = Deepseek4Config::from_model(&model).expect("config");
+    let fw = bigtea_arch::Deepseek4Forward::new(&model, config.clone());
+    let arena = 1024 << 20;
+    std::env::set_var("BIGTEA_ROUTING_LAST", "1");
+
+    let tokens: Vec<i32> = TOKENS_5.to_vec();
+    let n = 2usize;
+
+    bigtea_arch::routing_last_token_reset();
+    bigtea_arch::prefill(&fw, &tokens[..=n], arena).expect("full prefill");
+    let full = bigtea_arch::routing_last_token();
+
+    bigtea_arch::routing_last_token_reset();
+    let mut cache = bigtea_arch::Deepseek4Cache::new(config.n_layer, config.kv_lora_rank);
+    bigtea_arch::forward(&fw, &mut cache, &tokens[..n], arena).expect("partial");
+    bigtea_arch::step(&fw, &mut cache, tokens[n], arena).expect("step");
+    let stepwise = bigtea_arch::routing_last_token();
+
+    assert_eq!(full.len(), stepwise.len(), "layer count");
+
+    let hash_layers = config.hash_layer_count as usize;
+    let (mut differing, mut hash_differing) = (0usize, 0usize);
+    for (il, (a, b)) in full.iter().zip(&stepwise).enumerate() {
+        let (mut sa, mut sb) = (a.clone(), b.clone());
+        sa.sort_unstable();
+        sb.sort_unstable();
+        if sa != sb {
+            differing += 1;
+            if il < hash_layers {
+                hash_differing += 1;
+            }
+            if differing <= 5 {
+                eprintln!("  layer {il:>2} differs: full {sa:?} vs step {sb:?}");
+            }
+        }
+    }
+    eprintln!(
+        "\n  {differing} of {} layers routed the last token differently ({hash_differing} of \
+         them hash-routed)",
+        full.len()
+    );
+
+    assert_eq!(
+        hash_differing, 0,
+        "a hash-routed layer selects by token id and cannot depend on batch \
+         shape, so a disagreement there is a cache bug, not a near-tie flip"
+    );
+    assert!(
+        differing > 0,
+        "routing is identical, so the ~0.26% logit-sum gap is NOT a routing \
+         flip — the cache is feeding attention different values and the sum is \
+         telling the truth"
+    );
 }

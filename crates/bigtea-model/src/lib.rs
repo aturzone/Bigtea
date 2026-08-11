@@ -30,6 +30,7 @@ use std::sync::Arc;
 use bigtea_gguf::{GgmlType, Gguf};
 use bigtea_io::{DirectFile, IoMode, SkewedBuf};
 
+pub mod catalogue;
 mod discover;
 mod resident;
 
@@ -109,8 +110,52 @@ impl Location {
 
 struct Shard {
     file: DirectFile,
+    /// Extra handles onto the same file, one per concurrent reader.
+    ///
+    /// # Why a pool and not one handle
+    ///
+    /// Positioned reads carry their own offset, so several threads reading
+    /// through one handle need no locking *in this code* — which is what the
+    /// streaming path assumed. But a Windows handle opened without
+    /// `FILE_FLAG_OVERLAPPED` is **synchronous**, and the I/O manager serialises
+    /// operations on it: concurrent `ReadFile` calls queue behind one another
+    /// however many threads issue them. The drive is then held at queue depth 1,
+    /// where an NVMe delivers a fraction of its rated throughput.
+    ///
+    /// That is exactly what the old "no further gain past four readers" plateau
+    /// was. Measured on this machine, 256 scattered 4 MiB reads:
+    ///
+    /// ```text
+    /// threads      one shared handle      one handle each
+    ///       1           1.54 GiB/s             1.61 GiB/s
+    ///       4           2.01                   2.65
+    ///       8           2.05                   2.69      <- +31%
+    /// ```
+    ///
+    /// 2.69 GiB/s is also **above** the 2.37 GiB/s this project had recorded as
+    /// the drive's sequential ceiling, so the ceiling was the handle too.
+    readers: Vec<DirectFile>,
     on_disk: u64,
 }
+
+impl Shard {
+    /// The handle for reader `slot`. Falls back to the primary handle when the
+    /// pool could not be opened, so a file-descriptor limit degrades throughput
+    /// rather than failing the run.
+    fn reader(&self, slot: usize) -> &DirectFile {
+        if self.readers.is_empty() {
+            &self.file
+        } else {
+            &self.readers[slot % self.readers.len()]
+        }
+    }
+}
+
+/// How many extra handles each shard opens.
+///
+/// Eight is where the per-handle curve above flattens. Higher costs descriptors
+/// and buys nothing; the drive is saturated by then.
+const READER_HANDLES: usize = 8;
 
 /// A model spread across one or more GGUF shards.
 pub struct Model {
@@ -138,7 +183,21 @@ impl Model {
         let mut declared_tensor_count = None;
 
         for (idx, path) in paths.iter().enumerate() {
-            let file = DirectFile::open(path).map_err(|source| Error::Io {
+            // `--no-direct-io` sets `BIGTEA_IO=buffered`. Direct I/O bypasses
+            // the page cache, which is what makes streaming a 144 GB model
+            // predictable -- but on a filesystem that refuses it, or when the
+            // same model is read repeatedly and the page cache is *wanted*,
+            // buffered is the better answer. Both are real modes here, which
+            // is why the flag exists rather than being declined.
+            let buffered = std::env::var("BIGTEA_IO")
+                .map(|v| v.eq_ignore_ascii_case("buffered"))
+                .unwrap_or(false);
+            let opened = if buffered {
+                DirectFile::open_buffered(path)
+            } else {
+                DirectFile::open(path)
+            };
+            let file = opened.map_err(|source| Error::Io {
                 path: path.clone(),
                 source,
             })?;
@@ -186,7 +245,18 @@ impl Model {
                 }
             }
 
-            shards.push(Shard { file, on_disk });
+            // Open the reader pool now rather than on the first token: a handle
+            // opened mid-stream would show up as a stall in exactly the phase
+            // being optimised. A failure here is not fatal — `Shard::reader`
+            // falls back to the primary handle.
+            let readers: Vec<DirectFile> = (0..READER_HANDLES)
+                .map_while(|_| DirectFile::open(path).ok())
+                .collect();
+            shards.push(Shard {
+                file,
+                readers,
+                on_disk,
+            });
         }
 
         Ok(Model {
@@ -212,6 +282,27 @@ impl Model {
         &self.metadata
     }
 
+    /// Replace one metadata entry -- llama.cpp's `--override-kv`.
+    ///
+    /// The escape hatch for a container whose metadata is wrong. A GGUF is
+    /// often converted by a third party, and a mislabelled `rope.freq_base` or
+    /// a missing `attention.head_count_kv` makes the model answer fluently and
+    /// wrongly with nothing to point at. Overriding is safer than editing a
+    /// multi-gigabyte file, and it is visible in the run that used it.
+    ///
+    /// The architecture is re-read afterwards because `general.architecture`
+    /// is itself overridable, and it decides which config reader runs.
+    pub fn override_metadata(&mut self, key: &str, value: bigtea_gguf::Value) {
+        self.metadata.insert(key.to_string(), value);
+        if let Some(arch) = self
+            .metadata
+            .get("general.architecture")
+            .and_then(bigtea_gguf::Value::as_str)
+        {
+            self.architecture = arch.to_string();
+        }
+    }
+
     pub fn get_u64(&self, key: &str) -> Option<u64> {
         self.metadata.get(key).and_then(bigtea_gguf::Value::as_u64)
     }
@@ -219,6 +310,13 @@ impl Model {
     /// Architecture-scoped metadata, e.g. `arch_u64("expert_count")`.
     pub fn arch_u64(&self, suffix: &str) -> Option<u64> {
         self.get_u64(&format!("{}.{}", self.architecture, suffix))
+    }
+
+    /// An architecture-scoped string, e.g. `qwen3.rope.scaling.type`.
+    pub fn arch_str(&self, suffix: &str) -> Option<&str> {
+        self.metadata
+            .get(&format!("{}.{}", self.architecture, suffix))
+            .and_then(bigtea_gguf::Value::as_str)
     }
 
     pub fn arch_f32(&self, suffix: &str) -> Option<f32> {
@@ -364,6 +462,22 @@ impl Model {
     /// way in; zero means the drive wrote every byte into `dst` itself. See
     /// [`bigtea_io::SkewedBuf`] for how a caller arranges that.
     pub fn read_range_into(&self, name: &str, offset: u64, dst: &mut [u8]) -> Result<usize> {
+        self.read_range_into_via(name, offset, dst, 0)
+    }
+
+    /// [`Self::read_range_into`], but through reader handle `slot`.
+    ///
+    /// Concurrent readers must pass **distinct** slots. Sharing one handle
+    /// serialises them in the OS and holds the drive at queue depth 1 — see
+    /// [`Shard::readers`] for the measurement. This is the only difference
+    /// between the two, and it is worth 31% of expert-read throughput.
+    pub fn read_range_into_via(
+        &self,
+        name: &str,
+        offset: u64,
+        dst: &mut [u8],
+        slot: usize,
+    ) -> Result<usize> {
         let len = dst.len() as u64;
         let loc = self
             .tensors
@@ -386,7 +500,7 @@ impl Model {
             });
         }
         shard
-            .file
+            .reader(slot)
             .read_at_into(at, dst)
             .map_err(|source| Error::Io {
                 path: shard.file.path().to_path_buf(),

@@ -57,9 +57,15 @@ pub struct StreamStats {
     /// Grows with context length times layers, so it is a prime suspect for
     /// why generation slows down as the prompt gets longer.
     pub kv_build_seconds: f64,
-    /// Everything else computed per token: embeddings, Q/K/V, the router and
-    /// the vocabulary projection.
+    /// Everything else computed per token: embeddings, the router and the
+    /// vocabulary projection.
     pub other_seconds: f64,
+    /// The Q/K/V projections, separated from `other_seconds` because on a dense
+    /// model they and the feed-forward are the whole prefill cost and knowing
+    /// which dominates decides what to optimise.
+    pub qkv_seconds: f64,
+    /// The feed-forward, dense or expert-router-driven.
+    pub ffn_seconds: f64,
 }
 
 impl std::fmt::Display for StreamStats {
@@ -78,11 +84,13 @@ impl std::fmt::Display for StreamStats {
         )?;
         write!(
             f,
-            "\n           time: {:.1}s disk, {:.1}s expert compute, {:.1}s attention, \
-             {:.1}s slice copies, {:.1}s kv build, {:.1}s other compute",
+            "\n           time: {:.1}s disk, {:.1}s qkv, {:.1}s attention, {:.1}s ffn, \
+             {:.1}s expert compute, {:.1}s slice copies, {:.1}s kv build, {:.1}s other",
             self.read_seconds,
-            self.expert_seconds,
+            self.qkv_seconds,
             self.attn_seconds,
+            self.ffn_seconds,
+            self.expert_seconds,
             self.copy_seconds,
             self.kv_build_seconds,
             self.other_seconds
@@ -226,10 +234,164 @@ pub struct StreamingRunner<'m> {
     scratch: Vec<u8>,
     /// Reader threads, created once. Declared after `model` so it drops first.
     pool: ReadPool,
-    /// Threads for expert matmuls. Held rather than queried per call because
-    /// the expert loop runs it thousands of times per token.
+    /// Threads for a single-token step. Held rather than queried per call
+    /// because the expert loop runs it thousands of times per token, and the
+    /// default is now a measurement rather than a constant.
     threads: usize,
+    /// Threads for a multi-token block. Separate because prefill is
+    /// compute-bound and generation is bandwidth-bound, and the best count for
+    /// one is close to the worst for the other.
+    threads_batch: usize,
+    /// Walks a ladder of thread counts over the first generated tokens and
+    /// then settles. `None` once settled, or immediately when `-t` was given.
+    tuner: Option<ThreadTuner>,
     pub stats: StreamStats,
+}
+
+fn env_threads(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+fn logical_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+/// Tries thread counts on **real generated tokens** and keeps the fastest.
+///
+/// # Why the obvious cheaper thing does not work
+///
+/// The first attempt was a 150 ms microbenchmark at load: stream a buffer
+/// larger than L3 across `t` threads and take the smallest `t` that saturates
+/// DRAM. It measures a real quantity and it is **not predictive of this one** —
+/// it chose 6, 8, 12, 12, 4, 6 on six consecutive runs of the same binary while
+/// the true optimum was 2-4, and the run-to-run spread it introduced was worse
+/// than the bad default it replaced (5.51-8.20 tok/s against 7.53-7.74 pinned).
+/// A pure read has no per-node barrier; a ggml graph has one per node, and that
+/// is most of what extra threads cost. Deleted rather than tuned, because a
+/// proxy that has to be corrected until it agrees with the objective is just
+/// the objective measured badly.
+///
+/// So this measures the objective: one candidate per generated token, timed
+/// where it actually happens. It costs a handful of early tokens and cannot be
+/// wrong about what it is optimising.
+///
+/// The ladder is walked small-to-large and ties go to the earlier entry, which
+/// biases the answer downward. That is deliberate — the curve is steep on the
+/// over-threaded side (1.8x lost at 20 threads) and nearly flat on the other
+/// (~10% between 2 and 4), so erring low is much cheaper than erring high.
+struct ThreadTuner {
+    ladder: Vec<usize>,
+    at: usize,
+    secs: Vec<f64>,
+}
+
+impl ThreadTuner {
+    fn new(cores: usize) -> Option<Self> {
+        let mut ladder: Vec<usize> = [1usize, 2, 4, 6, 8, 12, 16]
+            .into_iter()
+            .filter(|&t| t < cores)
+            .collect();
+        ladder.push(cores);
+        // Nothing to choose between on a machine with one or two threads.
+        if ladder.len() < 2 {
+            return None;
+        }
+        Some(ThreadTuner {
+            secs: Vec::with_capacity(ladder.len()),
+            ladder,
+            at: 0,
+        })
+    }
+
+    /// The count to use for the next single-token step.
+    fn candidate(&self) -> usize {
+        self.ladder[self.at.min(self.ladder.len() - 1)]
+    }
+
+    /// Record how long that step took. `Some(best)` once a winner is known.
+    ///
+    /// Stops early on two consecutive regressions rather than always walking
+    /// the whole ladder. The curve has one peak and falls away monotonically
+    /// after it — measured on two models and reproduced on llama.cpp — so once
+    /// it has turned down twice there is nothing above worth paying for. That
+    /// takes the usual cost from eight tuning tokens to about four, which
+    /// matters because a short generation would otherwise spend most of itself
+    /// measuring. Two in a row rather than one, so a single noisy step does not
+    /// end it prematurely.
+    fn record(&mut self, secs: f64) -> Option<usize> {
+        self.secs.push(secs);
+        self.at += 1;
+        let best = self.best();
+        let walked = self.at >= self.ladder.len();
+        // Four samples minimum, and a regression has to be worth noticing.
+        // With three it could stop at the first entry on noise alone and pin
+        // generation to one thread, which is a 1.45x loss — the exact mistake
+        // this tuner exists to prevent, made in the other direction.
+        let turned_down = self.secs.len() >= 4
+            && self.secs[self.secs.len() - 1] > self.secs[best] * 1.05
+            && self.secs[self.secs.len() - 2] > self.secs[best] * 1.05;
+        if walked || turned_down {
+            return Some(self.ladder[best]);
+        }
+        None
+    }
+
+    fn best(&self) -> usize {
+        let mut best = 0usize;
+        for i in 1..self.secs.len() {
+            // Strictly less, so a tie keeps the smaller thread count.
+            if self.secs[i] < self.secs[best] {
+                best = i;
+            }
+        }
+        best
+    }
+}
+
+/// Threads for **generating one token at a time**.
+///
+/// `-t` sets `BIGTEA_THREADS` before any model is opened. **It used to be read
+/// only by the V4-Flash path**, so on every other architecture the flag was
+/// parsed, echoed in the header and then ignored. What exposed it: `-t 1` and
+/// `-t 20` on Qwen3-4B produced *bit-identical* phase timings — 1.0s qkv, 0.7s
+/// attention, 1.7s ffn — which no real matmul does. A second, differently
+/// spelled variable (`BIGTEA_EXPERT_THREADS`) was read here into a binding
+/// named `_threads` and discarded, so that override had never worked either.
+///
+/// Once the flag reached the graph it turned out the **default was the worst
+/// setting available**. Generation streams every weight once per token and does
+/// almost no arithmetic per byte, so it saturates DRAM long before it runs out
+/// of cores; past that point threads only contend. On this machine every
+/// logical core gave 4.49 tok/s on Qwen3-4B where two gave 7.64 — **1.70x
+/// thrown away by a default**. So the count is *measured*, not assumed: see
+/// [`bigtea_probe::saturating_threads`].
+/// Where tuning starts, and the answer when `-t` was given.
+///
+/// Without `-t` this is only a starting point — [`ThreadTuner`] replaces it
+/// within the first handful of generated tokens. It is deliberately low rather
+/// than "all cores": the first tokens are generated at this count, and the
+/// over-threaded side of the curve is the expensive one.
+pub fn configured_threads() -> usize {
+    env_threads("BIGTEA_THREADS").unwrap_or_else(|| logical_cores().clamp(1, 4))
+}
+
+/// Threads for **processing a block of tokens at once** — prefill.
+///
+/// The opposite problem to [`configured_threads`], and this is why llama.cpp
+/// carries two flags rather than one. A prefill block multiplies many columns
+/// at a time, so it is compute-bound and scales with cores: on Qwen3-4B, 519
+/// tokens ran at 47.4 tok/s on 4 threads and **81.5 on 20**. Handing prefill
+/// the generation count would cost as much as the generation default was
+/// already costing, in the other direction.
+///
+/// llama.cpp spells the override `-tb` / `--threads-batch`; so do we.
+pub fn configured_threads_batch() -> usize {
+    env_threads("BIGTEA_THREADS_BATCH").unwrap_or_else(logical_cores)
 }
 
 impl<'m> StreamingRunner<'m> {
@@ -237,14 +399,6 @@ impl<'m> StreamingRunner<'m> {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        // Generation runs single-column matmuls, where the work per thread can
-        // be smaller than the barrier that synchronises them. Overridable so
-        // the trade-off can be measured rather than assumed.
-        let _threads = std::env::var("BIGTEA_EXPERT_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(cores);
         StreamingRunner {
             // The reader pool always gets every core: its threads block on
             // disk rather than compete for CPU.
@@ -258,15 +412,35 @@ impl<'m> StreamingRunner<'m> {
             keys: Vec::new(),
             rng: 0x9E3779B97F4A7C15,
             scratch: Vec::new(),
-            threads: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4),
+            threads: configured_threads(),
+            threads_batch: configured_threads_batch(),
+            // An explicit `-t` is an instruction, not a hint: do not overrule
+            // it with a measurement the user did not ask for.
+            tuner: if env_threads("BIGTEA_THREADS").is_some() {
+                None
+            } else {
+                ThreadTuner::new(cores)
+            },
             stats: StreamStats::default(),
         }
     }
 
     pub fn config(&self) -> &Qwen3Config {
         &self.arch.config
+    }
+
+    /// The thread count for a step over `n_tokens` positions.
+    ///
+    /// One position is bandwidth-bound and wants few threads; a block is
+    /// compute-bound and wants every core. Deciding from the token count rather
+    /// than the call site means a path used by both phases — `forward_cached`
+    /// is — cannot get it wrong.
+    fn threads_for(&self, n_tokens: usize) -> usize {
+        if n_tokens > 1 {
+            self.threads_batch
+        } else {
+            self.threads
+        }
     }
 
     /// Tensors that stay in RAM: everything except routed experts.
@@ -404,7 +578,9 @@ impl<'m> StreamingRunner<'m> {
             // otherwise allocates and first-touches a fresh multi-megabyte
             // arena 55,296 times — 128 experts x 48 layers x 9 blocks.
             let mut buf = std::mem::take(&mut self.scratch);
-            let threads = self.threads;
+            // Only reached with more than one token — the single-position case
+            // returned above — so this is always the batch count.
+            let threads = self.threads_batch;
             let mut group_secs = 0f64;
             let group_result = (|| -> Result<()> {
                 for &expert in group {
@@ -852,9 +1028,14 @@ impl<'m> StreamingRunner<'m> {
 
     /// RoPE parameters this architecture uses.
     pub fn rope(&self) -> RopeParams {
+        let c = &self.arch.config;
         RopeParams {
-            freq_base: self.arch.config.rope_freq_base,
-            ..RopeParams::default()
+            freq_base: c.rope_freq_base,
+            freq_scale: c.rope_freq_scale,
+            ext_factor: c.rope_ext_factor,
+            attn_factor: c.rope_attn_factor,
+            beta_fast: c.rope_beta_fast,
+            beta_slow: c.rope_beta_slow,
         }
     }
 
@@ -869,7 +1050,39 @@ impl<'m> StreamingRunner<'m> {
         weights: &mut WeightSet<'a>,
     ) -> Result<u64> {
         let mut total = 0u64;
-        for name in self.resident_tensor_names() {
+        let c_fused_gate_up = self.arch.config.fused_gate_up;
+        // Repacking rearranges a quantised tensor into the layout the CPU
+        // kernels want, and it is worth **1.39x on prefill** -- the entire
+        // measured gap against llama.cpp on Qwen3-4B.
+        //
+        // Only for weights that are already resident. It allocates its own
+        // buffer, so it doubles the memory for whatever it touches: free when
+        // the bytes were being copied into RAM anyway, and fatal on the
+        // streaming path, where ggml is handed a pointer into the mapped
+        // container and that is what makes a 144 GB model run at all.
+        //
+        // `bind_repacked` falls back to an ordinary bind whenever ggml has no
+        // repacked kernel for the type or shape, so every tensor can be offered.
+        // Repacking is ON by default, because it is what **agrees with
+        // llama.cpp**. That is the opposite of what it looked like at first.
+        //
+        // Enabling it changed Llama-3.2's continuation, which read as a
+        // regression until the reference was actually consulted. Raw greedy
+        // completion, same container:
+        //
+        //   prompt                       llama.cpp                    Bigtea
+        //   "The largest ocean ..."      "covering an area of ..."    repacked: same
+        //                                                            unpacked: "which covers ..."
+        //
+        // The repacked path matches; the unpacked one is the outlier. Whatever
+        // the residual difference in the plain Q4_K path is, repacking is the
+        // side that reproduces the reference implementation.
+        //
+        // `BIGTEA_NO_REPACK` turns it off, for measuring the difference or for
+        // a machine where the rearranged copy is unaffordable.
+        let repack = std::env::var("BIGTEA_NO_REPACK").is_err();
+        let names: Vec<String> = self.resident_tensor_names().into_iter().collect();
+        for name in names {
             let loc = self
                 .model
                 .location(&name)
@@ -877,7 +1090,25 @@ impl<'m> StreamingRunner<'m> {
                 .clone();
             let data = self.model.read_tensor(&name)?;
             total += data.len() as u64;
-            weights.bind(ctx, &name, loc.ty, &loc.dims, data)?;
+            // Repacking is safe **only** for a tensor used exclusively as the
+            // weight argument of `mul_mat`. Two other uses break on it, and
+            // neither fails loudly:
+            //
+            //   * `get_rows` -- `token_embd` is indexed by token id, and a
+            //     repacked tensor's rows are interleaved, so row 5 is not
+            //     where row 5 was. Llama-3.2 ties this to its output
+            //     projection, so repacking it corrupted both at once.
+            //   * `view_2d` by byte offset -- Phi-3's fused `attn_qkv` and
+            //     `ffn_up` are split into q/k/v and gate/up that way, and the
+            //     offsets address the unpacked layout.
+            let sliced = name.ends_with("attn_qkv.weight")
+                || (c_fused_gate_up && name.ends_with("ffn_up.weight"));
+            let indexed = name == "token_embd.weight";
+            if repack && !sliced && !indexed {
+                weights.bind_repacked(ctx, &name, loc.ty, &loc.dims, data)?;
+            } else {
+                weights.bind(ctx, &name, loc.ty, &loc.dims, data)?;
+            }
         }
         // The output projection may be tied to the embeddings.
         if self.model.location("output.weight").is_some() {
@@ -888,7 +1119,11 @@ impl<'m> StreamingRunner<'m> {
                 .clone();
             let data = self.model.read_tensor("output.weight")?;
             total += data.len() as u64;
-            weights.bind(ctx, "output.weight", loc.ty, &loc.dims, data)?;
+            if repack {
+                weights.bind_repacked(ctx, "output.weight", loc.ty, &loc.dims, data)?;
+            } else {
+                weights.bind(ctx, "output.weight", loc.ty, &loc.dims, data)?;
+            }
         }
         self.stats.resident_bytes = total;
         Ok(total)
@@ -897,6 +1132,45 @@ impl<'m> StreamingRunner<'m> {
     /// Expose the expert FFN for the runner's layer loop.
     pub fn run_expert_ffn(&mut self, x: &[f32], il: u32, router_probs: &[f32]) -> Result<Vec<f32>> {
         self.expert_ffn(x, il, router_probs)
+    }
+
+    /// One post-norm applied to a whole activation buffer.
+    ///
+    /// Gemma normalises the attention output and the FFN output *before* each
+    /// rejoins the residual stream. Both arrive here as plain `Vec<f32>`
+    /// because the streaming path materialises between phases.
+    fn post_norm<'a>(
+        &self,
+        weights: &WeightSet<'a>,
+        il: u32,
+        values: &[f32],
+        n_new: i64,
+        suffix: &str,
+    ) -> Result<Vec<f32>> {
+        let n_embd = self.arch.config.n_embd as i64;
+        let name = format!("blk.{il}.{suffix}.weight");
+        let w = weights
+            .get(&name)
+            .copied()
+            .ok_or(ArchError::MissingTensor(name))?;
+        // Three tensors, not one: the input, the rms intermediate and the
+        // scaled result. Budgeting for one and relying on `arena_for`'s
+        // doubling covered two, and Gemma-2 at `-b 2048` asked for 56,624,208
+        // bytes from a 54,532,608-byte pool — 3 x 18,874,368 plus headers,
+        // which is exactly the three.
+        //
+        // Note `available` in that message is the **pool size**, not what is
+        // left in it. Reading it as the remainder sends you looking at whichever
+        // arena was nearly full instead of the one that was too small.
+        let ctx = Context::new(arena_for(
+            &[(n_embd, n_new), (n_embd, n_new), (n_embd, n_new)],
+            12,
+        ))?;
+        let t = ctx.new_f32_2d(n_embd, n_new)?;
+        t.set_f32(values)?;
+        let out = self.arch.norm_scaled(&ctx, &t, &w)?;
+        ctx.compute(&out, self.threads_for(n_new as usize))?;
+        Ok(out.to_vec_f32())
     }
 
     /// Incremental forward pass: computes only the new positions, attending
@@ -917,15 +1191,61 @@ impl<'m> StreamingRunner<'m> {
         tokens: &[u32],
         pos_start: usize,
     ) -> Result<Vec<f32>> {
+        // Only single-token steps are tuned. A prefill block runs on the batch
+        // count, which is a different question with a different answer.
+        if tokens.len() != 1 || self.tuner.is_none() {
+            return self.forward_cached_inner(weights, cache, tokens, pos_start);
+        }
+        if let Some(t) = self.tuner.as_ref() {
+            self.threads = t.candidate();
+        }
+        let start = std::time::Instant::now();
+        let disk_before = self.stats.read_seconds;
+        let out = self.forward_cached_inner(weights, cache, tokens, pos_start);
+        // Time the thread count can actually affect. On a streaming MoE model
+        // most of a token is disk, and how much varies per token with cache
+        // hits and warming — on Qwen3-30B that noise swamped the signal
+        // entirely and the tuner chose **one thread**, which is close to the
+        // worst answer available for the expert matmuls. Subtracting the reads
+        // measures the knob rather than the weather.
+        let elapsed = start.elapsed().as_secs_f64() - (self.stats.read_seconds - disk_before);
+        // A step that failed took no meaningful time; do not let it win.
+        if out.is_ok() {
+            if let Some(best) = self.tuner.as_mut().and_then(|t| t.record(elapsed.max(0.0))) {
+                self.threads = best;
+                self.tuner = None;
+            }
+        }
+        out
+    }
+
+    /// The number of threads generation settled on, and whether it was tuned.
+    ///
+    /// `false` means the ladder has not finished — a generation shorter than
+    /// the ladder ends mid-tune, which is fine but should not be reported as a
+    /// measured answer.
+    pub fn generation_threads(&self) -> (usize, bool) {
+        (self.threads, self.tuner.is_none())
+    }
+
+    fn forward_cached_inner<'a>(
+        &mut self,
+        weights: &WeightSet<'a>,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        pos_start: usize,
+    ) -> Result<Vec<f32>> {
         let c = self.arch.config.clone();
         let n_new = tokens.len() as i64;
         let n_embd = c.n_embd as i64;
         let head_dim = c.head_dim as i64;
         let n_kv = c.n_head_kv as i64;
         let kv_width = (n_kv * head_dim) as usize;
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        // The same function serves both phases — a prefill block arrives here
+        // with many tokens, a generated token with one — so the thread count
+        // has to follow the batch rather than the call site. This is exactly
+        // llama.cpp's `n_threads_batch` rule.
+        let threads = self.threads_for(tokens.len());
 
         let positions: Vec<i32> = (0..n_new).map(|i| (pos_start as i64 + i) as i32).collect();
 
@@ -953,6 +1273,37 @@ impl<'m> StreamingRunner<'m> {
             m
         };
 
+        // Gemma-2 alternates a sliding-window layer with a full-attention one,
+        // starting with the window at layer 0. A windowed layer may only see
+        // the last `sliding_window` keys, so it needs its own mask — the causal
+        // one above with the *old* keys closed off as well.
+        //
+        // Below the window the two masks are identical, which is why this was
+        // invisible for so long and why the build simply refused past 4096
+        // rather than answering. Above it, using the full mask everywhere lets
+        // the local layers attend arbitrarily far back: no error, just steadily
+        // wronger text.
+        let swa_mask: Option<Vec<u8>> = if c.sliding_window > 0 {
+            let window = c.sliding_window as i64;
+            let mut m = mask.clone();
+            for query in 0..n_new {
+                let absolute = pos_start as i64 + query;
+                let row = (query * n_total_final) as usize * 2;
+                // Keys strictly older than the window. llama.cpp's rule is
+                // `pos_key <= pos_query - n_swa` is masked, so the oldest key
+                // still visible is `absolute - window + 1` and the window is
+                // `window` positions wide including the query itself.
+                let oldest_visible = absolute - window + 1;
+                for key in 0..oldest_visible.min(n_total_final).max(0) {
+                    let at = row + key as usize * 2;
+                    m[at..at + 2].copy_from_slice(&F16_NEG_INF);
+                }
+            }
+            Some(m)
+        } else {
+            None
+        };
+
         let mut x: Vec<f32> = {
             // Sized from the prompt, not a constant: `get_rows` materialises
             // n_embd * n_new floats, and ggml aborts the process when an arena
@@ -964,6 +1315,14 @@ impl<'m> StreamingRunner<'m> {
                 .get("token_embd.weight")
                 .ok_or_else(|| ArchError::MissingTensor("token_embd.weight".into()))?;
             let rows = ctx.get_rows(emb, &tok)?;
+            // Gemma multiplies the embeddings by sqrt(n_embd) on the way in.
+            // Skipping it does not fail -- every activation downstream is just
+            // the wrong magnitude, and the model answers fluently and wrongly.
+            let rows = if c.scale_embeddings {
+                ctx.scale(&rows, (c.n_embd as f32).sqrt())?
+            } else {
+                rows
+            };
             ctx.compute(&rows, threads)?;
             rows.to_vec_f32()
         };
@@ -1003,33 +1362,51 @@ impl<'m> StreamingRunner<'m> {
                     &xt,
                     &get(weights, format!("blk.{il}.attn_norm.weight"))?,
                 )?;
-                let q = ctx.mul_mat(&get(weights, format!("blk.{il}.attn_q.weight"))?, &normed)?;
-                let k = ctx.mul_mat(&get(weights, format!("blk.{il}.attn_k.weight"))?, &normed)?;
-                let v = ctx.mul_mat(&get(weights, format!("blk.{il}.attn_v.weight"))?, &normed)?;
+                let (qw, kw, vw) = self.arch.qkv_weights(&ctx, weights, il)?;
+                let q = ctx.mul_mat(&qw, &normed)?;
+                let k = ctx.mul_mat(&kw, &normed)?;
+                let v = ctx.mul_mat(&vw, &normed)?;
 
                 let q = ctx.reshape_3d(&q, head_dim, c.n_head as i64, n_new)?;
                 let k = ctx.reshape_3d(&k, head_dim, n_kv, n_new)?;
-                let q = self.arch.norm_scaled(
-                    &ctx,
-                    &q,
-                    &get(weights, format!("blk.{il}.attn_q_norm.weight"))?,
-                )?;
-                let k = self.arch.norm_scaled(
-                    &ctx,
-                    &k,
-                    &get(weights, format!("blk.{il}.attn_k_norm.weight"))?,
-                )?;
+                // Qwen3 normalises each head before RoPE; llama, mistral,
+                // qwen2, gemma and phi have no such tensors at all, so asking
+                // for them refuses those containers outright.
+                let (q, k) = if c.qk_norm {
+                    (
+                        self.arch.norm_scaled(
+                            &ctx,
+                            &q,
+                            &get(weights, format!("blk.{il}.attn_q_norm.weight"))?,
+                        )?,
+                        self.arch.norm_scaled(
+                            &ctx,
+                            &k,
+                            &get(weights, format!("blk.{il}.attn_k_norm.weight"))?,
+                        )?,
+                    )
+                } else {
+                    (q, k)
+                };
 
                 let rp = self.rope();
-                let q = ctx.rope_ext(&q, &pos, None, head_dim as i32, ROPE_TYPE_NEOX, 0, rp)?;
-                let k = ctx.rope_ext(&k, &pos, None, head_dim as i32, ROPE_TYPE_NEOX, 0, rp)?;
+                // NORM for llama/mistral, NeoX for qwen/phi/gemma. Both run
+                // without error on either layout and the wrong one is fluent
+                // nonsense, so it comes from the config rather than a constant.
+                let rope_type = c.rope_type;
+                let q = ctx.rope_ext(&q, &pos, None, head_dim as i32, rope_type, 0, rp)?;
+                let k = ctx.rope_ext(&k, &pos, None, head_dim as i32, rope_type, 0, rp)?;
 
-                // One compute materialises all three; they share a graph.
+                // One compute materialises all three, which is what the comment
+                // here claimed while the code called `compute` once per tensor.
+                // `compute` re-evaluates the whole ancestor graph, so that ran
+                // the shared normalisation three times and paid three graph
+                // builds and three threadpool cycles — and at one token those
+                // fixed costs dominate, because the matmuls are matrix-vector
+                // products and tiny.
                 let t = std::time::Instant::now();
-                ctx.compute(&q, threads)?;
-                ctx.compute(&k, threads)?;
-                ctx.compute(&v, threads)?;
-                self.stats.other_seconds += t.elapsed().as_secs_f64();
+                ctx.compute_many(&[&q, &k, &v], threads)?;
+                self.stats.qkv_seconds += t.elapsed().as_secs_f64();
                 (q.to_vec_f32(), k.to_vec_f32(), v.to_vec_f32(), x.clone())
             };
 
@@ -1055,17 +1432,27 @@ impl<'m> StreamingRunner<'m> {
             // remains is Q, K, V, the mask and the output — about 100 MiB where
             // the explicit path needed 1.3 GiB.
             let n_head = c.n_head as i64;
+            // Every tensor here is one `ggml` allocation, and three were
+            // missing: the Q the caller sets, and the K and V read out of the
+            // cache — only their *permuted contiguous* copies were counted.
+            // `arena_for` doubles the total, which hid it until `n_total` grew
+            // enough for the K/V terms to dominate: Gemma-2 at 5201 tokens
+            // asked for 56,624,208 bytes and had 54,532,608. **3.8% short is
+            // still an abort** — ggml calls `GGML_ASSERT` and the process dies.
             let need = arena_for(
                 &[
-                    (head_dim * n_head, n_new), // q, contiguous
-                    (head_dim * n_kv, n_total), // k, contiguous
-                    (head_dim * n_kv, n_total), // v, contiguous (not transposed)
+                    (head_dim * n_head, n_new), // q, as set from the caller
+                    (head_dim * n_head, n_new), // q, permuted and contiguous
+                    (head_dim * n_kv, n_total), // k from the cache (F16, over-counted)
+                    (head_dim * n_kv, n_total), // k, permuted and contiguous
+                    (head_dim * n_kv, n_total), // v from the cache (F16, over-counted)
+                    (head_dim * n_kv, n_total), // v, permuted and contiguous
                     (n_total, n_new),           // causal mask (F16, so over-counted)
                     (head_dim * n_new, n_head), // attention output
                     (head_dim * n_new, n_head), // ...made contiguous
                     (n_embd, n_new),            // output projection
                 ],
-                24,
+                32,
             );
             let mut buf = std::mem::take(&mut self.scratch);
             if buf.len() < need {
@@ -1073,6 +1460,15 @@ impl<'m> StreamingRunner<'m> {
             }
             let arch = &self.arch;
             let out_w = get(weights, format!("blk.{il}.attn_output.weight"))?;
+            // Even layers slide, odd layers see everything — Gemma-2's pattern,
+            // and it starts with the window. Reversing it is not an error and
+            // not a crash; it is a model that answers slightly wrongly, so the
+            // ordering is checked against llama.cpp's output rather than
+            // reasoned about.
+            let layer_mask = match swa_mask.as_ref() {
+                Some(swa) if il % 2 == 0 => swa,
+                _ => &mask,
+            };
             let attn_result = (|| -> Result<(Vec<f32>, f64, f64)> {
                 // SAFETY: `buf` is a local outliving `ctx`, and no other context
                 // is live on it — the Q/K/V context above was dropped and its
@@ -1081,16 +1477,32 @@ impl<'m> StreamingRunner<'m> {
                 let q = ctx.new_f32_3d(head_dim, n_head, n_new)?;
                 q.set_f32(&q_v)?;
 
-                // F16, matching how the cache stores them and what the fused
-                // kernel wants — no conversion on this path at all.
+                // Whatever the cache stores, handed over unchanged — no
+                // conversion on this path at all. ggml's fused attention
+                // dispatches K through its type's `vec_dot` and V through its
+                // `to_float`, so a quantised cache needs no special case here;
+                // a type with neither would abort, which is why `KvType` is a
+                // closed set rather than an arbitrary id.
                 let tkv = std::time::Instant::now();
-                let k_all = ctx.new_f16_3d(head_dim, n_kv, n_total)?;
+                let kv_ty = bigtea_gguf::GgmlType(cache.kind().ggml_type());
+                let k_all = ctx.reshape_3d(
+                    &ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?,
+                    head_dim,
+                    n_kv,
+                    n_total,
+                )?;
                 k_all.set_bytes(cache.keys(il as usize))?;
-                let v_all = ctx.new_f16_3d(head_dim, n_kv, n_total)?;
+                let v_all = ctx.reshape_3d(
+                    &ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?,
+                    head_dim,
+                    n_kv,
+                    n_total,
+                )?;
                 v_all.set_bytes(cache.values(il as usize))?;
                 let kv_secs = tkv.elapsed().as_secs_f64();
 
-                let out = arch.attention_flash(&ctx, &q, &k_all, &v_all, n_new, n_total, &mask)?;
+                let out =
+                    arch.attention_flash(&ctx, &q, &k_all, &v_all, n_new, n_total, layer_mask)?;
                 let out = ctx.mul_mat(&out_w, &out)?;
                 let t = std::time::Instant::now();
                 ctx.compute(&out, threads)?;
@@ -1102,22 +1514,56 @@ impl<'m> StreamingRunner<'m> {
             self.stats.attn_seconds += attn_secs;
 
             // Residual, then the feed-forward.
+            // Gemma normalises the attention output *before* it rejoins the
+            // residual stream, on top of the pre-norm every other architecture
+            // here uses.
+            let attn_out = if c.post_norms {
+                self.post_norm(weights, il, &attn_out, n_new, "post_attention_norm")?
+            } else {
+                attn_out
+            };
             let mut ffn_input = residual;
             for (dst, v) in ffn_input.iter_mut().zip(attn_out) {
                 *dst += v;
             }
 
             let (normed_v, probs_v) = {
-                let ctx = Context::new(arena_for(
-                    &[
-                        (n_embd, n_new),            // ffn input
-                        (n_embd, n_new),            // normalised
-                        (n_embd, n_new),            // rms intermediate
-                        (c.n_expert as i64, n_new), // router logits
-                        (c.n_expert as i64, n_new), // router probabilities
-                    ],
-                    24,
-                ))?;
+                // The dense branch below runs the whole feed-forward in this
+                // arena -- gate, up, the SwiGLU product and down -- and those
+                // are `n_ff` wide, four times `n_embd` here. Budgeting only for
+                // the router's tensors aborted at 519 tokens: ggml asked for
+                // 56 MB and had 48. It is only the MoE path where the experts
+                // are computed elsewhere.
+                let mut shapes = vec![
+                    (n_embd, n_new),            // ffn input
+                    (n_embd, n_new),            // normalised
+                    (n_embd, n_new),            // rms intermediate
+                    (c.n_expert as i64, n_new), // router logits
+                    (c.n_expert as i64, n_new), // router probabilities
+                ];
+                if !c.is_moe() {
+                    let n_ff = c.n_ff as i64;
+                    // gate, up, silu(gate), the product, and the down output.
+                    shapes.extend([
+                        (n_ff, n_new),
+                        (n_ff, n_new),
+                        (n_ff, n_new),
+                        (n_ff, n_new),
+                        (n_embd, n_new),
+                        (n_embd, n_new),
+                    ]);
+                }
+                // Gemma's post-FFN norm runs in *this* context — an rms
+                // intermediate and the scaled result — and was not counted.
+                // The doubling inside `arena_for` hid it until the block grew:
+                // at `-b 2048` on a 5201-token prompt ggml asked for 56,624,208
+                // bytes with 54,532,608 left. **This is the third arena in this
+                // function found short the same way.** Every tensor a branch
+                // can allocate has to appear in the list for that branch.
+                if c.post_norms {
+                    shapes.extend([(n_embd, n_new), (n_embd, n_new)]);
+                }
+                let ctx = Context::new(arena_for(&shapes, 24))?;
                 let xt = ctx.new_f32_2d(n_embd, n_new)?;
                 xt.set_f32(&ffn_input)?;
                 let normed = self.arch.norm_scaled(
@@ -1125,6 +1571,24 @@ impl<'m> StreamingRunner<'m> {
                     &xt,
                     &get(weights, format!("blk.{il}.ffn_norm.weight"))?,
                 )?;
+                if !c.is_moe() {
+                    // Dense: no router at all. The FFN is one gate/up/down
+                    // triple on resident weights, so it runs here rather than
+                    // through the expert machinery.
+                    let ffn = self.arch.dense_ffn(&ctx, weights, &normed, il)?;
+                    let ffn = if c.post_norms {
+                        let w = get(weights, format!("blk.{il}.post_ffw_norm.weight"))?;
+                        self.arch.norm_scaled(&ctx, &ffn, &w)?
+                    } else {
+                        ffn
+                    };
+                    let out = ctx.add(&ffn, &xt)?;
+                    let t = std::time::Instant::now();
+                    ctx.compute(&out, threads)?;
+                    self.stats.ffn_seconds += t.elapsed().as_secs_f64();
+                    x = out.to_vec_f32();
+                    continue;
+                }
                 let logits = ctx.mul_mat(
                     &get(weights, format!("blk.{il}.ffn_gate_inp.weight"))?,
                     &normed,
@@ -1132,12 +1596,17 @@ impl<'m> StreamingRunner<'m> {
                 let probs = ctx.soft_max_ext(&logits, None, 1.0, 0.0)?;
                 let t = std::time::Instant::now();
                 ctx.compute(&probs, threads)?;
-                self.stats.other_seconds += t.elapsed().as_secs_f64();
+                self.stats.ffn_seconds += t.elapsed().as_secs_f64();
                 (normed.to_vec_f32(), probs.to_vec_f32())
             };
 
             let mut next = ffn_input;
             let expert_out = self.expert_ffn_block(&normed_v, il, &probs_v, tokens.len())?;
+            let expert_out = if c.post_norms {
+                self.post_norm(weights, il, &expert_out, n_new, "post_ffw_norm")?
+            } else {
+                expert_out
+            };
             for (dst, v) in next.iter_mut().zip(expert_out) {
                 *dst += v;
             }
@@ -1175,6 +1644,9 @@ impl<'m> StreamingRunner<'m> {
                 .ok_or_else(|| ArchError::MissingTensor(out_name.into()))?,
             &normed,
         )?;
+        // Gemma bounds the final logits smoothly rather than clipping them.
+        // Without it every sampling decision is made on the wrong scale.
+        let out = ctx.softcap(&out, c.final_logit_softcap)?;
         ctx.compute(&out, threads)?;
         let logits = out.to_vec_f32();
         self.stats.other_seconds += t_out.elapsed().as_secs_f64();
@@ -1196,9 +1668,7 @@ impl<'m> StreamingRunner<'m> {
         let c = self.arch.config.clone();
         let n_tokens = tokens.len() as i64;
         let n_embd = c.n_embd as i64;
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let threads = self.threads_for(tokens.len());
 
         // Embedding lookup, once.
         let mut x: Vec<f32> = {
@@ -1298,6 +1768,80 @@ impl<'m> StreamingRunner<'m> {
 }
 
 #[cfg(test)]
+mod tuner_tests {
+    use super::ThreadTuner;
+
+    /// Walk a tuner through a supplied cost curve, returning what it settles
+    /// on and how many tokens it spent getting there.
+    fn settle(cores: usize, cost: impl Fn(usize) -> f64) -> (usize, usize) {
+        let mut t = ThreadTuner::new(cores).expect("a ladder");
+        let mut spent = 0;
+        loop {
+            let candidate = t.candidate();
+            spent += 1;
+            if let Some(best) = t.record(cost(candidate)) {
+                return (best, spent);
+            }
+            assert!(spent < 64, "the tuner must terminate");
+        }
+    }
+
+    #[test]
+    fn it_finds_the_cheapest_thread_count() {
+        // The shape actually measured: a minimum at 2, rising after.
+        let (best, _) = settle(20, |t| match t {
+            1 => 0.190,
+            2 => 0.131,
+            4 => 0.133,
+            6 => 0.141,
+            8 => 0.160,
+            _ => 0.220,
+        });
+        assert_eq!(best, 2);
+    }
+
+    #[test]
+    fn it_stops_before_walking_the_whole_ladder() {
+        // Eight rungs exist; a curve that turns down should not cost eight
+        // tokens to discover, because a short generation is mostly tuning.
+        let (_, spent) = settle(20, |t| 0.1 + t as f64 * 0.01);
+        assert!(spent <= 5, "spent {spent} tokens tuning");
+    }
+
+    #[test]
+    fn a_flat_curve_keeps_the_smaller_count() {
+        // Ties go down: over-threading costs 1.8x and under-threading ~10%,
+        // so the two errors are not worth the same.
+        let (best, _) = settle(20, |_| 0.15);
+        assert_eq!(best, 1);
+    }
+
+    #[test]
+    fn one_slow_sample_does_not_end_the_search() {
+        // A single noisy step must not stop the walk — that is why the rule is
+        // two consecutive regressions and not one.
+        let (best, _) = settle(20, |t| match t {
+            1 => 0.190,
+            2 => 0.900, // a scheduler hiccup, not the real cost
+            4 => 0.120,
+            _ => 0.300,
+        });
+        assert_eq!(best, 4);
+    }
+
+    #[test]
+    fn the_ladder_never_exceeds_the_cores_available() {
+        for cores in [3usize, 4, 8, 20, 64] {
+            let t = ThreadTuner::new(cores).expect("a ladder");
+            assert!(t.ladder.iter().all(|&c| c <= cores), "cores={cores}");
+            assert_eq!(*t.ladder.last().expect("non-empty"), cores);
+        }
+        // Nothing to choose between with one thread.
+        assert!(ThreadTuner::new(1).is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1312,9 +1856,25 @@ mod tests {
             vocab_size: 32,
             rms_eps: 1e-6,
             rope_freq_base: 1_000_000.0,
+            rope_freq_scale: 1.0,
+            rope_ext_factor: 0.0,
+            rope_attn_factor: 1.0,
+            rope_beta_fast: 32.0,
+            rope_beta_slow: 1.0,
+            rope_orig_ctx: 0,
             n_expert: 4,
             n_expert_used: 2,
             n_ff_expert: 16,
+            qk_norm: true,
+            rope_type: 2,
+            rope_type_is_known: true,
+            fused_qkv: false,
+            fused_gate_up: false,
+            post_norms: false,
+            scale_embeddings: false,
+            attn_logit_softcap: 0.0,
+            final_logit_softcap: 0.0,
+            sliding_window: 0,
         }
     }
 

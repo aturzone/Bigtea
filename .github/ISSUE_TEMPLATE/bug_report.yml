@@ -31,7 +31,7 @@ body:
     id: machine
     attributes:
       label: Machine
-      description: OS, CPU, RAM, disk. `bigtea-probe --quick` output is ideal.
+      description: OS, CPU, RAM, disk. `bigtea-probe` output is ideal.
       render: shell
     validations: {required: true}
   - type: input

@@ -99,6 +99,16 @@ pub struct WeightSet<'ctx> {
     /// memcpy per token, for bytes that never change. An `Arc` clone is a
     /// refcount bump, and the address is as stable as a `Box`'s.
     _buffers: Vec<Arc<dyn WeightBytes>>,
+    /// Repacked weights, which own their own `ggml` allocation.
+    ///
+    /// Held here for exactly the same reason as `_buffers`: dropping one frees
+    /// the weights a graph is still pointing at.
+    _repacked: Vec<crate::repack::RepackBuffer>,
+    /// Repacked weights rearranged **before** this set existed and shared with
+    /// every other set that binds them — the V4-Flash path, which rebuilds its
+    /// `WeightSet` once per block.
+    _shared_repacked: Vec<Arc<crate::repack::Repacked>>,
+    repacked_bytes: usize,
 }
 
 impl<'ctx> WeightSet<'ctx> {
@@ -106,6 +116,9 @@ impl<'ctx> WeightSet<'ctx> {
         WeightSet {
             tensors: HashMap::new(),
             _buffers: Vec::new(),
+            _repacked: Vec::new(),
+            _shared_repacked: Vec::new(),
+            repacked_bytes: 0,
         }
     }
 
@@ -126,6 +139,119 @@ impl<'ctx> WeightSet<'ctx> {
         self.bind_shared(ctx, name, ty, dims, Arc::new(data))
     }
 
+    /// Every bound buffer, for a caller that needs the memory itself rather
+    /// than the tensors pointing at it — `--mlock` is the only one so far.
+    ///
+    /// Returns the buffers, not the repacked allocations: those live inside
+    /// `ggml`'s own arena and are not addressable from here.
+    pub fn bound_slices(&self) -> Vec<&[u8]> {
+        self._buffers.iter().map(|b| b.as_bytes()).collect()
+    }
+
+    /// How many tensors were rearranged, and the bytes they occupy.
+    pub fn repacked(&self) -> (usize, usize) {
+        (self._repacked.len(), self.repacked_bytes)
+    }
+
+    /// Bind `data`, rearranging it into the layout the CPU kernels want when
+    /// `ggml` has a repacked kernel for it.
+    ///
+    /// Worth **1.39x on prefill** — measured against llama.cpp with and without
+    /// its own repacking, which is the entire gap between the two engines on
+    /// Qwen3-4B. See [`crate::repack`].
+    ///
+    /// **Only for resident weights.** Repacking allocates its own buffer, so it
+    /// doubles the memory for whatever it touches; that is free when the bytes
+    /// were going to be copied into RAM anyway, and fatal on the streaming path
+    /// where `ggml` is handed a pointer into the mapped container.
+    ///
+    /// Falls back to an ordinary zero-copy bind whenever `ggml` has no repacked
+    /// kernel for the type or shape, so a caller can offer every tensor and let
+    /// this decide.
+    pub fn bind_repacked(
+        &mut self,
+        ctx: &'ctx Context,
+        name: &str,
+        ty: GgmlType,
+        dims: &[u64],
+        data: impl WeightBytes,
+    ) -> Result<bool, GgmlError> {
+        let (ne0, ne1) = Self::shape_2d(dims)?;
+        if !crate::repack::is_repackable(ty, ne0, ne1) {
+            self.bind_shared(ctx, name, ty, dims, Arc::new(data))?;
+            return Ok(false);
+        }
+        let tensor = ctx.new_typed_2d(ty, ne0, ne1)?;
+        let expected = tensor.bytes();
+        let bytes = data.as_bytes();
+        if bytes.len() != expected {
+            return Err(GgmlError::WrongSize {
+                expected,
+                actual: bytes.len(),
+            });
+        }
+        // SAFETY: `tensor` is live in `ctx`, created no_alloc so its data
+        // pointer is null and nothing is orphaned; `bytes` is exactly the
+        // tensor's size, checked above.
+        let repacked = unsafe { crate::repack::repack(tensor.as_ptr(), bytes) }?;
+        match repacked {
+            Some(buf) => {
+                self.repacked_bytes += buf.bytes();
+                self._repacked.push(buf);
+                self.tensors.insert(name.to_string(), tensor);
+                Ok(true)
+            }
+            // ggml declined. The tensor was never pointed anywhere, so binding
+            // normally is safe and is the right answer.
+            None => {
+                self.bind_shared(ctx, name, ty, dims, Arc::new(data))?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Bind a tensor that was rearranged **earlier**, without moving a byte.
+    ///
+    /// The V4-Flash path's case. Its arena is per block, so it builds a fresh
+    /// context and a fresh `WeightSet` for each of 43 blocks on every pass;
+    /// [`bind_repacked`](Self::bind_repacked) there would rearrange the whole
+    /// always-read set 43 times per token. The rearrangement happens once at
+    /// load and this points a fresh tensor at the result.
+    ///
+    /// The `Arc` is held so the buffer cannot be freed while a graph in this
+    /// set still reads it, exactly as `_buffers` does for borrowed bytes.
+    pub fn bind_repacked_shared(
+        &mut self,
+        ctx: &'ctx Context,
+        name: &str,
+        repacked: Arc<crate::repack::Repacked>,
+    ) -> Result<(), GgmlError> {
+        let (ne0, ne1) = repacked.shape();
+        let tensor = ctx.new_typed_2d(repacked.ty(), ne0, ne1)?;
+        // SAFETY: `tensor` is live in `ctx`, created no_alloc so its data
+        // pointer is null and nothing is orphaned, and it was built from this
+        // `Repacked`'s own type and shape. `self` holds the `Arc`, so the
+        // buffer outlives the tensor.
+        unsafe { repacked.attach(tensor.as_ptr()) }?;
+        self._shared_repacked.push(repacked);
+        self.tensors.insert(name.to_string(), tensor);
+        Ok(())
+    }
+
+    fn shape_2d(dims: &[u64]) -> Result<(i64, i64), GgmlError> {
+        Ok(match dims {
+            [] => {
+                return Err(GgmlError::WrongSize {
+                    expected: 1,
+                    actual: 0,
+                })
+            }
+            [a] => (*a as i64, 1i64),
+            [a, b] => (*a as i64, *b as i64),
+            [a, rest @ ..] => (*a as i64, rest.iter().product::<u64>() as i64),
+        })
+    }
+
     /// Bind bytes that are already shared — the expert cache's case, where the
     /// same slice is bound again on every token that routes to it.
     pub fn bind_shared(
@@ -136,19 +262,9 @@ impl<'ctx> WeightSet<'ctx> {
         dims: &[u64],
         data: Arc<dyn WeightBytes>,
     ) -> Result<(), GgmlError> {
-        let (ne0, ne1) = match dims {
-            [] => {
-                return Err(GgmlError::WrongSize {
-                    expected: 1,
-                    actual: 0,
-                })
-            }
-            [a] => (*a as i64, 1i64),
-            [a, b] => (*a as i64, *b as i64),
-            // Higher-rank weights are reshaped by the graph; binding them as
-            // 2-D keeps the byte layout identical.
-            [a, rest @ ..] => (*a as i64, rest.iter().product::<u64>() as i64),
-        };
+        // Higher-rank weights are reshaped by the graph; binding them as 2-D
+        // keeps the byte layout identical.
+        let (ne0, ne1) = Self::shape_2d(dims)?;
 
         let tensor = ctx.new_typed_2d(ty, ne0, ne1)?;
 

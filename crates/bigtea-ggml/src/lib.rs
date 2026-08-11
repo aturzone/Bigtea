@@ -23,10 +23,12 @@ use std::fmt;
 use bigtea_gguf::GgmlType;
 
 mod graph;
+pub mod repack;
 mod weights;
 
 #[cfg(have_ggml)]
 pub use graph::{arena_for, f16_to_f32, f32_to_f16, Context, RopeParams, Tensor};
+pub use repack::{is_repackable, Repacked};
 #[cfg(have_ggml)]
 pub use weights::WeightSet;
 
