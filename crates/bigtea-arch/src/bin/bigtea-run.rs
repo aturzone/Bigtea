@@ -178,6 +178,8 @@ impl RopeOverrides {
 #[derive(Clone, Default)]
 struct Ui {
     interactive: bool,
+    /// Take a turn from the user before generating anything.
+    interactive_first: bool,
     conversation: bool,
     single_turn: bool,
     multiline: bool,
@@ -695,8 +697,109 @@ fn dense_max_tokens(config: &Qwen3Config, budget: u64) -> i64 {
     lo
 }
 
+/// The full option list. One place, so `--help`, `-h` and a bare
+/// invocation cannot drift apart.
+fn usage() -> ExitCode {
+    eprintln!("usage: bigtea-run <model.gguf> \"prompt\" [options]");
+    eprintln!();
+    eprintln!("  -n N                tokens to generate");
+    eprintln!("  -f FILE             read the prompt from a file");
+    eprintln!("  -b N                prefill block size");
+    eprintln!("  --cache GIB         expert cache budget");
+    eprintln!("  --temp T            0 = greedy (default)");
+    eprintln!("  --top-k K           0 = off");
+    eprintln!("  --top-p P           1.0 = off");
+    eprintln!("  --min-p P           0.0 = off");
+    eprintln!("  --repeat-penalty R  1.0 = off");
+    eprintln!("  --frequency-penalty F  subtract F x count. 0 = off");
+    eprintln!("  --presence-penalty P   subtract P if used at all. 0 = off");
+    eprintln!("  --repeat-last-n N   penalty window (default 64)");
+    eprintln!("  --typical P         locally typical sampling. 1.0 = off");
+    eprintln!("  --top-nsigma N      keep logits within N sigma of the max. 0 = off");
+    eprintln!("  --dynatemp-range R  entropy-driven temperature spread. 0 = off");
+    eprintln!("  --dynatemp-exp E    how sharply it reacts (default 1.0)");
+    eprintln!("  --xtc-probability P exclude top choices, chance per token. 0 = off");
+    eprintln!("  --xtc-threshold T   XTC only considers tokens above this (default 0.1)");
+    eprintln!("  --mirostat N        0 off, 1 v1, 2 v2 -- targets a surprise, not a mass");
+    eprintln!("  --mirostat-ent TAU  target surprise in bits (default 5.0)");
+    eprintln!("  --mirostat-lr ETA   mirostat learning rate (default 0.1)");
+    eprintln!("  --logit-bias ID+B   nudge one token, repeatable (e.g. 42-100)");
+    eprintln!("  --ignore-eos        never stop at end-of-sequence");
+    eprintln!("  --dry-multiplier M  DRY repetition penalty. 0 = off");
+    eprintln!("  --dry-base B        DRY growth per extra repeated token (1.75)");
+    eprintln!("  --dry-allowed-length N  repeats shorter than this are free (2)");
+    eprintln!("  --dry-penalty-last-n N  how far DRY looks back. 0 = all");
+    eprintln!("  --dry-sequence-breaker S  a match may not cross this, repeatable");
+    eprintln!("  --samplers SPEC     chain order, e.g. \"top_k;temperature;top_p\"");
+    eprintln!("  -ctk, -ctv TYPE     KV cache storage: f16 (default) or q8_0");
+    eprintln!("  --no-direct-io      read through the page cache (also --no-mmap)");
+    eprintln!("  --direct-io         bypass the page cache (default)");
+    eprintln!("  --override-kv K=T:V override one GGUF metadata entry");
+    eprintln!("  --mlock             pin resident weights so the OS cannot page them out");
+    eprintln!("  --chat-template N   force a chat template (chatml, llama3, gemma, ...)");
+    eprintln!("  --prompt-cache F    reuse a saved KV cache for a repeated prefix");
+    eprintln!("  --prompt-cache-all  also cache what was generated, not just the prompt");
+    eprintln!("  --prompt-cache-ro   read the cache but never write it");
+    eprintln!("  -i, --interactive   keep the session open and take turns");
+    eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
+    eprintln!("  -st, --single-turn  one exchange, then exit");
+    eprintln!("  --multiline-input   a trailing backslash continues the line");
+    eprintln!("  --in-prefix S       wrap user input (non-conversation mode)");
+    eprintln!("  --in-suffix S       ...and after it");
+    eprintln!("  --in-prefix-bos     prepend BOS to each user turn");
+    eprintln!("  -sys, --system-prompt S   system message (implies a template)");
+    eprintln!("  --system-prompt-file F    ...read from a file");
+    eprintln!("  -co, --color        colour the generated text");
+    eprintln!("  --simple-io         no ANSI, for pipes and logs");
+    eprintln!("  --no-display-prompt do not echo the prompt back");
+    eprintln!("  -sp, --special      show control tokens instead of hiding them");
+    eprintln!("  --print-token-count report prompt and generated counts");
+    eprintln!("  --verbose-prompt    print the tokenised prompt and its ids");
+    eprintln!("  -e, --escape        process backslash escapes in -p (default on)");
+    eprintln!("  --no-escape         take -p literally");
+    eprintln!("  -r, --reverse-prompt S    llama.cpp's name for --stop");
+    eprintln!("  --rope-freq-base B  override the container's RoPE base");
+    eprintln!("  --rope-freq-scale S linear RoPE scaling (1.0 = off)");
+    eprintln!("  --rope-scale N      context multiplier (= 1 / freq-scale)");
+    eprintln!("  --rope-scaling T    none | linear | yarn");
+    eprintln!("  --yarn-ext-factor F   YaRN mix (0 = pure linear)");
+    eprintln!("  --yarn-attn-factor F  YaRN magnitude correction");
+    eprintln!("  --yarn-beta-fast F    YaRN high-frequency cutoff");
+    eprintln!("  --yarn-beta-slow F    YaRN low-frequency cutoff");
+    eprintln!("  --yarn-orig-ctx N     context the model was trained at");
+    eprintln!("  --log-disable       silence the status lines");
+    eprintln!("  --log-file F        write status to a file instead of stderr");
+    eprintln!("  --log-timestamps    prefix each status line with elapsed time");
+    eprintln!("  --log-prefix        prefix each status line with its level");
+    eprintln!("  -v, --verbose       verbosity 2");
+    eprintln!("  --verbosity N       0 quiet, 1 normal, 2+ verbose");
+    eprintln!("  --no-perf           omit the timing summary");
+    eprintln!("  --version           print the version and exit");
+    eprintln!("  --perplexity        score a corpus instead of generating");
+    eprintln!("  --ppl-chunk N       perplexity chunk size (default 512)");
+    eprintln!("  --seed S            reproducible sampling");
+    eprintln!("  --llamacpp-defaults temp 0.8, top-k 40, top-p 0.95, min-p 0.05, repeat 1.1");
+    eprintln!("  --chat              apply the model's chat template to the prompt");
+    eprintln!("  -t, --threads N     threads for generation (default: measured -- generation");
+    eprintln!("                      is bandwidth-bound and all cores is 1.7x SLOWER)");
+    eprintln!("  -tb, --threads-batch N  threads for prefill (default: all cores)");
+    eprintln!("  -c, --ctx-size N    cap the context; refuses past it rather than aborting");
+    eprintln!("  --stop TEXT         stop when this appears (repeatable)");
+    eprintln!("  --force             run an unverified architecture anyway");
+    eprintln!("  --no-repack         keep resident weights in their stored layout");
+    eprintln!("                      (repacking is on by default: 1.35x prefill)");
+    ExitCode::from(2)
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
+    // `-m model.gguf` puts a flag where the positional path used to be, so the
+    // first argument is only treated as the path when it is not one. Without
+    // this, `bigtea-run -m x.gguf -p "hi"` tries to open a file called `-m`.
+    let leads_with_flag = std::env::args()
+        .nth(1)
+        .map(|a| a.starts_with('-') && a != "-")
+        .unwrap_or(false);
     // Before the positional model path is taken. `--version` as the first
     // argument would otherwise *be* the path, and the runner would report that
     // it cannot open a file called `--version`.
@@ -712,98 +815,16 @@ fn main() -> ExitCode {
             println!("bigtea-run {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
+        if first == "--help" || first == "-h" {
+            // Falls into the usage block below by leaving `path` unset, so
+            // there is one list rather than two that drift apart.
+            return usage();
+        }
     }
-    let Some(path) = args.next() else {
-        eprintln!("usage: bigtea-run <model.gguf> \"prompt\" [options]");
-        eprintln!();
-        eprintln!("  -n N                tokens to generate");
-        eprintln!("  -f FILE             read the prompt from a file");
-        eprintln!("  -b N                prefill block size");
-        eprintln!("  --cache GIB         expert cache budget");
-        eprintln!("  --temp T            0 = greedy (default)");
-        eprintln!("  --top-k K           0 = off");
-        eprintln!("  --top-p P           1.0 = off");
-        eprintln!("  --min-p P           0.0 = off");
-        eprintln!("  --repeat-penalty R  1.0 = off");
-        eprintln!("  --frequency-penalty F  subtract F x count. 0 = off");
-        eprintln!("  --presence-penalty P   subtract P if used at all. 0 = off");
-        eprintln!("  --repeat-last-n N   penalty window (default 64)");
-        eprintln!("  --typical P         locally typical sampling. 1.0 = off");
-        eprintln!("  --top-nsigma N      keep logits within N sigma of the max. 0 = off");
-        eprintln!("  --dynatemp-range R  entropy-driven temperature spread. 0 = off");
-        eprintln!("  --dynatemp-exp E    how sharply it reacts (default 1.0)");
-        eprintln!("  --xtc-probability P exclude top choices, chance per token. 0 = off");
-        eprintln!("  --xtc-threshold T   XTC only considers tokens above this (default 0.1)");
-        eprintln!("  --mirostat N        0 off, 1 v1, 2 v2 -- targets a surprise, not a mass");
-        eprintln!("  --mirostat-ent TAU  target surprise in bits (default 5.0)");
-        eprintln!("  --mirostat-lr ETA   mirostat learning rate (default 0.1)");
-        eprintln!("  --logit-bias ID+B   nudge one token, repeatable (e.g. 42-100)");
-        eprintln!("  --ignore-eos        never stop at end-of-sequence");
-        eprintln!("  --dry-multiplier M  DRY repetition penalty. 0 = off");
-        eprintln!("  --dry-base B        DRY growth per extra repeated token (1.75)");
-        eprintln!("  --dry-allowed-length N  repeats shorter than this are free (2)");
-        eprintln!("  --dry-penalty-last-n N  how far DRY looks back. 0 = all");
-        eprintln!("  --dry-sequence-breaker S  a match may not cross this, repeatable");
-        eprintln!("  --samplers SPEC     chain order, e.g. \"top_k;temperature;top_p\"");
-        eprintln!("  -ctk, -ctv TYPE     KV cache storage: f16 (default) or q8_0");
-        eprintln!("  --no-direct-io      read through the page cache (also --no-mmap)");
-        eprintln!("  --direct-io         bypass the page cache (default)");
-        eprintln!("  --override-kv K=T:V override one GGUF metadata entry");
-        eprintln!("  --mlock             pin resident weights so the OS cannot page them out");
-        eprintln!("  --chat-template N   force a chat template (chatml, llama3, gemma, ...)");
-        eprintln!("  --prompt-cache F    reuse a saved KV cache for a repeated prefix");
-        eprintln!("  --prompt-cache-all  also cache what was generated, not just the prompt");
-        eprintln!("  --prompt-cache-ro   read the cache but never write it");
-        eprintln!("  -i, --interactive   keep the session open and take turns");
-        eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
-        eprintln!("  -st, --single-turn  one exchange, then exit");
-        eprintln!("  --multiline-input   a trailing backslash continues the line");
-        eprintln!("  --in-prefix S       wrap user input (non-conversation mode)");
-        eprintln!("  --in-suffix S       ...and after it");
-        eprintln!("  --in-prefix-bos     prepend BOS to each user turn");
-        eprintln!("  -sys, --system-prompt S   system message (implies a template)");
-        eprintln!("  --system-prompt-file F    ...read from a file");
-        eprintln!("  -co, --color        colour the generated text");
-        eprintln!("  --simple-io         no ANSI, for pipes and logs");
-        eprintln!("  --no-display-prompt do not echo the prompt back");
-        eprintln!("  -sp, --special      show control tokens instead of hiding them");
-        eprintln!("  --print-token-count report prompt and generated counts");
-        eprintln!("  --verbose-prompt    print the tokenised prompt and its ids");
-        eprintln!("  -e, --escape        process backslash escapes in -p (default on)");
-        eprintln!("  --no-escape         take -p literally");
-        eprintln!("  -r, --reverse-prompt S    llama.cpp's name for --stop");
-        eprintln!("  --rope-freq-base B  override the container's RoPE base");
-        eprintln!("  --rope-freq-scale S linear RoPE scaling (1.0 = off)");
-        eprintln!("  --rope-scale N      context multiplier (= 1 / freq-scale)");
-        eprintln!("  --rope-scaling T    none | linear | yarn");
-        eprintln!("  --yarn-ext-factor F   YaRN mix (0 = pure linear)");
-        eprintln!("  --yarn-attn-factor F  YaRN magnitude correction");
-        eprintln!("  --yarn-beta-fast F    YaRN high-frequency cutoff");
-        eprintln!("  --yarn-beta-slow F    YaRN low-frequency cutoff");
-        eprintln!("  --yarn-orig-ctx N     context the model was trained at");
-        eprintln!("  --log-disable       silence the status lines");
-        eprintln!("  --log-file F        write status to a file instead of stderr");
-        eprintln!("  --log-timestamps    prefix each status line with elapsed time");
-        eprintln!("  --log-prefix        prefix each status line with its level");
-        eprintln!("  -v, --verbose       verbosity 2");
-        eprintln!("  --verbosity N       0 quiet, 1 normal, 2+ verbose");
-        eprintln!("  --no-perf           omit the timing summary");
-        eprintln!("  --version           print the version and exit");
-        eprintln!("  --perplexity        score a corpus instead of generating");
-        eprintln!("  --ppl-chunk N       perplexity chunk size (default 512)");
-        eprintln!("  --seed S            reproducible sampling");
-        eprintln!("  --llamacpp-defaults temp 0.8, top-k 40, top-p 0.95, min-p 0.05, repeat 1.1");
-        eprintln!("  --chat              apply the model's chat template to the prompt");
-        eprintln!("  -t, --threads N     threads for generation (default: measured -- generation");
-        eprintln!("                      is bandwidth-bound and all cores is 1.7x SLOWER)");
-        eprintln!("  -tb, --threads-batch N  threads for prefill (default: all cores)");
-        eprintln!("  -c, --ctx-size N    cap the context; refuses past it rather than aborting");
-        eprintln!("  --stop TEXT         stop when this appears (repeatable)");
-        eprintln!("  --force             run an unverified architecture anyway");
-        eprintln!("  --no-repack         keep resident weights in their stored layout");
-        eprintln!("                      (repacking is on by default: 1.35x prefill)");
-        return ExitCode::from(2);
-    };
+    let path_positional = if leads_with_flag { None } else { args.next() };
+    if path_positional.is_none() && !leads_with_flag {
+        return usage();
+    }
     let mut prompt = String::new();
     let mut n_predict = 8usize;
     // A block reads nearly the whole expert set whatever its size, so larger
@@ -834,6 +855,7 @@ fn main() -> ExitCode {
     let mut overrides: Vec<(String, bigtea_gguf::Value)> = Vec::new();
     let mut mlock = false;
     let mut chat_template: Option<String> = None;
+    let mut model_flag: Option<String> = None;
     let mut prompt_cache: Option<String> = None;
     let mut prompt_cache_all = false;
     let mut prompt_cache_ro = false;
@@ -842,11 +864,17 @@ fn main() -> ExitCode {
     let mut ctx_size: Option<usize> = None;
     let mut stop: Vec<String> = Vec::new();
     let mut force = false;
-    let rest: Vec<String> = args.collect();
+    // With a leading flag nothing was consumed as the path, so every argument
+    // is a flag to parse.
+    let rest: Vec<String> = if leads_with_flag {
+        std::env::args().skip(1).collect()
+    } else {
+        args.collect()
+    };
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
-            "-n" => {
+            "-n" | "--n-predict" | "--predict" => {
                 n_predict = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(8);
                 i += 2;
             }
@@ -968,6 +996,11 @@ fn main() -> ExitCode {
             }
             // On by default -- it is 1.35x faster AND agrees with llama.cpp.
             // This turns it off, for measuring the difference.
+            // The default, spelled explicitly. llama.cpp has both, and a
+            // script passing --repack should not be told it is unknown.
+            "--repack" => {
+                i += 1;
+            }
             "--no-repack" => {
                 std::env::set_var("BIGTEA_NO_REPACK", "1");
                 i += 1;
@@ -1221,6 +1254,13 @@ fn main() -> ExitCode {
                 ui.interactive = true;
                 i += 1;
             }
+            // llama.cpp's: interactive, but the user speaks first. Distinct
+            // from -i, which generates from the prompt and then waits.
+            "-if" | "--interactive-first" => {
+                ui.interactive = true;
+                ui.interactive_first = true;
+                i += 1;
+            }
             "-cnv" | "--conversation" => {
                 ui.interactive = true;
                 ui.conversation = true;
@@ -1344,7 +1384,7 @@ fn main() -> ExitCode {
                 sampler = SamplerConfig::llamacpp_defaults();
                 i += 1;
             }
-            "-b" => {
+            "-b" | "--batch-size" => {
                 prefill_block = rest
                     .get(i + 1)
                     .and_then(|v| v.parse().ok())
@@ -1355,7 +1395,23 @@ fn main() -> ExitCode {
             // A long-context prompt does not fit on a command line; Windows
             // caps it around 32k characters, well under the token counts that
             // make streaming interesting.
-            "-f" => {
+            // llama.cpp names the model and the prompt with flags; this
+            // runner only ever took them positionally. Someone with the muscle
+            // memory types `-m model.gguf -p "..."`, and matching the spelling
+            // is the whole reason for copying a CLI.
+            "-m" | "--model" => {
+                if let Some(v) = rest.get(i + 1) {
+                    model_flag = Some(v.clone());
+                }
+                i += 2;
+            }
+            "-p" | "--prompt" => {
+                if let Some(v) = rest.get(i + 1) {
+                    prompt = v.clone();
+                }
+                i += 2;
+            }
+            "-f" | "--file" => {
                 let Some(file) = rest.get(i + 1) else {
                     eprintln!("bigtea-run: -f needs a file path");
                     return ExitCode::from(2);
@@ -1388,6 +1444,10 @@ fn main() -> ExitCode {
         prompt = unescape(&prompt);
     }
     let prompt = prompt;
+    let Some(path) = model_flag.or(path_positional) else {
+        eprintln!("bigtea-run: no model given. Pass it positionally or with -m.");
+        return ExitCode::from(2);
+    };
 
     bigtea_arch::log::configure(logcfg);
     match run(
@@ -1711,13 +1771,23 @@ fn run_streaming(
 
     // One iteration per exchange. A non-interactive run takes the `break` at
     // the bottom on its first pass, so its behaviour is exactly what it was.
+    // `--interactive-first`: the user speaks before the model does. Skipping
+    // the first generation rather than duplicating the turn-reading code below
+    // keeps one path for appending a turn to the cache.
+    let mut skip_generation = ui.interactive_first;
     loop {
         // Stop sequences are matched against the accumulated text, not the
         // token: a stop string can straddle a token boundary and per-token
         // matching would miss most of them. Reset per turn, or a stop string
         // from an earlier answer would end this one immediately.
         let mut generated_text = String::new();
-        for step in 0..n_predict {
+        let this_turn = if skip_generation {
+            skip_generation = false;
+            0
+        } else {
+            n_predict
+        };
+        for step in 0..this_turn {
             if logits.len() < vocab {
                 return Err(format!("logits too small: {} < {vocab}", logits.len()).into());
             }
@@ -1742,7 +1812,7 @@ fn run_streaming(
 
             // Only the new token needs computing; history lives in the cache.
             // Skipped on the last step — nothing would read those logits.
-            if step + 1 < n_predict {
+            if step + 1 < this_turn {
                 logits = runner.forward_cached(&weights, &mut cache, &[next], pos)?;
                 pos += 1;
             }

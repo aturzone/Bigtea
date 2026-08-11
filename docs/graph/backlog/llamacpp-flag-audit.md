@@ -14,7 +14,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 
 | bucket | flags | state |
 |---|---:|---|
-| **have** | **81** | done |
+| **have** | **106** | done |
 | **samplers** | 22 | **21 done**; only `--backend-sampling` left, and it is a GPU concept |
 | interaction / prompt handling | 22 | **done 2026-08-11** — including a real REPL |
 | runtime / threading / memory | 31 | I/O mode + `--override-kv` done; most of the rest **refused**, see below |
@@ -28,6 +28,24 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 | LoRA / control vectors | 5 | gap |
 | grammar / JSON schema | 4 | gap |
 | meta (`--help`, `--version`) | 4 | 3 done |
+
+### The count in this document was wrong for eight commits
+
+Every "have" figure before 2026-08-11 was measured by grepping **the help
+text**, which lists a flag under one spelling and often the short one:
+`--cache-type-k` prints as `-ctk`, `--typical-p` as `--typical`. The parser
+accepted them; the count did not see them.
+
+Measured from the parser instead:
+
+```
+$ grep -oE '"(-{1,2}[a-zA-Z0-9][a-zA-Z0-9-]*)"' bigtea-run.rs     | tr -d '"' | grep '^--' | sort -u | wc -l
+106
+```
+
+**81 was an undercount of 25.** The lesson is the one this project keeps
+relearning: measure the thing, not a description of the thing. A help text is a
+description, and it drifts.
 
 **"All of them" is not the right target and this table is why.** Fifteen are
 GPU-only on an engine with no GPU backend; several more (`--no-mmap`,
@@ -312,6 +330,28 @@ $ ... --override-kv llama.rope.freq_base=float:1000
 A malformed spec **refuses the run** (exit 2) rather than being skipped: an
 override silently dropped is worse than none, because the user believes the
 container has been corrected.
+
+### Long-form aliases and `-m`/`-p` - done 2026-08-11
+
+`-m`/`--model`, `-p`/`--prompt`, `--file`, `--batch-size`, `--n-predict`,
+`--predict`, `--repack`, `--help`, `-if`/`--interactive-first`.
+
+Muscle memory is the stated reason for copying a CLI, and until now the model
+and prompt could **only** be positional: someone typing
+`bigtea-run -m model.gguf -p "hi"` got a file-not-found for `-m`. The first
+argument is now treated as the path only when it is not a flag.
+
+`--interactive-first` is not an alias for `-i` and is implemented as its own
+thing: the user speaks before the model does.
+
+```
+$ printf 'What is 2 plus 2?
+' | bigtea-run -m <llama-3.2-1b>     -p "You are a calculator." -n 10 -if -cnv
+> The answer is... 4!
+```
+
+The option list is now one `usage()` function rather than a block inside
+`main`, so `--help`, `-h` and a bare invocation cannot drift apart.
 
 ### Prompt cache - done 2026-08-11, and worth 19x on a repeated prompt
 
