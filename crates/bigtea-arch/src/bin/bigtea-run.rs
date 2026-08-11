@@ -806,6 +806,19 @@ fn completion_bash() -> ExitCode {
 // being written.
 include!(concat!(env!("OUT_DIR"), "/flags.rs"));
 
+/// llama.cpp's `--context-shift` / `--keep`.
+///
+/// The difference between a runner that stops at its context limit and one that
+/// keeps going. Default **on**, as in llama.cpp.
+#[derive(Debug, Clone, Copy)]
+struct Shift {
+    on: bool,
+    /// Tokens at the front that are never discarded — a system prompt, or the
+    /// instructions the whole conversation depends on. `0` keeps nothing,
+    /// which is llama.cpp's default too.
+    keep: usize,
+}
+
 /// llama.cpp's `--fit` group: adjust what the user did not set so the run fits.
 ///
 /// The one flag group where this project should be ahead rather than level.
@@ -1299,6 +1312,10 @@ fn main() -> ExitCode {
     let mut check_tensors = false;
     let mut cpu_mask: Option<u64> = None;
     let mut cpu_strict = false;
+    // llama.cpp defaults context shift ON. So does this -- see the shift block
+    // in the generation loop for what it costs.
+    let mut context_shift = true;
+    let mut n_keep: usize = 0;
     // llama.cpp defaults --fit to on; so does this. It only ever adjusts
     // arguments the user did NOT set, which is what makes a default-on
     // auto-configuration safe.
@@ -1684,6 +1701,25 @@ fn main() -> ExitCode {
             // and the first NaN reaching a softmax makes every probability NaN
             // -- argmax then returns index 0 and the model repeats one token
             // forever, which reads as a broken model rather than a broken file.
+            // --- context shift ----------------------------------------------
+            //
+            // What lets generation continue past the context limit: keep the
+            // first `--keep` tokens, discard the oldest half of the rest, and
+            // slide the remainder down.
+            "--context-shift" => {
+                context_shift = true;
+                i += 1;
+            }
+            "--no-context-shift" => {
+                context_shift = false;
+                i += 1;
+            }
+            "--keep" => {
+                if let Some(v) = rest.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                    n_keep = v;
+                }
+                i += 2;
+            }
             // --- CPU affinity ------------------------------------------------
             //
             // Refused earlier on the premise that there is "no thread-affinity
@@ -2354,6 +2390,10 @@ fn main() -> ExitCode {
             target_mib: fit_target_mib,
             min_ctx: fit_ctx,
         },
+        Shift {
+            on: context_shift,
+            keep: n_keep,
+        },
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -2395,6 +2435,7 @@ fn run_streaming(
     infill: bool,
     grammar_triggers: Vec<String>,
     fit: Fit,
+    shift: Shift,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -2419,11 +2460,20 @@ fn run_streaming(
 
     // A context cap the user asked for, enforced before any work rather than
     // discovered as an arena abort partway through.
-    if let Some(limit) = ctx_size {
+    // Only when there is no way to make room. With context shift on -- the
+    // default, as in llama.cpp -- exceeding `-c` is the case the shift EXISTS
+    // to handle, and refusing here made the flag unreachable: it never fired
+    // once, because this check ran first.
+    if let Some(limit) = ctx_size.filter(|_| !shift.on) {
         if tokens.len() + n_predict > limit {
             return Err(format!(
-                "prompt is {} tokens and -n is {n_predict}, which exceeds the -c limit of {limit}",
-                tokens.len()
+                concat!(
+                    "prompt is {} tokens and -n is {}, which exceeds the -c limit of {}. ",
+                    "Drop --no-context-shift to let it make room instead."
+                ),
+                tokens.len(),
+                n_predict,
+                limit
             )
             .into());
         }
@@ -2783,6 +2833,17 @@ fn run_streaming(
         // matching would miss most of them. Reset per turn, or a stop string
         // from an earlier answer would end this one immediately.
         let mut generated_text = String::new();
+        // What "full" means here. An explicit -c wins; otherwise the model's
+        // own trained context, and failing that the prompt plus what was asked
+        // for, which never triggers and so never surprises anyone.
+        let shift_limit = ctx_size
+            .or(if config.rope_orig_ctx > 0 {
+                Some(config.rope_orig_ctx as usize)
+            } else {
+                None
+            })
+            .unwrap_or(usize::MAX);
+        let mut shifted_once = false;
         // A lazy grammar is off until a trigger appears; with no triggers the
         // grammar is armed from the first token, which is the ordinary case.
         let mut grammar_armed = grammar_triggers.is_empty();
@@ -2885,6 +2946,35 @@ fn run_streaming(
             // Only the new token needs computing; history lives in the cache.
             // Skipped on the last step — nothing would read those logits.
             if step + 1 < this_turn {
+                // Context shift: the cache is about to outgrow what this build
+                // can attend over, so make room rather than stopping.
+                //
+                // llama.cpp's rule -- keep the first `--keep` tokens (a system
+                // prompt, usually) and discard the oldest half of what follows,
+                // so the cost is paid once per half-context rather than once
+                // per token.
+                if shift.on && pos + 1 >= shift_limit {
+                    let keep = shift.keep.min(pos.saturating_sub(1));
+                    let drop = ((pos - keep) / 2).max(1);
+                    cache.shift_out(keep, drop);
+                    pos -= drop;
+                    if !shifted_once {
+                        shifted_once = true;
+                        // Said once, and said plainly, because the output after
+                        // a shift is NOT equivalent to output without one.
+                        bigtea_arch::info!(
+                            concat!(
+                                "shift      context full: kept {}, dropped {}. The shifted keys ",
+                                "still carry the rotation of their ORIGINAL positions -- ",
+                                "llama.cpp re-ropes them and this build does not, so history ",
+                                "past the first shift is approximate. --no-context-shift stops ",
+                                "instead."
+                            ),
+                            keep,
+                            drop
+                        );
+                    }
+                }
                 logits = runner.forward_cached(&weights, &mut cache, &[next], pos)?;
                 pos += 1;
             }
@@ -3009,6 +3099,7 @@ fn run(
     grammar_triggers: Vec<String>,
     check_tensors: bool,
     fit: Fit,
+    shift: Shift,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -3284,6 +3375,7 @@ fn run(
             infill,
             grammar_triggers,
             fit,
+            shift,
             t0,
         );
     }

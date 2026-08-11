@@ -291,6 +291,42 @@ impl KvCache {
         self.n_positions = n;
     }
 
+    /// Drop `drop` positions starting at `keep`, sliding the rest down.
+    ///
+    /// llama.cpp's context shift, and what makes generation past the context
+    /// limit possible at all: the first `keep` positions stay (a system prompt
+    /// usually), the oldest `drop` after them are discarded, and everything
+    /// later slides back so the sequence is contiguous again.
+    ///
+    /// # The part that is not obvious
+    ///
+    /// **The keys that slide are not re-encoded.** A key was computed with RoPE
+    /// applied at its original absolute position, and after the slide it sits
+    /// at a lower one — so every shifted key carries a rotation for a position
+    /// it no longer occupies. llama.cpp corrects this by re-roping the shifted
+    /// range (`llama_kv_cache_seq_add`); this does not, so the shifted history
+    /// is approximate rather than exact.
+    ///
+    /// That is a real limitation and the runner says so out loud rather than
+    /// presenting shifted output as equivalent. It is still far better than the
+    /// alternative, which is refusing to generate at all — and it is exactly
+    /// the trade llama.cpp made before it added re-roping.
+    pub fn shift_out(&mut self, keep: usize, drop: usize) {
+        if drop == 0 || keep >= self.n_positions {
+            return;
+        }
+        let drop = drop.min(self.n_positions - keep);
+        let step = self.kind.bytes_for(self.per_position);
+        let from = (keep + drop) * step;
+        let to = keep * step;
+        for layer in self.k.iter_mut().chain(self.v.iter_mut()) {
+            layer.copy_within(from.., to);
+            let new_len = layer.len() - drop * step;
+            layer.truncate(new_len);
+        }
+        self.n_positions -= drop;
+    }
+
     pub fn is_consistent(&self) -> bool {
         // In **bytes**, which is what the vectors now hold. Comparing against
         // the value count silently passed for F16 only because a length in
@@ -525,5 +561,62 @@ mod tests {
         assert!(c.is_empty());
         assert!(c.is_consistent());
         assert_eq!(c.bytes(), 0);
+    }
+
+    #[test]
+    fn shifting_out_keeps_the_head_and_slides_the_tail() {
+        // One layer, one head, head_dim 2 -> two f32 per position.
+        let mut c = KvCache::new(1, 1, 2);
+        for i in 0..6 {
+            let v = i as f32;
+            c.push(0, &[v, v], &[v, v]).unwrap();
+            // `advance` is separate from `push` so the count moves once per
+            // token rather than once per layer -- one layer here, so once each.
+            c.advance();
+        }
+        assert_eq!(c.len(), 6);
+        // Keep 2, drop 2: positions 0,1 stay; 2,3 go; 4,5 slide to 2,3.
+        c.shift_out(2, 2);
+        assert_eq!(c.len(), 4);
+        assert!(c.is_consistent());
+        // Byte-level: each position is two f16, so four bytes.
+        let k = c.keys(0);
+        assert_eq!(k.len(), 16);
+        let first_of = |slot: usize| &k[slot * 4..slot * 4 + 4];
+        assert_eq!(first_of(0), first_of(0));
+        // Slot 2 must now hold what position 4 held, not what position 2 did.
+        // Compare against a freshly built cache holding only 0,1,4,5.
+        let mut want = KvCache::new(1, 1, 2);
+        for i in [0.0f32, 1.0, 4.0, 5.0] {
+            want.push(0, &[i, i], &[i, i]).unwrap();
+            want.advance();
+        }
+        assert_eq!(c.keys(0), want.keys(0));
+        assert_eq!(c.values(0), want.values(0));
+    }
+
+    #[test]
+    fn shifting_more_than_there_is_clamps_rather_than_underflowing() {
+        let mut c = KvCache::new(1, 1, 2);
+        for i in 0..4 {
+            let v = i as f32;
+            c.push(0, &[v, v], &[v, v]).unwrap();
+            c.advance();
+        }
+        c.shift_out(1, 100);
+        assert_eq!(c.len(), 1);
+        assert!(c.is_consistent());
+    }
+
+    #[test]
+    fn shifting_nothing_is_a_no_op() {
+        let mut c = KvCache::new(1, 1, 2);
+        c.push(0, &[7.0, 7.0], &[7.0, 7.0]).unwrap();
+        c.advance();
+        let before = c.keys(0).to_vec();
+        c.shift_out(0, 0);
+        c.shift_out(5, 3);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.keys(0), &before[..]);
     }
 }

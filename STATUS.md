@@ -1433,6 +1433,45 @@ explicit `-t`/`-tb` still wins over both.
 
 Flags: **147 implemented, 44 declined**, of 191 recognised. Tests **435**.
 
+## Context shift: generation past the context limit (2026-08-11)
+
+`--context-shift` (default on), `--no-context-shift`, `--keep N`. 40 tokens
+generated under a 24-token limit:
+
+```
+$ bigtea-run -m m.gguf -p "Once upon a time" -n 40 -c 24 --keep 4
+shift      context full: kept 4, dropped 9. ...
+generated  40 tokens in 1.6s (25.10 tok/s)
+```
+
+**The shift was unreachable when first written.** The `-c` check refused the
+run before generation started — the exact case the shift exists to handle — so
+the flag fired zero times while being accepted and echoed. That check is now
+gated on `--no-context-shift`, and its message names the way forward instead of
+just the wall.
+
+### The limitation is stated at runtime, not buried
+
+```
+The shifted keys still carry the rotation of their ORIGINAL positions --
+llama.cpp re-ropes them and this build does not, so history past the first
+shift is approximate. --no-context-shift stops instead.
+```
+
+A key is computed with RoPE applied at its absolute position. After the slide it
+sits at a lower one, so every shifted key carries a rotation for a position it
+no longer occupies. llama.cpp corrects this (`llama_kv_cache_seq_add`); this
+does not. The output degrades visibly after a shift, and **saying so once, in
+the run itself, is the difference between a documented approximation and a
+silent one.** It is still better than refusing to generate, and it is the trade
+llama.cpp made before it added re-roping.
+
+`KvCache::shift_out` carries three unit tests, including one that checks a
+slid position holds what the *later* position held rather than what used to be
+in that slot — the failure mode that would look like plausible text.
+
+Flags: **150 implemented, 44 declined**, of 194 recognised. Tests **438**.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
