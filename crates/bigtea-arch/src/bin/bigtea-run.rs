@@ -974,45 +974,9 @@ const REFUSED: &[(&str, bool, &str)] = &[
         false,
         "reasoning-block parsing is not implemented",
     ),
-    // --- downloads. `bigtea-pull` is the tool; wiring it into the runner is
-    // real work rather than an alias, because a partial download has to be
-    // resumable and verified before a forward pass touches it.
-    (
-        "--hf-repo",
-        true,
-        "use `bigtea-pull` and pass the resulting path",
-    ),
-    (
-        "--hf-file",
-        true,
-        "use `bigtea-pull` and pass the resulting path",
-    ),
-    (
-        "--hf-repo-v",
-        true,
-        "use `bigtea-pull` and pass the resulting path",
-    ),
-    (
-        "--hf-file-v",
-        true,
-        "use `bigtea-pull` and pass the resulting path",
-    ),
-    (
-        "--hf-token",
-        true,
-        "use `bigtea-pull`, which takes the token",
-    ),
-    (
-        "--model-url",
-        true,
-        "use `bigtea-pull` and pass the resulting path",
-    ),
+    // --- downloads. Implemented now -- see `resolve_model_source`. Only the
+    // Docker registry stays out: it is a different protocol, not a URL.
     ("--docker-repo", true, "no Docker model registry support"),
-    (
-        "--cache-list",
-        false,
-        "`bigtea-pull` owns the download cache",
-    ),
     // --- NUMA and thread affinity.
     ("--numa", true, "no NUMA-aware allocation to select between"),
     (
@@ -1044,6 +1008,66 @@ fn refusal(flag: &str) -> Option<(bool, &'static str)> {
         .iter()
         .find(|(f, _, _)| *f == flag)
         .map(|(_, takes_arg, why)| (*takes_arg, *why))
+}
+
+/// Turn `-hf` / `--hf-repo` / `--model-url` into a local path, downloading if
+/// needed.
+///
+/// Returns `None` when none of them were given, so `-m` and the positional
+/// argument keep working unchanged.
+fn resolve_model_source(
+    hf_spec: Option<&str>,
+    hf_repo: Option<&str>,
+    hf_file: Option<&str>,
+    model_url: Option<&str>,
+    token: Option<&str>,
+    offline: bool,
+) -> Result<Option<String>, String> {
+    use bigtea_model::download;
+
+    // A bare URL first: it needs no repo parsing and nothing else can supply a
+    // filename for it.
+    if let Some(url) = model_url {
+        let name = url.rsplit('/').next().unwrap_or("model.gguf");
+        let dest = download::cache_path(None, name);
+        let got = download::fetch(url, &dest, token, offline)?;
+        bigtea_arch::info!(
+            "model      {} {}",
+            if got.cached { "cached" } else { "fetched" },
+            got.path.display()
+        );
+        return Ok(Some(got.path.to_string_lossy().into_owned()));
+    }
+
+    // `-hf owner/name/file.gguf`, or `--hf-repo owner/name --hf-file f.gguf`.
+    let (repo, file) = match (hf_spec, hf_repo) {
+        (Some(spec), _) => {
+            let (r, f) = download::parse_hf(spec)?;
+            (r, f.or_else(|| hf_file.map(str::to_string)))
+        }
+        (None, Some(r)) => (r.to_string(), hf_file.map(str::to_string)),
+        (None, None) => return Ok(None),
+    };
+    let Some(file) = file else {
+        // Refused rather than guessed. A repo holds several quants and picking
+        // one for the user is how someone ends up running Q2 and concluding the
+        // model is bad -- see the guessing this project has already paid for.
+        return Err(format!(
+            "--hf-repo {repo} names a repo but not a file. Pass --hf-file <name.gguf>, \
+             or use -hf {repo}/<name.gguf>. Listing a repo's quants needs the Hugging \
+             Face API, which this build does not call."
+        ));
+    };
+
+    let url = download::hf_url(&repo, &file);
+    let dest = download::cache_path(Some(&repo), &file);
+    let got = download::fetch(&url, &dest, token, offline)?;
+    bigtea_arch::info!(
+        "model      {} {}",
+        if got.cached { "cached" } else { "fetched" },
+        got.path.display()
+    );
+    Ok(Some(got.path.to_string_lossy().into_owned()))
 }
 
 /// The fill-in-the-middle control tokens in this vocabulary.
@@ -1257,6 +1281,12 @@ fn main() -> ExitCode {
     let mut warmup = false;
     let mut infill = false;
     let mut grammar_triggers: Vec<String> = Vec::new();
+    let mut hf_spec: Option<String> = None;
+    let mut hf_repo: Option<String> = None;
+    let mut hf_file: Option<String> = None;
+    let mut hf_token: Option<String> = None;
+    let mut model_url: Option<String> = None;
+    let mut offline = false;
     let mut chat_template: Option<String> = None;
     let mut model_flag: Option<String> = None;
     let mut grammar_src: Option<String> = None;
@@ -1576,6 +1606,61 @@ fn main() -> ExitCode {
             // --- I/O mode and metadata overrides --------------------------
             // The opposite of --no-mmap, and the default. Accepted so a
             // llama.cpp command line that spells the default out still runs.
+            // --- fetching a container --------------------------------------
+            //
+            // `-hf owner/name/file.gguf` is how most people get a model, and a
+            // runner that cannot do it sends them to a second tool for the step
+            // that comes first.
+            "-hf" | "--hf" | "--hf-repo" | "--hf-repo-v" => {
+                let Some(v) = rest.get(i + 1) else {
+                    eprintln!("bigtea-run: {} needs owner/name[/file.gguf]", rest[i]);
+                    return ExitCode::from(2);
+                };
+                if rest[i].starts_with("--hf-repo") {
+                    hf_repo = Some(v.clone());
+                } else {
+                    hf_spec = Some(v.clone());
+                }
+                i += 2;
+            }
+            "--hf-file" | "--hf-file-v" => {
+                hf_file = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            // Read but never echoed, including on the failure path -- a failed
+            // download is exactly when output gets pasted into an issue.
+            "--hf-token" => {
+                hf_token = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "-mu" | "--model-url" => {
+                model_url = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            // Makes the cache the only source. The honest way to run without a
+            // network, rather than discovering halfway that something wanted to
+            // phone home.
+            "--offline" => {
+                offline = true;
+                i += 1;
+            }
+            "--cache-list" => {
+                let dir = bigtea_model::download::cache_dir();
+                let files = bigtea_model::download::cached_files();
+                if files.is_empty() {
+                    println!("no containers cached in {}", dir.display());
+                } else {
+                    println!("{}:", dir.display());
+                    for (p, len) in files {
+                        println!(
+                            "  {:>8.2} GiB  {}",
+                            len as f64 / (1u64 << 30) as f64,
+                            p.file_name().unwrap_or_default().to_string_lossy()
+                        );
+                    }
+                }
+                return ExitCode::SUCCESS;
+            }
             "--mmap" => {
                 std::env::set_var("BIGTEA_IO", "buffered");
                 i += 1;
@@ -2041,8 +2126,24 @@ fn main() -> ExitCode {
         prompt = unescape(&prompt);
     }
     let prompt = prompt;
-    let Some(path) = model_flag.or(path_positional) else {
-        eprintln!("bigtea-run: no model given. Pass it positionally or with -m.");
+    // Resolved before anything else needs a path, so a download failure
+    // reports itself as a download failure rather than as "cannot open <url>".
+    let fetched = match resolve_model_source(
+        hf_spec.as_deref(),
+        hf_repo.as_deref(),
+        hf_file.as_deref(),
+        model_url.as_deref(),
+        hf_token.as_deref(),
+        offline,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("bigtea-run: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(path) = fetched.or(model_flag).or(path_positional) else {
+        eprintln!("bigtea-run: no model given. Pass it positionally, with -m, or with -hf.");
         return ExitCode::from(2);
     };
 

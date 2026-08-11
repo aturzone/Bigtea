@@ -1232,6 +1232,52 @@ Three more implemented in the same batch: `--mmap` (the default, spelled out),
 full and the window lives in the attention mask, so it reports that rather than
 accepting the flag silently.
 
+## `-hf` works: the runner fetches its own models (2026-08-11)
+
+Seven flags moved from **declined** to **implemented**: `-hf`, `--hf-repo`,
+`--hf-file`, `--hf-token`, `--model-url`, `--offline`, `--cache-list`. One
+command now downloads and runs:
+
+```
+$ bigtea-run -hf Qwen/Qwen2-0.5B-Instruct-GGUF/qwen2-0_5b-instruct-q4_k_m.gguf \
+             -p "The capital of France is" -n 8 --temp 0
+model      fetched .../bigtea/models/Qwen--Qwen2-0.5B-Instruct-GGUF--qwen2-0_5b-...gguf
+ Paris. It is the most populous city
+```
+
+Second run reports `model cached`. `--cache-list` shows it; `--offline` runs
+from it and refuses to reach the network.
+
+### Two things that are not "shell out to curl"
+
+**Every download is checked for GGUF's magic number, and a file that fails it
+is deleted.** A half-succeeded download is the worst outcome available here: a
+truncated container parses far enough to report a plausible architecture and
+then fails deep in a forward pass, and a gated repo returns an *HTML error
+page* which lands under a `.gguf` name. Leaving that on disk means the next run
+re-reads it and misdiagnoses a corrupt model. Four bytes settle it.
+
+**A repo without a filename is refused, not guessed.** `-hf owner/name` and
+`owner/name:Q4_K_M` both name a repo holding several quants, and resolving
+either needs the Hugging Face listing API, which this build does not call. It
+says so, and names both ways out:
+
+```
+--hf-repo unsloth/gemma-3-1b-it-GGUF names a repo but not a file. Pass
+--hf-file <name.gguf>, or use -hf unsloth/gemma-3-1b-it-GGUF/<name.gguf>.
+```
+
+Guessing `<name>-Q4_K_M.gguf` is right for some repos and a 404 for others, and
+a 404 saved under a `.gguf` name is exactly the failure above. **This project
+has already paid for guessing once**: the pre-tokenizer fallback that guessed
+`llama-bpe` where llama.cpp defaults to GPT-2, found today, wrong on every
+`gpt2` container that omits the key.
+
+The token is read and **never echoed, including on the failure path** — a
+failed download is exactly when output gets pasted into an issue.
+
+Flags recognised: **187** — 137 implemented, 50 declined. Tests **413 -> 420**.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

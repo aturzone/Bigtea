@@ -32,6 +32,7 @@ use bigtea_io::{DirectFile, IoMode, SkewedBuf};
 
 pub mod catalogue;
 mod discover;
+pub mod download;
 mod resident;
 
 pub use discover::discover_shards;
