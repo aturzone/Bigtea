@@ -1246,3 +1246,36 @@ property the whole design rests on: no two positions in one span share a slot.
 **Still stale, and not mine to change**: `bigtea-serve.rs` reports
 `context_limit() = 256` for deepseek4, so the server refuses sequences the engine
 now handles. One line, and it belongs to whoever owns that file.
+
+## StableLM and StarCoder2: one shared blocker (2026-08-11)
+
+Both downloaded, run and diffed. **Neither is verified.** They fail for the same
+reason, which is why the work is scoped as a feature and not as two models:
+`docs/graph/backlog/layernorm-and-biases.md`.
+
+```
+stablelm -> ??地なutorsemie路emieemieا起
+```
+
+The qwen2 CJK-noise signature. What is missing, after #60's Q/K/V bias support:
+
+1. **`bigtea-ggml` has no LayerNorm.** It binds `ggml_rms_norm` and not
+   `ggml_norm`. LayerNorm subtracts the mean and carries a **bias**; RMSNorm
+   does neither. The tell is `attn_norm.bias` in the container, and the metadata
+   key being `attention.layer_norm_epsilon` rather than `..._rms_epsilon`.
+2. **Biases beyond Q/K/V.** #60 added `attn_bias` (Q/K/V, detected from
+   `blk.0.attn_q.bias`). StarCoder2 also needs `attn_output.bias`,
+   `ffn_up.bias` and `ffn_down.bias`.
+3. **Partial RoPE.** `rope.dimension_count` is ignored — `head_dim` is passed as
+   `n_rot` unconditionally. StableLM declares **16 of its 64** dimensions, so its
+   rotation is wrong today. **This is a real bug beyond StableLM**: any container
+   declaring the key is currently over-rotated.
+4. **Ungated FFN.** StarCoder2 has no `ffn_gate` — plain MLP with GELU rather
+   than SwiGLU. `FfnAct` (added by #60) is where an ungated variant belongs, and
+   `ctx.gelu()` now exists.
+
+LayerNorm plus biases is also the shape of falcon, gpt2, gptneox, bloom, phi2
+and starcoder, so building it once moves the count by more than these two.
+
+Ruled out: the tokenizer (both declare `gpt2`, supported) and the RoPE
+convention (both NeoX, already mapped). The failure is entirely in the block.
