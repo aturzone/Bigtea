@@ -21,7 +21,7 @@ the real distance to "any model", and it is far larger than the performance gap.
 
 | | Bigtea | llama.cpp |
 |---|---|---|
-| architectures | **6** (`deepseek4`, `gemma2`, `llama`, `phi3`, `qwen3`, `qwen3moe`) | ~100 |
+| architectures | **7** (`deepseek4`, `gemma2`, `llama`, `phi3`, `qwen2`, `qwen3`, `qwen3moe`) | ~100. `gemma3` loads and is **wrong** — see `../research/gemma3-not-yet-2026-08-11.md` |
 | tokenizer families | **2** (`gpt2` BPE, `llama` SPM) | 6 (spm, bpe, wpm, ugm, rwkv, plamo2) |
 | quant types | all ggml can decode | same |
 | CLI flags | **106** (counted from the parser, not the help text) | **182** (counted, not estimated: `llamacpp-flag-audit.md`) |
