@@ -1497,6 +1497,41 @@ Two changes:
 Phi-3's two survive both checks — identical tokenization, below the cluster
 threshold — which is the answer the harness should have been giving all along.
 
+## Reasoning blocks: six more off the declined list (2026-08-11)
+
+`--reasoning-format`, `--reasoning`, `--reasoning-budget`,
+`--reasoning-budget-message`, `--reasoning-preserve`,
+`--no-reasoning-preserve`. On Qwen3-4B, which thinks:
+
+```
+default                     <think>Okay, the user is asking...</think> 2 + 2 = 4
+--reasoning-format auto     2 + 2 = 4
+--reasoning-budget 20       reasoning  budget of 20 tokens reached while
+                                       still inside <think>; stopping
+```
+
+**Refused earlier as "downstream of Jinja".** That was wrong for the fourth
+time in the same shape: the block is delimited by ordinary text in the output,
+and finding it needs no template engine at all. The pattern in every one of
+these — `--prio`, `--warmup`, the affinity group, and now this — is refusing on
+*architecture* ("we have no X layer") when the feature only needs to read what
+is already there.
+
+Two decisions worth recording:
+
+**The tags are matched as text, not as token ids.** Qwen3 emits `<`, `think`,
+`>` as three tokens, and the tags are ordinary vocabulary in most models.
+Matching ids would have worked on one model and failed silently on the next —
+which is this project's signature failure.
+
+**Hitting the budget stops rather than forcing `</think>`.** Injecting a close
+tag means guessing a token id that differs per vocabulary, and a model still
+thinking at its budget has not produced an answer — cutting mid-thought and
+continuing would read as one. `--reasoning-budget-message` prints in its place
+so the truncation is visible as truncation.
+
+Flags: **156 implemented, 38 declined**, of 194 recognised.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

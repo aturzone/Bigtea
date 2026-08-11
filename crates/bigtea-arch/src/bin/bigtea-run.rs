@@ -758,6 +758,109 @@ fn completion_bash() -> ExitCode {
 // being written.
 include!(concat!(env!("OUT_DIR"), "/flags.rs"));
 
+/// llama.cpp's `--reasoning-*` group: what to do with a thinking block.
+///
+/// A reasoning model wraps its scratch work in `<think>...</think>` and then
+/// answers. Printing that verbatim is right for a human debugging the model and
+/// wrong for anything parsing the output — an agent asked for JSON gets several
+/// paragraphs of deliberation first, and a `--grammar` would reject the whole
+/// completion because the thinking is not JSON.
+#[derive(Debug, Clone)]
+struct Reasoning {
+    /// `false` keeps the block in the visible output, which is llama.cpp's
+    /// `--reasoning-format none` and this build's previous behaviour.
+    strip: bool,
+    /// Tokens the block may take. `0` suppresses thinking entirely; `-1` is
+    /// unlimited. A model that thinks forever produces no answer at all, and
+    /// that is the failure this bound exists for.
+    budget: i64,
+    /// Printed in place of a block that was cut short, so a truncated thought
+    /// is visible as truncation rather than as the model stopping mid-sentence.
+    budget_message: Option<String>,
+}
+
+impl Default for Reasoning {
+    fn default() -> Self {
+        // Off, matching llama.cpp's `--reasoning-format none` default for the
+        // CLI: a build that silently swallowed part of the output would be
+        // hiding exactly what a person runs the CLI to see.
+        Reasoning {
+            strip: false,
+            budget: -1,
+            budget_message: None,
+        }
+    }
+}
+
+/// Where a stream of tokens is, relative to a `<think>` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkState {
+    /// Before any `<think>`; ordinary output.
+    Before,
+    Inside,
+    /// Past `</think>`; ordinary output again.
+    After,
+}
+
+/// Follows `<think>`/`</think>` across token boundaries.
+///
+/// Byte-wise on the accumulated text rather than by token id, because the tags
+/// are ordinary text in most vocabularies and **split across tokens**: Qwen3
+/// emits `<`, `think`, `>` as three. Matching ids would work on one model and
+/// silently fail on the next.
+struct ThinkTracker {
+    state: ThinkState,
+    seen: String,
+    /// Tokens consumed since the block opened, for the budget.
+    inside_tokens: i64,
+}
+
+impl ThinkTracker {
+    fn new() -> Self {
+        ThinkTracker {
+            state: ThinkState::Before,
+            seen: String::new(),
+            inside_tokens: 0,
+        }
+    }
+
+    /// Feed one token's text. Returns whether it should be printed.
+    fn accept(&mut self, text: &str, strip: bool) -> bool {
+        self.seen.push_str(text);
+        // Only the tail can hold a partial tag, and holding the whole
+        // completion to search it would make this quadratic in the answer.
+        if self.seen.len() > 64 {
+            let cut = self.seen.len() - 32;
+            let cut = (0..=cut)
+                .rev()
+                .find(|&i| self.seen.is_char_boundary(i))
+                .unwrap_or(0);
+            self.seen.drain(..cut);
+        }
+        match self.state {
+            ThinkState::Before if self.seen.contains("<think>") => {
+                self.state = ThinkState::Inside;
+                self.seen.clear();
+                self.inside_tokens = 0;
+                !strip
+            }
+            ThinkState::Inside => {
+                self.inside_tokens += 1;
+                if self.seen.contains("</think>") {
+                    self.state = ThinkState::After;
+                    self.seen.clear();
+                }
+                !strip
+            }
+            _ => true,
+        }
+    }
+
+    fn over_budget(&self, budget: i64) -> bool {
+        budget >= 0 && self.state == ThinkState::Inside && self.inside_tokens > budget
+    }
+}
+
 /// llama.cpp's `--context-shift` / `--keep`.
 ///
 /// The difference between a runner that stops at its context limit and one that
@@ -928,36 +1031,6 @@ const REFUSED: &[(&str, bool, &str)] = &[
         "no Jinja engine, so there is no parsed chat to skip",
     ),
     // --- reasoning-format parsing, which is downstream of Jinja.
-    (
-        "--reasoning-format",
-        true,
-        "reasoning-block parsing is not implemented; the block is emitted verbatim",
-    ),
-    (
-        "--reasoning",
-        true,
-        "reasoning-block parsing is not implemented",
-    ),
-    (
-        "--reasoning-budget",
-        true,
-        "reasoning-block parsing is not implemented",
-    ),
-    (
-        "--reasoning-budget-message",
-        true,
-        "reasoning-block parsing is not implemented",
-    ),
-    (
-        "--reasoning-preserve",
-        false,
-        "reasoning-block parsing is not implemented",
-    ),
-    (
-        "--no-reasoning-preserve",
-        false,
-        "reasoning-block parsing is not implemented",
-    ),
     // --- downloads. Implemented now -- see `resolve_model_source`. Only the
     // Docker registry stays out: it is a different protocol, not a URL.
     ("--docker-repo", true, "no Docker model registry support"),
@@ -1268,6 +1341,7 @@ fn main() -> ExitCode {
     // in the generation loop for what it costs.
     let mut context_shift = true;
     let mut n_keep: usize = 0;
+    let mut reasoning = Reasoning::default();
     // llama.cpp defaults --fit to on; so does this. It only ever adjusts
     // arguments the user did NOT set, which is what makes a default-on
     // auto-configuration safe.
@@ -1653,6 +1727,47 @@ fn main() -> ExitCode {
             // and the first NaN reaching a softmax makes every probability NaN
             // -- argmax then returns index 0 and the model repeats one token
             // forever, which reads as a broken model rather than a broken file.
+            // --- reasoning blocks --------------------------------------------
+            //
+            // Refused earlier as "downstream of Jinja". It is not: the block is
+            // delimited by ordinary text in the output, and finding it needs no
+            // template engine at all.
+            "--reasoning-format" | "--reasoning" => {
+                match rest.get(i + 1).map(String::as_str) {
+                    // llama.cpp's vocabulary. `none` keeps the block.
+                    Some("none") => reasoning.strip = false,
+                    Some("auto") | Some("deepseek") | Some("deepseek-legacy") => {
+                        reasoning.strip = true
+                    }
+                    other => {
+                        eprintln!(
+                            "bigtea-run: --reasoning-format {:?}: expected none, auto, deepseek \
+                             or deepseek-legacy",
+                            other.unwrap_or("")
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "--reasoning-budget" => {
+                reasoning.budget = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1);
+                i += 2;
+            }
+            "--reasoning-budget-message" => {
+                reasoning.budget_message = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            // Preserve is the inverse of strip, and both spellings exist
+            // because llama.cpp's default differs between its CLI and server.
+            "--reasoning-preserve" => {
+                reasoning.strip = false;
+                i += 1;
+            }
+            "--no-reasoning-preserve" => {
+                reasoning.strip = true;
+                i += 1;
+            }
             // --- context shift ----------------------------------------------
             //
             // What lets generation continue past the context limit: keep the
@@ -2346,6 +2461,7 @@ fn main() -> ExitCode {
             on: context_shift,
             keep: n_keep,
         },
+        reasoning,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -2388,6 +2504,7 @@ fn run_streaming(
     grammar_triggers: Vec<String>,
     fit: Fit,
     shift: Shift,
+    reasoning: Reasoning,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -2796,6 +2913,9 @@ fn run_streaming(
             })
             .unwrap_or(usize::MAX);
         let mut shifted_once = false;
+        // Follows <think>/</think> across token boundaries -- the tags are
+        // ordinary text and split across tokens, so this cannot key off ids.
+        let mut think = ThinkTracker::new();
         // A lazy grammar is off until a trigger appears; with no triggers the
         // grammar is armed from the first token, which is the ordinary case.
         let mut grammar_armed = grammar_triggers.is_empty();
@@ -2877,7 +2997,29 @@ fn run_streaming(
                 tokens.push(next);
                 break;
             }
-            writer.push_visible(tokenizer, next, &ui);
+            // The reasoning block, if there is one. `accept` decides whether
+            // this token is part of the answer or part of the scratch work, and
+            // `--reasoning-format none` (the default) prints both.
+            let piece = tokenizer.decode(std::slice::from_ref(&next));
+            let show = think.accept(&piece, reasoning.strip);
+            if think.over_budget(reasoning.budget) {
+                // Stopping is honest and forcing `</think>` would be a guess at
+                // a token id that differs per vocabulary. A model still
+                // thinking at its budget has not produced an answer, and
+                // pretending otherwise by cutting mid-thought would read as one.
+                if let Some(m) = reasoning.budget_message.as_deref() {
+                    println!("{m}");
+                }
+                bigtea_arch::info!(
+                    "reasoning  budget of {} tokens reached while still inside <think>; stopping",
+                    reasoning.budget
+                );
+                tokens.push(next);
+                break;
+            }
+            if show {
+                writer.push_visible(tokenizer, next, &ui);
+            }
             tokens.push(next);
             // Advance the grammar by what was actually emitted. Done after the
             // EOS check above, so a stop token never has to parse.
@@ -3052,6 +3194,7 @@ fn run(
     check_tensors: bool,
     fit: Fit,
     shift: Shift,
+    reasoning: Reasoning,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -3340,6 +3483,7 @@ fn run(
         grammar_triggers,
         fit,
         shift,
+        reasoning,
         t0,
     )
 }
