@@ -30,13 +30,30 @@ LLAMACPP_BIN=${LLAMACPP_BIN:-/c/Projects/llamacpp-unsloth/build/bin}
 BIGTEA=${BIGTEA:-./target/release/bigtea-run.exe}
 REF="$LLAMACPP_BIN/llama-completion.exe"
 
-# Deliberately three kinds of text. A single factual prompt hides an activation
-# error: "The capital of France is Paris" survives a surprising amount of wrong
-# arithmetic, because the answer is overdetermined by the training data.
+# Eight prompts, deliberately unalike, and the count is the point.
+#
+# A PASS IS EVIDENCE ABOUT THESE PROMPTS, NOT ABOUT THE ARCHITECTURE. That is
+# not pedantry: `starcoder2` passed 3/3 while running the WRONG PRE-TOKENIZER,
+# and only agreed because its merge table happened to differ from the model
+# that failed. Three prompts were enough to certify an architecture and not
+# enough to notice that its input was being split wrongly.
+#
+# A single factual prompt is the weakest of all: "The capital of France is
+# Paris" survives a surprising amount of wrong arithmetic, because the answer
+# is overdetermined by the training data. It was the code prompt that exposed
+# the pre-tokenizer, and the code prompt again that exposed Gemma's activation.
+# So: prose, code, a numeric run, a list continuation, arithmetic, SQL, and
+# formal register -- each stresses a different part of the vocabulary and a
+# different part of the graph.
 PROMPTS=(
   "The capital of France is"
   "Once upon a time"
   "def fibonacci(n):"
+  "1 2 3 4 5 6 7 8 9 10 11"
+  "The following is a list of items: apples, oranges,"
+  "Q: What is 17 plus 25? A:"
+  "SELECT name, COUNT(*) FROM users WHERE"
+  "Dear Sir or Madam, I am writing to"
 )
 
 strip() { sed 's/\x1b\[[0-9;]*m//g' | tr -d '\r'; }

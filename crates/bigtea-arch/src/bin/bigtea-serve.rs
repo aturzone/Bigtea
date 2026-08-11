@@ -538,8 +538,16 @@ impl Engine<'_> {
     /// Tokens this path can hold in total, prompt plus generation.
     fn context_limit(&self) -> usize {
         match self {
-            // Attention builds one cache for the whole sequence, 512 x 256.
-            Engine::Deepseek4 { .. } => 256,
+            // **Was 256, and stayed 256 for a release after the engine stopped
+            // needing it.** #61 replaced the position-indexed raw latents with
+            // a 1024-slot ring, so the total sequence is no longer capped at
+            // all -- what is capped is one pass, at 897 tokens, because a pass
+            // must hold `window + nt - 1` distinct positions live at once.
+            //
+            // The server refused sequences the engine had handled for days.
+            // A limit that outlives its cause is worse than no limit: it is a
+            // correct-looking refusal, and nobody re-derives those.
+            Engine::Deepseek4 { .. } => 897,
             // Bounded by the arena rather than by a cache. Kept modest because
             // every pass rebuilds the graph over the whole sequence.
             Engine::Dense { .. } => 2048,
@@ -685,9 +693,12 @@ fn run_prompt(
     if tokens.is_empty() {
         return Err("empty prompt".into());
     }
-    // The context limit is a real property of this path, not a policy: attention
-    // builds its cache for the whole sequence at once. Say so before spending
-    // ten seconds discovering it.
+    // A real property of the path rather than a policy, and worth stating
+    // before ten seconds of loading discovers it. For the V4-Flash path this
+    // is now the per-PASS bound rather than a total: the ring holds any length,
+    // but one forward pass cannot cover more than `RAW_RING - window + 1`
+    // positions. Since the server prefills a prompt in a single pass, the
+    // prompt is what the bound applies to.
     let limit = engine.context_limit();
     if tokens.len() + params.max_tokens > limit {
         return Err(format!(
