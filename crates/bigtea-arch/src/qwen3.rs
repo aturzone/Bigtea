@@ -60,6 +60,10 @@ pub enum FfnAct {
     Silu,
     /// The Gemma family, and the one llama.cpp calls `LLM_FFN_GELU`.
     Gelu,
+    /// **Not gated at all**: `down(gelu(up(x)))`, no `ffn_gate` tensor.
+    /// StarCoder2 and the GPT-2 lineage. Detected from the container rather
+    /// than the name, because a missing `ffn_gate` is a fact about the weights.
+    UngatedGelu,
 }
 
 /// Which non-linearity an architecture's FFN uses, by name.
@@ -110,6 +114,8 @@ pub const VERIFIED_ARCHITECTURES: &[&str] = &[
     "qwen2",
     "qwen3",
     "qwen3moe",
+    "stablelm",
+    "starcoder2",
 ];
 
 /// Whether this build has been run against `arch` and had its output checked.
@@ -181,6 +187,24 @@ pub struct Qwen3Config {
     /// container rather than the architecture name, so a finetune that adds or
     /// drops them is handled without a new arch.
     pub attn_bias: bool,
+    /// Whether every norm in the block is a **LayerNorm** rather than RMSNorm.
+    ///
+    /// Asked of the container, like `qk_norm` and `fused_qkv`: **a norm with a
+    /// bias is a LayerNorm.** RMSNorm divides by the root-mean-square and has
+    /// weight only; LayerNorm centres first and has weight *and* bias.
+    /// Substituting one is not an error and not a crash — StableLM and
+    /// StarCoder2 read as fluent CJK noise before this existed.
+    pub layer_norm: bool,
+    /// Biases on `attn_output`, `ffn_up` and `ffn_down`.
+    ///
+    /// Separate from [`attn_bias`](Self::attn_bias), which is Q/K/V: Qwen2 has
+    /// the latter and not these, StarCoder2 has both.
+    pub ffn_bias: bool,
+    pub attn_out_bias: bool,
+    /// Rotated dimensions per head. **Not always `head_dim`** — StableLM
+    /// declares 16 of its 64, and the rest pass through unrotated. Rotating all
+    /// of them is fluent nonsense, and this was ignored entirely before.
+    pub n_rot: u32,
     pub fused_qkv: bool,
     /// The FFN gate and up projections share one `ffn_up` tensor.
     ///
@@ -264,6 +288,20 @@ impl Qwen3Config {
             .arch_u64("attention.key_length")
             .unwrap_or((n_embd / n_head.max(1)) as u64) as u32;
 
+        // A missing `ffn_gate` means one of two very different things, and the
+        // **shape** separates them: Phi-3 fuses gate and up into one tensor
+        // twice `n_ff` wide, while StarCoder2 has no gate at all and its
+        // `ffn_up` is `n_ff` wide. Computed here rather than in the literal
+        // because `ffn_act` needs to know which of the two it is.
+        let no_gate = model.location("blk.0.ffn_gate.weight").is_none();
+        let up_ne1 = model
+            .location("blk.0.ffn_up.weight")
+            .and_then(|l| l.dims.get(1).copied())
+            .unwrap_or(0);
+        let declared_ff = model.arch_u64("feed_forward_length").unwrap_or(0);
+        let fused_gate_up = no_gate && declared_ff > 0 && up_ne1 == 2 * declared_ff;
+        let ungated = no_gate && !fused_gate_up;
+
         Ok(Qwen3Config {
             n_layer: need("block_count")? as u32,
             n_embd,
@@ -281,8 +319,11 @@ impl Qwen3Config {
                     model.location("token_embd.weight").map(|l| l.dims[1])
                 })
                 .unwrap_or(0) as u32,
+            // Two spellings for one number: RMSNorm models declare
+            // `..._rms_epsilon`, LayerNorm models declare `layer_norm_epsilon`.
             rms_eps: model
                 .arch_f32("attention.layer_norm_rms_epsilon")
+                .or_else(|| model.arch_f32("attention.layer_norm_epsilon"))
                 .unwrap_or(1e-6),
             // 10000 is llama.cpp's default and what every container that omits
             // the key was trained with. The previous default of 1e6 was Qwen3's
@@ -320,9 +361,25 @@ impl Qwen3Config {
             // Asked of the container, like `qk_norm`: a fusion is a fact about
             // this file, not about what it calls itself.
             attn_bias: model.location("blk.0.attn_q.bias").is_some(),
+            // A norm carrying a bias is a LayerNorm. Nothing else distinguishes
+            // them, and the metadata key differs too:
+            // `attention.layer_norm_epsilon` against `..._rms_epsilon`.
+            layer_norm: model.location("blk.0.attn_norm.bias").is_some(),
+            ffn_bias: model.location("blk.0.ffn_down.bias").is_some(),
+            attn_out_bias: model.location("blk.0.attn_output.bias").is_some(),
+            // Declared by the containers that rotate only part of each head;
+            // `head_dim` for everything else, which is what was assumed before.
+            n_rot: model
+                .arch_u64("rope.dimension_count")
+                .map(|v| v as u32)
+                .unwrap_or(head_dim),
             fused_qkv: model.location("blk.0.attn_qkv.weight").is_some(),
-            fused_gate_up: model.location("blk.0.ffn_gate.weight").is_none()
-                && model.location("blk.0.ffn_up.weight").is_some(),
+            // A missing `ffn_gate` means one of two very different things, and
+            // the **shape** is what separates them: Phi-3 fuses gate and up
+            // into one tensor twice `n_ff` wide, while StarCoder2 simply has no
+            // gate and its `ffn_up` is `n_ff` wide. Treating the second as the
+            // first splits a tensor in half and computes SwiGLU over nonsense.
+            fused_gate_up,
             post_norms: model.location("blk.0.post_attention_norm.weight").is_some(),
             // Gemma scales by sqrt(n_embd) on the way in. Keyed on the
             // architecture because nothing in the weights reveals it.
@@ -335,7 +392,16 @@ impl Qwen3Config {
                 _ => head_dim,
             },
             prescale_q: arch.starts_with("gemma"),
-            ffn_act: ffn_act_for(&arch),
+            // Ungated is a fact about the weights, so it overrides the
+            // by-name choice — but **only when the gate is genuinely absent
+            // rather than fused**. Phi-3 also has no `ffn_gate` and is very
+            // much gated, so testing for the tensor alone made it ungated and
+            // broke a verified architecture.
+            ffn_act: if ungated {
+                FfnAct::UngatedGelu
+            } else {
+                ffn_act_for(&arch)
+            },
             attn_logit_softcap: model.arch_f32("attn_logit_softcapping").unwrap_or(0.0),
             final_logit_softcap: model.arch_f32("final_logit_softcapping").unwrap_or(0.0),
             sliding_window: model.arch_u64("attention.sliding_window").unwrap_or(0) as u32,
@@ -411,7 +477,7 @@ impl Qwen3Config {
     pub fn activate<'a>(&self, ctx: &'a Context, gate: &Tensor<'a>) -> Result<Tensor<'a>> {
         Ok(match self.ffn_act {
             FfnAct::Silu => ctx.silu(gate)?,
-            FfnAct::Gelu => ctx.gelu(gate)?,
+            FfnAct::Gelu | FfnAct::UngatedGelu => ctx.gelu(gate)?,
         })
     }
 }
@@ -502,9 +568,33 @@ impl Qwen3Model {
             "token_embd.weight".to_string(),
             "output_norm.weight".to_string(),
         ];
+        // The final norm has a bias too on a LayerNorm architecture, and it is
+        // the easiest of the lot to miss: it is applied once, so a wrong final
+        // norm shifts every logit by the same vector and the text stays fluent.
+        if c.layer_norm {
+            names.push("output_norm.bias".to_string());
+        }
         for il in 0..c.n_layer {
             for suffix in ["attn_norm.weight", "attn_output.weight", "ffn_norm.weight"] {
                 names.push(format!("blk.{il}.{suffix}"));
+            }
+            // **A bias that is not listed here is never loaded**, and the graph
+            // then silently skips it — `weights.get` returns `None` and the
+            // shift is simply not applied. That is not a missing-tensor error;
+            // it is a slightly wrong answer, which is how StableLM read after
+            // LayerNorm landed but before this did.
+            if c.layer_norm {
+                for suffix in ["attn_norm.bias", "ffn_norm.bias"] {
+                    names.push(format!("blk.{il}.{suffix}"));
+                }
+            }
+            if c.attn_out_bias {
+                names.push(format!("blk.{il}.attn_output.bias"));
+            }
+            if c.ffn_bias {
+                for suffix in ["ffn_up.bias", "ffn_down.bias"] {
+                    names.push(format!("blk.{il}.{suffix}"));
+                }
             }
             if c.post_norms {
                 for suffix in ["post_attention_norm.weight", "post_ffw_norm.weight"] {
@@ -539,7 +629,10 @@ impl Qwen3Model {
                 ] {
                     names.push(format!("blk.{il}.{suffix}"));
                 }
-            } else if c.fused_gate_up {
+            } else if c.fused_gate_up || c.ffn_act == FfnAct::UngatedGelu {
+                // Both cases have no `ffn_gate`: Phi-3 fuses it into `ffn_up`,
+                // StarCoder2 does not have one at all. Demanding it here is an
+                // up-front refusal of a container that is perfectly loadable.
                 for suffix in ["ffn_up.weight", "ffn_down.weight"] {
                     names.push(format!("blk.{il}.{suffix}"));
                 }
@@ -805,8 +898,8 @@ impl Qwen3Model {
         Ok(ctx.reshape_2d(&out, (c.head_dim * c.n_head) as i64, n_new)?)
     }
 
-    /// RMS-normalise then scale by a learned weight — the pattern every norm
-    /// in this architecture uses.
+    /// Normalise then scale by a learned weight — the pattern every norm
+    /// in this architecture uses. No bias; see [`norm_named`](Self::norm_named).
     pub fn norm_scaled<'a>(
         &self,
         ctx: &'a Context,
@@ -816,14 +909,76 @@ impl Qwen3Model {
         self.rms_norm_mul(ctx, x, weight)
     }
 
+    /// A norm named by its tensor prefix, picking up `{prefix}.bias` when the
+    /// container carries one.
+    ///
+    /// Taking the prefix rather than a resolved tensor is what lets one call
+    /// site serve both kinds: a LayerNorm model's bias is found, an RMSNorm
+    /// model's absent bias is simply not applied, and neither needs the caller
+    /// to know which it is.
+    pub fn norm_named<'a>(
+        &self,
+        ctx: &'a Context,
+        weights: &WeightSet<'a>,
+        x: &Tensor<'a>,
+        prefix: &str,
+    ) -> Result<Tensor<'a>> {
+        let weight = weights
+            .get(&format!("{prefix}.weight"))
+            .ok_or_else(|| ArchError::MissingTensor(format!("{prefix}.weight")))?;
+        let bias = weights.get(&format!("{prefix}.bias"));
+        self.norm_mul(ctx, x, weight, bias)
+    }
+
+    /// Add `{name}.bias` to `x` when the container has one.
+    ///
+    /// Used for the projection biases StarCoder2 carries on `attn_output`,
+    /// `ffn_up` and `ffn_down`. Absent is the common case and not an error.
+    pub fn add_bias<'a>(
+        &self,
+        ctx: &'a Context,
+        weights: &WeightSet<'a>,
+        x: Tensor<'a>,
+        name: &str,
+    ) -> Result<Tensor<'a>> {
+        match weights.get(&format!("{name}.bias")) {
+            Some(b) => Ok(ctx.add(&x, b)?),
+            None => Ok(x),
+        }
+    }
+
     fn rms_norm_mul<'a>(
         &self,
         ctx: &'a Context,
         x: &Tensor<'a>,
         weight: &Tensor<'a>,
     ) -> Result<Tensor<'a>> {
-        let normed = ctx.rms_norm(x, self.config.rms_eps)?;
-        Ok(ctx.mul(&normed, weight)?)
+        self.norm_mul(ctx, x, weight, None)
+    }
+
+    /// Normalise, scale, and shift when the architecture has a shift.
+    ///
+    /// The kind comes from the config rather than the name, and the bias is
+    /// applied only when the container carries one — so an RMSNorm model that
+    /// gained a bias, or a LayerNorm model that lost one, is a shape error at
+    /// load rather than a silently different function.
+    fn norm_mul<'a>(
+        &self,
+        ctx: &'a Context,
+        x: &Tensor<'a>,
+        weight: &Tensor<'a>,
+        bias: Option<&Tensor<'a>>,
+    ) -> Result<Tensor<'a>> {
+        let normed = if self.config.layer_norm {
+            ctx.norm(x, self.config.rms_eps)?
+        } else {
+            ctx.rms_norm(x, self.config.rms_eps)?
+        };
+        let scaled = ctx.mul(&normed, weight)?;
+        match bias {
+            Some(b) => Ok(ctx.add(&scaled, b)?),
+            None => Ok(scaled),
+        }
     }
 
     /// Scaled dot-product attention with a causal mask.
@@ -899,11 +1054,23 @@ impl Qwen3Model {
         let get = |name: String| -> Result<&Tensor<'a>> {
             weights.get(&name).ok_or(ArchError::MissingTensor(name))
         };
+        // Ungated: `down(gelu(up(x)))`. There is no `ffn_gate` tensor at all,
+        // so the gated path below would ask for one that does not exist -- and
+        // the biases StarCoder2 carries on `ffn_up` and `ffn_down` are applied
+        // where llama.cpp applies them, before and after the activation.
+        if self.config.ffn_act == FfnAct::UngatedGelu {
+            let up = ctx.mul_mat(get(format!("blk.{il}.ffn_up.weight"))?, x)?;
+            let up = self.add_bias(ctx, weights, up, &format!("blk.{il}.ffn_up"))?;
+            let activated = self.config.activate(ctx, &up)?;
+            let down = ctx.mul_mat(get(format!("blk.{il}.ffn_down.weight"))?, &activated)?;
+            return self.add_bias(ctx, weights, down, &format!("blk.{il}.ffn_down"));
+        }
         let (gate_w, up_w) = self.gate_up_weights(ctx, weights, il)?;
         let gate = ctx.mul_mat(&gate_w, x)?;
         let up = ctx.mul_mat(&up_w, x)?;
         let activated = ctx.mul(&self.config.activate(ctx, &gate)?, &up)?;
-        Ok(ctx.mul_mat(get(format!("blk.{il}.ffn_down.weight"))?, &activated)?)
+        let down = ctx.mul_mat(get(format!("blk.{il}.ffn_down.weight"))?, &activated)?;
+        self.add_bias(ctx, weights, down, &format!("blk.{il}.ffn_down"))
     }
 
     /// Mixture-of-experts feed-forward.
@@ -982,6 +1149,10 @@ mod tests {
             rope_type: ROPE_TYPE_NEOX,
             rope_type_is_known: true,
             attn_bias: false,
+            layer_norm: false,
+            ffn_bias: false,
+            attn_out_bias: false,
+            n_rot: 16,
             fused_qkv: false,
             fused_gate_up: false,
             post_norms: false,

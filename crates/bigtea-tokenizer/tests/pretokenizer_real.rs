@@ -163,7 +163,7 @@ fn v4flash_still_uses_joyai_llm_unchanged() {
 /// A variant with no container to check against must be refused, not guessed.
 #[test]
 fn an_unverified_pre_tokenizer_is_refused_by_name() {
-    for unknown in ["deepseek-llm", "falcon", "default", "smaug-bpe"] {
+    for unknown in ["deepseek-llm", "falcon", "smaug-bpe", "bert-bge"] {
         let err = PreTokenizer::from_name(unknown).expect_err("must refuse");
         let text = err.to_string();
         assert!(text.contains(unknown), "must name the variant: {text}");

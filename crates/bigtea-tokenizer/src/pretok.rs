@@ -41,6 +41,13 @@ pub enum PreTokenizer {
     /// `joyai-llm`, DeepSeek-V4-Flash. Adds a CJK rule and has no contraction
     /// rule; verified against llama.cpp on that model.
     JoyaiLlm,
+    /// `default`, **and what an absent `tokenizer.ggml.pre` means.**
+    ///
+    /// llama.cpp's `LLAMA_VOCAB_PRE_TYPE_DEFAULT`, which is also where its
+    /// fallback lands when the key is missing. Structurally unlike the others:
+    /// **four rules applied in sequence**, each splitting the pieces the last
+    /// one produced, rather than one ordered alternation. See [`default_gpt2`].
+    Default,
 }
 
 /// A `tokenizer.ggml.pre` this build has not verified against a real container.
@@ -52,7 +59,7 @@ impl fmt::Display for UnknownPreTokenizer {
         write!(
             f,
             "tokenizer.ggml.pre = {:?} is not implemented (verified here: \
-             \"llama-bpe\"/\"llama3\", \"qwen2\", \"joyai-llm\"). \
+             \"llama-bpe\"/\"llama3\", \"qwen2\", \"joyai-llm\", \"default\"). \
              The pre-tokenizer decides where BPE may merge, so guessing one \
              shifts every token boundary and the model answers fluently and \
              wrongly rather than failing — which is why this refuses instead. \
@@ -72,6 +79,10 @@ impl PreTokenizer {
             "llama-bpe" | "llama3" => Ok(PreTokenizer::LlamaBpe),
             "qwen2" => Ok(PreTokenizer::Qwen2),
             "joyai-llm" => Ok(PreTokenizer::JoyaiLlm),
+            // **Also the absent case.** `Tokenizer::from_metadata` passes
+            // "default" when the container declares no `tokenizer.ggml.pre`,
+            // which is what llama.cpp does with a missing key.
+            "default" | "gpt-2" | "gpt2" => Ok(PreTokenizer::Default),
             other => Err(UnknownPreTokenizer(other.to_string())),
         }
     }
@@ -80,7 +91,7 @@ impl PreTokenizer {
     fn max_digits(self) -> usize {
         match self {
             PreTokenizer::Qwen2 => 1,
-            PreTokenizer::LlamaBpe | PreTokenizer::JoyaiLlm => 3,
+            PreTokenizer::LlamaBpe | PreTokenizer::JoyaiLlm | PreTokenizer::Default => 3,
         }
     }
 }
@@ -91,8 +102,94 @@ impl PreTokenizer {
 pub fn pre_tokenize(text: &str, pre: PreTokenizer) -> Vec<String> {
     match pre {
         PreTokenizer::JoyaiLlm => joyai(text),
+        PreTokenizer::Default => default_gpt2(text),
         PreTokenizer::LlamaBpe | PreTokenizer::Qwen2 => gpt4_style(text, pre.max_digits()),
     }
+}
+
+/// llama.cpp's `LLAMA_VOCAB_PRE_TYPE_DEFAULT`, and therefore what an **absent**
+/// `tokenizer.ggml.pre` means.
+///
+/// # Why this one is a pipeline and the others are not
+///
+/// The `llama3`/`qwen2` variants are a single regex whose alternatives are
+/// tried in order, so one pass over the text produces the pieces. The default
+/// is **four regexes applied in sequence** — `unicode_regex_split` runs each
+/// over the output of the last:
+///
+/// ```text
+/// [\p{P}\$\+<=>\^~\|]+                                   punctuation runs
+/// 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)
+/// \p{N}+                                                    digit runs
+/// [0-9][0-9][0-9]                                           groups of three
+/// ```
+///
+/// The first pass is what separates it from `llama-bpe` in practice: a run of
+/// punctuation is cut out *whole and first*, so `def fibonacci(n):` becomes
+/// `def fibonacci` `(` `n` `):` before anything else runs — five pieces where
+/// `llama-bpe` makes four. That one difference is the whole of StableLM's
+/// disagreement with llama.cpp.
+fn default_gpt2(text: &str) -> Vec<String> {
+    // Pass 1: runs of punctuation and the listed symbols, taken whole.
+    let is_punct_run = |c: char| {
+        c.is_ascii_punctuation() && !matches!(c, '$' | '+' | '<' | '=' | '>' | '^' | '~' | '|')
+            || matches!(c, '$' | '+' | '<' | '=' | '>' | '^' | '~' | '|')
+            || (!c.is_alphanumeric() && !c.is_whitespace() && !c.is_ascii())
+    };
+    let mut pieces = split_runs(text, is_punct_run);
+
+    // Pass 2: the GPT-2 rule. Digits group greedily here; passes 3 and 4 chop
+    // them, which is why `max_digits` is not applied yet.
+    pieces = pieces
+        .into_iter()
+        .flat_map(|p| gpt4_style(&p, usize::MAX))
+        .collect();
+
+    // Pass 3: separate digit runs from anything still attached to them, then
+    // pass 4: chop those runs into threes.
+    pieces = pieces
+        .into_iter()
+        .flat_map(|p| split_runs(&p, |c| c.is_ascii_digit()))
+        .flat_map(|p| chunk_digits(&p))
+        .collect();
+
+    pieces.retain(|p| !p.is_empty());
+    pieces
+}
+
+/// Split `text` wherever `wanted` changes, keeping matching runs whole.
+///
+/// Losslessly: concatenating the result reproduces the input.
+fn split_runs(text: &str, wanted: impl Fn(char) -> bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_is = None;
+    for c in text.chars() {
+        let is = wanted(c);
+        if cur_is != Some(is) && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur_is = Some(is);
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// `[0-9][0-9][0-9]` — a run of digits becomes groups of three, longest first.
+///
+/// Anything that is not all digits passes through untouched.
+fn chunk_digits(piece: &str) -> Vec<String> {
+    if piece.is_empty() || !piece.chars().all(|c| c.is_ascii_digit()) {
+        return vec![piece.to_string()];
+    }
+    piece
+        .as_bytes()
+        .chunks(3)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect()
 }
 
 /// The contractions both GPT-4-style variants match, case-insensitively.
@@ -369,6 +466,45 @@ fn is_other(c: char) -> bool {
 mod tests {
     use super::*;
 
+    /// **An absent `tokenizer.ggml.pre` is `default`, not `llama-bpe`.**
+    ///
+    /// The default's first pass cuts a run of punctuation out whole, so
+    /// `def fibonacci(n):` is five pieces where `llama-bpe` makes four --
+    /// verified against `llama-tokenize` on StableLM, which declares no key.
+    #[test]
+    fn the_default_cuts_punctuation_runs_whole() {
+        let d = pre_tokenize("def fibonacci(n):", PreTokenizer::Default);
+        assert_eq!(d, vec!["def", " fibonacci", "(", "n", "):"]);
+        // The variant it used to fall back to does not agree, which is the
+        // whole reason this exists.
+        let l = pre_tokenize("def fibonacci(n):", PreTokenizer::LlamaBpe);
+        assert_ne!(d, l, "if these agree the bug could not have happened");
+    }
+
+    /// Splitting never alters or drops input, on every variant.
+    #[test]
+    fn the_default_is_lossless() {
+        for text in [
+            "def fibonacci(n):",
+            "hello, world! 12345",
+            "a\n\nb   c",
+            "\u{4e2d}\u{6587}(test)",
+            "",
+        ] {
+            let joined: String = pre_tokenize(text, PreTokenizer::Default).concat();
+            assert_eq!(joined, text, "lossy on {text:?}");
+        }
+    }
+
+    #[test]
+    fn default_is_resolved_by_name_and_by_absence() {
+        assert_eq!(
+            PreTokenizer::from_name("default"),
+            Ok(PreTokenizer::Default)
+        );
+        assert_eq!(PreTokenizer::from_name("gpt2"), Ok(PreTokenizer::Default));
+    }
+
     fn assert_lossless(text: &str, pre: PreTokenizer) {
         let joined: String = pre_tokenize(text, pre).concat();
         assert_eq!(joined, text, "pre-tokenizing changed the text ({pre:?})");
@@ -493,7 +629,7 @@ mod tests {
             Ok(PreTokenizer::JoyaiLlm)
         );
         // Real llama.cpp variants this build has no container to check against.
-        for unknown in ["deepseek-llm", "falcon", "default", "gpt-2", "smaug-bpe"] {
+        for unknown in ["deepseek-llm", "falcon", "smaug-bpe", "bert-bge"] {
             let err = PreTokenizer::from_name(unknown).expect_err("must refuse");
             assert_eq!(err.0, unknown);
             let text = err.to_string();

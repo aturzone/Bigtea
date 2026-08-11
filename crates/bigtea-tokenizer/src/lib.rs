@@ -253,7 +253,13 @@ impl Tokenizer {
                 let name = meta
                     .get("tokenizer.ggml.pre")
                     .and_then(Value::as_str)
-                    .unwrap_or("llama-bpe");
+                    // **An absent key is not "llama-bpe".** llama.cpp falls
+                    // back to its DEFAULT GPT-2 rule, whose first pass cuts a
+                    // run of punctuation out whole -- so `def fibonacci(n):`
+                    // is five pieces there and was four here. A6c refused every
+                    // unknown `pre` by name and then guessed this case, which
+                    // is the same mistake one layer down.
+                    .unwrap_or("default");
                 PreTokenizer::from_name(name).map_err(TokenizerError::UnsupportedPreTokenizer)?
             }
             _ => PreTokenizer::LlamaBpe,
