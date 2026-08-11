@@ -5,8 +5,8 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-11 · **Version**: v0.0.2 · **Branch**: `main` at
-`c7a5534` · **Open PRs**: none.
+**Last updated**: 2026-08-11 · **Version**: v0.0.2 · **Branch**:
+`ticket/r11-grammar-cli`; `main` at `4c2de60` · **Open PRs**: none.
 
 **Everything is merged.** PR #55 brought R3, R7, R8 and R9 into `main` in one
 merge — the KV cache, six architectures, four tokenizer families, 106 CLI flags,
@@ -26,6 +26,63 @@ token, borrowing `ggml` for arithmetic while owning memory, residency, streaming
 and the token loop. It runs DeepSeek-V4-Flash (144 GB) and Qwen3-30B-A3B on a
 15.7 GiB laptop and produces correct text. **It is not yet faster than
 llama.cpp on V4-Flash — on that model it leads on nothing.**
+
+## Where we actually stand, measured 2026-08-11 in one session
+
+**Speed is level. Coverage is not.** Both halves matter and they have different
+answers, so they are stated separately.
+
+### Speed — parity on every model measured today
+
+Interleaved runs, same session, `--temp 0`, 401-token prompt for the dense
+models. **Absolute tok/s drifts up to 25% with machine state, so only
+within-session comparisons are quoted**, and each number below is a median of
+the rounds actually run.
+
+| model | phase | Bigtea | llama.cpp | verdict |
+|---|---|---:|---:|---|
+| Qwen3-4B (dense, fits RAM) | prefill | **76.5** | 69.3 | parity → ahead |
+| Qwen3-4B | generation | **5.97** | 5.54 | **1.08x ahead** |
+| Gemma-2-2B | prefill | 124 / 141 | 115 / 146 | parity |
+| Gemma-2-2B | generation | 8.01 / 10.78 | 7.12 / 10.67 | parity → ahead |
+| Qwen3-30B-A3B (streams from disk) | prefill | 1.70 | 1.77 | parity |
+| Qwen3-30B-A3B | generation | 3.10 | 3.25 | parity (5% behind, inside the spread) |
+
+**Three rows in the old scoreboard are now retracted as stale**, and all three
+were deficits:
+
+- Qwen3-4B "prefill 38.5 vs 111.2, **2.9x behind**" — now 76.5 vs 69.3.
+- Qwen3-4B "generation 0.67 vs 5.90, **8.8x behind**" — now 5.97 vs 5.54.
+- Qwen3-30B "generation 2.63 vs 4.21, **1.60x behind**" — now 3.10 vs 3.25,
+  i.e. inside the noise. **The 4.21 was llama.cpp on a better day**: measured
+  back to back today it runs 2.93–3.60 on the same command line, which is the
+  clearest possible demonstration of why cross-session numbers are worthless.
+
+**On the streaming model, run order dominates the result.** Whichever engine
+runs second is slower — Bigtea 3.92 running first against llama.cpp 3.60, and
+2.71 running second against 2.93. A warm-to-warm protocol (each engine twice,
+compare the seconds) is the only one that says anything, and it says parity.
+
+**Nothing here is a claim about V4-Flash**, which was last measured 2026-08-10
+and is unchanged: prefill 1.25x behind, generation at parity. See below.
+
+### Coverage — this is the real gap
+
+| | Bigtea | llama.cpp | gap |
+|---|---:|---:|---|
+| architectures **diffed against the reference** | **8** | 141 declared | the big one |
+| chat templates | 26 | 54 | half |
+| CLI flags (long) | 119 | 182 | 63 |
+| tokenizer families | 4 | 6 | rwkv, plamo2 |
+| samplers | 16 | 20 | adaptive-p, infill, 2 lazy-grammar |
+| GPU backends | **0** | CUDA, Metal, Vulkan, SYCL, HIP | total |
+
+The architecture number is not comparable as written: llama.cpp *declares* 141
+and Bigtea's 8 are ones whose output was diffed token for token against it.
+Nobody has checked all 141. But 8 is still 8.
+
+**The honest one-line answer: on this machine, for CPU inference on the models
+we support, Bigtea is as fast as llama.cpp. It supports far less.**
 
 ## The honest scoreboard
 
@@ -945,6 +1002,281 @@ would have lied.
 architectures and two tokenizer families. That same tool then measured the
 quantised KV cache: **q8_0 costs 0.64% of perplexity for roughly half the
 memory**.
+
+## Gemma was running the wrong activation (2026-08-11) — and `VERIFIED` was wrong
+
+**`gemma2` was in `VERIFIED_ARCHITECTURES` and had never been diffed against
+llama.cpp.** Its output is now identical; it was not before.
+
+```
+bigtea (before)  **Paris**.
+llama.cpp        :  a) Paris  b) Lyon  c) Marseille  d)
+```
+
+Two bugs, both silent by construction:
+
+1. **SiLU where the whole Gemma family uses GELU.** `grep -rn "gelu" crates/`
+   returned nothing — every gated FFN in the crate was SwiGLU. Nothing in a
+   container records the activation: a GELU model and a SiLU model hold
+   **byte-identical tensor sets**, so this is not a missing tensor, not a shape
+   error and not a crash. It is a model that keeps answering in English and
+   disagrees with the reference from the first token. Now `FfnAct`, chosen by
+   architecture, applied in one place. **This alone fixed Gemma-3.**
+2. **The scale went to the kernel instead of into Q.** llama.cpp pre-scales Q
+   by `1/sqrt(head_dim)` and passes `scale = 1.0`; ggml folds the soft cap into
+   the scale (`scale /= cap`), so the two are the same algebra and
+   `0.0625f/50f` vs `0.0625f*(1f/50f)` differ by **one ULP**. Through the cap's
+   `tanh` that flipped Gemma-2's first token between `:` and ` Paris`, and with
+   it the whole completion. **A soft cap turns a scale into a non-linearity's
+   argument** — match the reference's order, not its algebra.
+
+Also fixed: the Gemma **27B-only** attention scale (`n_embd/n_head`, not
+`head_dim`), which coincides at every other size — a check that passed here
+would still have been wrong at 27B.
+
+**Verified**: 3 prompts x 32 tokens x both engines, `--temp 0`, back to back.
+`gemma-2-2b-it` and `gemma-3-1b-it` identical token for token; llama, qwen2 and
+qwen3-4b re-checked and unchanged. Architectures **7 -> 8**, tests **409 ->
+411**, clippy 0, fmt clean.
+
+New: **`print_hparams` at `-v`** — llama.cpp has printed its hyper-parameters at
+load since the beginning, and the hours spent guessing which scale Gemma-2 used
+were hours nobody with that output would have spent. It prints *derived* values
+(`attn_scale`, per-layer RoPE bases, the windowed-layer list), because a key
+read under the wrong name looks exactly like a key that was absent.
+
+Full account: `docs/graph/research/gemma-was-running-silu-2026-08-11.md`.
+
+### Every architecture re-checked, and greedy decoding is not always reproducible
+
+`scripts/parity-check.sh` diffs both engines on three prompts at `--temp 0`.
+Seven containers, six architectures: **19 of 21 exact, 0 failures.**
+
+The two exceptions are the finding. **llama.cpp disagrees with itself** on
+them — `def fibonacci(n):` on Llama-3.2-1B answers "up to the nth term" with
+`-fa on` and "the first n Fibonacci numbers" with `-fa off`; `The capital of
+France is` on Phi-3 changes under `--no-repack`. Both flags only reorder a sum.
+Those prompts sit on a near-tie, and any engine that accumulates differently
+lands on the other side and writes a different paragraph.
+
+So token-for-token identity is not always an achievable target. The script
+re-runs the reference under a second configuration before calling anything a
+failure and reports `unstable` instead — **a test whose expected value is not
+reproducible in the reference must say so rather than fail.** Gemma was not
+this: its reference was stable and we were wrong.
+
+
+## Six more flags, and a list that could not be trusted (2026-08-11)
+
+`--binary-file`, `--chat-template-file`, `--log-colors`/`--no-log-colors`,
+`--prio`/`--prio-batch`, `--warmup`/`--no-warmup`, `--completion-bash`. Each
+was checked to change something observable before being accepted, which is the
+standard `-t` failed for weeks. Two came off the **refused** list:
+
+- **`--prio` was refused for "no thread-affinity or scheduler layer".** Wrong
+  premise — process priority needs one syscall, not an affinity layer. It is
+  real now, applied before the model opens so the load benefits. **`--prio 3`
+  maps to HIGH, not REALTIME, and says so**: realtime outranks the kernel's
+  own input and disk threads and can leave a desktop with no way to click
+  anything.
+- **`--warmup` was refused for "nothing is warmed".** Also wrong: the page
+  cache, the repacked tensors, the arenas and the thread ladder all are. It
+  runs one throwaway pass on a discarded cache. **Off by default, unlike
+  llama.cpp** — warming a disk-streaming runner reads gigabytes, and the cold
+  cost is the number this project exists to report honestly.
+
+### The completion list drifted in both directions inside an hour
+
+Hand-written from the help text, it claimed **four flags that do not exist**
+and was **missing 23 that do**. A phantom flag is worse than a missing one:
+the shell suggests it and the binary rejects it.
+
+Same failure as the flag count this project carried for eight commits.
+**Anything that enumerates the flags is a second copy of the parser and will
+drift**, so `build.rs` now scans `bigtea-run.rs` for the string literals its
+`match` arms are made of and generates the list: **119 long flags**, 0 phantom,
+0 missing.
+
+## Chat templates 25 -> 54, and 11 of the old ones were wrong (2026-08-11)
+
+llama.cpp knows 54 template names. Bigtea knew 25 — **and eleven of those
+rendered differently from the reference**, which nothing had ever checked.
+
+The oracle is `scripts/capture-chat-templates.py`: it runs llama.cpp with
+`--verbose-prompt` and reconstructs, token by token, the exact prompt it builds
+for every template it knows. That capture is a fixture in the repo and a test
+replays all of it. "Bigtea supports `gpt-oss`" now means **byte-identical to
+llama.cpp on a recorded command line**, not "it looked right".
+
+**52 of 54 match exactly.** The two skipped are Hunyuan variants whose bytes the
+capture model's tokenizer cannot round-trip; baking a corrupted expectation in
+would be worse than not comparing.
+
+### The eleven that were already wrong
+
+| family | what it did | what llama.cpp does |
+|---|---|---|
+| `llama2` | emitted the `<<SYS>>` block | plain — that block is `llama2-sys` |
+| `llama2-sys` | `<<SYS>>` *before* `[INST]` | `[INST] ` first, `<<SYS>>` inside it |
+| `falcon3` | shared RWKV-World's `System:` framing | `<\|system\|>`-shaped, nothing alike |
+| `zephyr` | the container's EOS | hardcodes `<\|endoftext\|>` |
+| `granite` (x3) | a newline after `<\|end_of_role\|>` | no newline |
+| `chatglm3` | no preamble, no space | `[gMASK]sop` and a space after the role |
+| `chatglm4` | no trailing newline | `<\|assistant\|>
+` |
+| `deepseek` | blank lines between turns | single newlines |
+| `minicpm` | labelled the system turn `<AI>` | emits it raw |
+| `monarch` | Bailing's `<role>HUMAN</role>` | `<s>role
+content</s>` — a different family |
+| `orion` | dropped the system turn's `Human: ` | opens `Human: ` on the system turn |
+
+`glmedge` was aliased to `chatglm4` and `bailing` to `monarch`; both are
+separate families, so those containers were fed two tokens at position 0 they
+were never trained to see.
+
+**A wrong template does not fail.** The model answers, fluently, having been
+handed a framing it has never seen — it comments on the question instead of
+answering it, or answers the system prompt. No test that checks "did it produce
+a string" can see that, which is why the expectation had to come from llama.cpp
+rather than from me.
+
+One place we deliberately differ, and it is recorded in the code: llama.cpp's
+Zephyr renderer hardcodes `<|endoftext|>` because its renderers have no
+vocabulary to read. **TinyLlama uses the Zephyr framing with `</s>`**, and its
+own Jinja template says `eos_token`, so the reference frames it with a token it
+has never seen. `eos_or` prefers the container's EOS when there is one and
+falls back to llama.cpp's literal when there is not — the fixture test passes
+`""` and so reproduces llama.cpp exactly.
+
+## Samplers 16 -> 20: parity (2026-08-11)
+
+| sampler | what it is |
+|---|---|
+| `--adaptive-target` / `--adaptive-decay` | aim for a token of a given *probability*, with the target moving as it observes what it actually picked — a feedback controller like mirostat, not a filter |
+| `--infill` | suppress fill-in-the-middle control tokens |
+| `--grammar-lazy` | hold a grammar back until the model writes a trigger, then constrain everything after it |
+
+Bigtea now implements **20 of llama.cpp's 20** sampler entry points.
+
+**Adaptive-p was written in the wrong slot first**, and the mistake is worth
+recording because it looked plausible: it went next to mirostat, *before* the
+truncations, since both replace the temperature tail. The transform hands every
+token whose probability is near the target the same peak logit — so on an
+untruncated 150k vocabulary it spread the mass across the whole dictionary and
+produced `LOGGER冲突ユー ihm definit🏤谋划`. It is llama.cpp's **terminal**
+sampler, in `dist`'s slot, and needs a candidate set top-k and top-p have
+already cut down. Moved, it produces `in a magical world called Aylum, a
+mysterious dragon slayer`.
+
+`is_greedy()` gained both new knobs in the same commit. **That method has now
+been the bug twice** — a knob that changes the output but is not listed there is
+accepted, echoed in the header, and silently ignored at temperature 0.
+`--mirostat 2` produced byte-identical output to greedy for a whole release
+that way.
+
+`--grammar-lazy` takes **substrings, not regexes**, and the help says so.
+llama.cpp's `--grammar-lazy-patterns` takes regexes; a half-implemented regex
+engine that silently mismatches would arm the grammar at the wrong moment,
+which is worse than not having the flag. Verified three ways: a trigger that
+fires (`grammar armed after 1 tokens`, then JSON), one that never appears
+(prose throughout), and no trigger at all (armed from token 1).
+
+`--infill` resolves the FIM tokens **from the vocabulary's own text** rather
+than from metadata keys, because containers disagree about which keys they set
+while the token text is stable. Qwen3-4B: 4 tokens found. Qwen2-0.5B: 0, and it
+says `0` rather than pretending.
+
+## Every llama.cpp flag is now recognised — 128 implemented, 57 declined
+
+`bigtea-run` accepts **185 long flags** against llama.cpp's 182. **That is not
+flag parity and must not be quoted as one:**
+
+| | count |
+|---|---:|
+| implemented — the flag changes something observable | **128** |
+| declined with a reason — recognised, exits 2, names what is missing | **57** |
+
+A command line copied from llama.cpp now runs or explains itself, instead of
+dying on an unknown flag. What it never does is quietly do less than it says:
+
+```
+$ bigtea-run -m m.gguf --n-gpu-layers 32
+bigtea-run: --n-gpu-layers is not supported: no GPU backend exists
+  Declined rather than ignored: a run never quietly does less
+  than its command line says. Drop the flag to continue.
+$ echo $?
+2
+```
+
+**`-t` was accepted and ignored here for weeks**, and a disconnected knob is
+indistinguishable from a flat response — the sweep that "proved threads are not
+the lever" was measuring a flag that reached nothing. Refusing out loud is the
+cheap defence against repeating that.
+
+What is declined, and the honest reason:
+
+| group | why |
+|---|---|
+| 15 GPU flags | **no GPU backend exists.** `bigtea-probe` detects the card and nothing uses it; a VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer |
+| 4 draft-model flags | speculative decoding measured ~1.4x here, not the literature's 2.2x, and is a net loss below ~0.75 acceptance |
+| 5 adapter flags | LoRA and control vectors are real work not yet done, and a silently unapplied LoRA is a model answering as though never fine-tuned |
+| 6 Jinja / chat-parsing | no Jinja engine. Templates are matched by family and verified byte-identical to llama.cpp for 52 of 54 names; a half-implemented Jinja would silently produce the wrong framing |
+| 6 reasoning-format | downstream of Jinja |
+| 8 download flags | `bigtea-pull` is the tool; wiring it in needs resumable, verified downloads rather than an alias |
+| 9 affinity / NUMA / poll | ggml owns its threadpool here; `-t`, `-tb` and `--prio` are the levers that exist |
+| 4 runner-shape | one sequence by design, an append-only KV cache that cannot fragment, no self-extend |
+
+Three more implemented in the same batch: `--mmap` (the default, spelled out),
+`--ubatch-size` (takes the smaller of it and `-b`, and says which), and
+`--swa-full`, which **is already the behaviour** — Bigtea's KV cache is always
+full and the window lives in the attention mask, so it reports that rather than
+accepting the flag silently.
+
+## `-hf` works: the runner fetches its own models (2026-08-11)
+
+Seven flags moved from **declined** to **implemented**: `-hf`, `--hf-repo`,
+`--hf-file`, `--hf-token`, `--model-url`, `--offline`, `--cache-list`. One
+command now downloads and runs:
+
+```
+$ bigtea-run -hf Qwen/Qwen2-0.5B-Instruct-GGUF/qwen2-0_5b-instruct-q4_k_m.gguf \
+             -p "The capital of France is" -n 8 --temp 0
+model      fetched .../bigtea/models/Qwen--Qwen2-0.5B-Instruct-GGUF--qwen2-0_5b-...gguf
+ Paris. It is the most populous city
+```
+
+Second run reports `model cached`. `--cache-list` shows it; `--offline` runs
+from it and refuses to reach the network.
+
+### Two things that are not "shell out to curl"
+
+**Every download is checked for GGUF's magic number, and a file that fails it
+is deleted.** A half-succeeded download is the worst outcome available here: a
+truncated container parses far enough to report a plausible architecture and
+then fails deep in a forward pass, and a gated repo returns an *HTML error
+page* which lands under a `.gguf` name. Leaving that on disk means the next run
+re-reads it and misdiagnoses a corrupt model. Four bytes settle it.
+
+**A repo without a filename is refused, not guessed.** `-hf owner/name` and
+`owner/name:Q4_K_M` both name a repo holding several quants, and resolving
+either needs the Hugging Face listing API, which this build does not call. It
+says so, and names both ways out:
+
+```
+--hf-repo unsloth/gemma-3-1b-it-GGUF names a repo but not a file. Pass
+--hf-file <name.gguf>, or use -hf unsloth/gemma-3-1b-it-GGUF/<name.gguf>.
+```
+
+Guessing `<name>-Q4_K_M.gguf` is right for some repos and a 404 for others, and
+a 404 saved under a `.gguf` name is exactly the failure above. **This project
+has already paid for guessing once**: the pre-tokenizer fallback that guessed
+`llama-bpe` where llama.cpp defaults to GPT-2, found today, wrong on every
+`gpt2` container that omits the key.
+
+The token is read and **never echoed, including on the failure path** — a
+failed download is exactly when output gets pasted into an issue.
+
+Flags recognised: **187** — 137 implemented, 50 declined. Tests **413 -> 420**.
 
 ## Known limitations
 

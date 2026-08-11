@@ -643,7 +643,7 @@ impl<'m> StreamingRunner<'m> {
 
                     let g = ctx.mul_mat(ws.get("gate").expect("bound"), &xt)?;
                     let u = ctx.mul_mat(ws.get("up").expect("bound"), &xt)?;
-                    let act = ctx.mul(&ctx.silu(&g)?, &u)?;
+                    let act = ctx.mul(&c.activate(&ctx, &g)?, &u)?;
                     let out = ctx.mul_mat(ws.get("down").expect("bound"), &act)?;
                     // Not 0: `compute` floors the count at 1, so passing 0 ran every
                     // expert matmul on a single thread — the bulk of the model's
@@ -771,7 +771,7 @@ impl<'m> StreamingRunner<'m> {
 
                 let g = ctx.mul_mat(ws.get(&gk).expect("bound"), &xt)?;
                 let u = ctx.mul_mat(ws.get(&uk).expect("bound"), &xt)?;
-                let act = ctx.mul(&ctx.silu(&g)?, &u)?;
+                let act = ctx.mul(&c.activate(&ctx, &g)?, &u)?;
                 let out = ctx.mul_mat(ws.get(&dk).expect("bound"), &act)?;
                 let scaled = ctx.scale(&out, weight)?;
                 total = Some(match total {
@@ -1008,7 +1008,7 @@ impl<'m> StreamingRunner<'m> {
 
             let g = ctx.mul_mat(ws.get("gate").expect("bound"), &xt)?;
             let u = ctx.mul_mat(ws.get("up").expect("bound"), &xt)?;
-            let act = ctx.mul(&ctx.silu(&g)?, &u)?;
+            let act = ctx.mul(&c.activate(&ctx, &g)?, &u)?;
             let out = ctx.mul_mat(ws.get("down").expect("bound"), &act)?;
             ctx.compute(&out, self.threads)?;
 
@@ -1028,9 +1028,14 @@ impl<'m> StreamingRunner<'m> {
 
     /// RoPE parameters this architecture uses.
     pub fn rope(&self) -> RopeParams {
+        self.rope_for(0)
+    }
+
+    /// RoPE parameters for one layer. Only the base varies.
+    pub fn rope_for(&self, il: u32) -> RopeParams {
         let c = &self.arch.config;
         RopeParams {
-            freq_base: c.rope_freq_base,
+            freq_base: c.rope_base_for(il),
             freq_scale: c.rope_freq_scale,
             ext_factor: c.rope_ext_factor,
             attn_factor: c.rope_attn_factor,
@@ -1349,6 +1354,13 @@ impl<'m> StreamingRunner<'m> {
                         (n_kv * head_dim, n_new),            // k normalised
                         (c.n_head as i64 * head_dim, n_new), // q roped
                         (n_kv * head_dim, n_new),            // k roped
+                        // The bias adds produce three more of the same shapes.
+                        // Unlisted, they are covered only by `arena_for`'s
+                        // doubling, which is how three arenas in this file were
+                        // found short already.
+                        (c.n_head as i64 * head_dim, n_new),
+                        (n_kv * head_dim, n_new),
+                        (n_kv * head_dim, n_new),
                     ],
                     32,
                 ))?;
@@ -1366,6 +1378,18 @@ impl<'m> StreamingRunner<'m> {
                 let q = ctx.mul_mat(&qw, &normed)?;
                 let k = ctx.mul_mat(&kw, &normed)?;
                 let v = ctx.mul_mat(&vw, &normed)?;
+                // Qwen2 carries a bias on each projection; Qwen3 does not.
+                // ggml broadcasts a `[n, 1]` addend across the columns, so the
+                // same vector applies to every position in the block.
+                let (q, k, v) = if c.attn_bias {
+                    (
+                        ctx.add(&q, &get(weights, format!("blk.{il}.attn_q.bias"))?)?,
+                        ctx.add(&k, &get(weights, format!("blk.{il}.attn_k.bias"))?)?,
+                        ctx.add(&v, &get(weights, format!("blk.{il}.attn_v.bias"))?)?,
+                    )
+                } else {
+                    (q, k, v)
+                };
 
                 let q = ctx.reshape_3d(&q, head_dim, c.n_head as i64, n_new)?;
                 let k = ctx.reshape_3d(&k, head_dim, n_kv, n_new)?;
@@ -1389,7 +1413,9 @@ impl<'m> StreamingRunner<'m> {
                     (q, k)
                 };
 
-                let rp = self.rope();
+                // Per layer, not per model: Gemma-3's windowed layers are
+                // trained at a different RoPE base from its global ones.
+                let rp = self.rope_for(il);
                 // NORM for llama/mistral, NeoX for qwen/phi/gemma. Both run
                 // without error on either layout and the wrong one is fluent
                 // nonsense, so it comes from the config rather than a constant.
@@ -1443,6 +1469,7 @@ impl<'m> StreamingRunner<'m> {
                 &[
                     (head_dim * n_head, n_new), // q, as set from the caller
                     (head_dim * n_head, n_new), // q, permuted and contiguous
+                    (head_dim * n_head, n_new), // q, pre-scaled (Gemma only)
                     (head_dim * n_kv, n_total), // k from the cache (F16, over-counted)
                     (head_dim * n_kv, n_total), // k, permuted and contiguous
                     (head_dim * n_kv, n_total), // v from the cache (F16, over-counted)
@@ -1466,7 +1493,7 @@ impl<'m> StreamingRunner<'m> {
             // ordering is checked against llama.cpp's output rather than
             // reasoned about.
             let layer_mask = match swa_mask.as_ref() {
-                Some(swa) if il % 2 == 0 => swa,
+                Some(swa) if c.is_swa_layer(il) => swa,
                 _ => &mask,
             };
             let attn_result = (|| -> Result<(Vec<f32>, f64, f64)> {
@@ -1862,6 +1889,7 @@ mod tests {
             rope_beta_fast: 32.0,
             rope_beta_slow: 1.0,
             rope_orig_ctx: 0,
+            attn_bias: false,
             n_expert: 4,
             n_expert_used: 2,
             n_ff_expert: 16,
@@ -1872,9 +1900,14 @@ mod tests {
             fused_gate_up: false,
             post_norms: false,
             scale_embeddings: false,
+            attn_scale_dim: 16,
+            prescale_q: false,
+            ffn_act: crate::qwen3::FfnAct::Silu,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             sliding_window: 0,
+            swa_pattern: 0,
+            rope_freq_base_swa: 10_000.0,
         }
     }
 

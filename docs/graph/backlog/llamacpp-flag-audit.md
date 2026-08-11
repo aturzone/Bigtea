@@ -26,7 +26,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 | KV cache type / prompt cache | 7 | **done 2026-08-11** -- both halves |
 | chat template | 6 | 3 done; `--jinja`/`--chat-template-file` **won't**, see below |
 | LoRA / control vectors | 5 | gap |
-| grammar / JSON schema | 4 | gap |
+| grammar / JSON schema | 4 | **done 2026-08-11** — wired into the CLI, verified against llama.cpp |
 | meta (`--help`, `--version`) | 4 | 3 done |
 
 ### The count in this document was wrong for eight commits
@@ -452,6 +452,32 @@ quietly means something else.
 Failure is counted, not fatal: a partially locked residency still helps, and the
 run says how much did not take and why.
 
+## Done 2026-08-11 - six flags, and a completion list that could not be trusted
+
+| flag | what it does, provably |
+|---|---|
+| `--binary-file F` | prompt from raw bytes, decoded lossily. **Not a duplicate of `-f`**: `read_to_string` *fails* on non-UTF-8, so a prompt captured from a binary source is unreachable through `-f`. Verified by running both on the same file — `-f` errors, `--binary-file` runs |
+| `--chat-template-file F` | the template from a file, because a real Jinja template is several hundred characters no shell survives. An unrecognised name is still **refused with the known list**, not ignored |
+| `--log-colors` / `--no-log-colors` | dims status so the generated text is findable when both share a terminal. **Never applied to `--log-file`** — escape codes in a file break every reader that is not a terminal |
+| `--prio N` / `--prio-batch N` | real process priority (`SetPriorityClass` / `setpriority`). Applied before the model opens, so the load benefits. **`3` maps to HIGH, not REALTIME, and says so** — realtime outranks the kernel's input and disk threads and can freeze the desktop with no way to click anything |
+| `--warmup` / `--no-warmup` | one throwaway forward pass on a discarded cache: page cache, repacked copies, arenas, and one timed token for the thread ladder. **Off by default, unlike llama.cpp** — warming a disk-streaming runner reads gigabytes, and the cold cost is the number this project exists to report honestly |
+| `--completion-bash` | a bash completion script |
+
+### The completion list drifted within the hour, in both directions
+
+The first version was hand-written from the help text. Checked against the
+parser it claimed **four flags that do not exist** (`--keep`, `--tfs`,
+`--no-cnv`, `--no-penalize-nl`) and was **missing 23 that do**. A phantom flag
+is worse than a missing one: the shell suggests it and the binary then rejects
+it.
+
+That is the same failure as the flag count this document carried for eight
+commits — **anything that enumerates the flags is a second copy of the parser
+and will drift.** So `build.rs` now scans `bigtea-run.rs` for the string
+literals its `match` arms are made of and emits the list. Currently **119 long
+flags**, and the check that found the drift now reports 0 phantom and 0
+missing.
+
 ### Refused, with reasons - most of the runtime bucket
 
 These are declined rather than accepted-and-ignored. That is the whole point of
@@ -461,9 +487,9 @@ this audit, and the standard `-t` failed for weeks.
 |---|---|
 | `--numa` | no NUMA-aware allocation to select between |
 | `--parallel` | one sequence at a time by design: one weight set, one KV cache |
-| `--cpu-mask`, `--cpu-range`, `--cpu-strict`, `--poll`, `--prio` | no thread-affinity or scheduler layer; `-t`/`-tb` are the levers that exist |
+| `--cpu-mask`, `--cpu-range`, `--cpu-strict`, `--poll` | no thread-affinity layer; `-t`/`-tb` are the levers that exist. **`--prio` moved out of this row and is implemented** — process priority needed no affinity layer, only one syscall |
 | `--defrag-thold` | the KV cache is append-only and never fragments |
-| `--warmup`/`--no-warmup` | nothing is warmed; the first token pays for what it needs |
+| ~~`--warmup`/`--no-warmup`~~ | **retracted and implemented.** "Nothing is warmed" was wrong: the page cache, the repacked tensors, the arenas and the thread ladder all are. The default stays off, which is the honest part |
 | `--ubatch-size` | `-b` is the only batch dimension here |
 | `--fit`, `--fit-ctx`, `--fit-target` | `bigtea-model-info --budget` answers this question already, in its own spelling |
 | `--check-tensors` | the container work in r8 validates structure at open; a values-level NaN scan would have to dequantise every tensor and is not obviously worth it |

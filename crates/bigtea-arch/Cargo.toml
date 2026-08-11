@@ -14,6 +14,7 @@ bigtea-ggml = { path = "../bigtea-ggml" }
 bigtea-io = { path = "../bigtea-io" }
 bigtea-model = { path = "../bigtea-model" }
 bigtea-probe = { path = "../bigtea-probe" }
+bigtea-grammar = { path = "../bigtea-grammar" }
 bigtea-tokenizer = { path = "../bigtea-tokenizer" }
 
 [[bin]]

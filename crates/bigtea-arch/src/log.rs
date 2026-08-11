@@ -38,6 +38,13 @@ pub struct LogConfig {
     pub prefix: bool,
     /// Append to this file instead of writing to stderr.
     pub file: Option<String>,
+    /// Colour the status lines by level.
+    ///
+    /// **Never applied to a `--log-file`**: escape codes written to a file are
+    /// noise in every reader that is not a terminal, and llama.cpp's own
+    /// `--log-colors` has the same carve-out. A log you cannot `grep` is worse
+    /// than an uncoloured one.
+    pub colors: bool,
 }
 
 impl Default for LogConfig {
@@ -47,6 +54,7 @@ impl Default for LogConfig {
             timestamps: false,
             prefix: false,
             file: None,
+            colors: false,
         }
     }
 }
@@ -115,11 +123,20 @@ pub fn log(level: u32, message: &str) {
 
     if let Ok(mut sink) = state.sink.lock() {
         if let Some(file) = sink.as_mut() {
+            // Uncoloured on purpose -- see `LogConfig::colors`.
             let _ = writeln!(file, "{line}");
             return;
         }
     }
-    eprintln!("{line}");
+    if state.config.colors {
+        // Detail dim, normal plain-but-bright. Two codes rather than a palette:
+        // the point is separating status from the generated text on stdout,
+        // not decorating it.
+        let code = if level >= 2 { "2" } else { "36" };
+        eprintln!("\x1b[{code}m{line}\x1b[0m");
+    } else {
+        eprintln!("{line}");
+    }
 }
 
 /// A status line at the normal level.

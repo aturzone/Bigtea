@@ -125,6 +125,7 @@ extern "C" {
         logit_softcap: f32,
     ) -> *mut ggml_tensor;
     fn ggml_silu(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    fn ggml_gelu(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
 
     fn ggml_new_tensor_3d(
         ctx: *mut ggml_context,
@@ -495,6 +496,17 @@ impl Context {
     pub fn silu<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
         // SAFETY: as above.
         self.tensor(unsafe { ggml_silu(self.raw.as_ptr(), a.raw.as_ptr()) })
+    }
+
+    /// GELU with the tanh approximation — the Gemma family's gate activation.
+    ///
+    /// `ggml_gelu`, not `ggml_gelu_erf`: llama.cpp's `LLM_FFN_GELU` reaches
+    /// `ggml_geglu_split`, whose kernel is the same tanh curve. The exact-erf
+    /// variant is a *different function* and picking it silently shifts every
+    /// FFN output.
+    pub fn gelu<'a>(&'a self, a: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_gelu(self.raw.as_ptr(), a.raw.as_ptr()) })
     }
 
     /// An I32 tensor — required for token ids and positions, which ggml

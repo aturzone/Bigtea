@@ -47,7 +47,39 @@ fn rope_type_for(arch: &str) -> (i32, bool) {
     }
 }
 
-/// Architectures this build has actually been run against and checked.
+/// The gate non-linearity of a gated feed-forward.
+///
+/// Both forms are `down(act(gate(x)) * up(x))` and differ only in `act`, so a
+/// mismatch changes no shape, allocates no tensor, and raises nothing. It just
+/// moves every FFN output a little — which reads as a different, equally
+/// fluent model. **Gemma-2 was listed as verified while running SiLU**; the
+/// reference said `a) Paris b) Lyon c) Marseille` where we said `**Paris**.`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfnAct {
+    /// Llama, Mistral, Qwen, Phi, DeepSeek — the majority.
+    Silu,
+    /// The Gemma family, and the one llama.cpp calls `LLM_FFN_GELU`.
+    Gelu,
+}
+
+/// Which non-linearity an architecture's FFN uses, by name.
+///
+/// By name rather than by tensor, because nothing in the container records it:
+/// a GELU model and a SiLU model hold byte-identical tensor sets. An unknown
+/// architecture gets SiLU, and [`Qwen3Config::verify`] still refuses it.
+fn ffn_act_for(arch: &str) -> FfnAct {
+    match arch {
+        "gemma" | "gemma2" | "gemma3" | "gemma3n" | "gemma-embedding" => FfnAct::Gelu,
+        _ => FfnAct::Silu,
+    }
+}
+
+/// Architectures whose output has been diffed against llama.cpp, token for
+/// token, on this build.
+///
+/// **Membership means someone ran the reference.** `gemma2` sat here for weeks
+/// while running SiLU where llama.cpp runs GELU, because "it answered in
+/// English" was mistaken for a check. The diff is two commands; run them.
 ///
 /// # Why a list, and why refusing is the right default
 ///
@@ -69,8 +101,16 @@ fn rope_type_for(arch: &str) -> (i32, bool) {
 /// So the default is to refuse an architecture nobody has checked. `--force`
 /// runs it anyway, which is the right escape hatch for someone testing a new
 /// architecture — but it has to be asked for.
-pub const VERIFIED_ARCHITECTURES: &[&str] =
-    &["deepseek4", "gemma2", "llama", "phi3", "qwen3", "qwen3moe"];
+pub const VERIFIED_ARCHITECTURES: &[&str] = &[
+    "deepseek4",
+    "gemma2",
+    "gemma3",
+    "llama",
+    "phi3",
+    "qwen2",
+    "qwen3",
+    "qwen3moe",
+];
 
 /// Whether this build has been run against `arch` and had its output checked.
 pub fn architecture_is_verified(arch: &str) -> bool {
@@ -132,6 +172,15 @@ pub struct Qwen3Config {
     /// rows are whole quantisation blocks, so three views cost nothing — but
     /// asking for `attn_q.weight` on such a container fails outright, which is
     /// what refused Phi-3 before this existed.
+    /// Q, K and V projections carry a bias vector.
+    ///
+    /// **Qwen2 has these and Qwen3 does not.** Ignoring them is not a missing
+    /// tensor and not an error — every attention score is simply shifted, and
+    /// Qwen2-0.5B answers "The capital of France is" with
+    /// `睢已经是成人istentation帮助企业 Hague(ord壑屁`. Detected from the
+    /// container rather than the architecture name, so a finetune that adds or
+    /// drops them is handled without a new arch.
+    pub attn_bias: bool,
     pub fused_qkv: bool,
     /// The FFN gate and up projections share one `ffn_up` tensor.
     ///
@@ -145,10 +194,52 @@ pub struct Qwen3Config {
     pub post_norms: bool,
     /// Multiply the embeddings by `sqrt(n_embd)` on the way in. Gemma only.
     pub scale_embeddings: bool,
+    /// The dimension the attention scale is `1 / sqrt(·)` of.
+    ///
+    /// Normally `head_dim`. **Gemma's 27B variants use `n_embd / n_head`
+    /// instead** — 4608/32 = 144 against a `head_dim` of 128, a 6% difference
+    /// that changes every attention score and breaks no shape. llama.cpp keys
+    /// it off the model size, so this does too; a check that passed on the 1B
+    /// would still have been wrong at 27B.
+    pub attn_scale_dim: u32,
+    /// Scale Q before the attention kernel instead of handing it the scale.
+    ///
+    /// Algebraically the same thing, and **not the same in floating point**:
+    /// ggml folds the scale into the soft cap (`scale /= cap`), so the two
+    /// orders round differently and the `tanh` sees a different number. One
+    /// ULP was enough to flip Gemma-2's first token from `:` to ` Paris` and
+    /// with it the whole completion. Set for whatever llama.cpp pre-scales, so
+    /// the two agree bit for bit rather than merely in exact arithmetic.
+    pub prescale_q: bool,
+    /// Which non-linearity the gated feed-forward applies to its gate.
+    ///
+    /// **Llama, Mistral, Qwen and Phi use SiLU; the whole Gemma family uses
+    /// GELU.** Running Gemma with SiLU is not a missing tensor and not an
+    /// error — every FFN output is merely a slightly different curve, and the
+    /// model still answers fluently. Gemma-2 shipped in
+    /// `VERIFIED_ARCHITECTURES` for weeks in exactly that state.
+    pub ffn_act: FfnAct,
     /// `tanh` soft cap on attention logits; `0.0` means none. Gemma-2 uses 50.
     pub attn_logit_softcap: f32,
     /// `tanh` soft cap on the final logits; `0.0` means none. Gemma-2 uses 30.
     pub final_logit_softcap: f32,
+    /// How often a **full-attention** layer appears among windowed ones.
+    ///
+    /// llama.cpp calls this the SWA pattern. `n` means layer `il` is windowed
+    /// when `il % n < n - 1`, so the last of every `n` is global. Gemma-2 is
+    /// **2** (alternating) and Gemma-3 is **6** (five local, one global).
+    ///
+    /// Getting it wrong windows the wrong layers, and **below the window
+    /// length every pattern is identical** — which is why a short prompt
+    /// cannot reveal the mistake and Gemma-3 answered plausibly and wrongly.
+    /// `0` or `1` means no windowing at all.
+    pub swa_pattern: u32,
+    /// RoPE base for the **windowed** layers, which is not the global one.
+    ///
+    /// Gemma-3 trains local layers at 10,000 and global layers at 1,000,000.
+    /// One base for the whole model is therefore wrong for five layers in six,
+    /// and wrong RoPE is fluent nonsense rather than an error.
+    pub rope_freq_base_swa: f32,
     /// Sliding-window attention width, `0` for full attention.
     ///
     /// Gemma-2 alternates full and windowed layers. Below the window every
@@ -228,6 +319,7 @@ impl Qwen3Config {
             rope_type_is_known: rope_type_for(&arch).1,
             // Asked of the container, like `qk_norm`: a fusion is a fact about
             // this file, not about what it calls itself.
+            attn_bias: model.location("blk.0.attn_q.bias").is_some(),
             fused_qkv: model.location("blk.0.attn_qkv.weight").is_some(),
             fused_gate_up: model.location("blk.0.ffn_gate.weight").is_none()
                 && model.location("blk.0.ffn_up.weight").is_some(),
@@ -235,9 +327,35 @@ impl Qwen3Config {
             // Gemma scales by sqrt(n_embd) on the way in. Keyed on the
             // architecture because nothing in the weights reveals it.
             scale_embeddings: arch.starts_with("gemma"),
+            // llama.cpp picks this by model size, not by a metadata key: the
+            // 27B Gemmas are the exception and every other size is head_dim.
+            // Sizes are identified by layer count there and here.
+            attn_scale_dim: match (arch.as_str(), need("block_count")? as u32) {
+                ("gemma2", 46) | ("gemma3", 62) => n_embd / n_head.max(1),
+                _ => head_dim,
+            },
+            prescale_q: arch.starts_with("gemma"),
+            ffn_act: ffn_act_for(&arch),
             attn_logit_softcap: model.arch_f32("attn_logit_softcapping").unwrap_or(0.0),
             final_logit_softcap: model.arch_f32("final_logit_softcapping").unwrap_or(0.0),
             sliding_window: model.arch_u64("attention.sliding_window").unwrap_or(0) as u32,
+            // Declared by the container when it knows; otherwise by
+            // architecture, because a wrong default here is silent.
+            swa_pattern: model
+                .arch_u64("attention.sliding_window_pattern")
+                .map(|v| v as u32)
+                .unwrap_or(match arch.as_str() {
+                    "gemma2" => 2,
+                    "gemma3" => 6,
+                    _ => 0,
+                }),
+            rope_freq_base_swa: model.arch_f32("rope.freq_base_swa").unwrap_or(
+                match arch.as_str() {
+                    // Gemma-3's local layers, which the container often omits.
+                    "gemma3" => 10_000.0,
+                    _ => model.arch_f32("rope.freq_base").unwrap_or(10_000.0),
+                },
+            ),
         })
     }
 
@@ -260,9 +378,41 @@ impl Qwen3Config {
         usize::MAX
     }
 
+    /// Whether layer `il` uses the sliding window rather than full attention.
+    ///
+    /// One rule for every architecture with mixed attention, rather than a
+    /// hardcoded parity per model. Gemma-2 (`n = 2`) gives even layers, which
+    /// is what the previous `il % 2 == 0` did; Gemma-3 (`n = 6`) gives five in
+    /// six, which that rule got wrong for a third of the model.
+    pub fn is_swa_layer(&self, il: u32) -> bool {
+        self.sliding_window > 0
+            && self.swa_pattern > 1
+            && il % self.swa_pattern < self.swa_pattern - 1
+    }
+
+    /// The RoPE base layer `il` was trained with.
+    pub fn rope_base_for(&self, il: u32) -> f32 {
+        if self.is_swa_layer(il) {
+            self.rope_freq_base_swa
+        } else {
+            self.rope_freq_base
+        }
+    }
+
     /// Scale applied to attention scores before softmax.
     pub fn attn_scale(&self) -> f32 {
-        1.0 / (self.head_dim as f32).sqrt()
+        1.0 / (self.attn_scale_dim.max(1) as f32).sqrt()
+    }
+
+    /// Apply the architecture's gate non-linearity.
+    ///
+    /// One place, so a new FFN site cannot quietly pick SiLU by habit. Every
+    /// gated feed-forward in this crate routes through here.
+    pub fn activate<'a>(&self, ctx: &'a Context, gate: &Tensor<'a>) -> Result<Tensor<'a>> {
+        Ok(match self.ffn_act {
+            FfnAct::Silu => ctx.silu(gate)?,
+            FfnAct::Gelu => ctx.gelu(gate)?,
+        })
     }
 }
 
@@ -366,6 +516,11 @@ impl Qwen3Model {
             } else {
                 for suffix in ["attn_q.weight", "attn_k.weight", "attn_v.weight"] {
                     names.push(format!("blk.{il}.{suffix}"));
+                }
+                if c.attn_bias {
+                    for suffix in ["attn_q.bias", "attn_k.bias", "attn_v.bias"] {
+                        names.push(format!("blk.{il}.{suffix}"));
+                    }
                 }
             }
             // Only Qwen3 carries these. Listing them unconditionally is what
@@ -599,7 +754,14 @@ impl Qwen3Model {
         mask.set_bytes(mask_f16)?;
 
         // [head_dim, n_head, n_new], already permuted for the reshape.
-        let out = ctx.flash_attn_ext(&q, &k, &v, &mask, c.attn_scale(), c.attn_logit_softcap)?;
+        // See `prescale_q`: same algebra, different rounding, and the rounding
+        // is what decides Gemma-2's first token.
+        let (q, scale) = if c.prescale_q {
+            (ctx.scale(&q, c.attn_scale())?, 1.0)
+        } else {
+            (q, c.attn_scale())
+        };
+        let out = ctx.flash_attn_ext(&q, &k, &v, &mask, scale, c.attn_logit_softcap)?;
         Ok(ctx.reshape_2d(&ctx.cont(&out)?, (c.head_dim * c.n_head) as i64, n_new)?)
     }
 
@@ -726,7 +888,7 @@ impl Qwen3Model {
         Ok(ctx.reshape_2d(&out, (c.head_dim * c.n_head) as i64, n_tokens)?)
     }
 
-    /// SwiGLU feed-forward: `down(silu(gate(x)) * up(x))`.
+    /// Gated feed-forward: `down(act(gate(x)) * up(x))`, `act` per architecture.
     pub(crate) fn dense_ffn<'a>(
         &self,
         ctx: &'a Context,
@@ -740,7 +902,7 @@ impl Qwen3Model {
         let (gate_w, up_w) = self.gate_up_weights(ctx, weights, il)?;
         let gate = ctx.mul_mat(&gate_w, x)?;
         let up = ctx.mul_mat(&up_w, x)?;
-        let activated = ctx.mul(&ctx.silu(&gate)?, &up)?;
+        let activated = ctx.mul(&self.config.activate(ctx, &gate)?, &up)?;
         Ok(ctx.mul_mat(get(format!("blk.{il}.ffn_down.weight"))?, &activated)?)
     }
 
@@ -778,7 +940,7 @@ impl Qwen3Model {
             &selected,
         )?;
         let up = ctx.mul_mat_id(get(format!("blk.{il}.ffn_up_exps.weight"))?, &x3, &selected)?;
-        let activated = ctx.mul(&ctx.silu(&gate)?, &up)?;
+        let activated = ctx.mul(&c.activate(ctx, &gate)?, &up)?;
         let down = ctx.mul_mat_id(
             get(format!("blk.{il}.ffn_down_exps.weight"))?,
             &activated,
@@ -819,13 +981,19 @@ mod tests {
             qk_norm: true,
             rope_type: ROPE_TYPE_NEOX,
             rope_type_is_known: true,
+            attn_bias: false,
             fused_qkv: false,
             fused_gate_up: false,
             post_norms: false,
             scale_embeddings: false,
+            attn_scale_dim: 16,
+            prescale_q: false,
+            ffn_act: FfnAct::Silu,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             sliding_window: 0,
+            swa_pattern: 0,
+            rope_freq_base_swa: 10_000.0,
         }
     }
 
@@ -860,6 +1028,46 @@ mod tests {
             "got {}",
             c.attn_scale()
         );
+    }
+
+    #[test]
+    fn the_gemma_family_uses_gelu_and_everyone_else_silu() {
+        // Nothing in a container records this: a GELU model and a SiLU model
+        // hold byte-identical tensor sets, so the wrong choice is not a
+        // missing tensor, not a shape error, and not a crash -- it is a model
+        // that still answers in fluent English and disagrees with llama.cpp
+        // from the first token. `gemma2` shipped as "verified" in exactly that
+        // state; the reference said "a) Paris b) Lyon" where we said "Paris".
+        for arch in ["gemma", "gemma2", "gemma3", "gemma3n"] {
+            assert_eq!(ffn_act_for(arch), FfnAct::Gelu, "{arch}");
+        }
+        for arch in ["llama", "qwen2", "qwen3", "qwen3moe", "phi3", "deepseek4"] {
+            assert_eq!(ffn_act_for(arch), FfnAct::Silu, "{arch}");
+        }
+    }
+
+    #[test]
+    fn only_the_27b_gemmas_scale_by_n_embd_over_n_head() {
+        // llama.cpp picks the attention scale by model size, and the two
+        // formulas COINCIDE at every size but 27B: gemma-3-1b has head_dim 256
+        // and n_embd/n_head = 1152/4 = 288, but its scale is 1/sqrt(256).
+        // A check that passed on the 1B would still have been wrong at 27B,
+        // which is why the rule is encoded rather than the observation.
+        let dim = |arch: &str, n_layer: u32, n_embd: u32, n_head: u32, head_dim: u32| match (
+            arch, n_layer,
+        ) {
+            ("gemma2", 46) | ("gemma3", 62) => n_embd / n_head.max(1),
+            _ => head_dim,
+        };
+        // gemma-2-2b and gemma-3-1b: head_dim wins even though it differs
+        // from n_embd/n_head.
+        assert_eq!(dim("gemma2", 26, 2304, 8, 256), 256);
+        assert_eq!(dim("gemma3", 26, 1152, 4, 256), 256);
+        // gemma-2-27b: 4608/32 = 144 against a head_dim of 128.
+        assert_eq!(dim("gemma2", 46, 4608, 32, 128), 144);
+        assert_eq!(dim("gemma3", 62, 5376, 32, 128), 168);
+        // Everything else, at every size.
+        assert_eq!(dim("llama", 46, 4096, 32, 128), 128);
     }
 
     #[test]
@@ -960,12 +1168,21 @@ mod tests {
         // implemented, Gemma-2 loaded through this path with no error at all
         // and answered "The capital of France is" with "himselff" — which is
         // exactly why loading is not evidence of anything.
-        for arch in ["deepseek4", "gemma2", "llama", "phi3", "qwen3", "qwen3moe"] {
+        for arch in [
+            "deepseek4",
+            "gemma2",
+            "gemma3",
+            "llama",
+            "phi3",
+            "qwen3",
+            "qwen3moe",
+        ] {
             assert!(architecture_is_verified(arch), "{arch} should be verified");
         }
         // `gemma` (v1) is deliberately absent: it is close to `gemma2` but not
-        // identical, and nobody has run it.
-        for arch in ["gemma", "gemma3", "falcon", "mamba", "something-new"] {
+        // identical, and nobody has run it. So is `gemma3n`, which is a
+        // different model despite the name.
+        for arch in ["gemma", "gemma3n", "falcon", "mamba", "something-new"] {
             assert!(
                 !architecture_is_verified(arch),
                 "{arch} has not been checked and must not claim to be"
