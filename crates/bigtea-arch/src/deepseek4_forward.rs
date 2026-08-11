@@ -457,14 +457,24 @@ pub fn routing_weight_report(expert_gib_per_token: f64) {
 /// Roughly 24 MB across 43 layers. Memory is not the constraint here;
 /// correctness is.
 pub struct Deepseek4Cache {
-    /// Raw KV latents, F16, `kv_lora_rank * N_KV` per layer.
+    /// Raw KV latents, F16, `kv_lora_rank * RAW_RING` per layer.
     ///
-    /// **Slot index is the absolute position**, which is what lets the mask stay
-    /// simple arithmetic — and what a ring with wraparound would break, so the
-    /// mask and any future ring must be rewritten together.
+    /// **Slot index is `position % RAW_RING`.** It used to be the absolute
+    /// position, which is why position 256 wrote past the end. The mask and the
+    /// ring had to be rewritten together — the mask's key axis is no longer the
+    /// slot index, it is a span of absolute positions gathered out of the ring,
+    /// so the two cannot drift apart without the shapes disagreeing.
+    ///
+    /// Sound only because raw attention is **sliding**; see [`RAW_RING`].
     raw: Vec<Vec<u16>>,
-    /// Compressed summaries, F16, `kv_lora_rank * N_KV` per layer. Slot index is
-    /// the **block** index, not the position.
+    /// Compressed summaries, F16, `kv_lora_rank * blocks` per layer. Slot index
+    /// is the **block** index, not the position.
+    ///
+    /// **Grows; it cannot be a ring.** The compressed half is
+    /// visibility-limited rather than windowed — a token sees *every* block that
+    /// is complete and behind it — so nothing here ever becomes unreachable. At
+    /// ratio 4 that is one slot per 4 tokens, which is what a 1M context costs
+    /// and why it is grown on demand rather than sized up front.
     comp: Vec<Vec<u16>>,
     /// The compressor's input ring, per layer: the last `state_rows` rows of the
     /// `kv` and `score` projections, interleaved as `(kv, score)`.
@@ -489,10 +499,12 @@ pub struct Deepseek4Cache {
 
 impl Deepseek4Cache {
     pub fn new(n_layer: u32, kv_lora_rank: u32) -> Self {
-        let per_layer = kv_lora_rank as usize * N_KV as usize;
+        let per_layer = kv_lora_rank as usize * RAW_RING as usize;
         Deepseek4Cache {
             raw: vec![vec![0u16; per_layer]; n_layer as usize],
-            comp: vec![vec![0u16; per_layer]; n_layer as usize],
+            // Empty: grown to whatever the sequence reaches. A layer with no
+            // compressor never grows one at all.
+            comp: vec![Vec::new(); n_layer as usize],
             ring: vec![(Vec::new(), Vec::new()); n_layer as usize],
             comp_len: vec![0; n_layer as usize],
             n_past: 0,
@@ -506,8 +518,14 @@ impl Deepseek4Cache {
 
     /// Forget everything, so the same cache can start a new sequence.
     pub fn clear(&mut self) {
-        for layer in self.raw.iter_mut().chain(self.comp.iter_mut()) {
+        for layer in self.raw.iter_mut() {
             layer.fill(0);
+        }
+        // Released rather than zeroed: a new sequence regrows only what it
+        // reaches, so a long one does not leave its footprint behind.
+        for layer in self.comp.iter_mut() {
+            layer.clear();
+            layer.shrink_to_fit();
         }
         for (kv, sc) in self.ring.iter_mut() {
             kv.clear();
@@ -616,8 +634,29 @@ fn prefetch_overlap() -> bool {
     })
 }
 
-/// The padded key window each half of the cache occupies.
-const N_KV: i64 = 256;
+/// Positions the raw latent ring holds, and therefore the longest span a
+/// single pass may need.
+///
+/// # Why a ring is exact here rather than an approximation
+///
+/// V4-Flash's raw attention is **sliding**, not merely causal: the container
+/// declares `attention.sliding_window = 128`, and the mask drops any key more
+/// than 128 positions behind its query. A position older than the window can
+/// never be read again, so overwriting its slot loses nothing. That is what
+/// makes wraparound sound, and it is a property of *this* model checked against
+/// the container rather than an assumption — `sliding_window = 0` would mean
+/// full causal attention, where a ring would quietly drop keys that are still
+/// visible, so that case is refused.
+///
+/// The size is not the window, though. One pass covers queries
+/// `pos0 ..= pos0 + nt - 1`, and the earliest of them still reaches `window - 1`
+/// positions further back, so `window + nt - 1` distinct positions must be live
+/// at once. 1024 leaves room for a 897-token batch, past any prefill block this
+/// runner uses; beyond that [`forward`] refuses with both numbers rather than
+/// wrapping over data the pass is still going to read.
+///
+/// 512 latents x 1024 positions x 2 bytes x 43 layers = 45 MB.
+const RAW_RING: i64 = 1024;
 
 /// Threads for every `ggml` graph evaluation in this file.
 ///
@@ -965,7 +1004,13 @@ impl<'m> Deepseek4Forward<'m> {
     /// indexer selects everything and changes nothing.
     pub fn indexer_is_exact(&self, n_tokens: usize) -> bool {
         let blocks = n_tokens as i64 / Deepseek4Config::CSA_RATIO;
-        blocks.min(N_KV) <= self.config.indexer_top_k as i64
+        // The `min(256)` this used to carry was the old fixed cache bound: the
+        // compressed half could never hold more than 256 blocks, so it could
+        // never exceed the indexer's budget either. Now that it grows, the
+        // block count is the real quantity — and dropping the clamp is what
+        // makes this report `false` at the length it actually stops being
+        // exact instead of claiming exactness forever.
+        blocks <= self.config.indexer_top_k as i64
     }
 
     /// Tensor names one block needs, plus the globals for block 0.
@@ -1521,6 +1566,26 @@ fn compressor<'c>(
     Ok(out)
 }
 
+/// The inclusive span of **absolute positions** one pass must be able to read.
+///
+/// `hi` is the last query. `lo` is how far the *earliest* query in the batch
+/// still reaches — `window - 1` positions behind `pos0`, not behind `hi`, which
+/// is the off-by-a-batch that would silently drop the keys the first rows of a
+/// prefill need.
+///
+/// With no sliding window every position stays visible, so the span is the whole
+/// sequence and a ring cannot serve it; [`forward`] refuses that case rather
+/// than returning a span it cannot fill.
+fn raw_span(pos0: i64, nt: i64, window: i64) -> (i64, i64) {
+    let hi = pos0 + nt - 1;
+    let lo = if window > 0 {
+        (pos0 - window + 1).max(0)
+    } else {
+        0
+    };
+    (lo, hi)
+}
+
 /// Attention over the raw window, and optionally the compressed summaries.
 ///
 /// The raw half is causal **and sliding**: every layer's raw window is an SWA
@@ -1563,10 +1628,36 @@ fn attention<'c>(
     // and a wrong cache here returns fluent nonsense rather than an error.
     let kv_vals = kv_full.to_vec_f32();
     let raw = &mut cache.raw[il as usize];
-    let at = (pos0 * head) as usize;
-    bigtea_ggml::f32_to_f16(&kv_vals, &mut raw[at..at + kv_vals.len()]);
+    // One row per token, at `position % RAW_RING`. A batch that straddles the
+    // wrap writes two runs, which is why this is a loop and not one copy.
+    for i in 0..nt {
+        let slot = ((pos0 + i) % RAW_RING) as usize;
+        let src = (i * head) as usize;
+        let dst = slot * head as usize;
+        bigtea_ggml::f32_to_f16(
+            &kv_vals[src..src + head as usize],
+            &mut raw[dst..dst + head as usize],
+        );
+    }
 
-    let mut packed: Vec<u16> = raw.clone();
+    // The span of absolute positions this pass can actually read: the earliest
+    // query reaches `window - 1` back, the latest is `pos0 + nt - 1`.
+    //
+    // **This is the key axis now** — a contiguous run of absolute positions
+    // gathered out of the ring, not the ring's own slot order. Handing the mask
+    // slot indices instead would attend to whatever happened to be `p % 1024`,
+    // which is a wrong answer and not an error.
+    let window = config.sliding_window as i64;
+    let (lo, hi) = raw_span(pos0, nt, window);
+    let n_raw = hi - lo + 1;
+
+    let mut packed: Vec<u16> = Vec::with_capacity((n_raw * head) as usize);
+    for p in lo..=hi {
+        let slot = (p % RAW_RING) as usize;
+        let at = slot * head as usize;
+        packed.extend_from_slice(&raw[at..at + head as usize]);
+    }
+
     if let Some(c) = comp {
         // The compressor returns only the blocks **this batch completed**, so
         // they append at their absolute index. Writing them from block 0 —
@@ -1575,6 +1666,12 @@ fn attention<'c>(
         let cv = c.to_vec_f32();
         let store = &mut cache.comp[il as usize];
         let at = (comp_block0 * head) as usize;
+        // Grown here rather than sized up front: the compressed half cannot be
+        // a ring — every complete block behind a token stays visible — so its
+        // length is whatever the sequence has reached.
+        if store.len() < at + cv.len() {
+            store.resize(at + cv.len(), 0);
+        }
         bigtea_ggml::f32_to_f16(&cv, &mut store[at..at + cv.len()]);
         cache.comp_len[il as usize] = comp_block0 + cv.len() as i64 / head;
     }
@@ -1584,33 +1681,41 @@ fn attention<'c>(
     // and attending over the raw window alone on those would discard everything
     // the sequence had already compressed — silently, and only on the cached path.
     let has_comp = cache.comp_len[il as usize] > 0;
-    let n_kv = if has_comp {
-        packed.extend_from_slice(&cache.comp[il as usize]);
-        2 * N_KV
+    // Only the blocks the sequence has actually produced. This used to be the
+    // whole 256-slot array, so the mask spent its time masking off zeros; now
+    // the tensor is the size of the history, which is also what lets it grow.
+    let n_comp = if has_comp {
+        let blocks = cache.comp_len[il as usize];
+        packed.extend_from_slice(&cache.comp[il as usize][..(blocks * head) as usize]);
+        blocks
     } else {
-        N_KV
+        0
     };
+    let n_kv = n_raw + n_comp;
     let k = ctx.new_f16_3d(head, n_kv, 1)?;
     let bytes: Vec<u8> = packed.iter().flat_map(|h| h.to_le_bytes()).collect();
     k.set_bytes(&bytes)?;
 
     let ratio = config.compress_block(il).unwrap_or(1);
-    let window = config.sliding_window as i64;
     let mut mask = vec![0u8; (n_kv * nt) as usize * 2];
     for query in 0..nt {
-        // The key axis is indexed by absolute position, so the query must be too
-        // — otherwise a step at position 40 would mask everything before it.
+        // The key axis is absolute positions `lo..=hi`, so the query must be
+        // absolute too — otherwise a step at position 40 would mask everything
+        // before it.
         let q_abs = pos0 + query;
         let row = (query * n_kv) as usize * 2;
-        for key in 0..N_KV {
+        for j in 0..n_raw {
+            // `j` is an offset into the gathered span, not a ring slot and not
+            // a bare position. `lo + j` is the position it holds.
+            let key = lo + j;
             if key > q_abs || (window > 0 && q_abs - key >= window) {
-                let at = row + key as usize * 2;
+                let at = row + j as usize * 2;
                 mask[at..at + 2].copy_from_slice(&F16_NEG_INF);
             }
         }
         if has_comp {
-            for blk in ((q_abs + 1) / ratio)..N_KV {
-                let at = row + (N_KV + blk) as usize * 2;
+            for blk in ((q_abs + 1) / ratio)..n_comp {
+                let at = row + (n_raw + blk) as usize * 2;
                 mask[at..at + 2].copy_from_slice(&F16_NEG_INF);
             }
         }
@@ -2501,16 +2606,10 @@ pub fn head(fw: &Deepseek4Forward<'_>, streams: &[f32], arena: usize) -> Result<
 
 /// Prefill: every block in order, then the head. Returns one logit per token id.
 pub fn prefill(fw: &Deepseek4Forward<'_>, tokens: &[i32], arena: usize) -> Result<Vec<f32>> {
-    // `attention` builds one F16 cache of `kv_lora_rank * N_KV` and indexes it by
-    // absolute position, so a longer sequence used to run for eight seconds and
-    // then panic on a slice range. Refuse it here, before any weight is read,
-    // with a message that says what the limit is and why.
-    if tokens.len() > N_KV as usize {
-        return Err(crate::ArchError::ContextTooLong {
-            tokens: tokens.len(),
-            limit: N_KV as usize,
-        });
-    }
+    // No sequence limit any more — the raw latents live in a ring and the
+    // compressed half grows. What is still bounded is **one pass**, and
+    // `forward` enforces that, so a prompt longer than a batch is chunked
+    // rather than refused.
     let mut cache = Deepseek4Cache::new(fw.config.n_layer, fw.config.kv_lora_rank);
     forward(fw, &mut cache, tokens, arena)
 }
@@ -2533,10 +2632,34 @@ pub fn forward(
     // single funnel both `prefill` and `step` pass through.
     BATCH.store(tokens.len(), std::sync::atomic::Ordering::Relaxed);
     let pos0 = cache.n_past as i64;
-    if pos0 as usize + tokens.len() > N_KV as usize {
+
+    // The limit is now on **one pass**, not on the sequence.
+    //
+    // A pass needs `window + nt - 1` distinct positions live at once: its
+    // earliest query still reaches `window - 1` behind itself. Past that the
+    // ring would wrap over rows this same pass is going to read — which is not
+    // an error, it is attention over whatever those slots held before.
+    //
+    // With `sliding_window = 0` there is no window at all and raw attention is
+    // full causal, so every position stays visible and a ring cannot hold them.
+    // V4-Flash declares 128; anything else is refused rather than silently
+    // dropping keys that are still in scope.
+    let window = fw.config.sliding_window as i64;
+    let (span, limit) = if window > 0 {
+        // Reported as a *batch* limit, because that is what the caller can act
+        // on: chunk the prompt. `span` is an internal quantity nobody can do
+        // anything about.
+        (
+            window + tokens.len() as i64 - 1,
+            (RAW_RING - window + 1).max(1),
+        )
+    } else {
+        (pos0 + tokens.len() as i64, RAW_RING)
+    };
+    if span > RAW_RING {
         return Err(crate::ArchError::ContextTooLong {
-            tokens: pos0 as usize + tokens.len(),
-            limit: N_KV as usize,
+            tokens: tokens.len(),
+            limit: limit as usize,
         });
     }
     // R2: read block N+1's always-read weights while block N computes.
@@ -2634,7 +2757,98 @@ pub fn step(
 
 #[cfg(test)]
 mod routing_tests {
-    use super::{is_repackable_dense, pool_passes, record_into};
+    use super::{is_repackable_dense, pool_passes, raw_span, record_into, RAW_RING};
+
+    /// V4-Flash's declared window, from the container:
+    /// `deepseek4.attention.sliding_window = 128`.
+    const WINDOW: i64 = 128;
+
+    /// A prefill from zero reaches no further back than zero.
+    #[test]
+    fn the_span_of_a_prefill_starts_at_the_beginning() {
+        assert_eq!(raw_span(0, 1, WINDOW), (0, 0));
+        assert_eq!(raw_span(0, 5, WINDOW), (0, 4));
+        assert_eq!(raw_span(0, 165, WINDOW), (0, 164));
+    }
+
+    /// **The off-by-a-batch this is here to prevent.** The earliest query in the
+    /// batch reaches `window - 1` behind `pos0`, not behind `hi`. Measuring from
+    /// `hi` would drop exactly the keys the first rows of a prefill need — and
+    /// attention over a short key set is fluent nonsense, not an error.
+    #[test]
+    fn the_span_reaches_back_from_the_first_query_not_the_last() {
+        let (lo, hi) = raw_span(300, 64, WINDOW);
+        assert_eq!(lo, 300 - WINDOW + 1, "measured from pos0");
+        assert_eq!(hi, 363);
+        // 128 for the window, plus the 63 later queries in the batch.
+        assert_eq!(hi - lo + 1, WINDOW + 63);
+    }
+
+    /// A single cached step needs exactly one window.
+    #[test]
+    fn a_step_needs_exactly_the_window() {
+        let (lo, hi) = raw_span(2000, 1, WINDOW);
+        assert_eq!(hi - lo + 1, WINDOW);
+        assert_eq!((lo, hi), (1873, 2000));
+    }
+
+    /// Every position in a span maps to a distinct ring slot — which is the
+    /// whole safety argument for wraparound. If two positions in one span
+    /// collided, one would silently read the other's latents.
+    #[test]
+    fn no_two_positions_in_one_span_share_a_ring_slot() {
+        for &(pos0, nt) in &[(0, 1), (0, 897), (1100, 1), (5000, 400), (100_000, 64)] {
+            let (lo, hi) = raw_span(pos0, nt, WINDOW);
+            assert!(
+                hi - lo < RAW_RING,
+                "span {} exceeds the ring at pos0 {pos0}, nt {nt}",
+                hi - lo + 1
+            );
+            let mut seen = std::collections::HashSet::new();
+            for p in lo..=hi {
+                assert!(
+                    seen.insert(p % RAW_RING),
+                    "positions collide in the ring at pos0 {pos0}, nt {nt}"
+                );
+            }
+        }
+    }
+
+    /// The span is allowed to wrap, and must stay contiguous *in position
+    /// order* when it does — the gather walks `lo..=hi`, not slot order.
+    #[test]
+    fn a_span_that_wraps_the_ring_is_still_read_in_position_order() {
+        let (lo, hi) = raw_span(1100, 1, WINDOW);
+        assert_eq!((lo, hi), (973, 1100));
+        let slots: Vec<i64> = (lo..=hi).map(|p| p % RAW_RING).collect();
+        assert_eq!(slots[0], 973);
+        assert_eq!(*slots.last().expect("non-empty"), 1100 % RAW_RING);
+        assert!(
+            slots.windows(2).any(|w| w[1] < w[0]),
+            "this case is chosen because it wraps; if it stopped wrapping the \
+             test no longer covers wraparound"
+        );
+    }
+
+    /// The largest batch the ring can serve, and one past it. `forward` refuses
+    /// beyond this rather than wrapping over rows the same pass will read.
+    #[test]
+    fn the_batch_limit_is_the_ring_minus_the_window() {
+        let max_batch = RAW_RING - WINDOW + 1;
+        let (lo, hi) = raw_span(0, max_batch, WINDOW);
+        assert!(hi - lo < RAW_RING);
+        let (lo, hi) = raw_span(10_000, max_batch, WINDOW);
+        assert_eq!(hi - lo + 1, RAW_RING, "exactly fills the ring");
+        let (lo, hi) = raw_span(10_000, max_batch + 1, WINDOW);
+        assert!(hi - lo + 1 > RAW_RING, "one past it must not fit");
+    }
+
+    /// With no sliding window the span is the whole sequence, which is what
+    /// makes a ring unusable and why that configuration is refused.
+    #[test]
+    fn without_a_window_the_span_is_the_whole_sequence() {
+        assert_eq!(raw_span(5000, 1, 0), (0, 5000));
+    }
 
     /// Selections land in the newest pass, and pooling sums every pass.
     ///
