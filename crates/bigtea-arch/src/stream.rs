@@ -1881,6 +1881,7 @@ mod tests {
             rope_beta_fast: 32.0,
             rope_beta_slow: 1.0,
             rope_orig_ctx: 0,
+            attn_bias: false,
             n_expert: 4,
             n_expert_used: 2,
             n_ff_expert: 16,
