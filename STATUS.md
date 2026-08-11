@@ -27,6 +27,63 @@ and the token loop. It runs DeepSeek-V4-Flash (144 GB) and Qwen3-30B-A3B on a
 15.7 GiB laptop and produces correct text. **It is not yet faster than
 llama.cpp on V4-Flash — on that model it leads on nothing.**
 
+## Where we actually stand, measured 2026-08-11 in one session
+
+**Speed is level. Coverage is not.** Both halves matter and they have different
+answers, so they are stated separately.
+
+### Speed — parity on every model measured today
+
+Interleaved runs, same session, `--temp 0`, 401-token prompt for the dense
+models. **Absolute tok/s drifts up to 25% with machine state, so only
+within-session comparisons are quoted**, and each number below is a median of
+the rounds actually run.
+
+| model | phase | Bigtea | llama.cpp | verdict |
+|---|---|---:|---:|---|
+| Qwen3-4B (dense, fits RAM) | prefill | **76.5** | 69.3 | parity → ahead |
+| Qwen3-4B | generation | **5.97** | 5.54 | **1.08x ahead** |
+| Gemma-2-2B | prefill | 124 / 141 | 115 / 146 | parity |
+| Gemma-2-2B | generation | 8.01 / 10.78 | 7.12 / 10.67 | parity → ahead |
+| Qwen3-30B-A3B (streams from disk) | prefill | 1.70 | 1.77 | parity |
+| Qwen3-30B-A3B | generation | 3.10 | 3.25 | parity (5% behind, inside the spread) |
+
+**Three rows in the old scoreboard are now retracted as stale**, and all three
+were deficits:
+
+- Qwen3-4B "prefill 38.5 vs 111.2, **2.9x behind**" — now 76.5 vs 69.3.
+- Qwen3-4B "generation 0.67 vs 5.90, **8.8x behind**" — now 5.97 vs 5.54.
+- Qwen3-30B "generation 2.63 vs 4.21, **1.60x behind**" — now 3.10 vs 3.25,
+  i.e. inside the noise. **The 4.21 was llama.cpp on a better day**: measured
+  back to back today it runs 2.93–3.60 on the same command line, which is the
+  clearest possible demonstration of why cross-session numbers are worthless.
+
+**On the streaming model, run order dominates the result.** Whichever engine
+runs second is slower — Bigtea 3.92 running first against llama.cpp 3.60, and
+2.71 running second against 2.93. A warm-to-warm protocol (each engine twice,
+compare the seconds) is the only one that says anything, and it says parity.
+
+**Nothing here is a claim about V4-Flash**, which was last measured 2026-08-10
+and is unchanged: prefill 1.25x behind, generation at parity. See below.
+
+### Coverage — this is the real gap
+
+| | Bigtea | llama.cpp | gap |
+|---|---:|---:|---|
+| architectures **diffed against the reference** | **8** | 141 declared | the big one |
+| chat templates | 26 | 54 | half |
+| CLI flags (long) | 119 | 182 | 63 |
+| tokenizer families | 4 | 6 | rwkv, plamo2 |
+| samplers | 16 | 20 | adaptive-p, infill, 2 lazy-grammar |
+| GPU backends | **0** | CUDA, Metal, Vulkan, SYCL, HIP | total |
+
+The architecture number is not comparable as written: llama.cpp *declares* 141
+and Bigtea's 8 are ones whose output was diffed token for token against it.
+Nobody has checked all 141. But 8 is still 8.
+
+**The honest one-line answer: on this machine, for CPU inference on the models
+we support, Bigtea is as fast as llama.cpp. It supports far less.**
+
 ## The honest scoreboard
 
 Never quote a comparison without the model name and the phase.
