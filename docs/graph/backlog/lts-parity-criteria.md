@@ -24,7 +24,7 @@ the real distance to "any model", and it is far larger than the performance gap.
 | architectures | **8** (`deepseek4`, `gemma2`, `gemma3`, `llama`, `phi3`, `qwen2`, `qwen3`, `qwen3moe`) | ~100. Every entry is diffed against llama.cpp token for token; `gemma2` sat here for weeks without that and was **wrong** — see `../research/gemma-was-running-silu-2026-08-11.md` |
 | tokenizer families | **2** (`gpt2` BPE, `llama` SPM) | 6 (spm, bpe, wpm, ugm, rwkv, plamo2) |
 | quant types | all ggml can decode | same |
-| CLI flags | **106** (counted from the parser, not the help text) | **182** (counted, not estimated: `llamacpp-flag-audit.md`) |
+| CLI flags | **119 long** (generated from the parser by `build.rs`, so it cannot drift from what is accepted) | **182** (counted, not estimated: `llamacpp-flag-audit.md`) |
 | chat templates | **25 families** | 56 (counted from `llama-chat.cpp`) |
 | backends | CPU | CPU, CUDA, Metal, Vulkan, ROCm, SYCL |
 

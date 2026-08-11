@@ -76,6 +76,63 @@ pub fn reserve_working_set(_bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Scheduling priority, llama.cpp's `--prio` scale.
+///
+/// `0` normal, `1` medium, `2` high, `3` realtime. Raising it is a real lever
+/// on a machine that is doing something else: a generation step is a tight
+/// loop of short compute bursts separated by disk waits, and every wait is a
+/// chance for the scheduler to hand the core to a browser tab.
+///
+/// **`3` is deliberately not `REALTIME_PRIORITY_CLASS`.** That class outranks
+/// the kernel's own input and disk threads, and a process that pins the CPU
+/// there can make the machine unresponsive with no way to click anything. It
+/// maps to `HIGH` plus a note, which is the honest reading of "as high as it
+/// is safe to go". llama.cpp asks for realtime; we decline that one and say so.
+#[cfg(windows)]
+pub fn set_priority(level: u32) -> Result<&'static str, String> {
+    // Win32 priority classes.
+    const NORMAL: u32 = 0x0000_0020;
+    const ABOVE_NORMAL: u32 = 0x0000_8000;
+    const HIGH: u32 = 0x0000_0080;
+    let (class, name) = match level {
+        0 => (NORMAL, "normal"),
+        1 => (ABOVE_NORMAL, "above normal"),
+        2 => (HIGH, "high"),
+        _ => (HIGH, "high (realtime declined: it can freeze the desktop)"),
+    };
+    // SAFETY: a plain Win32 call on the current process with a valid class.
+    unsafe {
+        if ffi::SetPriorityClass(ffi::GetCurrentProcess(), class) == 0 {
+            return Err(format!(
+                "SetPriorityClass({class:#x}) failed ({})",
+                ffi::GetLastError()
+            ));
+        }
+    }
+    Ok(name)
+}
+
+/// Scheduling priority via `nice`. Lower `nice` is higher priority, so the
+/// llama.cpp scale is inverted here.
+#[cfg(not(windows))]
+pub fn set_priority(level: u32) -> Result<&'static str, String> {
+    let (nice, name) = match level {
+        0 => (0, "normal"),
+        1 => (-5, "above normal"),
+        2 => (-10, "high"),
+        _ => (-15, "high (realtime declined: it can starve the kernel)"),
+    };
+    // SAFETY: `setpriority` on the current process with a valid class.
+    let rc = unsafe {
+        ffi::setpriority(0 /* PRIO_PROCESS */, 0, nice)
+    };
+    if rc != 0 {
+        // Lowering `nice` needs privilege; saying so beats pretending.
+        return Err(format!("setpriority({nice}) failed -- needs privilege"));
+    }
+    Ok(name)
+}
+
 /// Pin `bytes` in physical memory.
 ///
 /// The slice must stay alive and unmoved for as long as the lock matters —
@@ -128,6 +185,7 @@ mod ffi {
         pub fn GetProcessWorkingSetSize(h: isize, min: *mut usize, max: *mut usize) -> i32;
         pub fn SetProcessWorkingSetSize(h: isize, min: usize, max: usize) -> i32;
         pub fn VirtualLock(addr: *const c_void, size: usize) -> i32;
+        pub fn SetPriorityClass(h: isize, class: u32) -> i32;
         pub fn GetLastError() -> u32;
     }
 }
@@ -137,6 +195,7 @@ mod ffi {
     use core::ffi::c_void;
     unsafe extern "C" {
         pub fn mlock(addr: *const c_void, len: usize) -> i32;
+        pub fn setpriority(which: i32, who: u32, prio: i32) -> i32;
     }
 }
 

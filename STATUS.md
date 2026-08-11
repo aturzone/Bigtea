@@ -1009,6 +1009,37 @@ reproducible in the reference must say so rather than fail.** Gemma was not
 this: its reference was stable and we were wrong.
 
 
+## Six more flags, and a list that could not be trusted (2026-08-11)
+
+`--binary-file`, `--chat-template-file`, `--log-colors`/`--no-log-colors`,
+`--prio`/`--prio-batch`, `--warmup`/`--no-warmup`, `--completion-bash`. Each
+was checked to change something observable before being accepted, which is the
+standard `-t` failed for weeks. Two came off the **refused** list:
+
+- **`--prio` was refused for "no thread-affinity or scheduler layer".** Wrong
+  premise — process priority needs one syscall, not an affinity layer. It is
+  real now, applied before the model opens so the load benefits. **`--prio 3`
+  maps to HIGH, not REALTIME, and says so**: realtime outranks the kernel's
+  own input and disk threads and can leave a desktop with no way to click
+  anything.
+- **`--warmup` was refused for "nothing is warmed".** Also wrong: the page
+  cache, the repacked tensors, the arenas and the thread ladder all are. It
+  runs one throwaway pass on a discarded cache. **Off by default, unlike
+  llama.cpp** — warming a disk-streaming runner reads gigabytes, and the cold
+  cost is the number this project exists to report honestly.
+
+### The completion list drifted in both directions inside an hour
+
+Hand-written from the help text, it claimed **four flags that do not exist**
+and was **missing 23 that do**. A phantom flag is worse than a missing one:
+the shell suggests it and the binary rejects it.
+
+Same failure as the flag count this project carried for eight commits.
+**Anything that enumerates the flags is a second copy of the parser and will
+drift**, so `build.rs` now scans `bigtea-run.rs` for the string literals its
+`match` arms are made of and generates the list: **119 long flags**, 0 phantom,
+0 missing.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
