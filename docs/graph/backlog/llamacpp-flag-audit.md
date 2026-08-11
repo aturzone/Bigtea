@@ -14,10 +14,10 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 
 | bucket | flags | state |
 |---|---:|---|
-| **have** | **74** | done |
+| **have** | **76** | done |
 | **samplers** | 22 | **21 done**; only `--backend-sampling` left, and it is a GPU concept |
 | interaction / prompt handling | 22 | **done 2026-08-11** — including a real REPL |
-| runtime / threading / memory | 31 | mostly gap; several are meaningless here |
+| runtime / threading / memory | 31 | I/O mode + `--override-kv` done; most of the rest **refused**, see below |
 | RoPE, YaRN, context shift | 15 | **9 done 2026-08-11**; the other 6 refused, see below |
 | logging | 13 | **11 done 2026-08-11**; status moved to stderr |
 | **GPU** | 15 | **won't** — no backend to apply them to |
@@ -27,7 +27,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 | chat template | 6 | 2 done (detection), `--jinja` won't |
 | LoRA / control vectors | 5 | gap |
 | grammar / JSON schema | 4 | gap |
-| meta (`--help`, `--version`) | 4 | 2 done |
+| meta (`--help`, `--version`) | 4 | 3 done |
 
 **"All of them" is not the right target and this table is why.** Fifteen are
 GPU-only on an engine with no GPU backend; several more (`--no-mmap`,
@@ -278,6 +278,57 @@ reached. Both spellings are accepted and the last wins.
 `q4_0` is **not** offered. ggml has the kernels, but the accuracy cost at 4 bits
 in attention is real and unmeasured here, and offering a type without the
 perplexity number beside it is the thing this audit exists to prevent.
+
+## Done 2026-08-11 - I/O mode, metadata override, and a long refusal list
+
+`--direct-io`, `--no-direct-io`/`--no-mmap`, `--override-kv`, `--usage`.
+
+**`--no-mmap` lands on the same switch as `--no-direct-io`**, because what it
+means -- "do not let the OS page cache hold the weights" -- is what direct I/O
+already does here. Both are real modes in `bigtea-io`, so this is a genuine
+switch rather than an accepted no-op:
+
+```
+$ bigtea-run <model> ...
+model      llama (direct (cache bypassed))
+$ bigtea-run <model> ... --no-direct-io
+model      llama (buffered (page cache in use))
+```
+
+**`--override-kv key=type:value`** is the escape hatch for a container whose
+metadata is wrong. GGUFs are often converted by third parties, and a mislabelled
+`rope.freq_base` makes a model answer fluently and wrongly with nothing to point
+at. Overriding beats editing a multi-gigabyte file, and the run says which
+override it used. Proven load-bearing rather than merely printed:
+
+```
+$ bigtea-run <llama-3.2-1b> -f prose.txt -n 10
+ similar with the invention of the printing press. Befor
+
+$ ... --override-kv llama.rope.freq_base=float:1000
+ esta, and siesta is a thing, and
+```
+
+A malformed spec **refuses the run** (exit 2) rather than being skipped: an
+override silently dropped is worse than none, because the user believes the
+container has been corrected.
+
+### Refused, with reasons - most of the runtime bucket
+
+These are declined rather than accepted-and-ignored. That is the whole point of
+this audit, and the standard `-t` failed for weeks.
+
+| flag | why |
+|---|---|
+| `--mlock` | **wanted, not yet done.** Needs `SetProcessWorkingSetSize` before `VirtualLock` on Windows or the lock silently fails, which is the exact no-op being avoided. Scoped as the next runtime item |
+| `--numa` | no NUMA-aware allocation to select between |
+| `--parallel` | one sequence at a time by design: one weight set, one KV cache |
+| `--cpu-mask`, `--cpu-range`, `--cpu-strict`, `--poll`, `--prio` | no thread-affinity or scheduler layer; `-t`/`-tb` are the levers that exist |
+| `--defrag-thold` | the KV cache is append-only and never fragments |
+| `--warmup`/`--no-warmup` | nothing is warmed; the first token pays for what it needs |
+| `--ubatch-size` | `-b` is the only batch dimension here |
+| `--fit`, `--fit-ctx`, `--fit-target` | `bigtea-model-info --budget` answers this question already, in its own spelling |
+| `--check-tensors` | the container work in r8 validates structure at open; a values-level NaN scan would have to dequantise every tensor and is not obviously worth it |
 
 ## Next batches, in order
 2. **RoPE / context (15)** — `--rope-freq-base`, `--rope-freq-scale`,

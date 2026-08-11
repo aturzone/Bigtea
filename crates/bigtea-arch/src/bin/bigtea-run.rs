@@ -283,6 +283,29 @@ fn unescape(text: &str) -> String {
     out
 }
 
+/// Parse `key=type:value` for `--override-kv`.
+///
+/// llama.cpp's spelling exactly, because muscle memory is the point of
+/// matching a CLI. Returns `None` on anything malformed so the caller can
+/// refuse the run: an override silently dropped is worse than no override,
+/// since the user believes the container has been corrected.
+fn parse_override(spec: &str) -> Option<(String, bigtea_gguf::Value)> {
+    let (key, rest) = spec.split_once('=')?;
+    let (ty, raw) = rest.split_once(':')?;
+    let value = match ty.trim().to_ascii_lowercase().as_str() {
+        "int" | "i32" | "i64" | "u32" | "u64" => bigtea_gguf::Value::I64(raw.trim().parse().ok()?),
+        "float" | "f32" | "f64" => bigtea_gguf::Value::F32(raw.trim().parse().ok()?),
+        "bool" => bigtea_gguf::Value::Bool(match raw.trim() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            _ => return None,
+        }),
+        "str" | "string" => bigtea_gguf::Value::String(raw.to_string()),
+        _ => return None,
+    };
+    Some((key.trim().to_string(), value))
+}
+
 /// Apply the model's chat template when asked, and say which one was used.
 ///
 /// An instruct model trained on `<|im_start|>user` does not fail on raw text —
@@ -495,6 +518,13 @@ fn main() -> ExitCode {
     // argument would otherwise *be* the path, and the runner would report that
     // it cannot open a file called `--version`.
     if let Some(first) = std::env::args().nth(1) {
+        if first == "--usage" {
+            // llama.cpp's alias for --help. Falls through to the usage block
+            // by leaving `path` unset.
+            eprintln!("usage: bigtea-run <model.gguf> \"prompt\" [options]");
+            eprintln!("  run with no arguments for the full option list");
+            return ExitCode::from(2);
+        }
         if first == "--version" {
             println!("bigtea-run {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
@@ -533,6 +563,9 @@ fn main() -> ExitCode {
         eprintln!("  --dry-sequence-breaker S  a match may not cross this, repeatable");
         eprintln!("  --samplers SPEC     chain order, e.g. \"top_k;temperature;top_p\"");
         eprintln!("  -ctk, -ctv TYPE     KV cache storage: f16 (default) or q8_0");
+        eprintln!("  --no-direct-io      read through the page cache (also --no-mmap)");
+        eprintln!("  --direct-io         bypass the page cache (default)");
+        eprintln!("  --override-kv K=T:V override one GGUF metadata entry");
         eprintln!("  -i, --interactive   keep the session open and take turns");
         eprintln!("  -cnv, --conversation  interactive, with the chat template per turn");
         eprintln!("  -st, --single-turn  one exchange, then exit");
@@ -610,6 +643,7 @@ fn main() -> ExitCode {
     // Held as text until a tokenizer exists to turn them into ids.
     let mut dry_breakers: Vec<String> = Vec::new();
     let mut kv_type = bigtea_arch::KvType::F16;
+    let mut overrides: Vec<(String, bigtea_gguf::Value)> = Vec::new();
     let mut show_perf = true;
     let mut system_prompt: Option<String> = None;
     let mut ctx_size: Option<usize> = None;
@@ -758,6 +792,33 @@ fn main() -> ExitCode {
             // Generation and prefill want opposite thread counts — one is
             // bandwidth-bound, the other compute-bound — so llama.cpp carries
             // two flags and so do we, with its spelling.
+            // --- I/O mode and metadata overrides --------------------------
+            "--direct-io" => {
+                std::env::set_var("BIGTEA_IO", "direct");
+                i += 1;
+            }
+            // Also llama.cpp's --no-mmap: it means "do not let the OS page
+            // cache hold the weights", which is what direct I/O already does
+            // here, so the two spellings land on the same switch.
+            "--no-direct-io" | "--no-mmap" => {
+                std::env::set_var("BIGTEA_IO", "buffered");
+                i += 1;
+            }
+            "--override-kv" => {
+                match rest.get(i + 1).and_then(|spec| parse_override(spec)) {
+                    Some(kv) => overrides.push(kv),
+                    None => {
+                        eprintln!(
+                            "bigtea-run: --override-kv: expected key=type:value, got {:?}",
+                            rest.get(i + 1).cloned().unwrap_or_default()
+                        );
+                        eprintln!("  types: int, float, bool, str");
+                        eprintln!("  e.g. --override-kv qwen3.rope.freq_base=float:1000000");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
             // --- KV cache storage type ------------------------------------
             // One type for both halves: ggml's banded attention asserts
             // k->type == v->type, so accepting different ones would work until
@@ -1124,6 +1185,7 @@ fn main() -> ExitCode {
         show_perf,
         dry_breakers,
         kv_type,
+        overrides,
         ctx_size,
         stop,
         force,
@@ -1453,6 +1515,7 @@ fn run(
     show_perf: bool,
     dry_breakers: Vec<String>,
     kv_type: bigtea_arch::KvType,
+    overrides: Vec<(String, bigtea_gguf::Value)>,
     ctx_size: Option<usize>,
     stop: Vec<String>,
     force: bool,
@@ -1468,7 +1531,15 @@ fn run(
     }
 
     // --- container ---------------------------------------------------------
-    let model = Model::open_split(path)?;
+    let mut model = Model::open_split(path)?;
+    // Applied before anything reads the metadata, and reported: a wrong
+    // override is indistinguishable from a wrong container unless the run says
+    // which one it used.
+    for (key, value) in &overrides {
+        bigtea_arch::info!("override   {key} = {value:?}");
+        model.override_metadata(key, value.clone());
+    }
+    let model = model;
 
     // Refuse an architecture nobody has checked, rather than answering wrongly
     // and confidently. Gemma-2 loads through the generic dense path with no
