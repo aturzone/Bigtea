@@ -127,7 +127,18 @@ pub const VERIFIED_ARCHITECTURES: &[&str] = &[
     "phi3",
     "qwen2",
     "qwen3",
-    "qwen3moe",
+    // `qwen3moe` WAS HERE AND HAS BEEN REMOVED. It had never been through the
+    // eight-prompt diff; run at last it came back 1 FAIL + 6 unstable. Fixing
+    // its activation (an MoE container has no `ffn_gate`, so it was classified
+    // ungated and ran GELU where the reference runs SiLU) killed the loop and
+    // most of the near-ties, but a stable-reference FAIL remains:
+    //
+    //   bigtea   : …Spain is Madrid. The capital of Portugal is Lisbon.
+    //   llama.cpp: …Spain is Madrid. The capital of Germany is Berlin.
+    //
+    // Four countries in rather than the second word, so whatever is left is
+    // small — but "small" is what SiLU-for-GELU looked like too. The entry
+    // comes back when the diff passes, not when the diff looks close.
     "stablelm",
     "starcoder2",
 ];
@@ -1390,21 +1401,25 @@ mod tests {
         // implemented, Gemma-2 loaded through this path with no error at all
         // and answered "The capital of France is" with "himselff" — which is
         // exactly why loading is not evidence of anything.
-        for arch in [
-            "deepseek4",
-            "gemma2",
-            "gemma3",
-            "llama",
-            "phi3",
-            "qwen3",
-            "qwen3moe",
-        ] {
+        for arch in ["deepseek4", "gemma2", "gemma3", "llama", "phi3", "qwen3"] {
             assert!(architecture_is_verified(arch), "{arch} should be verified");
         }
         // `gemma` (v1) is deliberately absent: it is close to `gemma2` but not
         // identical, and nobody has run it. So is `gemma3n`, which is a
         // different model despite the name.
-        for arch in ["gemma", "gemma3n", "falcon", "mamba", "something-new"] {
+        //
+        // **`qwen3moe` is absent because it was REMOVED**, not because nobody
+        // tried. It sat here through a diff it had never been given, and the
+        // first eight-prompt run returned 1 FAIL + 6 unstable. This assertion
+        // is what would have caught someone quietly putting it back.
+        for arch in [
+            "gemma",
+            "gemma3n",
+            "qwen3moe",
+            "falcon",
+            "mamba",
+            "something-new",
+        ] {
             assert!(
                 !architecture_is_verified(arch),
                 "{arch} has not been checked and must not claim to be"

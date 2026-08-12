@@ -92,14 +92,8 @@ strip() {
     | sed 's/ *\[end of text\] *$//'
 }
 
-# `llama-completion` prints " [end of text]" when the model stops on EOS. That
-# is a status line, not output, and Bigtea prints no equivalent -- so any model
-# that terminates early read as a FAIL whose two sides were otherwise identical.
-# TinyLlama answers "42" to the arithmetic prompt and stops, which is exactly
-# the shape: `bigtea: 42` against `llama.cpp: 42 [end of text]`.
 ref() {
-  "$REF" -m "$MODEL" -p "$1" -n "$N" --temp 0 --no-warmup -no-cnv "${@:2}" 2>/dev/null |
-    strip | sed 's/ \[end of text\]$//'
+  "$REF" -m "$MODEL" -p "$1" -n "$N" --temp 0 --no-warmup -no-cnv "${@:2}" 2>/dev/null | strip
 }
 
 # How many tokens each engine makes of a prompt. Different counts mean the two
