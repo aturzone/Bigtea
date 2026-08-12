@@ -182,6 +182,12 @@ impl<'a> P<'a> {
         false
     }
 
+    /// Whether the next non-space byte is `b`, without consuming it.
+    fn peek(&mut self, b: u8) -> bool {
+        self.ws();
+        self.s.get(self.i) == Some(&b)
+    }
+
     fn sym(&mut self, sym: &str) -> bool {
         self.ws();
         let end = self.i + sym.len();
@@ -292,14 +298,27 @@ impl<'a> P<'a> {
         let mut left = self.unary()?;
         loop {
             self.ws();
-            // `+` only. `-` would be ambiguous with the whitespace-control dash
-            // the lexer already stripped, and no template on disk subtracts.
-            if self.sym("+") {
+            // `-` and `%` are here because the acceptance test found them, not
+            // because the census predicted them: Qwen3 writes
+            // `messages|length - 1` and Gemma-3 writes `loop.index0 % 2 == 0`.
+            // The census counted statement tags and saw neither.
+            let op = if self.sym("+") {
+                '+'
+            } else if self.sym("-") {
+                '-'
+            } else if self.sym("%") {
+                '%'
+            } else {
+                return Ok(left);
+            };
+            {
                 let right = self.unary()?;
-                left = match (&left, &right) {
-                    (Value::Str(a), Value::Str(b)) => Value::Str(format!("{a}{b}")),
-                    (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
-                    (Value::List(a), Value::List(b)) => {
+                left = match (op, &left, &right) {
+                    ('-', Value::Int(a), Value::Int(b)) => Value::Int(a - b),
+                    ('%', Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a % b),
+                    ('+', Value::Str(a), Value::Str(b)) => Value::Str(format!("{a}{b}")),
+                    ('+', Value::Int(a), Value::Int(b)) => Value::Int(a + b),
+                    ('+', Value::List(a), Value::List(b)) => {
                         let mut v = a.clone();
                         v.extend(b.clone());
                         Value::List(v)
@@ -308,12 +327,10 @@ impl<'a> P<'a> {
                     // that meant to concatenate ends up printing `None`.
                     _ => {
                         return Err(Error::Unsupported(format!(
-                            "`+` between {left:?} and {right:?}"
+                            "`{op}` between {left:?} and {right:?}"
                         )))
                     }
                 };
-            } else {
-                return Ok(left);
             }
         }
     }
@@ -331,7 +348,35 @@ impl<'a> P<'a> {
                 };
                 v = index(&v, &Value::Str(field));
             } else if self.sym("[") {
+                // A slice, `messages[1:]`, which four templates on disk use to
+                // drop the system turn. The census that scoped this crate
+                // counted STATEMENT TAGS and missed every expression form --
+                // this was the largest of the misses.
+                if self.sym(":") {
+                    let end = if self.peek(b']') {
+                        None
+                    } else {
+                        Some(self.or()?)
+                    };
+                    if !self.sym("]") {
+                        return Err(Error::Syntax(format!("unclosed `[` in `{}`", self.src)));
+                    }
+                    v = slice(&v, None, end.as_ref());
+                    continue;
+                }
                 let idx = self.or()?;
+                if self.sym(":") {
+                    let end = if self.peek(b']') {
+                        None
+                    } else {
+                        Some(self.or()?)
+                    };
+                    if !self.sym("]") {
+                        return Err(Error::Syntax(format!("unclosed `[` in `{}`", self.src)));
+                    }
+                    v = slice(&v, Some(&idx), end.as_ref());
+                    continue;
+                }
                 if !self.sym("]") {
                     return Err(Error::Syntax(format!("unclosed `[` in `{}`", self.src)));
                 }
@@ -457,12 +502,32 @@ impl<'a> P<'a> {
         if self.i < self.s.len() && self.s[self.i] == b'(' {
             self.i += 1;
             let mut args = Vec::new();
+            let mut kwargs: HashMap<String, Value> = HashMap::new();
             loop {
                 self.ws();
                 if self.sym(")") {
                     break;
                 }
-                args.push(self.or()?);
+                // `namespace(multi_step_tool=true, last_query_index=...)` is
+                // how Qwen3 opens its namespace. Detected by looking ahead for
+                // a `name =` that is not `==`, because `a == b` is an ordinary
+                // positional argument and misreading it would silently bind a
+                // comparison as a field.
+                let save = self.i;
+                let kw = self.name().filter(|_| {
+                    self.ws();
+                    self.s.get(self.i) == Some(&b'=') && self.s.get(self.i + 1) != Some(&b'=')
+                });
+                match kw {
+                    Some(k) => {
+                        self.i += 1;
+                        kwargs.insert(k, self.or()?);
+                    }
+                    None => {
+                        self.i = save;
+                        args.push(self.or()?);
+                    }
+                }
                 self.ws();
                 if self.sym(")") {
                     break;
@@ -483,7 +548,8 @@ impl<'a> P<'a> {
                 )),
                 // `namespace(a=1)` -- keyword arguments are not parsed, and an
                 // empty namespace is what every template on disk creates.
-                "namespace" => Ok(Value::Map(HashMap::new())),
+                // The keyword arguments ARE the namespace's initial fields.
+                "namespace" => Ok(Value::Map(kwargs)),
                 other => Err(Error::Unsupported(format!("call to `{other}()`"))),
             };
         }
@@ -538,6 +604,34 @@ fn index(v: &Value, key: &Value) -> Value {
         }
         _ => Value::None,
     }
+}
+
+/// Python's slice semantics, which Jinja inherits: negative indices count from
+/// the end and out-of-range bounds clamp rather than panic.
+fn slice(v: &Value, start: Option<&Value>, end: Option<&Value>) -> Value {
+    let Value::List(items) = v else {
+        // A slice of anything else is a template bug. `None` renders visibly
+        // wrong rather than silently dropping turns.
+        return Value::None;
+    };
+    let n = items.len() as i64;
+    let norm = |x: i64| -> usize {
+        let x = if x < 0 { n + x } else { x };
+        x.clamp(0, n) as usize
+    };
+    let lo = match start {
+        Some(Value::Int(i)) => norm(*i),
+        _ => 0,
+    };
+    let hi = match end {
+        Some(Value::Int(i)) => norm(*i),
+        _ => n as usize,
+    };
+    Value::List(if lo >= hi {
+        Vec::new()
+    } else {
+        items[lo..hi].to_vec()
+    })
 }
 
 fn contains(hay: &Value, needle: &Value) -> bool {

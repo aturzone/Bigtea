@@ -90,3 +90,51 @@ llama.cpp's own rendering of all 54 templates, captured token by token.
 3. A template using anything outside the subset must **fall back with a named
    reason**, and a test must assert that — the fallback is the safety property,
    so it needs a test more than the happy path does.
+
+## MEASURED 2026-08-11: the census was wrong, and the method was the reason
+
+The crate is built and the acceptance test run. **3 of 15 containers agree, 9
+are refused, 3 differ.** Not close to wiring `--jinja`.
+
+The census above counted **statement tags** — `{% for %}`, `{% if %}` — because
+that is what a regex over `{%-?\s*(\w+)` finds. It saw none of the
+**expression** forms, and those are where the language actually lives. Each
+round of fixes revealed the next one:
+
+| round | added | next thing it hit |
+|---|---|---|
+| 1 | the censused subset | `messages[1:]` — slices |
+| 2 | slices | `namespace(a=1, b=2)` — keyword arguments |
+| 3 | kwargs | `messages\|length - 1` — subtraction |
+| 4 | `-` and `%` | `range(ns.last_query_index, -1, -1)` |
+| 5 | ? | a multi-line string literal inside `{{ }}` |
+
+**"No macros, no imports, no inheritance — a weekend, not a quarter" was wrong**,
+and wrong in a specific, repeatable way: I measured the part of the language
+that is easy to grep for and concluded the whole language was that size.
+
+What the 9 refusals actually are:
+
+- **5** are DeepSeek-V4-Flash's five shards, i.e. **one** template using
+  `for k, v in ...`.
+- **2** are Qwen3's `range()` loop over prior turns.
+- **1** is Gemma-3's multi-line string.
+- **1 is not a bug at all**: Gemma-2's template *raises* on a system turn, and
+  the engine correctly propagated it. **That means the family matcher silently
+  accepts a conversation Gemma's own template forbids** — worth its own look,
+  and found only because the Jinja path refused.
+
+## What this changes
+
+The crate stays. It is 34 tests of real evaluation, it builds ggml-free, and
+every construct it does not know is refused by name — the safety property held
+through all five rounds, which is the part that actually mattered.
+
+`--jinja` stays declined. The gap between "a template engine exists" and "the
+flag can be claimed" is exactly the 12 containers it cannot render, and shipping
+the flag now would mean falling back on 80% of the models on this machine while
+the help text promised evaluation.
+
+**Next round is a real re-census**, on expressions rather than tags: extract
+every `{{ … }}` and `{% … %}` body from all 12 templates, and enumerate the
+distinct syntactic forms. That is the measurement that should have come first.

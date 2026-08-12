@@ -10,6 +10,7 @@ dependencies = [
  "bigtea-gguf",
  "bigtea-grammar",
  "bigtea-io",
+ "bigtea-jinja",
  "bigtea-model",
  "bigtea-probe",
  "bigtea-tokenizer",
