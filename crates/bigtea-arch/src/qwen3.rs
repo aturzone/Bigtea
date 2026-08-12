@@ -768,108 +768,6 @@ impl Qwen3Model {
         }
     }
 
-    /// Build the forward graph for one batch of tokens and return the logits
-    /// tensor. Nothing is computed until [`Context::compute`] runs.
-    ///
-    /// `positions` must hold each token's absolute position; RoPE depends on
-    /// it, and off-by-one here degrades output subtly rather than obviously.
-    pub fn build_graph<'a>(
-        &self,
-        ctx: &'a Context,
-        weights: &WeightSet<'a>,
-        tokens: &Tensor<'a>,
-        positions: &Tensor<'a>,
-        n_tokens: i64,
-    ) -> Result<Tensor<'a>> {
-        let c = &self.config;
-        let get = |name: &str| -> Result<&Tensor<'a>> {
-            weights
-                .get(name)
-                .ok_or_else(|| ArchError::MissingTensor(name.to_string()))
-        };
-        let rope = RopeParams {
-            freq_base: c.rope_freq_base,
-            ..RopeParams::default()
-        };
-
-        // Token ids -> embedding vectors.
-        let mut cur = ctx.get_rows(get("token_embd.weight")?, tokens)?;
-
-        for il in 0..c.n_layer {
-            let residual = cur;
-
-            // --- attention ---------------------------------------------------
-            let normed =
-                self.rms_norm_mul(ctx, &cur, get(&format!("blk.{il}.attn_norm.weight"))?)?;
-
-            let (qw, kw, vw) = self.qkv_weights(ctx, weights, il)?;
-            let q = ctx.mul_mat(&qw, &normed)?;
-            let k = ctx.mul_mat(&kw, &normed)?;
-            let v = ctx.mul_mat(&vw, &normed)?;
-
-            // Split into heads before normalising: Qwen3 normalises each head
-            // separately, with a weight of head_dim rather than n_embd.
-            let q = ctx.reshape_3d(&q, c.head_dim as i64, c.n_head as i64, n_tokens)?;
-            let k = ctx.reshape_3d(&k, c.head_dim as i64, c.n_head_kv as i64, n_tokens)?;
-
-            // Absent on Llama, Mistral, Qwen2, Gemma and Phi: those normalise
-            // once before the projections and not again per head.
-            let (q, k) = if c.qk_norm {
-                (
-                    self.rms_norm_mul(ctx, &q, get(&format!("blk.{il}.attn_q_norm.weight"))?)?,
-                    self.rms_norm_mul(ctx, &k, get(&format!("blk.{il}.attn_k_norm.weight"))?)?,
-                )
-            } else {
-                (q, k)
-            };
-
-            let q = ctx.rope_ext(&q, positions, None, c.head_dim as i32, c.rope_type, 0, rope)?;
-            let k = ctx.rope_ext(&k, positions, None, c.head_dim as i32, c.rope_type, 0, rope)?;
-
-            let attn = self.attention(ctx, &q, &k, &v, n_tokens)?;
-            let attn = ctx.mul_mat(get(&format!("blk.{il}.attn_output.weight"))?, &attn)?;
-
-            let ffn_input = ctx.add(&attn, &residual)?;
-
-            // --- feed forward ------------------------------------------------
-            let normed =
-                self.rms_norm_mul(ctx, &ffn_input, get(&format!("blk.{il}.ffn_norm.weight"))?)?;
-
-            let ffn_out = if c.is_moe() {
-                self.moe_ffn(ctx, weights, &normed, il, n_tokens)?
-            } else {
-                self.dense_ffn(ctx, weights, &normed, il)?
-            };
-
-            cur = ctx.add(&ffn_out, &ffn_input)?;
-        }
-
-        // Only the final position predicts the next token, so the output
-        // projection is taken on that row alone.
-        //
-        // Projecting all of them is what a naive graph does, and it is enormous:
-        // the vocabulary is 151936 wide, so a 651-token prompt costs
-        // `651 x 2560 x 151936` = **253 GFLOP** and 395 MB of logits, of which
-        // one row is used. It also made the arena quadratic-looking when the
-        // real driver was this term, and a 651-token prompt aborted with
-        // `GGML_ASSERT` on a 2 GiB arena.
-        let cur = ctx.view_2d(
-            &cur,
-            c.n_embd as i64,
-            1,
-            c.n_embd as usize * std::mem::size_of::<f32>(),
-            (n_tokens - 1) as usize * c.n_embd as usize * std::mem::size_of::<f32>(),
-        )?;
-        let cur = self.rms_norm_mul(ctx, &cur, get("output_norm.weight")?)?;
-        // Output projection; tied to the embedding table when absent.
-        let out_name = if weights.get("output.weight").is_some() {
-            "output.weight"
-        } else {
-            "token_embd.weight"
-        };
-        Ok(ctx.mul_mat(get(out_name)?, &cur)?)
-    }
-
     /// One layer's attention, from the pre-norm through the output projection.
     ///
     /// Shared by the single-graph path and the streaming path so the
@@ -919,10 +817,17 @@ impl Qwen3Model {
 
     /// Attention through ggml's fused kernel.
     ///
-    /// Same result as [`Self::attention_cached`], without building the scores
-    /// matrix. `mask_f16` holds the causal mask already in F16 — ggml asserts
-    /// that type, and since the only values are 0 and -inf the bit patterns
+    /// Same result as [`Self::attention`], without building the scores matrix.
+    /// `mask_f16` holds the causal mask already in F16 — ggml asserts that
+    /// type, and since the only values are 0 and -inf the bit patterns
     /// (`0x0000`, `0xFC00`) are written directly rather than converted.
+    ///
+    /// This superseded an `attention_cached` that took the same arguments and
+    /// built the scores by hand. That one kept compiling, kept being documented
+    /// against, and had **no callers at all** from the commit this landed in
+    /// until it was deleted — a third attention implementation nothing
+    /// exercised, which is the shape of hazard that let a second *forward*
+    /// implementation miss four fixes.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash<'a>(
         &self,
@@ -957,46 +862,6 @@ impl Qwen3Model {
         };
         let out = ctx.flash_attn_ext(&q, &k, &v, &mask, scale, c.attn_logit_softcap)?;
         Ok(ctx.reshape_2d(&ctx.cont(&out)?, (c.head_dim * c.n_head) as i64, n_new)?)
-    }
-
-    /// Attention where K and V come from a cache covering the whole history.
-    ///
-    /// The mask must be offset by the query's absolute position: query `i` may
-    /// attend to keys up to `pos_start + i`, not up to `i`. Getting that wrong
-    /// lets a token see its own future during incremental decoding — the same
-    /// failure as omitting the mask entirely, but only visible after the first
-    /// generated token. The caller builds it; see `forward_cached`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn attention_cached<'a>(
-        &self,
-        ctx: &'a Context,
-        q: &Tensor<'a>,
-        k_all: &Tensor<'a>,
-        v_all: &Tensor<'a>,
-        n_new: i64,
-        n_total: i64,
-        mask_data: &[f32],
-    ) -> Result<Tensor<'a>> {
-        let c = &self.config;
-
-        let q = ctx.cont(&ctx.permute(q, [0, 2, 1, 3])?)?;
-        let k = ctx.cont(&ctx.permute(k_all, [0, 2, 1, 3])?)?;
-
-        // [n_total, n_new, n_head]
-        let scores = ctx.mul_mat(&k, &q)?;
-
-        // The mask depends only on positions, so it is identical for every
-        // layer and is built once per call by the caller. Rebuilding it here
-        // cost an n_total * n_new scalar loop and a copy of the same size,
-        // 48 times per block.
-        let mask = ctx.new_f32_2d(n_total, n_new)?;
-        mask.set_f32(mask_data)?;
-        let probs = ctx.soft_max_ext(&scores, Some(&mask), c.attn_scale(), 0.0)?;
-
-        let v = ctx.cont(&ctx.transpose(&ctx.permute(v_all, [0, 2, 1, 3])?)?)?;
-        let out = ctx.mul_mat(&v, &probs)?;
-        let out = ctx.cont(&ctx.permute(&out, [0, 2, 1, 3])?)?;
-        Ok(ctx.reshape_2d(&out, (c.head_dim * c.n_head) as i64, n_new)?)
     }
 
     /// Normalise then scale by a learned weight — the pattern every norm
@@ -1183,53 +1048,6 @@ impl Qwen3Model {
         let activated = ctx.mul(&self.config.activate(ctx, &gate)?, &up)?;
         let down = ctx.mul_mat(get(format!("blk.{il}.ffn_down.weight"))?, &activated)?;
         self.add_bias(ctx, weights, down, &format!("blk.{il}.ffn_down"))
-    }
-
-    /// Mixture-of-experts feed-forward.
-    ///
-    /// The router scores every expert, the top `n_expert_used` are selected,
-    /// and `mul_mat_id` applies only those — which is the whole reason a model
-    /// with 128 experts costs about as much as one with a handful.
-    fn moe_ffn<'a>(
-        &self,
-        ctx: &'a Context,
-        weights: &WeightSet<'a>,
-        x: &Tensor<'a>,
-        il: u32,
-        n_tokens: i64,
-    ) -> Result<Tensor<'a>> {
-        let c = &self.config;
-        let get = |name: String| -> Result<&Tensor<'a>> {
-            weights.get(&name).ok_or(ArchError::MissingTensor(name))
-        };
-
-        // Router: one score per expert per token, softmaxed into weights.
-        let logits = ctx.mul_mat(get(format!("blk.{il}.ffn_gate_inp.weight"))?, x)?;
-        let probs = ctx.soft_max_ext(&logits, None, 1.0, 0.0)?;
-
-        // top_k returns indices. NOTE: they are NOT ordered by score, so the
-        // per-expert weight must be looked up by index rather than by
-        // position -- see the ggml top_k test.
-        let selected = ctx.top_k(&probs, c.n_expert_used as i32)?;
-
-        let x3 = ctx.reshape_3d(x, c.n_embd as i64, 1, n_tokens)?;
-        let gate = ctx.mul_mat_id(
-            get(format!("blk.{il}.ffn_gate_exps.weight"))?,
-            &x3,
-            &selected,
-        )?;
-        let up = ctx.mul_mat_id(get(format!("blk.{il}.ffn_up_exps.weight"))?, &x3, &selected)?;
-        let activated = ctx.mul(&c.activate(ctx, &gate)?, &up)?;
-        let down = ctx.mul_mat_id(
-            get(format!("blk.{il}.ffn_down_exps.weight"))?,
-            &activated,
-            &selected,
-        )?;
-
-        // Weight each expert's output by its router probability, then sum.
-        let weights_sel = ctx.get_rows(&probs, &selected)?;
-        let weighted = ctx.mul(&down, &weights_sel)?;
-        Ok(ctx.sum_rows(&weighted)?)
     }
 }
 
