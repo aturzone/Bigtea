@@ -1611,12 +1611,18 @@ dismissed along with the false one.
 | gemma-2-2b-it | 8 | 0 | 0 |
 | gemma-3-1b-it | 8 | 0 | 0 |
 | Qwen3-4B | 8 | 0 | 0 |
+| Phi-3-mini-4k-instruct | 6 | 2 | 0 |
 | **Llama-3.2-1B-Instruct** | 3 | 4 | **1** |
 
 **Gemma-3's arithmetic prompt and Gemma-2's are no longer unstable.** Both were
 the `[end of text]` artefact, not near-ties — the harness had been comparing
 llama.cpp's EOS marker against our silence. Five containers are now clean at
 eight prompts where three prompts had certified them.
+
+**Phi-3's two unstable prompts survive the harness fix**, which settles what
+they are: llama.cpp genuinely disagrees with itself on them under `--no-repack`.
+Gemma's did not survive it, so the two cases are different and only one was ever
+about the models.
 
 Llama-3.2 is the outlier twice over: the only FAIL (`rope_freqs.weight`,
 ticketed) and the only container with four genuine near-ties in eight.
