@@ -929,28 +929,12 @@ const REFUSED: &[(&str, bool, &str)] = &[
     ("--split-mode", true, "no GPU backend exists"),
     ("--tensor-split", true, "no GPU backend exists"),
     ("--kv-offload", false, "the KV cache is always host memory"),
-    (
-        "--no-kv-offload",
-        false,
-        "the KV cache is always host memory; this is already the behaviour",
-    ),
     ("--op-offload", false, "no GPU backend exists"),
-    (
-        "--no-op-offload",
-        false,
-        "no GPU backend exists; this is already the behaviour",
-    ),
     (
         "--override-tensor",
         true,
         "buffer-type overrides select a backend, and there is only one",
     ),
-    (
-        "--cpu-moe",
-        false,
-        "experts are always on the CPU here; this is already the behaviour",
-    ),
-    ("--n-cpu-moe", true, "experts are always on the CPU here"),
     (
         "--backend-sampling",
         false,
@@ -1722,6 +1706,39 @@ fn main() -> ExitCode {
             // and the first NaN reaching a softmax makes every probability NaN
             // -- argmax then returns index 0 and the model repeats one token
             // forever, which reads as a broken model rather than a broken file.
+            // --- flags that ask for what this build already does --------------
+            //
+            // Refusing these was inconsistent with `--swa-full`, which reports
+            // "already the behaviour" and continues. A user asking for the
+            // thing they are going to get should not be stopped -- the reason
+            // to refuse a flag is that the run would quietly do LESS than the
+            // command line says, and here it does exactly what it says.
+            //
+            // Their positive forms (`--kv-offload`, `--op-offload`) ask for a
+            // GPU and are still declined: those WOULD do less.
+            "--no-kv-offload" | "-nkvo" => {
+                bigtea_arch::info!("offload    the KV cache is always host memory here");
+                i += 1;
+            }
+            "--no-op-offload" => {
+                bigtea_arch::info!("offload    every op runs on the host here");
+                i += 1;
+            }
+            "--cpu-moe" | "-cmoe" => {
+                bigtea_arch::info!("offload    experts always stream to host memory here");
+                i += 1;
+            }
+            // Takes a layer count. Reported rather than silently satisfied:
+            // asking for 8 and getting all of them is still not what was asked,
+            // even though it is a superset.
+            "--n-cpu-moe" | "-ncmoe" => {
+                if let Some(v) = rest.get(i + 1) {
+                    bigtea_arch::info!(
+                        "offload    --n-cpu-moe {v}: ALL experts are on the host here, not {v} layers"
+                    );
+                }
+                i += 2;
+            }
             // --- loading mode -------------------------------------------------
             //
             // llama.cpp's unified replacement for --mlock, --mmap and

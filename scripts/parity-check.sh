@@ -76,7 +76,21 @@ PROMPTS=(
   "Dear Sir or Madam, I am writing to"
 )
 
-strip() { sed 's/\x1b\[[0-9;]*m//g' | tr -d '\r'; }
+# Strip terminal colouring, CRs, and llama.cpp's own end-of-stream marker.
+#
+# `[end of text]` is printed by llama-completion when it hits EOS; Bigtea stops
+# silently. The GENERATED TOKENS ARE IDENTICAL -- this is the two CLIs framing
+# the same result differently, and leaving it in reported tinyllama's
+# `Q: What is 17 plus 25? A:` as a FAIL where both had answered ` 42`.
+#
+# A harness that cries wolf is worse than no harness. The whole value of this
+# script is that a FAIL means something, and the first thing anyone does with a
+# FAIL is go looking in the forward pass.
+strip() {
+  sed 's/\x1b\[[0-9;]*m//g' \
+    | tr -d '\r' \
+    | sed 's/ *\[end of text\] *$//'
+}
 
 ref() { "$REF" -m "$MODEL" -p "$1" -n "$N" --temp 0 --no-warmup -no-cnv "${@:2}" 2>/dev/null | strip; }
 

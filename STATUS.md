@@ -1564,6 +1564,44 @@ after this?". The right one is "what does this actually require?".
 
 Flags: **158 implemented, 36 declined**, of 194 recognised.
 
+## `rope_freqs.weight` is ignored — every Llama-3.x model is wrong (2026-08-11)
+
+The eight-prompt sweep found it. Llama-3.2-1B:
+
+```
+FAIL  SELECT name, COUNT(*) FROM users WHERE
+  bigtea   :  age > 18 AND gender = 'male' GROUP BY name;
+  llama.cpp:  age > 18 GROUP BY name HAVING COUNT(*) > 1;
+```
+
+llama.cpp is **stable** on that prompt across `-fa on`, `-fa off`,
+`--no-repack` and `-t 4`, so it is not a near-tie.
+
+Llama-3.x containers ship a `rope_freqs.weight` tensor and llama.cpp passes it
+to `ggml_rope_ext` as `freq_factors`. **This build passes `None` at all four
+call sites** — and the parameter is already there as an `Option`, so nothing
+was missing except the value.
+
+**`llama` has been in `VERIFIED_ARCHITECTURES` since the beginning**, and
+TinyLlama passes 8/8 — because TinyLlama is Llama-2 and has no such tensor. One
+container in a family exercising a feature and another not is exactly the gap a
+three-prompt set leaves. Read `llama` as "verified on Llama-2-shaped
+containers" until this lands.
+
+Ticket: `docs/graph/backlog/rope-freqs-ignored.md`. The fix is three lines in
+`qwen3.rs`/`stream.rs`, which the other session owns.
+
+### The harness also cried wolf once, and that is worth as much
+
+TinyLlama reported a FAIL on `Q: What is 17 plus 25? A:` where both engines
+answered ` 42`. llama.cpp prints `[end of text]` on EOS and Bigtea stops
+silently — **the generated tokens were identical.** Stripped now.
+
+A harness that cries wolf is worse than no harness: the first thing anyone does
+with a FAIL is go looking in the forward pass. Two FAILs appeared in this sweep
+and exactly one was real; without checking both, the real one would have been
+dismissed along with the false one.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
