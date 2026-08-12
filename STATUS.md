@@ -2119,3 +2119,64 @@ byte-reduction roadmap closed. That sweep needs no toolkit and no new code.
 
 PCIe bandwidth in that node is labelled arithmetic, not measurement — it cannot
 be measured until the toolkit is installed.
+
+## The tok/s-versus-RAM frontier, measured — and it says no GPU ticket
+
+`research/ram-frontier-qwen3-30b-2026-08-12.md`, 2026-08-12. The first
+published curve of generation speed against **owned** cache size for a model of
+this class. It can be swept at all only because this engine is told how much RAM
+to use; `mmap` cannot be asked for exactly N GiB.
+
+Qwen3-30B-A3B, `--cache` 1→12 GiB, `-n 16`, five interleaved rounds, medians,
+free RAM sampled on every row.
+
+| `--cache` | tok/s | vs 1 GiB | streamed | evictions |
+|---:|---:|---:|---:|---:|
+| 1 GiB | 0.78 | 1.00x | 12.13 GiB | 1758 |
+| 2 | 1.62 | 2.08x | 9.34 | 1957 |
+| 4 | 1.85 | 2.37x | 6.69 | 1286 |
+| **6** | **2.63** | **3.37x** | **5.53** | **0** |
+| 8 | 2.56 | 3.28x | 5.53 | 0 |
+| 10 | 2.13 | 2.73x | 5.53 | 0 |
+| 12 | 2.56 | 3.28x | 5.53 | 0 |
+
+**Rises to 6 GiB, flat after: 3.37x for 6 GiB of owned residency.** It flattens
+for a *capacity* reason the engine reports directly — at ≥6 GiB `evictions` is
+**0** and `streamed` is 5.53 GiB, which is what 16 generated tokens of this
+prompt distinctly touch. Below it the same run re-reads what it already had.
+
+**The 8/10/12 rows are a free null** — provably one configuration, so their
+16.8% median spread is the noise floor. Nothing above 6 GiB is distinguishable;
+the 1→6 climb is far outside it.
+
+### Two methodological findings that outlive the numbers
+
+**A wrong activation is a wrong residency benchmark.** Fixing GELU-for-SiLU on
+this model moved streamed bytes **7.00 → 5.53 GiB** and hits 80% → 70%, because
+different FFN outputs become different router inputs and select **different
+experts**. The pre-fix sweep measured a different workload. Do not benchmark a
+cache on an unverified model.
+
+**The free-RAM column is not decoration.** A first attempt had an entire round
+flattened by this session's own git work releasing memory — visible only as free
+RAM *rising* 8.7 → 10.4 GiB mid-round. Without the column it would have been
+folded into the medians.
+
+### Verdict for the VRAM tier
+
+**No GPU ticket, now measured rather than argued.** The flat region already fits
+in this machine's 9–10 GiB of free RAM, so VRAM adds nothing on this model. 5 GiB
+of VRAM is 31% of Qwen3-30B's expert bank and **3.6% of V4-Flash's** — neither is
+the window where a second tier changes the shape.
+
+But **where the curve flattens is a property of the workload, not the hardware**:
+it saturates at 5.53 GiB because that is what 16 tokens touch, and distinct
+expert bytes grow with generation length. The frontier is a *surface* in (cache
+size, tokens generated) and only one slice of it exists. That slice is the next
+measurement, and it is not a GPU ticket either.
+
+**Caveats, stated in the node:** one prompt, one machine, one session; `-n 16`;
+round-over-round drift of ~25% with free RAM stable and the cause unidentified;
+and **Qwen3-30B-A3B is not in `VERIFIED_ARCHITECTURES`** — it was delisted the
+same day for a remaining stable-reference divergence, and it is the only
+container here in the size class where the curve is interesting.
