@@ -138,3 +138,64 @@ the help text promised evaluation.
 **Next round is a real re-census**, on expressions rather than tags: extract
 every `{{ … }}` and `{% … %}` body from all 12 templates, and enumerate the
 distinct syntactic forms. That is the measurement that should have come first.
+
+## Round 6-9, same day: 3 agree -> 6, and a PANIC on a real container
+
+Driving off the acceptance test instead of a census closed most of the gap:
+
+| added | because |
+|---|---|
+| slices `messages[1:]` | 4 templates drop the system turn that way |
+| keyword arguments | `namespace(multi_step_tool=true, ...)` |
+| `-` and `%` | `messages\|length - 1`, `loop.index0 % 2 == 0` |
+| negative literals | `range(n, -1, -1)` has no left operand for a binary minus |
+| inline conditional | `(first_user_prefix if loop.first else "")` |
+| `range()` | Qwen3 walks backwards over prior turns |
+| `is true` / `is false` | Qwen3. **Not the same as falsy** — `is false` asks whether the value IS the boolean, so an empty string must not satisfy it |
+| tuple unpacking | DeepSeek-V4-Flash |
+
+**The most important find was a panic, not a missing feature.** Keyword matching
+sliced by byte offset, and DeepSeek's template is full of U+FF5C (`｜`):
+
+```
+end byte index 3 is not a char boundary; it is inside '｜'
+```
+
+A real container **crashed** the parser rather than being refused by it. That
+breaks the crate's entire premise — the caller can fall back from a refusal and
+cannot fall back from a crash. Fixed by matching through `str::get`, with a
+regression test that feeds it the exact characters.
+
+### Where it stands
+
+**6 agree, 6 refused, 3 differ** of 15 containers — and 15 containers is about
+11 distinct templates, since DeepSeek's five shards share one.
+
+The 6 refusals are **two** templates: Gemma-2 (a correct `raise_exception`) and
+DeepSeek's five shards, which want `'' + true`. Jinja itself raises on that,
+so the refusal may be right and llama.cpp's `--jinja` has to settle it.
+
+### The differences are the interesting part now
+
+Llama-3.2, family vs Jinja:
+
+```
+family: "<|start_header_id|>system<|end_header_id|>
+
+SYS<|eot_id|>..."
+jinja : "<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+
+         Today Date: 26 Jul 2024
+
+SYS<|eot_id|>..."
+```
+
+**The Jinja rendering is the more faithful one.** Llama-3's own template emits
+that preamble and the hardcoded renderer — ours *and* llama.cpp's — drops it. So
+this is no longer only a coverage gap: the family path is losing content the
+model's template specifies, on a model that is verified.
+
+That has to be settled against `llama-completion --jinja` before either path
+changes, and it is the next thing to do here.

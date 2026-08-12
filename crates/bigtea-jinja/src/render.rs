@@ -101,6 +101,14 @@ fn exec(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<()> {
                 // Saved and restored: Jinja's loop variable does not leak, and
                 // nested loops must not see the outer `loop`.
                 let saved_var = env.vars.get(var).cloned();
+                let saved_pair: Vec<(String, Option<crate::Value>)> = var
+                    .split(',')
+                    .map(|n| n.trim().to_string())
+                    .map(|n| {
+                        let old = env.vars.get(&n).cloned();
+                        (n, old)
+                    })
+                    .collect();
                 let saved_loop = env.vars.get("loop").cloned();
                 for (idx, item) in items.into_iter().enumerate() {
                     let mut lp = HashMap::new();
@@ -110,7 +118,27 @@ fn exec(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<()> {
                     lp.insert("last".to_string(), Value::Bool(idx + 1 == n));
                     lp.insert("length".to_string(), Value::Int(n as i64));
                     env.set("loop", Value::Map(lp));
-                    env.set(var, item);
+                    // `for k, v in pairs` binds two names from a two-element
+                    // item. A pair that is not two elements is a template bug,
+                    // and binding `none` would render a prompt with holes, so
+                    // it refuses.
+                    if let Some((a, b)) = var.split_once(',') {
+                        let Value::List(pair) = &item else {
+                            return Err(Error::Unsupported(format!(
+                                "unpacking `{var}` from a non-pair"
+                            )));
+                        };
+                        if pair.len() != 2 {
+                            return Err(Error::Unsupported(format!(
+                                "unpacking `{var}` from {} elements",
+                                pair.len()
+                            )));
+                        }
+                        env.set(a.trim(), pair[0].clone());
+                        env.set(b.trim(), pair[1].clone());
+                    } else {
+                        env.set(var, item);
+                    }
                     exec(body, env, out)?;
                 }
                 match saved_var {
@@ -120,6 +148,18 @@ fn exec(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<()> {
                         &mut *env
                     }
                 };
+                // ...and each unpacked name, so `for k, v in` does not leak
+                // either. Jinja's loop scope covers both.
+                for (name, old) in saved_pair {
+                    match old {
+                        Some(v) => {
+                            env.set(&name, v);
+                        }
+                        None => {
+                            env.vars.remove(&name);
+                        }
+                    }
+                }
                 match saved_loop {
                     Some(v) => env.set("loop", v),
                     None => {
@@ -143,12 +183,12 @@ pub fn eval(src: &str, env: &Env) -> Result<Value> {
         env,
     };
     p.ws();
-    let v = p.or()?;
+    let v = p.ternary()?;
     p.ws();
     if p.i < p.s.len() {
         return Err(Error::Unsupported(format!(
             "trailing `{}` in expression `{src}`",
-            &src[p.i..]
+            src.get(p.i..).unwrap_or("")
         )));
     }
     Ok(v)
@@ -172,8 +212,12 @@ impl<'a> P<'a> {
     fn word(&mut self, word: &str) -> bool {
         self.ws();
         let end = self.i + word.len();
-        if end <= self.s.len()
-            && &self.src[self.i..end] == word
+        // `get`, not `[..]`. Indexing panics when the range ends inside a
+        // multi-byte character, and DeepSeek's template is full of U+FF5C
+        // (`｜`) -- so a real container CRASHED this parser rather than being
+        // refused by it. A panic is strictly worse than a refusal here: the
+        // caller can fall back from a refusal.
+        if self.src.get(self.i..end) == Some(word)
             && (end == self.s.len() || !is_name_byte(self.s[end]))
         {
             self.i = end;
@@ -191,11 +235,41 @@ impl<'a> P<'a> {
     fn sym(&mut self, sym: &str) -> bool {
         self.ws();
         let end = self.i + sym.len();
-        if end <= self.s.len() && &self.src[self.i..end] == sym {
+        // As in `word`: multi-byte characters make byte indexing a panic.
+        if self.src.get(self.i..end) == Some(sym) {
             self.i = end;
             return true;
         }
         false
+    }
+
+    /// `a if cond else b`. Jinja's inline conditional, and the only place the
+    /// `if` keyword appears inside an expression rather than starting a block.
+    ///
+    /// **Both branches are evaluated** before one is chosen, which differs from
+    /// Jinja's laziness. Harmless for chat templates -- the branches are string
+    /// literals and variable reads with no side effects -- and noted rather
+    /// than hidden, because a template whose unchosen branch raised would
+    /// behave differently here.
+    fn ternary(&mut self) -> Result<Value> {
+        let first = self.or()?;
+        let save = self.i;
+        if !self.word("if") {
+            return Ok(first);
+        }
+        let cond = self.or()?;
+        if !self.word("else") {
+            // `x if y` with no `else` is not something a chat template writes,
+            // and guessing `none` for the missing branch would render a prompt
+            // with a hole in it.
+            self.i = save;
+            return Err(Error::Unsupported(format!(
+                "`if` without `else` in expression `{}`",
+                self.src
+            )));
+        }
+        let otherwise = self.ternary()?;
+        Ok(if cond.truthy() { first } else { otherwise })
     }
 
     fn or(&mut self) -> Result<Value> {
@@ -238,6 +312,13 @@ impl<'a> P<'a> {
                 "defined" => !matches!(left, Value::None),
                 "none" => matches!(left, Value::None),
                 "string" => matches!(left, Value::Str(_)),
+                // Qwen3 writes `is false` where a plain `not` would do. NOT the
+                // same as falsy: `is false` asks whether the value IS the
+                // boolean false, so an empty string must not satisfy it.
+                "false" => matches!(left, Value::Bool(false)),
+                "true" => matches!(left, Value::Bool(true)),
+                "number" | "integer" => matches!(left, Value::Int(_)),
+                "sequence" => matches!(left, Value::List(_)),
                 "mapping" => matches!(left, Value::Map(_)),
                 "iterable" => matches!(left, Value::List(_) | Value::Str(_)),
                 other => {
@@ -433,7 +514,7 @@ impl<'a> P<'a> {
         let c = self.s[self.i];
         if c == b'(' {
             self.i += 1;
-            let v = self.or()?;
+            let v = self.ternary()?;
             if !self.sym(")") {
                 return Err(Error::Syntax(format!("unclosed `(` in `{}`", self.src)));
             }
@@ -477,6 +558,20 @@ impl<'a> P<'a> {
             let raw = &self.src[start..self.i];
             self.i += 1;
             return Ok(Value::Str(unescape(raw)));
+        }
+        // A negative literal. Not folded into `add` as a binary minus, because
+        // `range(n, -1, -1)` has no left operand there -- Qwen3 walks backwards
+        // over prior turns with exactly that, and without this the call failed
+        // to parse at the comma.
+        if c == b'-' && self.s.get(self.i + 1).is_some_and(|d| d.is_ascii_digit()) {
+            self.i += 1;
+            let start = self.i;
+            while self.i < self.s.len() && self.s[self.i].is_ascii_digit() {
+                self.i += 1;
+            }
+            return Ok(Value::Int(
+                -self.src[start..self.i].parse::<i64>().unwrap_or(0),
+            ));
         }
         if c.is_ascii_digit() {
             let start = self.i;
@@ -550,6 +645,32 @@ impl<'a> P<'a> {
                 // empty namespace is what every template on disk creates.
                 // The keyword arguments ARE the namespace's initial fields.
                 "namespace" => Ok(Value::Map(kwargs)),
+                // Python's semantics, including a negative step -- Qwen3 walks
+                // backwards over prior turns with `range(n, -1, -1)`, and a
+                // forward-only range would silently produce an empty loop and
+                // drop every turn it was meant to inspect.
+                "range" => {
+                    let n = |i: usize| match args.get(i) {
+                        Some(Value::Int(v)) => Some(*v),
+                        _ => None,
+                    };
+                    let (start, stop, step) = match args.len() {
+                        1 => (0, n(0).unwrap_or(0), 1),
+                        2 => (n(0).unwrap_or(0), n(1).unwrap_or(0), 1),
+                        3 => (n(0).unwrap_or(0), n(1).unwrap_or(0), n(2).unwrap_or(1)),
+                        _ => return Err(Error::Unsupported("range() with 0 or >3 args".into())),
+                    };
+                    if step == 0 {
+                        return Err(Error::Unsupported("range() with step 0".into()));
+                    }
+                    let mut out = Vec::new();
+                    let mut i = start;
+                    while (step > 0 && i < stop) || (step < 0 && i > stop) {
+                        out.push(Value::Int(i));
+                        i += step;
+                    }
+                    Ok(Value::List(out))
+                }
                 other => Err(Error::Unsupported(format!("call to `{other}()`"))),
             };
         }
@@ -741,6 +862,18 @@ mod tests {
             r("{{ messages | join(', ') }}").unwrap_err(),
             Error::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn multibyte_characters_do_not_panic() {
+        // DeepSeek's template is full of U+FF5C (`｜`), and byte-indexed
+        // keyword matching PANICKED on it against a real container:
+        // `end byte index 3 is not a char boundary`. A panic is strictly
+        // worse than a refusal, because the caller can fall back from a
+        // refusal and cannot fall back from a crash.
+        for src in ["'<｜User｜>'", "a｜b", "｜", "messages[0]['｜']"] {
+            let _ = eval(src, &env());
+        }
     }
 
     #[test]

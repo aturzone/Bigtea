@@ -108,13 +108,9 @@ fn parse_block(tokens: &[Token], i: &mut usize, stop: &[&str]) -> Result<Vec<Nod
                         let Some((var, iter)) = rest.split_once(" in ") else {
                             return Err(Error::Syntax(format!("`for` without ` in `: {s}")));
                         };
-                        // `for k, v in m.items()` is real Jinja and no chat
-                        // template on disk uses it. Refused rather than half
-                        // handled: a loop variable bound to the wrong thing
-                        // renders a plausible prompt from the wrong data.
-                        if var.contains(',') {
-                            return Err(Error::Unsupported("tuple unpacking in `for`".into()));
-                        }
+                        // `for k, v in ...` -- DeepSeek-V4-Flash uses it. The
+                        // variable names are kept comma-joined and split in the
+                        // renderer, which is where the value to unpack lives.
                         *i += 1;
                         let body = parse_block(tokens, i, &["endfor"])?;
                         match tokens.get(*i).map(|t| t.kind.clone()) {
@@ -194,9 +190,14 @@ mod tests {
     }
 
     #[test]
-    fn tuple_unpacking_is_refused_rather_than_guessed() {
-        let e = parse("{% for k, v in m %}{% endfor %}").unwrap_err();
-        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+    fn tuple_unpacking_keeps_both_names() {
+        // DeepSeek-V4-Flash uses this. The names stay comma-joined here and
+        // are split in the renderer, where the value to unpack is.
+        let n = parse("{% for k, v in m %}{% endfor %}").unwrap();
+        let Node::For { var, .. } = &n[0] else {
+            panic!("{n:?}");
+        };
+        assert_eq!(var, "k, v");
     }
 
     #[test]
