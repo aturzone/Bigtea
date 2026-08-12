@@ -1532,6 +1532,38 @@ so the truncation is visible as truncation.
 
 Flags: **156 implemented, 38 declined**, of 194 recognised.
 
+## `--load-mode` and `--numa isolate` (2026-08-11) — the fifth and sixth wrong premise
+
+```
+--load-mode dio          model qwen2 (direct (cache bypassed))
+--load-mode mmap         model qwen2 (buffered (page cache in use))
+--load-mode mmap+mlock   ... mlock 0.34 GiB pinned in physical memory
+--numa distribute        refused BY NAME, with what it would need
+```
+
+**`--load-mode` was refused for "`--direct-io`/`--no-direct-io` are the two
+modes that exist".** llama.cpp now marks `--mlock`, `--mmap` and `--direct-io`
+all *deprecated in favour of* `--load-mode`, and every one of its five modes
+maps onto a switch this build already had. The modes existed; the spelling did
+not. `mmap+mlock` is one mode, not two flags — that is the part a naive alias
+would have got wrong.
+
+**`--numa` was refused for "no NUMA-aware allocation to select between".** Half
+right, and the half that matters was wrong: `isolate` is a mask and a syscall,
+exactly like the affinity group. `distribute` and `numactl` place *individual
+threads* on chosen nodes and ggml owns the pool, so those two are refused **by
+name** with what they would need, rather than the whole flag being declined.
+
+On a single-node machine `isolate` reports that there is nothing to isolate.
+Silently pinning to "the whole machine" would have looked like it worked.
+
+**Six refusals in a row have now turned out to rest on a wrong premise** —
+`--prio`, `--warmup`, the affinity group, the reasoning group, `--load-mode`,
+`--numa`. The question that produced all six was "do we have a subsystem named
+after this?". The right one is "what does this actually require?".
+
+Flags: **158 implemented, 36 declined**, of 194 recognised.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

@@ -220,6 +220,69 @@ pub fn set_affinity(mask: u64) -> Result<u32, String> {
     Ok(mask.count_ones())
 }
 
+/// The CPU mask of the NUMA node this process started on.
+///
+/// llama.cpp's `--numa isolate`: keep every thread on one node, so a matmul
+/// never reads weights across the interconnect. Implementable here for the same
+/// reason affinity was — it is a syscall and a mask, not a threadpool.
+///
+/// `distribute` and `numactl` are NOT implementable: both place *individual
+/// threads* on chosen nodes, and ggml owns the pool. Returning `None` for a
+/// single-node machine is not a failure; it means there is nothing to isolate.
+#[cfg(windows)]
+pub fn numa_node_mask() -> Option<u64> {
+    // SAFETY: three plain Win32 calls; both out-pointers are stack locals.
+    unsafe {
+        let cpu = ffi::GetCurrentProcessorNumber();
+        let mut highest = 0u32;
+        if ffi::GetNumaHighestNodeNumber(&mut highest) == 0 || highest == 0 {
+            // One node: isolating to it is the machine's whole CPU set, so
+            // there is nothing to do and saying so beats pretending.
+            return None;
+        }
+        let mut node = 0u8;
+        if ffi::GetNumaProcessorNode(cpu as u8, &mut node) == 0 {
+            return None;
+        }
+        let mut mask = 0u64;
+        if ffi::GetNumaNodeProcessorMask(node, &mut mask) == 0 || mask == 0 {
+            return None;
+        }
+        Some(mask)
+    }
+}
+
+/// Linux reports node topology through sysfs rather than a syscall.
+#[cfg(not(windows))]
+pub fn numa_node_mask() -> Option<u64> {
+    // `node0` alone means a single node -- nothing to isolate.
+    let nodes = std::fs::read_dir("/sys/devices/system/node").ok()?;
+    let count = nodes
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("node"))
+        .count();
+    if count <= 1 {
+        return None;
+    }
+    // Which node this thread is on is not readable without libnuma, so the
+    // honest answer is node 0's mask -- and the caller reports which it used.
+    let list = std::fs::read_to_string("/sys/devices/system/node/node0/cpulist").ok()?;
+    let mut mask = 0u64;
+    for part in list.trim().split(',') {
+        let (lo, hi) = match part.split_once('-') {
+            Some((a, b)) => (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?),
+            None => {
+                let n = part.parse::<u32>().ok()?;
+                (n, n)
+            }
+        };
+        for c in lo..=hi.min(63) {
+            mask |= 1u64 << c;
+        }
+    }
+    (mask != 0).then_some(mask)
+}
+
 /// Pin `bytes` in physical memory.
 ///
 /// The slice must stay alive and unmoved for as long as the lock matters —
@@ -274,6 +337,10 @@ mod ffi {
         pub fn VirtualLock(addr: *const c_void, size: usize) -> i32;
         pub fn SetPriorityClass(h: isize, class: u32) -> i32;
         pub fn SetProcessAffinityMask(h: isize, mask: usize) -> i32;
+        pub fn GetCurrentProcessorNumber() -> u32;
+        pub fn GetNumaHighestNodeNumber(n: *mut u32) -> i32;
+        pub fn GetNumaProcessorNode(processor: u8, node: *mut u8) -> i32;
+        pub fn GetNumaNodeProcessorMask(node: u8, mask: *mut u64) -> i32;
         pub fn GetLastError() -> u32;
     }
 }

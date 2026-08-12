@@ -1035,18 +1035,12 @@ const REFUSED: &[(&str, bool, &str)] = &[
     // Docker registry stays out: it is a different protocol, not a URL.
     ("--docker-repo", true, "no Docker model registry support"),
     // --- NUMA and thread affinity.
-    ("--numa", true, "no NUMA-aware allocation to select between"),
     (
         "--poll",
         true,
         "ggml owns its threadpool here; `-t`/`-tb` are the levers that exist",
     ),
     ("--poll-batch", true, "ggml owns its threadpool here"),
-    (
-        "--load-mode",
-        true,
-        "`--direct-io` / `--no-direct-io` are the two modes that exist",
-    ),
 ];
 
 /// Whether `flag` is refused, and the message if so.
@@ -1342,6 +1336,7 @@ fn main() -> ExitCode {
     let mut context_shift = true;
     let mut n_keep: usize = 0;
     let mut reasoning = Reasoning::default();
+    let mut numa_isolate = false;
     // llama.cpp defaults --fit to on; so does this. It only ever adjusts
     // arguments the user did NOT set, which is what makes a default-on
     // auto-configuration safe.
@@ -1727,6 +1722,63 @@ fn main() -> ExitCode {
             // and the first NaN reaching a softmax makes every probability NaN
             // -- argmax then returns index 0 and the model repeats one token
             // forever, which reads as a broken model rather than a broken file.
+            // --- loading mode -------------------------------------------------
+            //
+            // llama.cpp's unified replacement for --mlock, --mmap and
+            // --direct-io, all three of which it now marks DEPRECATED. Every
+            // mode maps onto a switch this build already had, which is why the
+            // earlier refusal ("--direct-io / --no-direct-io are the two modes
+            // that exist") was too narrow: the modes existed, the spelling did
+            // not. `mmap+mlock` is one mode, not two flags.
+            "-lm" | "--load-mode" => {
+                let Some(mode) = rest.get(i + 1) else {
+                    eprintln!("bigtea-run: --load-mode needs none|mmap|mlock|mmap+mlock|dio");
+                    return ExitCode::from(2);
+                };
+                for part in mode.split('+') {
+                    match part.trim() {
+                        "none" => std::env::set_var("BIGTEA_IO", "buffered"),
+                        "mmap" => std::env::set_var("BIGTEA_IO", "buffered"),
+                        "mlock" => mlock = true,
+                        "dio" | "direct-io" => std::env::set_var("BIGTEA_IO", "direct"),
+                        other => {
+                            eprintln!(
+                                "bigtea-run: --load-mode {other:?}: expected none, mmap, mlock, \
+                                 mmap+mlock or dio"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+                i += 2;
+            }
+            // --- NUMA ---------------------------------------------------------
+            //
+            // `isolate` is reachable for the same reason affinity was: it is a
+            // mask and a syscall. `distribute` and `numactl` place INDIVIDUAL
+            // THREADS on chosen nodes, and ggml owns the pool -- so those two
+            // are refused by name rather than accepted and ignored.
+            "--numa" => {
+                match rest.get(i + 1).map(String::as_str) {
+                    Some("isolate") => numa_isolate = true,
+                    Some(other @ ("distribute" | "numactl")) => {
+                        eprintln!(
+                            "bigtea-run: --numa {other} is not supported: it places individual \
+                             threads on chosen nodes, and ggml owns the threadpool here."
+                        );
+                        eprintln!("  --numa isolate works, and pins the process to one node.");
+                        return ExitCode::from(2);
+                    }
+                    other => {
+                        eprintln!(
+                            "bigtea-run: --numa {:?}: expected isolate, distribute or numactl",
+                            other.unwrap_or("")
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
             // --- reasoning blocks --------------------------------------------
             //
             // Refused earlier as "downstream of Jinja". It is not: the block is
@@ -2382,6 +2434,21 @@ fn main() -> ExitCode {
     bigtea_arch::log::configure(logcfg);
     // After the log is configured so the outcome is reported through it, and
     // before the model opens so the load itself runs at the asked-for priority.
+    // NUMA isolation narrows the same mask affinity uses, so it is resolved
+    // first and an explicit --cpu-mask still wins by intersecting with it.
+    if numa_isolate {
+        match bigtea_io::lock::numa_node_mask() {
+            Some(node) => {
+                cpu_mask = Some(cpu_mask.map_or(node, |m| m & node).max(1));
+                bigtea_arch::info!("numa       isolating to node mask {node:#x}");
+            }
+            // Not a failure: a single-node machine has nothing to isolate, and
+            // silently pinning to "the whole machine" would look like it worked.
+            None => bigtea_arch::info!(
+                "numa       one node only (or topology unavailable); nothing to isolate"
+            ),
+        }
+    }
     // Before the model opens, so the load runs under the same mask.
     if let Some(mask) = cpu_mask {
         match bigtea_io::lock::set_affinity(mask) {
