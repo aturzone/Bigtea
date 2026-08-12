@@ -36,6 +36,10 @@ name = "bigtea-io"
 version = "0.0.2"
 
 [[package]]
+name = "bigtea-jinja"
+version = "0.0.2"
+
+[[package]]
 name = "bigtea-model"
 version = "0.0.2"
 dependencies = [

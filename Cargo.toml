@@ -9,6 +9,7 @@ members = [
     "crates/bigtea-ggml",
     "crates/bigtea-tokenizer",
     "crates/bigtea-grammar",
+    "crates/bigtea-jinja",
     "crates/bigtea-arch",
 ]
 
