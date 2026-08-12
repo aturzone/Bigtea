@@ -1654,6 +1654,43 @@ independent implementations**, not a self-check.
 
 Ticket: `docs/graph/backlog/jinja-chat-templates.md`.
 
+## `-b 1` joins the no-op probe, and why that is a cost as well as a fix
+
+The other session asked for it and the principle holds: batching changes how
+many tokens a forward pass covers, which for a correct engine only reorders
+sums. llama.cpp disagrees with **itself** under it, verified here on
+Qwen3-30B-A3B:
+
+```
+default : ...Spain is Madrid. The capital of Germany is Berlin.
+-b 1    : ...Spain is Madrid. The capital of Portugal is Lisbon.
+```
+
+**The set of no-op configurations tested decides what counts as a bug**, and
+that cuts both ways. Every configuration added makes `unstable` easier to reach,
+and `unstable` is exactly where a real bug hides — Llama-3.2 reported **four**
+unstable prompts for a day and all four turned out to be `rope_freqs.weight`
+being ignored. The cluster was the signal, not the noise.
+
+So the harness now **names which configuration moved it**:
+
+```
+unstable  Phi-3-mini-4k-instruct  The capital of France is
+  the reference disagrees with itself under: -fa-off --no-repack -b-1
+```
+
+"`-b 1` only" is a weaker claim than "every no-op moves it", and collapsing the
+two into one word is how a cluster stops looking like a cluster. The rule that
+three or more unstable in eight exits non-zero is what keeps the addition
+honest.
+
+One correction back to that session: their report says `-b 1` reproduces **both**
+Phi-3 near-ties byte-identically against Bigtea. Re-run here, only the
+arithmetic prompt does; `The capital of France is` gives `Paris. Paris is known
+for its rich history` under `-b 1` against Bigtea's `Paris. <|assistant|> That's
+correct!`. The classification is unchanged — the reference is unstable there
+under all three configurations — but the stated reason was not reproducible.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

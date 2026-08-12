@@ -130,9 +130,27 @@ for p in "${PROMPTS[@]}"; do
   # `--no-repack` both change only how a sum is ordered.
   c=$(ref "$p" -fa off)
   d=$(ref "$p" --no-repack)
+  # `-b 1` is the third no-op, and adding it was a deliberate decision rather
+  # than a convenience. Batching changes how many tokens a forward pass covers;
+  # for a correct engine that only reorders sums. llama.cpp disagrees with
+  # ITSELF under it -- on Qwen3-30B-A3B, `The capital of France is`:
+  #
+  #   default : ...Spain is Madrid. The capital of Germany is Berlin.
+  #   -b 1    : ...Spain is Madrid. The capital of Portugal is Lisbon.
+  #
+  # THE SET OF NO-OP CONFIGURATIONS TESTED HERE DECIDES WHAT COUNTS AS A BUG,
+  # and it cuts both ways: every configuration added makes `unstable` easier to
+  # reach, and `unstable` is where a real bug hides. Llama-3.2 reported FOUR
+  # unstable prompts for a day and all four were `rope_freqs.weight` being
+  # ignored -- the cluster was the signal, not the noise.
+  #
+  # So this stays honest only because of the cluster rule below: three or more
+  # unstable in eight still exits non-zero and demands a look.
+  e=$(ref "$p" -b 1)
   c=${c#*"$p"}
   d=${d#*"$p"}
-  if [ "$c" != "$b" ] || [ "$d" != "$b" ]; then
+  e=${e#*"$p"}
+  if [ "$c" != "$b" ] || [ "$d" != "$b" ] || [ "$e" != "$b" ]; then
     # Before shrugging: did the two engines even read the same prompt? A
     # near-tie is what a DIFFERENT INPUT looks like, so this is checked first.
     bt=$(bigtea_tokens "$p")
@@ -147,8 +165,15 @@ for p in "${PROMPTS[@]}"; do
     fi
     unstable=$((unstable + 1))
     printf 'unstable  %-36s %s\n' "$name" "$p"
-    printf '  the reference disagrees with itself here (-fa off / --no-repack),\n'
-    printf '  and both engines tokenized the prompt identically. Suspicious, not\n'
+    which=""
+    [ "$c" != "$b" ] && which="$which -fa-off"
+    [ "$d" != "$b" ] && which="$which --no-repack"
+    [ "$e" != "$b" ] && which="$which -b-1"
+    # WHICH configuration moved it, not merely that one did. "-b 1 only" is a
+    # weaker claim than "every no-op moves it", and collapsing the two into one
+    # word is how a cluster stops looking like a cluster.
+    printf '  the reference disagrees with itself under:%s\n' "$which"
+    printf '  Both engines tokenized the prompt identically. Suspicious, not\n'
     printf '  proof either way.\n'
     continue
   fi
