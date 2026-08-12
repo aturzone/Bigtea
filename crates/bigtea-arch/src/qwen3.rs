@@ -13,7 +13,7 @@
 //! The MoE variant differs only in the feed-forward block: a router picks
 //! `n_expert_used` of `n_expert`, and `mul_mat_id` applies just those.
 
-use bigtea_ggml::{Context, RopeParams, Tensor, WeightSet};
+use bigtea_ggml::{Context, Tensor, WeightSet};
 use bigtea_model::Model;
 
 use crate::{ArchError, Result};
@@ -127,18 +127,33 @@ pub const VERIFIED_ARCHITECTURES: &[&str] = &[
     "phi3",
     "qwen2",
     "qwen3",
-    // `qwen3moe` WAS HERE AND HAS BEEN REMOVED. It had never been through the
-    // eight-prompt diff; run at last it came back 1 FAIL + 6 unstable. Fixing
-    // its activation (an MoE container has no `ffn_gate`, so it was classified
-    // ungated and ran GELU where the reference runs SiLU) killed the loop and
-    // most of the near-ties, but a stable-reference FAIL remains:
+    // `qwen3moe` WAS HERE AND HAS BEEN REMOVED — but what still keeps it out is
+    // the *harness*, not the engine.
     //
-    //   bigtea   : …Spain is Madrid. The capital of Portugal is Lisbon.
-    //   llama.cpp: …Spain is Madrid. The capital of Germany is Berlin.
+    // It had never been through the eight-prompt diff; run at last it came back
+    // 1 FAIL + 6 unstable. One real bug was found and fixed: an MoE container
+    // has no `ffn_gate` (its gate is `ffn_gate_exps`), so it was classified
+    // ungated and ran GELU where the reference runs SiLU. That killed a loop
+    // and four of the near-ties.
     //
-    // Four countries in rather than the second word, so whatever is left is
-    // small — but "small" is what SiLU-for-GELU looked like too. The entry
-    // comes back when the diff passes, not when the diff looks close.
+    // The remaining FAIL is a **near-tie, demonstrated**: llama.cpp produces
+    // our exact answer under `-b 1` and `-ub 1`, which change batching, and so
+    // summation order, and nothing else.
+    //
+    //   default / -fa off / --no-repack : …Madrid. The capital of Germany is Berlin.
+    //   -b 1 / -ub 1                    : …Madrid. The capital of Portugal is Lisbon.
+    //   bigtea                          : …Madrid. The capital of Portugal is Lisbon.
+    //
+    // `parity-check.sh` re-checks a mismatch against `-fa off` and
+    // `--no-repack` only, and neither moves this prompt, so it reports FAIL.
+    // **The set of no-op configurations you test decides what you call a bug**,
+    // and `-b 1` is the axis that moves this model. It also reproduces both of
+    // Phi-3's otherwise-unexplained near-ties.
+    //
+    // Left out regardless, because the rule is that the diff passes — not that
+    // someone argues it should have. It goes back when the harness gains `-b 1`
+    // and the run comes out clean, which is a decision for the session that
+    // owns `scripts/`.
     "stablelm",
     "starcoder2",
 ];
@@ -793,53 +808,6 @@ impl Qwen3Model {
         }
     }
 
-    /// One layer's attention, from the pre-norm through the output projection.
-    ///
-    /// Shared by the single-graph path and the streaming path so the
-    /// architecture is defined once; two copies would drift.
-    #[allow(clippy::too_many_arguments)]
-    pub fn attention_block<'a>(
-        &self,
-        ctx: &'a Context,
-        weights: &WeightSet<'a>,
-        x: &Tensor<'a>,
-        positions: &Tensor<'a>,
-        n_tokens: i64,
-        il: u32,
-        rope: RopeParams,
-        rope_type: i32,
-    ) -> Result<Tensor<'a>> {
-        let c = &self.config;
-        let get = |name: String| -> Result<&Tensor<'a>> {
-            weights.get(&name).ok_or(ArchError::MissingTensor(name))
-        };
-
-        let normed = self.rms_norm_mul(ctx, x, get(format!("blk.{il}.attn_norm.weight"))?)?;
-
-        let (qw, kw, vw) = self.qkv_weights(ctx, weights, il)?;
-        let q = ctx.mul_mat(&qw, &normed)?;
-        let k = ctx.mul_mat(&kw, &normed)?;
-        let v = ctx.mul_mat(&vw, &normed)?;
-
-        let q = ctx.reshape_3d(&q, c.head_dim as i64, c.n_head as i64, n_tokens)?;
-        let k = ctx.reshape_3d(&k, c.head_dim as i64, c.n_head_kv as i64, n_tokens)?;
-
-        let (q, k) = if c.qk_norm {
-            (
-                self.rms_norm_mul(ctx, &q, get(format!("blk.{il}.attn_q_norm.weight"))?)?,
-                self.rms_norm_mul(ctx, &k, get(format!("blk.{il}.attn_k_norm.weight"))?)?,
-            )
-        } else {
-            (q, k)
-        };
-
-        let q = ctx.rope_ext(&q, positions, None, c.head_dim as i32, rope_type, 0, rope)?;
-        let k = ctx.rope_ext(&k, positions, None, c.head_dim as i32, rope_type, 0, rope)?;
-
-        let attn = self.attention(ctx, &q, &k, &v, n_tokens)?;
-        Ok(ctx.mul_mat(get(format!("blk.{il}.attn_output.weight"))?, &attn)?)
-    }
-
     /// Attention through ggml's fused kernel.
     ///
     /// Same result as [`Self::attention`], without building the scores matrix.
@@ -981,68 +949,6 @@ impl Qwen3Model {
             Some(b) => Ok(ctx.add(&scaled, b)?),
             None => Ok(scaled),
         }
-    }
-
-    /// Scaled dot-product attention with a causal mask.
-    fn attention<'a>(
-        &self,
-        ctx: &'a Context,
-        q: &Tensor<'a>,
-        k: &Tensor<'a>,
-        v: &Tensor<'a>,
-        n_tokens: i64,
-    ) -> Result<Tensor<'a>> {
-        let c = &self.config;
-
-        // Shapes are the whole difficulty here, so each step names what it
-        // produces. ggml's ne[0] is the fastest dimension, and mul_mat
-        // contracts over ne[0] of both operands.
-
-        // [head_dim, n_head, n_tok] -> [head_dim, n_tok, n_head]
-        let q = ctx.cont(&ctx.permute(q, [0, 2, 1, 3])?)?;
-        // [head_dim, n_kv, n_tok] -> [head_dim, n_tok, n_kv]
-        let k = ctx.cont(&ctx.permute(k, [0, 2, 1, 3])?)?;
-
-        // Contracts over head_dim -> [n_tok, n_tok, n_head]. Grouped-query
-        // attention works because ggml broadcasts when n_head is a multiple
-        // of n_kv.
-        let scores = ctx.mul_mat(&k, &q)?;
-
-        // Causal mask. Without it every position attends to future tokens --
-        // the model sees the answer before predicting it, and collapses into
-        // repeating one token. Added to the scores before softmax, so masked
-        // positions need -inf rather than 0.
-        let mask = ctx.new_f32_2d(n_tokens, n_tokens)?;
-        let mut m = vec![0f32; (n_tokens * n_tokens) as usize];
-        for query in 0..n_tokens {
-            for key in 0..n_tokens {
-                if key > query {
-                    m[(query * n_tokens + key) as usize] = f32::NEG_INFINITY;
-                }
-            }
-        }
-        mask.set_f32(&m)?;
-
-        let probs = ctx.soft_max_ext(&scores, Some(&mask), c.attn_scale(), 0.0)?;
-
-        // V must contract over n_tok, so it needs n_tok in ne[0]:
-        //   [head_dim, n_kv, n_tok] --permute--> [head_dim, n_tok, n_kv]
-        //                           --transpose-> [n_tok, head_dim, n_kv]
-        // Transposing without the permute first leaves [n_kv, head_dim, n_tok],
-        // whose ne[0] is n_kv -- which is exactly the mismatch that aborts
-        // ggml with `ggml_can_mul_mat` failing.
-        let v = ctx.reshape_3d(v, c.head_dim as i64, c.n_head_kv as i64, n_tokens)?;
-        let v = ctx.cont(&ctx.transpose(&ctx.permute(&v, [0, 2, 1, 3])?)?)?;
-
-        // [head_dim, n_tok, n_head]
-        let out = ctx.mul_mat(&v, &probs)?;
-
-        // -> [head_dim, n_head, n_tok] -> flat [n_head*head_dim, n_tok].
-        // Note n_head*head_dim need not equal n_embd: Qwen3-4B has 32*128 =
-        // 4096 against n_embd 2560, and the output projection maps between
-        // them.
-        let out = ctx.cont(&ctx.permute(&out, [0, 2, 1, 3])?)?;
-        Ok(ctx.reshape_2d(&out, (c.head_dim * c.n_head) as i64, n_tokens)?)
     }
 
     /// Gated feed-forward: `down(act(gate(x)) * up(x))`, `act` per architecture.
