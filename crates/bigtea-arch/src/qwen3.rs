@@ -351,12 +351,26 @@ impl Qwen3Config {
             .arch_u64("attention.key_length")
             .unwrap_or((n_embd / n_head.max(1)) as u64) as u32;
 
-        // A missing `ffn_gate` means one of two very different things, and the
-        // **shape** separates them: Phi-3 fuses gate and up into one tensor
-        // twice `n_ff` wide, while StarCoder2 has no gate at all and its
-        // `ffn_up` is `n_ff` wide. Computed here rather than in the literal
-        // because `ffn_act` needs to know which of the two it is.
-        let no_gate = model.location("blk.0.ffn_gate.weight").is_none();
+        // A missing `ffn_gate` means one of **three** very different things.
+        //
+        // Phi-3 fuses gate and up into one tensor twice `n_ff` wide; StarCoder2
+        // has no gate at all and its `ffn_up` is `n_ff` wide — the shape
+        // separates those two. And an **MoE container has no `ffn_gate` either**,
+        // because its gate is `ffn_gate_exps`, one tensor holding every expert.
+        //
+        // Testing the dense name alone made every all-MoE model "ungated" and
+        // ran **GELU over its experts where Qwen3-MoE runs SiLU** — the Gemma
+        // activation bug again, introduced by the fix for StarCoder2 and caught
+        // only when `qwen3moe` was finally put through the eight-prompt sweep.
+        // It answered `Paris. True or False? The capital of France is Paris.
+        // True or False?` against the reference's `Paris. The capital of Italy
+        // is Rome.` — a loop, which is what a subtly wrong FFN looks like.
+        //
+        // DeepSeek-V4-Flash escaped it because its first layers are dense, so
+        // `blk.0.ffn_gate.weight` exists there. Being saved by which layer is
+        // numbered zero is not a check.
+        let moe_gate = model.location("blk.0.ffn_gate_exps.weight").is_some();
+        let no_gate = !moe_gate && model.location("blk.0.ffn_gate.weight").is_none();
         let up_ne1 = model
             .location("blk.0.ffn_up.weight")
             .and_then(|l| l.dims.get(1).copied())
@@ -1295,6 +1309,44 @@ mod tests {
         assert!(qwen
             .required_tensors()
             .contains(&"blk.0.attn_q_norm.weight".to_string()));
+    }
+
+    /// **An MoE model is not an ungated one.**
+    ///
+    /// `ffn_gate` is absent from an MoE container because the gate is
+    /// `ffn_gate_exps`, and reading that absence as "no gate" gave every
+    /// all-MoE model `UngatedGelu`. Qwen3-30B-A3B then ran **GELU over its
+    /// experts where the reference runs SiLU** and looped —
+    /// `Paris. True or False? The capital of France is Paris. True or False?`
+    /// against `Paris. The capital of Italy is Rome.`
+    ///
+    /// The activation is not in `required_tensors`, so no test that checks
+    /// tensor names can catch this. It has to be asserted directly.
+    #[test]
+    fn an_moe_container_is_gated_even_though_ffn_gate_is_absent() {
+        for (arch, expected) in [
+            ("qwen3moe", FfnAct::Silu),
+            ("qwen2moe", FfnAct::Silu),
+            ("deepseek4", FfnAct::Silu),
+        ] {
+            assert_eq!(
+                ffn_act_for(arch),
+                expected,
+                "{arch} must not be reclassified by the ungated-FFN detection"
+            );
+        }
+        // The MoE config the streaming path actually runs.
+        let moe = Qwen3Model::new(Qwen3Config {
+            n_expert: 128,
+            n_expert_used: 8,
+            ..dense_config()
+        });
+        assert!(moe.config.is_moe());
+        assert_eq!(
+            moe.config.ffn_act,
+            FfnAct::Silu,
+            "an MoE config must never carry UngatedGelu"
+        );
     }
 
     #[test]
