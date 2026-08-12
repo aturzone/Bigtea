@@ -1602,6 +1602,52 @@ with a FAIL is go looking in the forward pass. Two FAILs appeared in this sweep
 and exactly one was real; without checking both, the real one would have been
 dismissed along with the false one.
 
+## The eight-prompt sweep, re-run after the harness fix (2026-08-11)
+
+| container | ok | unstable | FAIL |
+|---|---:|---:|---:|
+| tinyllama-1.1b-chat | 8 | 0 | 0 |
+| Qwen2-0.5B-Instruct | 8 | 0 | 0 |
+| gemma-2-2b-it | 8 | 0 | 0 |
+| gemma-3-1b-it | 8 | 0 | 0 |
+| Qwen3-4B | 8 | 0 | 0 |
+| **Llama-3.2-1B-Instruct** | 3 | 4 | **1** |
+
+**Gemma-3's arithmetic prompt and Gemma-2's are no longer unstable.** Both were
+the `[end of text]` artefact, not near-ties — the harness had been comparing
+llama.cpp's EOS marker against our silence. Five containers are now clean at
+eight prompts where three prompts had certified them.
+
+Llama-3.2 is the outlier twice over: the only FAIL (`rope_freqs.weight`,
+ticketed) and the only container with four genuine near-ties in eight.
+
+## The Jinja gap, scoped rather than guessed at (2026-08-11)
+
+`--jinja` is the last CLI capability that is not GPU, not a draft model and not
+an adapter. It has stayed unbuilt because of the rule in `chat.rs`: **a
+half-implemented Jinja silently produces the wrong framing.**
+
+Censusing all 12 `tokenizer.chat_template`s on disk makes the subset bounded:
+
+```
+if/endif 123 · set 98 · else 40 · for/endfor 31 · elif 21
+loop.index0 20 · loop.last 12 · loop.first 10
+namespace() 10 · raise_exception() 6 · strftime_now() 1
+filters: tojson 15, trim 6, length 5
+operators: in, not, is defined, is string, is not none
+```
+
+**No macros, no imports, no inheritance, three filters.** That is a
+self-contained crate with no dependencies, the same shape as `bigtea-grammar`
+— a weekend, not a quarter.
+
+The acceptance test already exists: `chat-templates.txt` is llama.cpp's own
+rendering of all 54 templates, and 52 of the family renderers are verified
+against it. A Jinja engine agreeing with them is a **cross-check between two
+independent implementations**, not a self-check.
+
+Ticket: `docs/graph/backlog/jinja-chat-templates.md`.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
