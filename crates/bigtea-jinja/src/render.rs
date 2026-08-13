@@ -181,6 +181,7 @@ pub fn eval(src: &str, env: &Env) -> Result<Value> {
         i: 0,
         src,
         env,
+        last_name: None,
     };
     p.ws();
     let v = p.ternary()?;
@@ -199,6 +200,10 @@ struct P<'a> {
     i: usize,
     src: &'a str,
     env: &'a Env,
+    /// The last bare name read, so `is defined` can ask about the NAME rather
+    /// than about the value it evaluated to. Without it a missing variable and
+    /// a built-in function are indistinguishable -- both are `None`.
+    last_name: Option<String>,
 }
 
 impl<'a> P<'a> {
@@ -309,7 +314,16 @@ impl<'a> P<'a> {
             let r = match t.as_str() {
                 // `defined` is the reason a bare name may be missing without
                 // being an error -- every other path treats that as a bug.
-                "defined" => !matches!(left, Value::None),
+                //
+                // **A built-in FUNCTION is defined too.** Llama-3's template
+                // guards with `if strftime_now is defined`, and answering
+                // `false` sent it down a fallback branch that hardcodes
+                // `26 Jul 2024` -- so every Llama-3 prompt carried a date two
+                // years stale, four tokens different from llama.cpp --jinja.
+                "defined" => {
+                    !matches!(left, Value::None)
+                        || self.last_name.as_deref().is_some_and(is_builtin)
+                }
                 "none" => matches!(left, Value::None),
                 "string" => matches!(left, Value::Str(_)),
                 // Qwen3 writes `is false` where a plain `not` would do. NOT the
@@ -645,6 +659,21 @@ impl<'a> P<'a> {
                 // empty namespace is what every template on disk creates.
                 // The keyword arguments ARE the namespace's initial fields.
                 "namespace" => Ok(Value::Map(kwargs)),
+                // Llama-3's template stamps today's date into the system turn.
+                // llama.cpp --jinja emits the real date; without this we took
+                // the template's hardcoded 2024 fallback and produced a prompt
+                // that differed from the reference by four tokens.
+                //
+                // **This makes the render non-reproducible**, which is a real
+                // cost: two runs a day apart produce different prompts, so a
+                // byte-comparison against a captured fixture will fail for a
+                // reason that is not a bug. Recorded rather than avoided,
+                // because freezing a fake date would make every Llama-3 prompt
+                // wrong in a way nothing would ever notice.
+                "strftime_now" => {
+                    let fmt = args.first().map(|a| a.render()).unwrap_or_default();
+                    Ok(Value::Str(strftime_now(&fmt)))
+                }
                 // Python's semantics, including a negative step -- Qwen3 walks
                 // backwards over prior turns with `range(n, -1, -1)`, and a
                 // forward-only range would silently produce an empty loop and
@@ -677,7 +706,9 @@ impl<'a> P<'a> {
         // A bare name. Missing is `none` so `is defined` can ask about it --
         // every other use of a missing name surfaces as a render that is
         // visibly wrong rather than silently short.
-        Ok(self.env.get(&name).cloned().unwrap_or(Value::None))
+        let v = self.env.get(&name).cloned().unwrap_or(Value::None);
+        self.last_name = Some(name);
+        Ok(v)
     }
 
     fn name(&mut self) -> Option<String> {
@@ -688,6 +719,18 @@ impl<'a> P<'a> {
         }
         (self.i > start).then(|| self.src[start..self.i].to_string())
     }
+}
+
+/// Names the evaluator provides as functions rather than variables.
+///
+/// Kept next to the call site that implements them; a name here with no
+/// implementation would report itself defined and then fail to call, which is a
+/// worse failure than reporting it undefined.
+fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "strftime_now" | "namespace" | "raise_exception" | "range"
+    )
 }
 
 fn is_name_byte(b: u8) -> bool {
@@ -753,6 +796,61 @@ fn slice(v: &Value, start: Option<&Value>, end: Option<&Value>) -> Value {
     } else {
         items[lo..hi].to_vec()
     })
+}
+
+/// The handful of `strftime` fields Llama-3's template uses, from the system
+/// clock.
+///
+/// Written out rather than pulled from `chrono`: this crate has no dependencies
+/// by design, and the conversion is Howard Hinnant's `civil_from_days`, which
+/// is exact for every date in the range and about ten lines.
+fn strftime_now(fmt: &str) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('d') => out.push_str(&format!("{d:02}")),
+            Some('m') => out.push_str(&format!("{m:02}")),
+            Some('Y') => out.push_str(&y.to_string()),
+            Some('b') => out.push_str(MONTHS[(m as usize).clamp(1, 12) - 1]),
+            Some('e') => out.push_str(&format!("{d:2}")),
+            // An unknown field is emitted literally rather than dropped: a
+            // silently missing date component is a prompt that looks right.
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+/// Days since the Unix epoch to `(year, month, day)`.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 fn contains(hay: &Value, needle: &Value) -> bool {
@@ -862,6 +960,38 @@ mod tests {
             r("{{ messages | join(', ') }}").unwrap_err(),
             Error::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn a_builtin_function_is_defined() {
+        // Llama-3 guards with `if strftime_now is defined` and takes a
+        // fallback branch that hardcodes 26 Jul 2024 when the answer is false.
+        assert_eq!(r("{{ strftime_now is defined }}").unwrap(), "True");
+        assert_eq!(r("{{ namespace is defined }}").unwrap(), "True");
+        assert_eq!(r("{{ nope is defined }}").unwrap(), "False");
+    }
+
+    #[test]
+    fn strftime_formats_the_fields_llama3_uses() {
+        // Not asserting the value -- it is the wall clock. Asserting the SHAPE,
+        // which is what a wrong conversion would break: `26 Jul 2024`.
+        let s = strftime_now("%d %b %Y");
+        let parts: Vec<&str> = s.split(' ').collect();
+        assert_eq!(parts.len(), 3, "{s:?}");
+        assert_eq!(parts[0].len(), 2, "{s:?}");
+        assert_eq!(parts[1].len(), 3, "{s:?}");
+        assert_eq!(parts[2].len(), 4, "{s:?}");
+        assert!(parts[2].parse::<i64>().unwrap() >= 2024, "{s:?}");
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        // Exact anchors, because an off-by-one here is a prompt that differs
+        // from the reference by one token and nothing else would catch it.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+        // A leap day, which is where naive conversions break.
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
     }
 
     #[test]

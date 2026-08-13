@@ -199,3 +199,47 @@ model's template specifies, on a model that is verified.
 
 That has to be settled against `llama-completion --jinja` before either path
 changes, and it is the next thing to do here.
+
+## SETTLED against `llama.cpp --jinja`: our engine is right, both hardcoded renderers are not
+
+The Llama-3.2 difference was the open question. It is answered, and the answer
+is not the one the family matcher would have preferred.
+
+```
+$ llama-completion -m Llama-3.2-1B-Instruct-Q4_K_M.gguf --no-jinja     -sys SYS -p HI -n 1 --temp 0 -st --verbose-prompt
+"<|start_header_id|>system<|end_header_id|>
+
+SYS<|eot_id|>..."
+
+$ llama-completion ... --jinja ...
+"<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+ Today Date: 13 Aug 2026
+
+SYS<|eot_id|>..."
+```
+
+**`--jinja` emits the preamble; the hardcoded renderer drops it.** Ours dropped
+it too, because ours is a port of llama.cpp's. So on every Llama-3.x model, both
+engines' default path has been feeding the model a system turn its own template
+says should carry a knowledge cutoff and today's date.
+
+Our Jinja output is now **byte-identical to `llama.cpp --jinja`**, including the
+date and the trailing newlines. Two bugs stood between:
+
+**`strftime_now is defined` answered false.** Built-in *functions* were not in
+the environment, so a name lookup returned `none` and `is defined` said no —
+sending the template down a fallback branch that hardcodes `26 Jul 2024`. Every
+Llama-3 prompt carried a date two years stale. Fixed by asking about the *name*
+rather than the value it evaluated to.
+
+**Jinja drops one trailing newline from a template.** `keep_trailing_newline`
+defaults to false, Llama-3's template ends with `{%- endif %}
+`, and keeping it
+put a third newline after the assistant header where llama.cpp emits two. A
+one-token difference in every prompt, invisible without a byte comparison.
+
+`strftime_now` makes a render **non-reproducible** — two runs a day apart differ.
+That is a real cost, recorded rather than avoided: freezing a fake date would
+make every Llama-3 prompt wrong in a way nothing would ever notice.

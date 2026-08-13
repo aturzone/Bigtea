@@ -32,6 +32,12 @@ pub struct Token {
 
 /// Split `src` into tokens, applying `-` whitespace control.
 pub fn lex(src: &str) -> Result<Vec<Token>> {
+    // Jinja's `keep_trailing_newline` defaults to FALSE: exactly one newline at
+    // the very end of a template is dropped. Llama-3's template ends with
+    // `{%- endif %}\n`, and keeping it put a third newline after the assistant
+    // header where llama.cpp --jinja emits two -- a one-token difference in
+    // every prompt, invisible unless byte-compared.
+    let src = src.strip_suffix('\n').unwrap_or(src);
     let b = src.as_bytes();
     let mut out: Vec<Token> = Vec::new();
     let mut i = 0usize;
@@ -186,6 +192,16 @@ mod tests {
             kinds("a{# note #}b"),
             vec![TokenKind::Text("a".into()), TokenKind::Text("b".into())]
         );
+    }
+
+    #[test]
+    fn one_trailing_newline_is_dropped_and_only_one() {
+        // Jinja's keep_trailing_newline=False. Llama-3's template ends with a
+        // newline after `{%- endif %}` and keeping it added a third blank line
+        // after the assistant header.
+        assert_eq!(kinds("a\n"), vec![TokenKind::Text("a".into())]);
+        assert_eq!(kinds("a\n\n"), vec![TokenKind::Text("a\n".into())]);
+        assert_eq!(kinds("a"), vec![TokenKind::Text("a".into())]);
     }
 
     #[test]
