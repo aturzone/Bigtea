@@ -131,6 +131,75 @@ fn json(v: &Value) -> String {
     }
 }
 
+/// Does this template ever look at a `system` turn?
+///
+/// # Why a caller needs to know
+///
+/// Phi-3's template handles `user` and `assistant` and **silently drops
+/// anything else**. Render a conversation with a system turn through it and the
+/// system prompt simply vanishes — no error, and a model that ignores its
+/// instructions for a reason nothing reports.
+///
+/// llama.cpp does not fix this in the template. It fixes it *before* rendering:
+/// when the template has no system support it merges the system content into
+/// the first user turn. `--jinja` on Phi-3 emits
+/// `<|user|> SYS\nHI<|end|>`, where the template alone would emit
+/// `<|user|>\nHI<|end|>`.
+///
+/// So evaluating the template correctly is not sufficient to match the
+/// reference — the caller has to apply the same polyfill, and to do that it has
+/// to ask this question first.
+pub fn mentions_system_role(template: &str) -> bool {
+    // Substring rather than a parse: the question is whether the word appears
+    // at all, and a template that mentions it in a comment is one that its
+    // author thought about. False positives cost nothing here (the merge is
+    // simply not applied); a false negative silently drops the system prompt.
+    template.contains("'system'") || template.contains("\"system\"")
+}
+
+/// Merge the system turn into the first user turn, llama.cpp's polyfill.
+///
+/// Returns the messages unchanged when there is no system turn or no user turn
+/// to merge it into — dropping it on the floor would be the very failure this
+/// exists to prevent.
+pub fn merge_system_into_first_user(messages: &[Value], separator: &str) -> Vec<Value> {
+    let system: Option<String> = messages.iter().find_map(|m| match m {
+        Value::Map(f) if matches!(f.get("role"), Some(Value::Str(r)) if r == "system") => {
+            f.get("content").map(|c| c.render())
+        }
+        _ => None,
+    });
+    let Some(system) = system else {
+        return messages.to_vec();
+    };
+    let mut out = Vec::with_capacity(messages.len());
+    let mut merged = false;
+    for m in messages {
+        match m {
+            Value::Map(f) if matches!(f.get("role"), Some(Value::Str(r)) if r == "system") => {}
+            Value::Map(f)
+                if !merged && matches!(f.get("role"), Some(Value::Str(r)) if r == "user") =>
+            {
+                let mut f = f.clone();
+                let body = f.get("content").map(|c| c.render()).unwrap_or_default();
+                f.insert(
+                    "content".to_string(),
+                    Value::Str(format!("{system}{separator}{body}")),
+                );
+                out.push(Value::Map(f));
+                merged = true;
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    // No user turn to merge into: keep the system turn rather than lose it.
+    if merged {
+        out
+    } else {
+        messages.to_vec()
+    }
+}
+
 /// Why a template could not be rendered.
 ///
 /// Every variant is a *refusal to guess*. `Unsupported` in particular is the
@@ -179,6 +248,42 @@ pub use render::{render, Env};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_template_without_a_system_branch_is_detected() {
+        // Phi-3's, trimmed. It handles user and assistant and drops the rest.
+        let phi3 = "{% for m in messages %}{% if (m['role'] == 'user') %}x{% endif %}{% endfor %}";
+        assert!(!mentions_system_role(phi3));
+        let chatml =
+            "{% for m in messages %}{% if m['role'] == 'system' %}y{% endif %}{% endfor %}";
+        assert!(mentions_system_role(chatml));
+    }
+
+    #[test]
+    fn the_system_turn_is_merged_rather_than_dropped() {
+        let mk = |role: &str, content: &str| {
+            let mut m = HashMap::new();
+            m.insert("role".to_string(), Value::Str(role.into()));
+            m.insert("content".to_string(), Value::Str(content.into()));
+            Value::Map(m)
+        };
+        let msgs = vec![mk("system", "SYS"), mk("user", "HI")];
+        let out = merge_system_into_first_user(&msgs, "\n");
+        assert_eq!(out.len(), 1);
+        let Value::Map(f) = &out[0] else { panic!() };
+        assert_eq!(f["role"], Value::Str("user".into()));
+        assert_eq!(f["content"], Value::Str("SYS\nHI".into()));
+    }
+
+    #[test]
+    fn with_no_user_turn_the_system_turn_survives() {
+        // Losing it would be the exact failure the polyfill exists to prevent.
+        let mut m = HashMap::new();
+        m.insert("role".to_string(), Value::Str("system".into()));
+        m.insert("content".to_string(), Value::Str("SYS".into()));
+        let msgs = vec![Value::Map(m)];
+        assert_eq!(merge_system_into_first_user(&msgs, "\n").len(), 1);
+    }
 
     #[test]
     fn truthiness_follows_jinja_not_rust() {

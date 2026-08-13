@@ -64,6 +64,17 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             if trim_next_leading {
                 owned = owned.trim_start().to_string();
             }
+            // `lstrip_blocks`: for a BLOCK tag, indentation between the last
+            // newline and the tag is dropped. Hugging Face's
+            // `apply_chat_template` enables it, so a template written with
+            // indented `{% if %}` lines -- which is most of them -- renders
+            // without that indentation reaching the prompt.
+            if !is_output && !is_comment && !strip_before {
+                let keep = owned.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                if owned[keep..].chars().all(|c| c == ' ' || c == '\t') {
+                    owned.truncate(keep);
+                }
+            }
             trim_next_leading = false;
             if !owned.is_empty() {
                 out.push(Token {
@@ -104,6 +115,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 });
             }
             i = body_start + rel + 2;
+            // `trim_blocks`: one newline immediately AFTER a block tag is
+            // dropped, also on by default in Hugging Face. Without both rules
+            // TinyLlama's template -- whose tags each sit on their own line --
+            // emitted a newline per tag, six extra in a two-message prompt.
+            if !is_output && !is_comment && b.get(i) == Some(&b'\n') {
+                i += 1;
+            }
             text_start = i;
         } else {
             i += 1;
@@ -191,6 +209,32 @@ mod tests {
         assert_eq!(
             kinds("a{# note #}b"),
             vec![TokenKind::Text("a".into()), TokenKind::Text("b".into())]
+        );
+    }
+
+    #[test]
+    fn block_tags_trim_their_own_line() {
+        // `trim_blocks` + `lstrip_blocks`, both on in Hugging Face's
+        // apply_chat_template. A template whose tags each sit on their own
+        // indented line must not emit a newline and an indent per tag --
+        // TinyLlama's produced six extra newlines in a two-message prompt.
+        assert_eq!(
+            kinds("a\n  {% if x %}\nb"),
+            vec![
+                TokenKind::Text("a\n".into()),
+                TokenKind::Stmt("if x".into()),
+                TokenKind::Text("b".into()),
+            ]
+        );
+        // An OUTPUT tag is untouched by either rule: `{{ x }}` on its own line
+        // keeps the newline, which is how ChatML's per-turn newline survives.
+        assert_eq!(
+            kinds("a\n{{ x }}\nb"),
+            vec![
+                TokenKind::Text("a\n".into()),
+                TokenKind::Output("x".into()),
+                TokenKind::Text("\nb".into()),
+            ]
         );
     }
 

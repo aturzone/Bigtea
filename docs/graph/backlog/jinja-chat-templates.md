@@ -243,3 +243,52 @@ one-token difference in every prompt, invisible without a byte comparison.
 `strftime_now` makes a render **non-reproducible** — two runs a day apart differ.
 That is a real cost, recorded rather than avoided: freezing a fake date would
 make every Llama-3 prompt wrong in a way nothing would ever notice.
+
+## Evaluating the template correctly is NOT sufficient (2026-08-13)
+
+`scripts/jinja-vs-llamacpp.py` compares llama.cpp against **itself** —
+`--no-jinja` versus `--jinja` — which is the only thing that can settle a
+family-vs-Jinja disagreement. Run on Phi-3 and TinyLlama, both differ *inside
+llama.cpp*:
+
+```
+Phi-3   --no-jinja: <s><|system|> SYS<|end|><|user|> HI<|end|><|assistant|>
+        --jinja   : <s><|user|> SYS
+HI<|end|><|assistant|>
+```
+
+**Phi-3's template handles `user` and `assistant` and silently drops everything
+else.** Our engine rendered it faithfully — and faithfully meant losing the
+system prompt, with no error and a model that ignores its instructions for a
+reason nothing reports.
+
+llama.cpp does not fix that in the template. It fixes it *before* rendering: a
+template with no system branch gets the system content **merged into the first
+user turn**. So matching `--jinja` needs llama.cpp's message preprocessing as
+well as its template evaluation, and `mentions_system_role` +
+`merge_system_into_first_user` are that. The merge keeps the system turn when
+there is no user turn to merge into — dropping it there would be the exact
+failure the polyfill exists to prevent.
+
+### TinyLlama was whitespace, and the cause is a Hugging Face default
+
+`trim_blocks` and `lstrip_blocks` are **on** in `apply_chat_template`. A newline
+immediately after a block tag is dropped, and indentation before one is dropped.
+TinyLlama's template puts every tag on its own line, so without both rules it
+emitted a newline per tag — six extra in a two-message prompt. Both rules apply
+to `{% %}` and **not** to `{{ }}`, which is what keeps ChatML's per-turn newline.
+
+TinyLlama now agrees with the family matcher.
+
+### State
+
+**6 agree, 6 refused, 3 differ** of 15 containers. The three differences are all
+family-vs-Jinja and all understood: Llama-3.2 (preamble, Jinja verified correct
+against `--jinja`), Phi-3 (system polyfill), internlm2 (newly added, not yet
+looked at).
+
+A caveat on the comparison tool, since it will mislead someone otherwise:
+**reconstructing the prompt from `--verbose-prompt` is unreliable for
+SentencePiece vocabularies**, which render whitespace as markers rather than as
+characters. Phi-3 and TinyLlama are both SPM, so their captured strings are
+right about structure and not trustworthy about spaces.

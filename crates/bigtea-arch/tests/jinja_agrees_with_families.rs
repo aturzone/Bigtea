@@ -94,11 +94,21 @@ fn every_container_template_renders_the_same_both_ways() {
         let messages = vec![Message::new("system", "SYS"), Message::new("user", "HI")];
         let want = fmt.apply(&messages, "</s>", true);
 
+        // llama.cpp's polyfill, applied before rendering: a template with no
+        // system branch would otherwise DROP the system turn silently, and
+        // Phi-3's does exactly that. Comparing without it compares two
+        // different conversations.
+        let raw = vec![msg("system", "SYS"), msg("user", "HI")];
+        let prepared = if bigtea_jinja::mentions_system_role(template) {
+            raw
+        } else {
+            bigtea_jinja::merge_system_into_first_user(
+                &raw, "
+",
+            )
+        };
         let mut env = Env::new();
-        env.set(
-            "messages",
-            Value::List(vec![msg("system", "SYS"), msg("user", "HI")]),
-        );
+        env.set("messages", Value::List(prepared));
         env.set("bos_token", Value::Str(String::new()));
         env.set("eos_token", Value::Str("</s>".into()));
         env.set("add_generation_prompt", Value::Bool(true));
