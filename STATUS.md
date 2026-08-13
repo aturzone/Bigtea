@@ -1691,6 +1691,54 @@ for its rich history` under `-b 1` against Bigtea's `Paris. <|assistant|> That's
 correct!`. The classification is unchanged — the reference is unstable there
 under all three configurations — but the stated reason was not reproducible.
 
+## `--jinja` is wired, and the fallback is the feature (2026-08-13)
+
+The container's own template is evaluated when asked, and **declines loudly** on
+anything the engine does not fully understand:
+
+```
+$ bigtea-run -m Qwen2-0.5B --jinja -sys SYS -p HI
+chat       template evaluated (--jinja)
+prompt     "<|im_start|>system
+SYS<|im_end|>
+<|im_start|>user
+HI<|im_end|>
+..."
+
+$ bigtea-run -m Llama-3.2-1B --jinja -sys SYS -p HI
+prompt     "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+
+            Cutting Knowledge Date: December 2023
+Today Date: 13 Aug 2026
+
+SYS..."
+
+$ bigtea-run -m Phi-3-mini --jinja -sys SYS -p HI
+chat       template has no system branch; merging it into the first user turn
+chat       template evaluated (--jinja)
+
+$ bigtea-run -m gemma-2-2b-it --jinja -sys SYS -p HI
+chat       --jinja declined: template rejected this conversation: System role not supported
+           falling back to the family matcher.
+```
+
+**Off by default, unlike llama.cpp.** The family renderers are verified
+byte-identical to llama.cpp's for 52 of its 54 names; making evaluation the
+default would change the prompt on models that are currently verified. That is
+a thing to opt into.
+
+Every decline names the construct. A fallback nobody can see is
+indistinguishable from a flag that does nothing — which is the failure `-t`
+already cost this project once.
+
+Gemma-2's decline is worth its own note: its template **raises** on a system
+turn, and falling back means the family matcher then accepts a conversation the
+model's own template forbids. The fallback is still the safe move; the family
+matcher's permissiveness is the open question.
+
+Flags: **165 implemented, 30 declined**, of 195 recognised. Tests **481**.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

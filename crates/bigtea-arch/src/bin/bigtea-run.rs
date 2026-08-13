@@ -497,7 +497,13 @@ fn parse_override(spec: &str) -> Option<(String, bigtea_gguf::Value)> {
 /// it continues it. Asked to "Write one sentence about the sea", Llama-3.2
 /// answered "The sentence should be concise and evocative", because it was
 /// completing an instruction rather than following one.
-fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool, system: Option<&str>) -> String {
+fn framed(
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    chat: bool,
+    system: Option<&str>,
+    jinja: bool,
+) -> String {
     // A system prompt is only meaningful inside a template — there is nowhere
     // to put it in raw completion — so asking for one implies chat framing
     // rather than being silently dropped.
@@ -518,7 +524,91 @@ fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool, system: Option<&str>)
         messages.push(Message::new("system", sys));
     }
     messages.push(Message::new("user", prompt));
+
+    if jinja {
+        if let Some(rendered) = render_with_jinja(tokenizer, system, prompt) {
+            return rendered;
+        }
+        // The message came from `render_with_jinja`; falling through is the
+        // designed path, not an error path.
+    }
     tokenizer.apply_chat_template(&messages, true)
+}
+
+/// Render the chat prompt by evaluating the container's own template.
+///
+/// `None` means the engine declined and the caller should use the family
+/// matcher. Every decline says why, because a silent fallback would make
+/// `--jinja` look like it worked while changing nothing.
+fn render_with_jinja(tokenizer: &Tokenizer, system: Option<&str>, prompt: &str) -> Option<String> {
+    use bigtea_jinja::Value;
+
+    let template = tokenizer.chat_template()?;
+    let mk = |role: &str, content: &str| {
+        let mut m = std::collections::HashMap::new();
+        m.insert("role".to_string(), Value::Str(role.to_string()));
+        m.insert("content".to_string(), Value::Str(content.to_string()));
+        Value::Map(m)
+    };
+    let mut raw = Vec::new();
+    if let Some(sys) = system {
+        raw.push(mk("system", sys));
+    }
+    raw.push(mk("user", prompt));
+
+    // llama.cpp's polyfill: a template with no system branch DROPS the system
+    // turn, so the content is merged into the first user turn instead. Phi-3's
+    // template does exactly that, and rendering it faithfully loses the system
+    // prompt with no error at all.
+    let messages = if bigtea_jinja::mentions_system_role(template) {
+        raw
+    } else {
+        if system.is_some() {
+            bigtea_arch::info!(
+                "chat       template has no system branch; merging it into the first user turn"
+            );
+        }
+        bigtea_jinja::merge_system_into_first_user(&raw, "\n")
+    };
+
+    let mut env = bigtea_jinja::Env::new();
+    env.set("messages", Value::List(messages));
+    env.set(
+        "bos_token",
+        Value::Str(
+            tokenizer
+                .bos
+                .and_then(|id| tokenizer.token_text(id))
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    );
+    env.set(
+        "eos_token",
+        Value::Str(
+            tokenizer
+                .eos
+                .and_then(|id| tokenizer.token_text(id))
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    );
+    env.set("add_generation_prompt", Value::Bool(true));
+
+    match bigtea_jinja::parse(template).and_then(|n| bigtea_jinja::render(&n, &mut env)) {
+        Ok(text) => {
+            bigtea_arch::info!("chat       template evaluated (--jinja)");
+            Some(text)
+        }
+        Err(e) => {
+            // Named, always. This is the fallback the crate exists to make
+            // safe, and a fallback nobody can see is indistinguishable from a
+            // flag that does nothing.
+            bigtea_arch::info!("chat       --jinja declined: {e}");
+            bigtea_arch::info!("           falling back to the family matcher.");
+            None
+        }
+    }
 }
 
 /// Perplexity over a corpus: the standard way to say a model still works.
@@ -1004,16 +1094,6 @@ const REFUSED: &[(&str, bool, &str)] = &[
         false,
         "no Jinja engine; templates are matched by family (see --chat-template)",
     ),
-    (
-        "--skip-chat-parsing",
-        false,
-        "no Jinja engine, so there is no parsed chat to skip",
-    ),
-    (
-        "--no-skip-chat-parsing",
-        false,
-        "no Jinja engine, so there is no parsed chat to skip",
-    ),
     // --- reasoning-format parsing, which is downstream of Jinja.
     // --- downloads. Implemented now -- see `resolve_model_source`. Only the
     // Docker registry stays out: it is a different protocol, not a URL.
@@ -1321,6 +1401,7 @@ fn main() -> ExitCode {
     let mut n_keep: usize = 0;
     let mut reasoning = Reasoning::default();
     let mut numa_isolate = false;
+    let mut jinja = false;
     // llama.cpp defaults --fit to on; so does this. It only ever adjusts
     // arguments the user did NOT set, which is what makes a default-on
     // auto-configuration safe.
@@ -1795,6 +1876,33 @@ fn main() -> ExitCode {
                     }
                 }
                 i += 2;
+            }
+            // --- template evaluation -----------------------------------------
+            //
+            // Evaluate the container's own Jinja rather than matching it to a
+            // family. **Falls back, loudly, on any construct the engine does
+            // not fully understand** -- that fallback is the whole safety
+            // property, because a wrong framing does not error and the model
+            // answers fluently having never seen the prompt shape.
+            //
+            // Off by default, unlike llama.cpp: the family renderers are
+            // verified byte-identical to llama.cpp's for 52 of its 54 names,
+            // and 6 of 15 containers here evaluate cleanly. Making evaluation
+            // the default would change the prompt on models that are currently
+            // verified, which is a thing to opt into.
+            "--jinja" => {
+                jinja = true;
+                i += 1;
+            }
+            "--no-jinja" => {
+                jinja = false;
+                i += 1;
+            }
+            // llama.cpp parses a rendered chat back into structured turns.
+            // Nothing here does, so there is nothing to skip -- accepted rather
+            // than refused, in the same spirit as `--swa-full`.
+            "--skip-chat-parsing" | "--no-skip-chat-parsing" => {
+                i += 1;
             }
             // --- reasoning blocks --------------------------------------------
             //
@@ -2546,6 +2654,7 @@ fn main() -> ExitCode {
             keep: n_keep,
         },
         reasoning,
+        jinja,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -3279,6 +3388,7 @@ fn run(
     fit: Fit,
     shift: Shift,
     reasoning: Reasoning,
+    jinja: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -3400,6 +3510,7 @@ fn run(
             prompt,
             chat || ui.conversation,
             system_prompt.as_deref(),
+            jinja,
         );
         run_deepseek4(
             &model,
@@ -3510,6 +3621,7 @@ fn run(
         prompt,
         chat || ui.conversation,
         system_prompt.as_deref(),
+        jinja,
     );
     let tokens: Vec<u32> = tokenizer.encode(prompt);
     bigtea_arch::info!("prompt     {prompt:?} -> {} tokens", tokens.len());
