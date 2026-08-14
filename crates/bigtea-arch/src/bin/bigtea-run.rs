@@ -1133,16 +1133,12 @@ const REFUSED: &[(&str, bool, &str)] = &[
         "this is a CLI, not a server; see `bigtea-serve`",
     ),
     ("--no-mmproj", false, "no multimodal projector support"),
-    // --- Jinja. llama.cpp evaluates chat templates with a real Jinja engine.
-    // This build matches them by family and applies a hardcoded renderer,
-    // verified byte-identical against llama.cpp for 52 of its 54 names. A
-    // half-implemented Jinja would silently produce the wrong framing, which is
-    // the failure this project is most expensive at.
-    (
-        "--jinja",
-        false,
-        "no Jinja engine; templates are matched by family (see --chat-template)",
-    ),
+    // --- Jinja WAS refused here, and the entry outlived the refusal. `--jinja`
+    // gained an explicit match arm when the engine landed, and because the
+    // `REFUSED` lookup happens in the fallback arm, that arm shadowed this
+    // entry: the row said "no Jinja engine" while the engine ran. Dead code
+    // that lies is worse than dead code, and it inflated the declined count by
+    // one. `declined_flags_actually_decline` now runs the binary once per row.
     // --- reasoning-format parsing, which is downstream of Jinja.
     // --- downloads. Implemented now -- see `resolve_model_source`. Only the
     // Docker registry stays out: it is a different protocol, not a URL.
@@ -1929,6 +1925,55 @@ fn main() -> ExitCode {
                 }
                 i += 2;
             }
+            // --- flash attention ----------------------------------------------
+            //
+            // **This build has exactly one attention path and it is the flash
+            // one** -- `attention_flash` in `qwen3.rs`, the sole caller being
+            // `stream.rs`. There is no `mul_mat` fallback to switch back to.
+            //
+            // So `on` and `auto` describe what already happens and are accepted
+            // saying so; `off` is refused by name. Accepting `off` and running
+            // flash anyway would be the exact lie the `REFUSED` table exists to
+            // stop, and it would be an expensive one: `-fa off` is one of the
+            // no-op configurations `scripts/parity-check.sh` uses to ask the
+            // reference whether it agrees with itself, so a silently-ignored
+            // `off` turns a parity check into a comparison of a run with itself.
+            //
+            // Until this arm existed the flag was not merely missing, it was
+            // SWALLOWED: `-fa` became the prompt. See the unknown-flag arm.
+            "-fa" | "--flash-attn" => {
+                match rest.get(i + 1).map(String::as_str) {
+                    // Bare `-fa`, or followed by the prompt rather than a value.
+                    None | Some("on" | "auto" | "1" | "true") => {
+                        bigtea_arch::info!(
+                            "attn       flash attention is the only path here; -fa is the default"
+                        );
+                        // A value was consumed only if one was actually given.
+                        i += match rest.get(i + 1).map(String::as_str) {
+                            Some("on" | "auto" | "1" | "true") => 2,
+                            _ => 1,
+                        };
+                    }
+                    Some("off" | "0" | "false") => {
+                        eprintln!(
+                            "bigtea-run: -fa off is not supported: this build has one attention \
+                             path and it is the flash one."
+                        );
+                        eprintln!(
+                            "  Declined rather than ignored -- accepting it would report a \
+                             non-flash"
+                        );
+                        eprintln!(
+                            "  run that never happened, and `-fa off` is a parity-check control."
+                        );
+                        return ExitCode::from(2);
+                    }
+                    Some(other) => {
+                        eprintln!("bigtea-run: -fa {other:?}: expected on, off or auto");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             // --- adapters -----------------------------------------------------
             //
             // Loaded and CHECKED, not applied. Applying either is a change to
@@ -2619,6 +2664,15 @@ fn main() -> ExitCode {
                 }
                 i += 2;
             }
+            // Everything after `--` is a prompt, whatever it starts with. The
+            // escape hatch has to exist before unknown flags become an error,
+            // or a prompt that begins with a dash becomes unsayable.
+            "--" => {
+                if prompt.is_empty() {
+                    prompt = rest[i + 1..].join(" ");
+                }
+                break;
+            }
             other => {
                 // Declined, not ignored -- see `REFUSED`.
                 if let Some((takes_arg, why)) = refusal(other) {
@@ -2626,6 +2680,25 @@ fn main() -> ExitCode {
                     eprintln!("  Declined rather than ignored: a run never quietly does less");
                     eprintln!("  than its command line says. Drop the flag to continue.");
                     let _ = takes_arg;
+                    return ExitCode::from(2);
+                }
+                // **An unknown flag is an error, not a prompt.** This arm used
+                // to take any leftover token as the prompt, so a mistyped or
+                // unimplemented flag was SILENTLY EATEN and the real prompt
+                // discarded with it:
+                //
+                //   bigtea-run -m m -fa off "hello"   ->  prompt = "-fa"
+                //
+                // No message, exit 0, a completion of the wrong text. That is
+                // the same failure the `REFUSED` table exists to prevent,
+                // arriving through the gap the table does not cover — and it
+                // covered `-fa`, which llama.cpp has and this build does not.
+                // Being wrong about a flag is survivable; being quiet is not.
+                if other.starts_with('-') && other.len() > 1 {
+                    eprintln!("bigtea-run: unknown flag {other}");
+                    eprintln!("  Not treated as a prompt: doing that silently discards the");
+                    eprintln!("  real one and completes the wrong text. `--help` lists what");
+                    eprintln!("  is recognised; `-- {other}` forces it to be the prompt.");
                     return ExitCode::from(2);
                 }
                 if prompt.is_empty() {

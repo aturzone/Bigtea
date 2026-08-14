@@ -1208,15 +1208,39 @@ than from metadata keys, because containers disagree about which keys they set
 while the token text is stable. Qwen3-4B: 4 tokens found. Qwen2-0.5B: 0, and it
 says `0` rather than pretending.
 
-## Every llama.cpp flag is now recognised — 128 implemented, 57 declined
+## Every llama.cpp flag is now recognised — 158 implemented, 24 declined
 
-`bigtea-run` accepts **185 long flags** against llama.cpp's 182. **That is not
-flag parity and must not be quoted as one:**
+**Updated 2026-08-14, and the previous headline was false.** It read "every
+llama.cpp flag is now recognised" while `--flash-attn`/`-fa` was in neither the
+implemented set nor the declined one — and an unrecognised flag was not an
+error, it became the *prompt*. `bigtea-run -m m.gguf -fa off "hello"` ran with
+`prompt = "-fa"`, discarded `"hello"`, and exited **0**. The claim was checked by
+reading a table; the gap was in the code the table does not describe.
+
+The counts are now **computed from both sources** rather than tallied:
+
+```
+llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u   # 182
+```
+
+intersected with `bigtea-run`'s match arms and with its `REFUSED` table:
 
 | | count |
 |---|---:|
-| implemented — the flag changes something observable | **128** |
-| declined with a reason — recognised, exits 2, names what is missing | **57** |
+| implemented — the flag changes something observable | **158** |
+| declined with a reason — recognised, exits 2, names what is missing | **24** |
+| in neither — silently swallowed | **0** |
+
+**That is still not flag parity and must not be quoted as one.** 24 flags do
+nothing here, and 15 of them are GPU.
+
+An unknown `-` token is now an error, with `--` as the escape hatch for a prompt
+that genuinely starts with a dash. `declined_flags_actually_decline` extracts the
+`REFUSED` table from source at test time and runs the binary once per row, so the
+table cannot drift from the binary again — it had, silently: `--jinja` sat in the
+table claiming "no Jinja engine" while `bigtea-jinja` evaluated templates one
+match arm above it, and because `REFUSED` is consulted from the *fallback* arm,
+the explicit arm shadowed the row. Dead code that lies.
 
 A command line copied from llama.cpp now runs or explains itself, instead of
 dying on an unknown flag. What it never does is quietly do less than it says:
@@ -1237,16 +1261,30 @@ cheap defence against repeating that.
 
 What is declined, and the honest reason:
 
-| group | why |
-|---|---|
-| 15 GPU flags | **no GPU backend exists.** `bigtea-probe` detects the card and nothing uses it; a VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer (`weights.rs:286`). Scoped 2026-08-11 in `research/gpu-tier-smallest-honest-slice-2026-08-11.md`: this machine has **no CUDA toolkit at all**, and dense-layers-in-VRAM is a 1.10x ceiling on the model where it fits and doesn't fit on the model where it would matter |
-| 4 draft-model flags | speculative decoding measured ~1.4x here, not the literature's 2.2x, and is a net loss below ~0.75 acceptance |
-| 5 adapter flags | LoRA and control vectors are real work not yet done, and a silently unapplied LoRA is a model answering as though never fine-tuned |
-| 6 Jinja / chat-parsing | no Jinja engine. Templates are matched by family and verified byte-identical to llama.cpp for 52 of 54 names; a half-implemented Jinja would silently produce the wrong framing |
-| 6 reasoning-format | downstream of Jinja |
-| 8 download flags | `bigtea-pull` is the tool; wiring it in needs resumable, verified downloads rather than an alias |
-| 9 affinity / NUMA / poll | ggml owns its threadpool here; `-t`, `-tb` and `--prio` are the levers that exist |
-| 4 runner-shape | one sequence by design, an append-only KV cache that cannot fragment, no self-extend |
+All 24, by group — the counts add up to 24 because they are the table's rows,
+not a summary of it:
+
+| n | flags | why |
+|---:|---|---|
+| 10 | `--device`, `--list-devices`, `--gpu-layers`, `--n-gpu-layers`, `--main-gpu`, `--split-mode`, `--tensor-split`, `--kv-offload`, `--op-offload`, `--override-tensor` | **no GPU backend exists.** `bigtea-probe` detects the card and nothing uses it; a VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer (`weights.rs:286`). Scoped 2026-08-11 in `research/gpu-tier-smallest-honest-slice-2026-08-11.md`: this machine has **no CUDA toolkit at all**, and dense-layers-in-VRAM is a 1.10x ceiling on the model where it fits and doesn't fit on the model where it would matter |
+| 4 | `--cache-type-{k,v}-draft`, `--spec-draft-type-{k,v}` | speculative decoding measured ~1.4x here, not the literature's 2.2x, and is a net loss below ~0.75 acceptance |
+| 2 | `--grp-attn-n`, `--grp-attn-w` | self-extend, which needs a change to `stream.rs` |
+| 2 | `--parallel`, `--defrag-thold` | one sequence by design; an append-only KV cache that cannot fragment |
+| 2 | `--poll`, `--poll-batch` | spin-vs-yield inside ggml's threadpool, which ggml owns. Affinity, NUMA-isolate and `--prio` all moved *out* of this row and are implemented — they were one syscall each, and "no affinity layer" described the code rather than the difficulty |
+| 2 | `--no-host`, `--no-mmproj` | a host buffer type and a multimodal projector, neither of which exists here |
+| 1 | `--backend-sampling` | a GPU concept |
+| 1 | `--docker-repo` | a different protocol, not a URL. `-hf`, `--hf-repo` and `--model-url` are implemented |
+
+**`-fa off` is refused too but is not in that table**, because it is a refused
+*value* of an implemented flag: one attention path exists and it is the flash
+one. It is declined by name rather than accepted, since `-fa off` is a control
+`parity-check.sh` passes to the *reference* — ignoring it would silently turn a
+parity check into a comparison of a run with itself.
+
+Jinja, reasoning-format, the download flags, affinity and the adapters **left
+this table**. The 57 → 24 move is mostly those, not a change of standard: the
+adapter flags now load and shape-check a LoRA, though nothing applies it yet, and
+that gap is stated where the flag is documented rather than by declining it.
 
 Three more implemented in the same batch: `--mmap` (the default, spelled out),
 `--ubatch-size` (takes the smaller of it and `-b`, and says which), and
