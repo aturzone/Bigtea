@@ -1388,6 +1388,22 @@ impl<'m> StreamingRunner<'m> {
                 } else {
                     (q, k, v)
                 };
+                // MPT, DBRX and OLMo declare `attention.clamp_kqv`, and
+                // llama.cpp clamps here — after the bias, before the reshape.
+                // Order matters: clamping before the bias would bound a
+                // different quantity. The OLMo-1B container declares 0.0, so
+                // this branch is written against the reference's code rather
+                // than exercised by a run.
+                let (q, k, v) = if c.clamp_kqv > 0.0 {
+                    let (lo, hi) = (-c.clamp_kqv, c.clamp_kqv);
+                    (
+                        ctx.clamp(&q, lo, hi)?,
+                        ctx.clamp(&k, lo, hi)?,
+                        ctx.clamp(&v, lo, hi)?,
+                    )
+                } else {
+                    (q, k, v)
+                };
 
                 let q = ctx.reshape_3d(&q, head_dim, c.n_head as i64, n_new)?;
                 let k = ctx.reshape_3d(&k, head_dim, n_kv, n_new)?;
@@ -1421,8 +1437,19 @@ impl<'m> StreamingRunner<'m> {
                 // `n_rot`, not `head_dim`: StableLM rotates 16 of its 64 and
                 // leaves the rest alone. Rotating all of them is not an error.
                 let n_rot = c.n_rot as i32;
-                let q = ctx.rope_ext(&q, &pos, None, n_rot, rope_type, 0, rp)?;
-                let k = ctx.rope_ext(&k, &pos, None, n_rot, rope_type, 0, rp)?;
+                // **Llama-3.1/3.2/3.3 ship their RoPE scaling as a tensor.**
+                // `rope_freqs.weight` is `n_rot/2` divisors, one per frequency,
+                // and `ggml_rope_ext` takes it where this used to pass `None`.
+                // Without it the low frequencies rotate as though the model had
+                // never been extended: short prompts still agree, longer ones
+                // drift, and on Llama-3.2-1B four of eight parity prompts read
+                // as "the reference disagrees with itself" while a fifth was a
+                // clean FAIL. Nothing in the metadata announces it — llama.cpp
+                // logs `create_tensor: loading tensor rope_freqs.weight` and
+                // that line is the only sign.
+                let freqs = weights.get("rope_freqs.weight");
+                let q = ctx.rope_ext(&q, &pos, freqs, n_rot, rope_type, 0, rp)?;
+                let k = ctx.rope_ext(&k, &pos, freqs, n_rot, rope_type, 0, rp)?;
 
                 // One compute materialises all three, which is what the comment
                 // here claimed while the code called `compute` once per tensor.
@@ -1676,113 +1703,6 @@ impl<'m> StreamingRunner<'m> {
         self.stats.other_seconds += t_out.elapsed().as_secs_f64();
         Ok(logits)
     }
-
-    /// Full forward pass, streaming experts, returning logits for every token.
-    ///
-    /// Runs one layer at a time so the router's choice can drive what is read
-    /// next. Activations cross layer boundaries as plain `Vec<f32>` — small
-    /// (`n_embd * n_tokens`) compared to the weights, and it lets each layer's
-    /// arena be reclaimed immediately.
-    pub fn forward<'a>(
-        &mut self,
-        weights: &WeightSet<'a>,
-        tokens: &[u32],
-        positions: &[i32],
-    ) -> Result<Vec<f32>> {
-        let c = self.arch.config.clone();
-        let n_tokens = tokens.len() as i64;
-        let n_embd = c.n_embd as i64;
-        let threads = self.threads_for(tokens.len());
-
-        // Embedding lookup, once.
-        let mut x: Vec<f32> = {
-            let ctx = Context::new(512 << 20)?;
-            let tok = ctx.new_i32_1d(n_tokens)?;
-            tok.set_i32(&tokens.iter().map(|&t| t as i32).collect::<Vec<_>>())?;
-            let emb = weights
-                .get("token_embd.weight")
-                .ok_or_else(|| ArchError::MissingTensor("token_embd.weight".into()))?;
-            let rows = ctx.get_rows(emb, &tok)?;
-            ctx.compute(&rows, threads)?;
-            rows.to_vec_f32()
-        };
-
-        for il in 0..c.n_layer {
-            // Attention and the router run as one graph; computing the router
-            // output also materialises everything upstream, so the residual
-            // and the normed activations can be read from the same pass.
-            let ctx = Context::new(1 << 30)?;
-            let get = |n: &str| -> Result<&Tensor<'a>> {
-                weights
-                    .get(n)
-                    .ok_or_else(|| ArchError::MissingTensor(n.into()))
-            };
-
-            let xt = ctx.new_f32_2d(n_embd, n_tokens)?;
-            xt.set_f32(&x)?;
-            let pos = ctx.new_i32_1d(n_tokens)?;
-            pos.set_i32(positions)?;
-
-            let attn_out = self.arch.attention_block(
-                &ctx,
-                weights,
-                &xt,
-                &pos,
-                n_tokens,
-                il,
-                self.rope(),
-                ROPE_TYPE_NEOX,
-            )?;
-            let ffn_input = ctx.add(&attn_out, &xt)?;
-            let normed = self.arch.norm_scaled(
-                &ctx,
-                &ffn_input,
-                get(&format!("blk.{il}.ffn_norm.weight"))?,
-            )?;
-
-            let logits = ctx.mul_mat(get(&format!("blk.{il}.ffn_gate_inp.weight"))?, &normed)?;
-            let probs = ctx.soft_max_ext(&logits, None, 1.0, 0.0)?;
-            ctx.compute(&probs, threads)?;
-
-            let residual = ffn_input.to_vec_f32();
-            let normed_v = normed.to_vec_f32();
-            let probs_v = probs.to_vec_f32();
-            drop(ctx);
-
-            // Experts, per token: the router's choice differs for each.
-            let n_expert = c.n_expert as usize;
-            let mut next = residual;
-            for t in 0..tokens.len() {
-                let lo = t * c.n_embd as usize;
-                let hi = lo + c.n_embd as usize;
-                let token_probs = &probs_v[t * n_expert..(t + 1) * n_expert];
-                let expert_out = self.expert_ffn(&normed_v[lo..hi], il, token_probs)?;
-                for (dst, v) in next[lo..hi].iter_mut().zip(expert_out) {
-                    *dst += v;
-                }
-            }
-            x = next;
-        }
-
-        // Final norm and output projection.
-        let ctx = Context::new(1 << 30)?;
-        let xt = ctx.new_f32_2d(n_embd, n_tokens)?;
-        xt.set_f32(&x)?;
-        let normed = self.arch.norm_named(&ctx, weights, &xt, "output_norm")?;
-        let out_name = if weights.get("output.weight").is_some() {
-            "output.weight"
-        } else {
-            "token_embd.weight"
-        };
-        let out = ctx.mul_mat(
-            weights
-                .get(out_name)
-                .ok_or_else(|| ArchError::MissingTensor(out_name.into()))?,
-            &normed,
-        )?;
-        ctx.compute(&out, threads)?;
-        Ok(out.to_vec_f32())
-    }
 }
 
 #[cfg(test)]
@@ -1882,6 +1802,11 @@ mod tests {
             rope_orig_ctx: 0,
             attn_bias: false,
             layer_norm: false,
+            norm_affine: true,
+            norm_bias: false,
+            clamp_kqv: 0.0,
+            uses_alibi: false,
+            rope_freqs: false,
             ffn_bias: false,
             attn_out_bias: false,
             n_rot: 16,

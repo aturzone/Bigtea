@@ -13,7 +13,7 @@
 //! The MoE variant differs only in the feed-forward block: a router picks
 //! `n_expert_used` of `n_expert`, and `mul_mat_id` applies just those.
 
-use bigtea_ggml::{Context, RopeParams, Tensor, WeightSet};
+use bigtea_ggml::{Context, Tensor, WeightSet};
 use bigtea_model::Model;
 
 use crate::{ArchError, Result};
@@ -40,9 +40,16 @@ const ROPE_TYPE_NORM: i32 = 0;
 /// and the runner says so out loud.
 fn rope_type_for(arch: &str) -> (i32, bool) {
     match arch {
-        "llama" | "llama4" | "baichuan" | "deci" | "mistral" => (ROPE_TYPE_NORM, true),
+        // `olmo` and `internlm2` were read straight out of llama.cpp's
+        // `llama_model_rope_type`, which lists both in the NORM branch beside
+        // `LLM_ARCH_LLAMA`. `olmo` was previously in the NEOX arm below **with
+        // `known = true`** — a guess wearing the label of a checked fact, and
+        // wrong. Nothing had ever been run against the reference for it.
+        "llama" | "llama4" | "baichuan" | "deci" | "mistral" | "olmo" | "internlm2" => {
+            (ROPE_TYPE_NORM, true)
+        }
         "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "phi3" | "gemma" | "gemma2" | "gemma3"
-        | "stablelm" | "olmo" | "starcoder2" => (ROPE_TYPE_NEOX, true),
+        | "stablelm" | "starcoder2" => (ROPE_TYPE_NEOX, true),
         _ => (ROPE_TYPE_NEOX, false),
     }
 }
@@ -105,15 +112,48 @@ fn ffn_act_for(arch: &str) -> FfnAct {
 /// So the default is to refuse an architecture nobody has checked. `--force`
 /// runs it anyway, which is the right escape hatch for someone testing a new
 /// architecture — but it has to be asked for.
+/// A name here is **not** a claim that every model calling itself that will
+/// run. `baichuan` covers a 7B this path is verified against and a 13B it
+/// refuses (see [`Qwen3Config::uses_alibi`]); membership means the eight-prompt
+/// diff was run against *a* container, and the refusals guard the rest.
 pub const VERIFIED_ARCHITECTURES: &[&str] = &[
+    "baichuan",
     "deepseek4",
     "gemma2",
     "gemma3",
+    "internlm2",
     "llama",
+    "olmo",
     "phi3",
     "qwen2",
     "qwen3",
-    "qwen3moe",
+    // `qwen3moe` WAS HERE AND HAS BEEN REMOVED — but what still keeps it out is
+    // the *harness*, not the engine.
+    //
+    // It had never been through the eight-prompt diff; run at last it came back
+    // 1 FAIL + 6 unstable. One real bug was found and fixed: an MoE container
+    // has no `ffn_gate` (its gate is `ffn_gate_exps`), so it was classified
+    // ungated and ran GELU where the reference runs SiLU. That killed a loop
+    // and four of the near-ties.
+    //
+    // The remaining FAIL is a **near-tie, demonstrated**: llama.cpp produces
+    // our exact answer under `-b 1` and `-ub 1`, which change batching, and so
+    // summation order, and nothing else.
+    //
+    //   default / -fa off / --no-repack : …Madrid. The capital of Germany is Berlin.
+    //   -b 1 / -ub 1                    : …Madrid. The capital of Portugal is Lisbon.
+    //   bigtea                          : …Madrid. The capital of Portugal is Lisbon.
+    //
+    // `parity-check.sh` re-checks a mismatch against `-fa off` and
+    // `--no-repack` only, and neither moves this prompt, so it reports FAIL.
+    // **The set of no-op configurations you test decides what you call a bug**,
+    // and `-b 1` is the axis that moves this model. It also reproduces both of
+    // Phi-3's otherwise-unexplained near-ties.
+    //
+    // Left out regardless, because the rule is that the diff passes — not that
+    // someone argues it should have. It goes back when the harness gains `-b 1`
+    // and the run comes out clean, which is a decision for the session that
+    // owns `scripts/`.
     "stablelm",
     "starcoder2",
 ];
@@ -195,6 +235,55 @@ pub struct Qwen3Config {
     /// Substituting one is not an error and not a crash — StableLM and
     /// StarCoder2 read as fluent CJK noise before this existed.
     pub layer_norm: bool,
+    /// Whether the norms have learned parameters at all.
+    ///
+    /// **OLMo has none**: llama.cpp builds every one of its norms as
+    /// `build_norm(x, NULL, NULL, LLM_NORM)` — centre, divide by the standard
+    /// deviation, and stop. The container holds no `attn_norm.weight`, no
+    /// `ffn_norm.weight` and no `output_norm.weight`, so the previous code
+    /// refused it up front with `container has no tensor "output_norm.weight"`.
+    /// That refusal was the *good* outcome; the danger is the opposite reading,
+    /// where an affine architecture loses a norm weight and quietly runs
+    /// non-parametric. Hence a flag rather than "apply the weight if you find
+    /// one": when this is true a missing weight is still `MissingTensor`.
+    pub norm_affine: bool,
+    /// Whether the norms carry a **shift** as well as a scale.
+    ///
+    /// Separate from [`layer_norm`](Self::layer_norm), and the separation is
+    /// the OLMo lesson: LayerNorm-ness and having-a-bias used to be the same
+    /// boolean, because every LayerNorm seen so far had one. OLMo is a
+    /// LayerNorm with neither parameter, so folding the two together made the
+    /// loader demand an `output_norm.bias` that cannot exist.
+    ///
+    /// It still gates `required_tensors`, which is what keeps the original
+    /// guarantee: if `blk.0` has a bias then every layer must list one, and a
+    /// bias that is not listed is never loaded and silently skipped.
+    pub norm_bias: bool,
+    /// Symmetric clamp on Q, K and V after projection; `0.0` means none.
+    ///
+    /// llama.cpp applies it inside `build_qkv`, after the bias and before the
+    /// reshape. Declared by MPT, DBRX and OLMo — the OLMo-1B container says
+    /// `0.0`, so this is implemented against the reference's *code* rather than
+    /// against a run, and the 7B is the container that would exercise it.
+    pub clamp_kqv: f32,
+    /// This model biases attention by distance instead of rotating — and
+    /// **nothing in the container says so.**
+    ///
+    /// llama.cpp reads it from the *layer count*: `baichuan.cpp` sets
+    /// `f_max_alibi_bias = 8.0` when `n_layer == 40`, which is the 13B. So one
+    /// architecture name covers a model this path runs correctly (the 7B,
+    /// verified) and one it cannot. [`Qwen3::verify`] refuses the second rather
+    /// than rotating keys that should not be rotated.
+    pub uses_alibi: bool,
+    /// The container ships `rope_freqs.weight`: **per-frequency RoPE divisors,
+    /// carried as a tensor rather than as metadata.**
+    ///
+    /// This is how llama.cpp represents `rope_scaling.rope_type = "llama3"` —
+    /// the low/high frequency factors are folded into `n_rot/2` numbers at
+    /// conversion time, and `ggml_rope_ext` takes them as `freq_factors`. The
+    /// metadata says `rope scaling = linear, freq_scale_train = 1`, which reads
+    /// exactly like a model that was never extended.
+    pub rope_freqs: bool,
     /// Biases on `attn_output`, `ffn_up` and `ffn_down`.
     ///
     /// Separate from [`attn_bias`](Self::attn_bias), which is Q/K/V: Qwen2 has
@@ -288,12 +377,26 @@ impl Qwen3Config {
             .arch_u64("attention.key_length")
             .unwrap_or((n_embd / n_head.max(1)) as u64) as u32;
 
-        // A missing `ffn_gate` means one of two very different things, and the
-        // **shape** separates them: Phi-3 fuses gate and up into one tensor
-        // twice `n_ff` wide, while StarCoder2 has no gate at all and its
-        // `ffn_up` is `n_ff` wide. Computed here rather than in the literal
-        // because `ffn_act` needs to know which of the two it is.
-        let no_gate = model.location("blk.0.ffn_gate.weight").is_none();
+        // A missing `ffn_gate` means one of **three** very different things.
+        //
+        // Phi-3 fuses gate and up into one tensor twice `n_ff` wide; StarCoder2
+        // has no gate at all and its `ffn_up` is `n_ff` wide — the shape
+        // separates those two. And an **MoE container has no `ffn_gate` either**,
+        // because its gate is `ffn_gate_exps`, one tensor holding every expert.
+        //
+        // Testing the dense name alone made every all-MoE model "ungated" and
+        // ran **GELU over its experts where Qwen3-MoE runs SiLU** — the Gemma
+        // activation bug again, introduced by the fix for StarCoder2 and caught
+        // only when `qwen3moe` was finally put through the eight-prompt sweep.
+        // It answered `Paris. True or False? The capital of France is Paris.
+        // True or False?` against the reference's `Paris. The capital of Italy
+        // is Rome.` — a loop, which is what a subtly wrong FFN looks like.
+        //
+        // DeepSeek-V4-Flash escaped it because its first layers are dense, so
+        // `blk.0.ffn_gate.weight` exists there. Being saved by which layer is
+        // numbered zero is not a check.
+        let moe_gate = model.location("blk.0.ffn_gate_exps.weight").is_some();
+        let no_gate = !moe_gate && model.location("blk.0.ffn_gate.weight").is_none();
         let up_ne1 = model
             .location("blk.0.ffn_up.weight")
             .and_then(|l| l.dims.get(1).copied())
@@ -364,7 +467,18 @@ impl Qwen3Config {
             // A norm carrying a bias is a LayerNorm. Nothing else distinguishes
             // them, and the metadata key differs too:
             // `attention.layer_norm_epsilon` against `..._rms_epsilon`.
-            layer_norm: model.location("blk.0.attn_norm.bias").is_some(),
+            //
+            // A norm with **neither** weight nor bias is a LayerNorm too, and
+            // only a LayerNorm: llama.cpp's non-parametric form is `LLM_NORM`,
+            // and a parameterless RMSNorm exists nowhere in it. OLMo is that
+            // case, and reading it as RMSNorm would skip the centring.
+            layer_norm: model.location("blk.0.attn_norm.bias").is_some()
+                || model.location("blk.0.attn_norm.weight").is_none(),
+            norm_affine: model.location("blk.0.attn_norm.weight").is_some(),
+            norm_bias: model.location("blk.0.attn_norm.bias").is_some(),
+            clamp_kqv: model.arch_f32("attention.clamp_kqv").unwrap_or(0.0),
+            uses_alibi: arch == "baichuan" && need("block_count")? == 40,
+            rope_freqs: model.location("rope_freqs.weight").is_some(),
             ffn_bias: model.location("blk.0.ffn_down.bias").is_some(),
             attn_out_bias: model.location("blk.0.attn_output.bias").is_some(),
             // Declared by the containers that rotate only part of each head;
@@ -564,26 +678,40 @@ impl Qwen3Model {
     /// out at layer 37 that a tensor is missing is a poor way to learn it.
     pub fn required_tensors(&self) -> Vec<String> {
         let c = &self.config;
-        let mut names = vec![
-            "token_embd.weight".to_string(),
-            "output_norm.weight".to_string(),
-        ];
+        let mut names = vec!["token_embd.weight".to_string()];
+        // OLMo's norms have no parameters at all, so demanding these refuses a
+        // container that is perfectly loadable — which is exactly how it failed
+        // before: `container has no tensor "output_norm.weight"`.
+        if c.norm_affine {
+            names.push("output_norm.weight".to_string());
+        }
         // The final norm has a bias too on a LayerNorm architecture, and it is
         // the easiest of the lot to miss: it is applied once, so a wrong final
         // norm shifts every logit by the same vector and the text stays fluent.
-        if c.layer_norm {
+        if c.norm_bias {
             names.push("output_norm.bias".to_string());
         }
+        // Listed so that it is **loaded**. A tensor absent from here is never
+        // bound, `weights.get` returns `None`, and the graph carries on without
+        // it — which for RoPE divisors is a slightly wrong rotation, not an
+        // error. Asked of the container because only the extended Llama-3.x
+        // models carry one.
+        if c.rope_freqs {
+            names.push("rope_freqs.weight".to_string());
+        }
         for il in 0..c.n_layer {
-            for suffix in ["attn_norm.weight", "attn_output.weight", "ffn_norm.weight"] {
-                names.push(format!("blk.{il}.{suffix}"));
+            names.push(format!("blk.{il}.attn_output.weight"));
+            if c.norm_affine {
+                for suffix in ["attn_norm.weight", "ffn_norm.weight"] {
+                    names.push(format!("blk.{il}.{suffix}"));
+                }
             }
             // **A bias that is not listed here is never loaded**, and the graph
             // then silently skips it — `weights.get` returns `None` and the
             // shift is simply not applied. That is not a missing-tensor error;
             // it is a slightly wrong answer, which is how StableLM read after
             // LayerNorm landed but before this did.
-            if c.layer_norm {
+            if c.norm_bias {
                 for suffix in ["attn_norm.bias", "ffn_norm.bias"] {
                     names.push(format!("blk.{il}.{suffix}"));
                 }
@@ -647,6 +775,19 @@ impl Qwen3Model {
 
     /// Check the container has everything, before any weights are read.
     pub fn verify(&self, model: &Model) -> Result<()> {
+        // **ALiBi is not implemented, and the container never says so.**
+        // Baichuan-7B and Baichuan-13B hold the same tensor set under the same
+        // architecture name; llama.cpp picks positional encoding by layer
+        // count, giving the 40-layer 13B a linear attention bias and no RoPE at
+        // all. The 7B is verified here. The 13B would load, rotate keys it
+        // should not rotate, skip a bias it should apply, and answer fluently.
+        if self.config.uses_alibi {
+            return Err(ArchError::Unimplemented(
+                "this model uses ALiBi rather than RoPE (baichuan at 40 layers \
+                 is the 13B), and no ALiBi path exists — it would run and be \
+                 wrong rather than fail",
+            ));
+        }
         for name in self.required_tensors() {
             if model.location(&name).is_none() {
                 return Err(ArchError::MissingTensor(name));
@@ -667,161 +808,19 @@ impl Qwen3Model {
         }
     }
 
-    /// Build the forward graph for one batch of tokens and return the logits
-    /// tensor. Nothing is computed until [`Context::compute`] runs.
-    ///
-    /// `positions` must hold each token's absolute position; RoPE depends on
-    /// it, and off-by-one here degrades output subtly rather than obviously.
-    pub fn build_graph<'a>(
-        &self,
-        ctx: &'a Context,
-        weights: &WeightSet<'a>,
-        tokens: &Tensor<'a>,
-        positions: &Tensor<'a>,
-        n_tokens: i64,
-    ) -> Result<Tensor<'a>> {
-        let c = &self.config;
-        let get = |name: &str| -> Result<&Tensor<'a>> {
-            weights
-                .get(name)
-                .ok_or_else(|| ArchError::MissingTensor(name.to_string()))
-        };
-        let rope = RopeParams {
-            freq_base: c.rope_freq_base,
-            ..RopeParams::default()
-        };
-
-        // Token ids -> embedding vectors.
-        let mut cur = ctx.get_rows(get("token_embd.weight")?, tokens)?;
-
-        for il in 0..c.n_layer {
-            let residual = cur;
-
-            // --- attention ---------------------------------------------------
-            let normed =
-                self.rms_norm_mul(ctx, &cur, get(&format!("blk.{il}.attn_norm.weight"))?)?;
-
-            let (qw, kw, vw) = self.qkv_weights(ctx, weights, il)?;
-            let q = ctx.mul_mat(&qw, &normed)?;
-            let k = ctx.mul_mat(&kw, &normed)?;
-            let v = ctx.mul_mat(&vw, &normed)?;
-
-            // Split into heads before normalising: Qwen3 normalises each head
-            // separately, with a weight of head_dim rather than n_embd.
-            let q = ctx.reshape_3d(&q, c.head_dim as i64, c.n_head as i64, n_tokens)?;
-            let k = ctx.reshape_3d(&k, c.head_dim as i64, c.n_head_kv as i64, n_tokens)?;
-
-            // Absent on Llama, Mistral, Qwen2, Gemma and Phi: those normalise
-            // once before the projections and not again per head.
-            let (q, k) = if c.qk_norm {
-                (
-                    self.rms_norm_mul(ctx, &q, get(&format!("blk.{il}.attn_q_norm.weight"))?)?,
-                    self.rms_norm_mul(ctx, &k, get(&format!("blk.{il}.attn_k_norm.weight"))?)?,
-                )
-            } else {
-                (q, k)
-            };
-
-            let q = ctx.rope_ext(&q, positions, None, c.head_dim as i32, c.rope_type, 0, rope)?;
-            let k = ctx.rope_ext(&k, positions, None, c.head_dim as i32, c.rope_type, 0, rope)?;
-
-            let attn = self.attention(ctx, &q, &k, &v, n_tokens)?;
-            let attn = ctx.mul_mat(get(&format!("blk.{il}.attn_output.weight"))?, &attn)?;
-
-            let ffn_input = ctx.add(&attn, &residual)?;
-
-            // --- feed forward ------------------------------------------------
-            let normed =
-                self.rms_norm_mul(ctx, &ffn_input, get(&format!("blk.{il}.ffn_norm.weight"))?)?;
-
-            let ffn_out = if c.is_moe() {
-                self.moe_ffn(ctx, weights, &normed, il, n_tokens)?
-            } else {
-                self.dense_ffn(ctx, weights, &normed, il)?
-            };
-
-            cur = ctx.add(&ffn_out, &ffn_input)?;
-        }
-
-        // Only the final position predicts the next token, so the output
-        // projection is taken on that row alone.
-        //
-        // Projecting all of them is what a naive graph does, and it is enormous:
-        // the vocabulary is 151936 wide, so a 651-token prompt costs
-        // `651 x 2560 x 151936` = **253 GFLOP** and 395 MB of logits, of which
-        // one row is used. It also made the arena quadratic-looking when the
-        // real driver was this term, and a 651-token prompt aborted with
-        // `GGML_ASSERT` on a 2 GiB arena.
-        let cur = ctx.view_2d(
-            &cur,
-            c.n_embd as i64,
-            1,
-            c.n_embd as usize * std::mem::size_of::<f32>(),
-            (n_tokens - 1) as usize * c.n_embd as usize * std::mem::size_of::<f32>(),
-        )?;
-        let cur = self.rms_norm_mul(ctx, &cur, get("output_norm.weight")?)?;
-        // Output projection; tied to the embedding table when absent.
-        let out_name = if weights.get("output.weight").is_some() {
-            "output.weight"
-        } else {
-            "token_embd.weight"
-        };
-        Ok(ctx.mul_mat(get(out_name)?, &cur)?)
-    }
-
-    /// One layer's attention, from the pre-norm through the output projection.
-    ///
-    /// Shared by the single-graph path and the streaming path so the
-    /// architecture is defined once; two copies would drift.
-    #[allow(clippy::too_many_arguments)]
-    pub fn attention_block<'a>(
-        &self,
-        ctx: &'a Context,
-        weights: &WeightSet<'a>,
-        x: &Tensor<'a>,
-        positions: &Tensor<'a>,
-        n_tokens: i64,
-        il: u32,
-        rope: RopeParams,
-        rope_type: i32,
-    ) -> Result<Tensor<'a>> {
-        let c = &self.config;
-        let get = |name: String| -> Result<&Tensor<'a>> {
-            weights.get(&name).ok_or(ArchError::MissingTensor(name))
-        };
-
-        let normed = self.rms_norm_mul(ctx, x, get(format!("blk.{il}.attn_norm.weight"))?)?;
-
-        let (qw, kw, vw) = self.qkv_weights(ctx, weights, il)?;
-        let q = ctx.mul_mat(&qw, &normed)?;
-        let k = ctx.mul_mat(&kw, &normed)?;
-        let v = ctx.mul_mat(&vw, &normed)?;
-
-        let q = ctx.reshape_3d(&q, c.head_dim as i64, c.n_head as i64, n_tokens)?;
-        let k = ctx.reshape_3d(&k, c.head_dim as i64, c.n_head_kv as i64, n_tokens)?;
-
-        let (q, k) = if c.qk_norm {
-            (
-                self.rms_norm_mul(ctx, &q, get(format!("blk.{il}.attn_q_norm.weight"))?)?,
-                self.rms_norm_mul(ctx, &k, get(format!("blk.{il}.attn_k_norm.weight"))?)?,
-            )
-        } else {
-            (q, k)
-        };
-
-        let q = ctx.rope_ext(&q, positions, None, c.head_dim as i32, rope_type, 0, rope)?;
-        let k = ctx.rope_ext(&k, positions, None, c.head_dim as i32, rope_type, 0, rope)?;
-
-        let attn = self.attention(ctx, &q, &k, &v, n_tokens)?;
-        Ok(ctx.mul_mat(get(format!("blk.{il}.attn_output.weight"))?, &attn)?)
-    }
-
     /// Attention through ggml's fused kernel.
     ///
-    /// Same result as [`Self::attention_cached`], without building the scores
-    /// matrix. `mask_f16` holds the causal mask already in F16 — ggml asserts
-    /// that type, and since the only values are 0 and -inf the bit patterns
+    /// Same result as [`Self::attention`], without building the scores matrix.
+    /// `mask_f16` holds the causal mask already in F16 — ggml asserts that
+    /// type, and since the only values are 0 and -inf the bit patterns
     /// (`0x0000`, `0xFC00`) are written directly rather than converted.
+    ///
+    /// This superseded an `attention_cached` that took the same arguments and
+    /// built the scores by hand. That one kept compiling, kept being documented
+    /// against, and had **no callers at all** from the commit this landed in
+    /// until it was deleted — a third attention implementation nothing
+    /// exercised, which is the shape of hazard that let a second *forward*
+    /// implementation miss four fixes.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash<'a>(
         &self,
@@ -858,46 +857,6 @@ impl Qwen3Model {
         Ok(ctx.reshape_2d(&ctx.cont(&out)?, (c.head_dim * c.n_head) as i64, n_new)?)
     }
 
-    /// Attention where K and V come from a cache covering the whole history.
-    ///
-    /// The mask must be offset by the query's absolute position: query `i` may
-    /// attend to keys up to `pos_start + i`, not up to `i`. Getting that wrong
-    /// lets a token see its own future during incremental decoding — the same
-    /// failure as omitting the mask entirely, but only visible after the first
-    /// generated token. The caller builds it; see `forward_cached`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn attention_cached<'a>(
-        &self,
-        ctx: &'a Context,
-        q: &Tensor<'a>,
-        k_all: &Tensor<'a>,
-        v_all: &Tensor<'a>,
-        n_new: i64,
-        n_total: i64,
-        mask_data: &[f32],
-    ) -> Result<Tensor<'a>> {
-        let c = &self.config;
-
-        let q = ctx.cont(&ctx.permute(q, [0, 2, 1, 3])?)?;
-        let k = ctx.cont(&ctx.permute(k_all, [0, 2, 1, 3])?)?;
-
-        // [n_total, n_new, n_head]
-        let scores = ctx.mul_mat(&k, &q)?;
-
-        // The mask depends only on positions, so it is identical for every
-        // layer and is built once per call by the caller. Rebuilding it here
-        // cost an n_total * n_new scalar loop and a copy of the same size,
-        // 48 times per block.
-        let mask = ctx.new_f32_2d(n_total, n_new)?;
-        mask.set_f32(mask_data)?;
-        let probs = ctx.soft_max_ext(&scores, Some(&mask), c.attn_scale(), 0.0)?;
-
-        let v = ctx.cont(&ctx.transpose(&ctx.permute(v_all, [0, 2, 1, 3])?)?)?;
-        let out = ctx.mul_mat(&v, &probs)?;
-        let out = ctx.cont(&ctx.permute(&out, [0, 2, 1, 3])?)?;
-        Ok(ctx.reshape_2d(&out, (c.head_dim * c.n_head) as i64, n_new)?)
-    }
-
     /// Normalise then scale by a learned weight — the pattern every norm
     /// in this architecture uses. No bias; see [`norm_named`](Self::norm_named).
     pub fn norm_scaled<'a>(
@@ -923,9 +882,14 @@ impl Qwen3Model {
         x: &Tensor<'a>,
         prefix: &str,
     ) -> Result<Tensor<'a>> {
-        let weight = weights
-            .get(&format!("{prefix}.weight"))
-            .ok_or_else(|| ArchError::MissingTensor(format!("{prefix}.weight")))?;
+        let weight = weights.get(&format!("{prefix}.weight"));
+        // Absent is only allowed where the config already established that this
+        // architecture's norms have no parameters. Otherwise it is the missing
+        // tensor it looks like — silently dropping a scale is exactly the class
+        // of bug that made StableLM read "almost right".
+        if weight.is_none() && self.config.norm_affine {
+            return Err(ArchError::MissingTensor(format!("{prefix}.weight")));
+        }
         let bias = weights.get(&format!("{prefix}.bias"));
         self.norm_mul(ctx, x, weight, bias)
     }
@@ -953,7 +917,7 @@ impl Qwen3Model {
         x: &Tensor<'a>,
         weight: &Tensor<'a>,
     ) -> Result<Tensor<'a>> {
-        self.norm_mul(ctx, x, weight, None)
+        self.norm_mul(ctx, x, Some(weight), None)
     }
 
     /// Normalise, scale, and shift when the architecture has a shift.
@@ -966,7 +930,7 @@ impl Qwen3Model {
         &self,
         ctx: &'a Context,
         x: &Tensor<'a>,
-        weight: &Tensor<'a>,
+        weight: Option<&Tensor<'a>>,
         bias: Option<&Tensor<'a>>,
     ) -> Result<Tensor<'a>> {
         let normed = if self.config.layer_norm {
@@ -974,73 +938,17 @@ impl Qwen3Model {
         } else {
             ctx.rms_norm(x, self.config.rms_eps)?
         };
-        let scaled = ctx.mul(&normed, weight)?;
+        // Both are optional and independently so, which is the whole point:
+        // OLMo has neither, StableLM has both, Qwen has weight only. Three
+        // shapes, one expression.
+        let scaled = match weight {
+            Some(w) => ctx.mul(&normed, w)?,
+            None => normed,
+        };
         match bias {
             Some(b) => Ok(ctx.add(&scaled, b)?),
             None => Ok(scaled),
         }
-    }
-
-    /// Scaled dot-product attention with a causal mask.
-    fn attention<'a>(
-        &self,
-        ctx: &'a Context,
-        q: &Tensor<'a>,
-        k: &Tensor<'a>,
-        v: &Tensor<'a>,
-        n_tokens: i64,
-    ) -> Result<Tensor<'a>> {
-        let c = &self.config;
-
-        // Shapes are the whole difficulty here, so each step names what it
-        // produces. ggml's ne[0] is the fastest dimension, and mul_mat
-        // contracts over ne[0] of both operands.
-
-        // [head_dim, n_head, n_tok] -> [head_dim, n_tok, n_head]
-        let q = ctx.cont(&ctx.permute(q, [0, 2, 1, 3])?)?;
-        // [head_dim, n_kv, n_tok] -> [head_dim, n_tok, n_kv]
-        let k = ctx.cont(&ctx.permute(k, [0, 2, 1, 3])?)?;
-
-        // Contracts over head_dim -> [n_tok, n_tok, n_head]. Grouped-query
-        // attention works because ggml broadcasts when n_head is a multiple
-        // of n_kv.
-        let scores = ctx.mul_mat(&k, &q)?;
-
-        // Causal mask. Without it every position attends to future tokens --
-        // the model sees the answer before predicting it, and collapses into
-        // repeating one token. Added to the scores before softmax, so masked
-        // positions need -inf rather than 0.
-        let mask = ctx.new_f32_2d(n_tokens, n_tokens)?;
-        let mut m = vec![0f32; (n_tokens * n_tokens) as usize];
-        for query in 0..n_tokens {
-            for key in 0..n_tokens {
-                if key > query {
-                    m[(query * n_tokens + key) as usize] = f32::NEG_INFINITY;
-                }
-            }
-        }
-        mask.set_f32(&m)?;
-
-        let probs = ctx.soft_max_ext(&scores, Some(&mask), c.attn_scale(), 0.0)?;
-
-        // V must contract over n_tok, so it needs n_tok in ne[0]:
-        //   [head_dim, n_kv, n_tok] --permute--> [head_dim, n_tok, n_kv]
-        //                           --transpose-> [n_tok, head_dim, n_kv]
-        // Transposing without the permute first leaves [n_kv, head_dim, n_tok],
-        // whose ne[0] is n_kv -- which is exactly the mismatch that aborts
-        // ggml with `ggml_can_mul_mat` failing.
-        let v = ctx.reshape_3d(v, c.head_dim as i64, c.n_head_kv as i64, n_tokens)?;
-        let v = ctx.cont(&ctx.transpose(&ctx.permute(&v, [0, 2, 1, 3])?)?)?;
-
-        // [head_dim, n_tok, n_head]
-        let out = ctx.mul_mat(&v, &probs)?;
-
-        // -> [head_dim, n_head, n_tok] -> flat [n_head*head_dim, n_tok].
-        // Note n_head*head_dim need not equal n_embd: Qwen3-4B has 32*128 =
-        // 4096 against n_embd 2560, and the output projection maps between
-        // them.
-        let out = ctx.cont(&ctx.permute(&out, [0, 2, 1, 3])?)?;
-        Ok(ctx.reshape_2d(&out, (c.head_dim * c.n_head) as i64, n_tokens)?)
     }
 
     /// Gated feed-forward: `down(act(gate(x)) * up(x))`, `act` per architecture.
@@ -1071,53 +979,6 @@ impl Qwen3Model {
         let activated = ctx.mul(&self.config.activate(ctx, &gate)?, &up)?;
         let down = ctx.mul_mat(get(format!("blk.{il}.ffn_down.weight"))?, &activated)?;
         self.add_bias(ctx, weights, down, &format!("blk.{il}.ffn_down"))
-    }
-
-    /// Mixture-of-experts feed-forward.
-    ///
-    /// The router scores every expert, the top `n_expert_used` are selected,
-    /// and `mul_mat_id` applies only those — which is the whole reason a model
-    /// with 128 experts costs about as much as one with a handful.
-    fn moe_ffn<'a>(
-        &self,
-        ctx: &'a Context,
-        weights: &WeightSet<'a>,
-        x: &Tensor<'a>,
-        il: u32,
-        n_tokens: i64,
-    ) -> Result<Tensor<'a>> {
-        let c = &self.config;
-        let get = |name: String| -> Result<&Tensor<'a>> {
-            weights.get(&name).ok_or(ArchError::MissingTensor(name))
-        };
-
-        // Router: one score per expert per token, softmaxed into weights.
-        let logits = ctx.mul_mat(get(format!("blk.{il}.ffn_gate_inp.weight"))?, x)?;
-        let probs = ctx.soft_max_ext(&logits, None, 1.0, 0.0)?;
-
-        // top_k returns indices. NOTE: they are NOT ordered by score, so the
-        // per-expert weight must be looked up by index rather than by
-        // position -- see the ggml top_k test.
-        let selected = ctx.top_k(&probs, c.n_expert_used as i32)?;
-
-        let x3 = ctx.reshape_3d(x, c.n_embd as i64, 1, n_tokens)?;
-        let gate = ctx.mul_mat_id(
-            get(format!("blk.{il}.ffn_gate_exps.weight"))?,
-            &x3,
-            &selected,
-        )?;
-        let up = ctx.mul_mat_id(get(format!("blk.{il}.ffn_up_exps.weight"))?, &x3, &selected)?;
-        let activated = ctx.mul(&c.activate(ctx, &gate)?, &up)?;
-        let down = ctx.mul_mat_id(
-            get(format!("blk.{il}.ffn_down_exps.weight"))?,
-            &activated,
-            &selected,
-        )?;
-
-        // Weight each expert's output by its router probability, then sum.
-        let weights_sel = ctx.get_rows(&probs, &selected)?;
-        let weighted = ctx.mul(&down, &weights_sel)?;
-        Ok(ctx.sum_rows(&weighted)?)
     }
 }
 
@@ -1150,6 +1011,11 @@ mod tests {
             rope_type_is_known: true,
             attn_bias: false,
             layer_norm: false,
+            norm_affine: true,
+            norm_bias: false,
+            clamp_kqv: 0.0,
+            uses_alibi: false,
+            rope_freqs: false,
             ffn_bias: false,
             attn_out_bias: false,
             n_rot: 16,
@@ -1166,6 +1032,60 @@ mod tests {
             swa_pattern: 0,
             rope_freq_base_swa: 10_000.0,
         }
+    }
+
+    /// A non-parametric-norm container asks for no norm weights at all.
+    ///
+    /// OLMo's norms are `build_norm(x, NULL, NULL, LLM_NORM)` there, so
+    /// `output_norm.weight` does not exist and demanding it refused a container
+    /// that runs — the first thing OLMo did here was fail on that exact name.
+    #[test]
+    fn a_non_parametric_norm_is_not_a_missing_tensor() {
+        let c = Qwen3Config {
+            norm_affine: false,
+            norm_bias: false,
+            layer_norm: true,
+            qk_norm: false,
+            ..dense_config()
+        };
+        let names = Qwen3Model::new(c).required_tensors();
+        for n in &names {
+            assert!(
+                !n.ends_with("_norm.weight") && !n.ends_with("_norm.bias"),
+                "asked for {n} from a model whose norms have no parameters"
+            );
+        }
+        // Everything else is still demanded, so this is not a blanket weakening.
+        assert!(names.contains(&"blk.0.attn_output.weight".to_string()));
+        assert!(names.contains(&"token_embd.weight".to_string()));
+
+        // And an affine architecture still gets the full list.
+        let affine = Qwen3Model::new(dense_config_no_qk_norm()).required_tensors();
+        assert!(affine.contains(&"output_norm.weight".to_string()));
+        assert!(affine.contains(&"blk.1.ffn_norm.weight".to_string()));
+    }
+
+    /// `rope_freqs.weight` has to be **listed** to be loaded.
+    ///
+    /// Llama-3.1/3.2/3.3 carry their RoPE scaling as this tensor and nothing in
+    /// the metadata says so — it reports `rope scaling = linear, freq_scale = 1`
+    /// either way. Unlisted, `weights.get` returns `None`, the rotation is
+    /// quietly the un-extended one, and Llama-3.2-1B scored 3 of 8 on parity
+    /// with four prompts blaming the reference for the disagreement.
+    #[test]
+    fn rope_freqs_is_required_when_the_container_has_one() {
+        let with = Qwen3Model::new(Qwen3Config {
+            rope_freqs: true,
+            ..dense_config()
+        })
+        .required_tensors();
+        assert!(with.contains(&"rope_freqs.weight".to_string()));
+
+        let without = Qwen3Model::new(dense_config()).required_tensors();
+        assert!(
+            !without.contains(&"rope_freqs.weight".to_string()),
+            "demanding it would refuse every model that is not an extended Llama-3"
+        );
     }
 
     /// The same model without per-head QK norm — a Llama-family container.
@@ -1252,6 +1172,16 @@ mod tests {
         assert_eq!(rope_type_for("qwen3moe"), (ROPE_TYPE_NEOX, true));
         assert_eq!(rope_type_for("gemma2"), (ROPE_TYPE_NEOX, true));
 
+        // `olmo` sat in the NeoX arm claiming `known = true` while llama.cpp
+        // lists `LLM_ARCH_OLMO` in the NORM branch beside `LLM_ARCH_LLAMA` —
+        // a guess wearing the label of a checked fact, since nothing had ever
+        // been run against the reference for it. These four are now diffed at
+        // eight prompts each.
+        assert_eq!(rope_type_for("olmo"), (ROPE_TYPE_NORM, true));
+        assert_eq!(rope_type_for("internlm2"), (ROPE_TYPE_NORM, true));
+        assert_eq!(rope_type_for("baichuan"), (ROPE_TYPE_NORM, true));
+        assert_eq!(rope_type_for("starcoder2"), (ROPE_TYPE_NEOX, true));
+
         // An architecture nobody has checked gets a default AND is flagged as a
         // guess, so the runner can say so rather than quietly being wrong.
         let (ty, known) = rope_type_for("some-model-invented-next-year");
@@ -1298,6 +1228,44 @@ mod tests {
             .contains(&"blk.0.attn_q_norm.weight".to_string()));
     }
 
+    /// **An MoE model is not an ungated one.**
+    ///
+    /// `ffn_gate` is absent from an MoE container because the gate is
+    /// `ffn_gate_exps`, and reading that absence as "no gate" gave every
+    /// all-MoE model `UngatedGelu`. Qwen3-30B-A3B then ran **GELU over its
+    /// experts where the reference runs SiLU** and looped —
+    /// `Paris. True or False? The capital of France is Paris. True or False?`
+    /// against `Paris. The capital of Italy is Rome.`
+    ///
+    /// The activation is not in `required_tensors`, so no test that checks
+    /// tensor names can catch this. It has to be asserted directly.
+    #[test]
+    fn an_moe_container_is_gated_even_though_ffn_gate_is_absent() {
+        for (arch, expected) in [
+            ("qwen3moe", FfnAct::Silu),
+            ("qwen2moe", FfnAct::Silu),
+            ("deepseek4", FfnAct::Silu),
+        ] {
+            assert_eq!(
+                ffn_act_for(arch),
+                expected,
+                "{arch} must not be reclassified by the ungated-FFN detection"
+            );
+        }
+        // The MoE config the streaming path actually runs.
+        let moe = Qwen3Model::new(Qwen3Config {
+            n_expert: 128,
+            n_expert_used: 8,
+            ..dense_config()
+        });
+        assert!(moe.config.is_moe());
+        assert_eq!(
+            moe.config.ffn_act,
+            FfnAct::Silu,
+            "an MoE config must never carry UngatedGelu"
+        );
+    }
+
     #[test]
     fn required_tensors_cover_every_layer_and_match_the_variant() {
         let dense = Qwen3Model::new(dense_config());
@@ -1339,21 +1307,25 @@ mod tests {
         // implemented, Gemma-2 loaded through this path with no error at all
         // and answered "The capital of France is" with "himselff" — which is
         // exactly why loading is not evidence of anything.
-        for arch in [
-            "deepseek4",
-            "gemma2",
-            "gemma3",
-            "llama",
-            "phi3",
-            "qwen3",
-            "qwen3moe",
-        ] {
+        for arch in ["deepseek4", "gemma2", "gemma3", "llama", "phi3", "qwen3"] {
             assert!(architecture_is_verified(arch), "{arch} should be verified");
         }
         // `gemma` (v1) is deliberately absent: it is close to `gemma2` but not
         // identical, and nobody has run it. So is `gemma3n`, which is a
         // different model despite the name.
-        for arch in ["gemma", "gemma3n", "falcon", "mamba", "something-new"] {
+        //
+        // **`qwen3moe` is absent because it was REMOVED**, not because nobody
+        // tried. It sat here through a diff it had never been given, and the
+        // first eight-prompt run returned 1 FAIL + 6 unstable. This assertion
+        // is what would have caught someone quietly putting it back.
+        for arch in [
+            "gemma",
+            "gemma3n",
+            "qwen3moe",
+            "falcon",
+            "mamba",
+            "something-new",
+        ] {
             assert!(
                 !architecture_is_verified(arch),
                 "{arch} has not been checked and must not claim to be"

@@ -206,7 +206,7 @@ pub fn set_affinity(mask: u64) -> Result<u32, String> {
     Ok(mask.count_ones())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 pub fn set_affinity(mask: u64) -> Result<u32, String> {
     // glibc's cpu_set_t is 1024 bits; only the first 64 are addressed here,
     // which covers every machine this runner targets and is honest about it.
@@ -218,6 +218,31 @@ pub fn set_affinity(mask: u64) -> Result<u32, String> {
         return Err(format!("sched_setaffinity({mask:#x}) failed"));
     }
     Ok(mask.count_ones())
+}
+
+/// **macOS has no CPU affinity to set**, so this refuses rather than pretending.
+///
+/// `sched_setaffinity` is Linux-only. The gate here was `not(windows)`, which
+/// includes macOS, and the link failed with `Undefined symbols for architecture
+/// arm64: "_sched_setaffinity"`. A build break rather than a wrong answer is the
+/// good outcome, and the only reason it surfaced: CI runs on pull requests, so
+/// it appeared on the first PR built on top of the commit that added it.
+///
+/// The tempting fix is to return `Ok` and do nothing. That would make
+/// `--cpu-mask` report success on a machine where it binds nothing — the exact
+/// shape of knowingly-wrong path this codebase has spent two days deleting.
+///
+/// Darwin genuinely cannot do it. `thread_policy_set` with
+/// `THREAD_AFFINITY_POLICY` sets an affinity *hint* that groups threads onto a
+/// shared cache, and the kernel is free to ignore it; there is no call that pins
+/// a process to a CPU set.
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn set_affinity(mask: u64) -> Result<u32, String> {
+    Err(format!(
+        "--cpu-mask ({mask:#x}) is not supported on this platform: CPU affinity \
+         is a Linux and Windows facility, and macOS offers only a scheduling \
+         hint the kernel may ignore. Refused rather than accepted and dropped"
+    ))
 }
 
 /// The CPU mask of the NUMA node this process started on.
@@ -349,8 +374,17 @@ mod ffi {
 mod ffi {
     use core::ffi::c_void;
     unsafe extern "C" {
+        // POSIX, present on every unix here.
         pub fn mlock(addr: *const c_void, len: usize) -> i32;
         pub fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+    }
+
+    // **Linux only.** Declaring it unconditionally is what broke the macOS
+    // link: an `extern` declaration costs nothing until something references
+    // it, so the error arrives at the call site's linker step rather than here,
+    // naming `_sched_setaffinity` and no file.
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" {
         pub fn sched_setaffinity(pid: i32, len: usize, set: *const u64) -> i32;
     }
 }

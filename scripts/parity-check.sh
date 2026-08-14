@@ -92,7 +92,9 @@ strip() {
     | sed 's/ *\[end of text\] *$//'
 }
 
-ref() { "$REF" -m "$MODEL" -p "$1" -n "$N" --temp 0 --no-warmup -no-cnv "${@:2}" 2>/dev/null | strip; }
+ref() {
+  "$REF" -m "$MODEL" -p "$1" -n "$N" --temp 0 --no-warmup -no-cnv "${@:2}" 2>/dev/null | strip
+}
 
 # How many tokens each engine makes of a prompt. Different counts mean the two
 # are not answering the same question, and every difference downstream is
