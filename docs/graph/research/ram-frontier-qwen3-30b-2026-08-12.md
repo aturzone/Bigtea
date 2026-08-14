@@ -20,6 +20,17 @@ factual prompt. It is the only container on this machine in the size class where
 the curve is interesting, so the sweep is published with that stated rather than
 withheld or quietly labelled.
 
+**2026-08-14, re-run with `-b 1` in the harness's re-check set — it did not
+clear.** The remaining FAIL became `unstable`, exactly as predicted, because the
+reference does disagree with itself on that prompt once batching is probed. But
+the *count* held: 0 FAIL and **6 of 8 prompts unstable**, which
+`parity-check.sh` reads as a cluster rather than chance and exits non-zero on.
+Every prompt tokenizes identically in both engines, so it is not the input. The
+standing of this curve is therefore unchanged and slightly worse-founded than it
+read on the 12th: it is measured on a model whose divergence from llama.cpp is
+now **unexplained rather than excused**. The activation was one bug, it is
+fixed, and something else is still there.
+
 This matters more than a footnote, because **the activation fix changed the
 workload, not just the arithmetic.** The same sweep on the pre-fix build read:
 
