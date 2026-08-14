@@ -15,6 +15,7 @@
 mod bytes;
 pub mod chat;
 mod pretok;
+pub mod rwkv;
 pub mod spm;
 pub mod ugm;
 pub mod wpm;
@@ -41,6 +42,10 @@ pub enum Kind {
     /// `"t5"` — Unigram: the highest-scoring path through a lattice of every
     /// possible segmentation, not a greedy merge. See [`ugm`].
     Ugm,
+    /// `"rwkv"` — greedy longest match over a trie of raw byte strings. No
+    /// merge table, no scores, and **the vocabulary is stored escaped**. See
+    /// [`rwkv`].
+    Rwkv,
 }
 
 use std::collections::HashMap;
@@ -124,6 +129,9 @@ pub struct Tokenizer {
     max_token_len: usize,
     /// SentencePiece's `remove_extra_whitespaces`.
     remove_extra_whitespaces: bool,
+    /// Built once, on first use. A 65k-entry trie is not worth constructing for
+    /// a tokenizer that will never take the RWKV path.
+    rwkv_trie: std::sync::OnceLock<rwkv::Trie>,
     /// Control tokens, longest first, with their ids.
     ///
     /// These must be matched **literally in the text and mapped to one id**.
@@ -149,6 +157,7 @@ impl Tokenizer {
         let kind = match model {
             "gpt2" => Kind::Bpe,
             "llama" => Kind::Spm,
+            "rwkv" => Kind::Rwkv,
             "bert" => Kind::Wpm,
             "t5" => Kind::Ugm,
             other => return Err(TokenizerError::UnsupportedModel(other.to_string())),
@@ -285,6 +294,7 @@ impl Tokenizer {
             pre,
             user_defined,
             max_token_len,
+            rwkv_trie: std::sync::OnceLock::new(),
             remove_extra_whitespaces: match meta.get("tokenizer.ggml.remove_extra_whitespaces") {
                 Some(Value::Bool(v)) => *v,
                 _ => true,
@@ -471,6 +481,18 @@ impl Tokenizer {
         if text.is_empty() {
             return;
         }
+        if self.kind == Kind::Rwkv {
+            // No pre-tokenizer at all: RWKV walks the raw bytes and takes the
+            // longest vocabulary entry at each position. Splitting the text
+            // first would forbid entries that span a split point, which is
+            // most of the interesting ones.
+            out.extend(rwkv::encode(
+                self.rwkv_trie.get_or_init(|| rwkv::build(&self.tokens)),
+                text,
+                self.unk,
+            ));
+            return;
+        }
         if self.kind == Kind::Wpm {
             // No pre-tokenizer and no byte fallback: WordPiece does its own
             // splitting, and anything it cannot cover becomes one [UNK].
@@ -541,6 +563,18 @@ impl Tokenizer {
     /// valid UTF-8 boundary. [`Self::decode`] is for whole sequences, where the
     /// bytes are all present and the conversion is safe.
     pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        if self.kind == Kind::Rwkv {
+            // The vocabulary is stored ESCAPED, so decoding has to unescape --
+            // emitting the stored text would put a literal `\n` in the output
+            // where the model produced a newline.
+            let mut bytes = Vec::new();
+            for &id in ids {
+                if let Some(text) = self.token_text(id) {
+                    bytes.extend(rwkv::unescape(text));
+                }
+            }
+            return bytes;
+        }
         if self.kind == Kind::Wpm {
             return self.decode(ids).into_bytes();
         }
