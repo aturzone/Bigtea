@@ -1739,6 +1739,32 @@ matcher's permissiveness is the open question.
 
 Flags: **165 implemented, 30 declined**, of 195 recognised. Tests **481**.
 
+## Jinja: every template on disk renders (2026-08-13)
+
+**15 containers: 6 agree with the family matcher, 8 differ, 1 refuses** — and
+the refusal is Gemma-2's template *correctly* raising on a system turn.
+
+Our rendering is **byte-identical to `llama-completion --jinja`** on Llama-3.2,
+date included. Two fixes got the last four tokens:
+
+- **`strftime_now`, and treating a built-in as `is defined`.** Llama-3 guards
+  with `if strftime_now is defined` and falls back to a hardcoded
+  `26 Jul 2024` — so answering `false` put a two-year-stale date in every
+  Llama-3 prompt.
+- **Jinja strips one trailing newline** (`keep_trailing_newline=False`), which
+  Llama-3's template depends on.
+
+The 8 "differ" rows are **not failures**: llama.cpp behaves identically, its
+`--no-jinja` matching our family matcher and its `--jinja` matching our engine.
+Hardcoded renderers drop content the templates specify — a property of the
+approach, not a bug in either engine.
+
+One judgement reversed: `'' + true` was refused on the principle that silent
+coercion is how a template prints `None`. llama.cpp evaluates with **minja,
+which coerces**, and DeepSeek writes exactly that. The line is now **a defined
+scalar coerces, `none` still refuses** — the dangerous case was never `true`,
+it was a missing variable becoming the literal text `None`.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

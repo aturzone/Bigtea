@@ -418,8 +418,21 @@ impl<'a> P<'a> {
                         v.extend(b.clone());
                         Value::List(v)
                     }
-                    // Jinja would coerce; coercing silently is how a template
-                    // that meant to concatenate ends up printing `None`.
+                    // Coerce a DEFINED scalar into a string, refuse `none`.
+                    //
+                    // That line is the whole judgement: llama.cpp evaluates
+                    // templates with minja, which coerces, and DeepSeek-V4-Flash
+                    // writes `'' + true`. Refusing it meant declining a template
+                    // the reference renders. But coercing `none` is the case
+                    // that hurts -- a missing variable becomes the literal text
+                    // "None" in the prompt and nothing ever notices -- so that
+                    // one still refuses.
+                    ('+', Value::Str(a), b @ (Value::Bool(_) | Value::Int(_))) => {
+                        Value::Str(format!("{a}{}", b.render()))
+                    }
+                    ('+', a @ (Value::Bool(_) | Value::Int(_)), Value::Str(b)) => {
+                        Value::Str(format!("{}{b}", a.render()))
+                    }
                     _ => {
                         return Err(Error::Unsupported(format!(
                             "`{op}` between {left:?} and {right:?}"
@@ -1009,8 +1022,14 @@ mod tests {
     #[test]
     fn string_concatenation_works_and_mixed_types_refuse() {
         assert_eq!(r("{{ 'a' + 'b' }}").unwrap(), "ab");
+        // A defined scalar coerces, matching minja, which is what llama.cpp
+        // evaluates templates with -- DeepSeek-V4-Flash writes `'' + true`.
+        assert_eq!(r("{{ 'a' + 1 }}").unwrap(), "a1");
+        assert_eq!(r("{{ 'a' + true }}").unwrap(), "aTrue");
+        // `none` still refuses. A missing variable becoming the literal text
+        // "None" in a prompt is the failure this whole crate is shaped around.
         assert!(matches!(
-            r("{{ 'a' + 1 }}").unwrap_err(),
+            r("{{ 'a' + nope }}").unwrap_err(),
             Error::Unsupported(_)
         ));
     }

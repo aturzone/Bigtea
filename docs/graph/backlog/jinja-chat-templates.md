@@ -292,3 +292,53 @@ A caveat on the comparison tool, since it will mislead someone otherwise:
 SentencePiece vocabularies**, which render whitespace as markers rather than as
 characters. Phi-3 and TinyLlama are both SPM, so their captured strings are
 right about structure and not trustworthy about spaces.
+
+## DONE 2026-08-13: every template on disk renders, and `--jinja` is wired
+
+**15 containers: 6 agree with the family matcher, 8 differ, 1 refuses.** The one
+refusal is Gemma-2's template *correctly* raising on a system turn.
+
+The last two fixes:
+
+- **`strftime_now`**, plus making a built-in count as `is defined`. Llama-3's
+  template guards with `if strftime_now is defined` and falls back to a
+  hardcoded `26 Jul 2024`, so answering `false` put a two-year-stale date in
+  every Llama-3 prompt — four tokens different from the reference.
+- **Jinja strips one trailing newline** (`keep_trailing_newline=False`).
+  Llama-3's template ends with `{%- endif %}
+`, and keeping it emitted a third
+  newline after the assistant header where llama.cpp emits two.
+
+With both, our rendering is **byte-identical to `llama-completion --jinja`**:
+
+```
+ours  : ...<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 13 Aug 2026
+
+SYS<|eot_id|>...
+llama : ...<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 13 Aug 2026
+
+SYS<|eot_id|>...
+```
+
+### The 8 "differ" rows are not failures
+
+They are the family matcher and the evaluated template disagreeing, and
+**llama.cpp behaves the same way** — its `--no-jinja` output matches our family
+matcher and its `--jinja` matches our engine. Verified on Llama-3.2 with both
+command lines. The hardcoded renderers drop content the templates specify; that
+is a property of hardcoded renderers, not a bug in either engine.
+
+### One judgement call worth naming
+
+`'' + true` was refused on the principle that silent coercion is how a template
+ends up printing `None`. But llama.cpp evaluates with **minja, which coerces**,
+and DeepSeek-V4-Flash writes exactly that — so refusing meant declining a
+template the reference renders. The line is now: **a defined scalar coerces,
+`none` still refuses.** The dangerous case was never `true`; it was a missing
+variable becoming the literal text `None` in a prompt.
