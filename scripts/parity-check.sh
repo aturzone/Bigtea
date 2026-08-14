@@ -30,6 +30,13 @@
 #   2. **Counts them.** One near-tie in eight is ordinary. Three or more is a
 #      bug that has not been found yet, and the script exits non-zero saying so
 #      rather than printing eight reassuring lines.
+#   3. **Asks whether OUR answer is inside the band.** "The reference disagrees
+#      with itself" and "our output is one of the things it disagrees between"
+#      are different questions, and for a day this script asked the first while
+#      reporting it as though it answered the second. Reproducing llama.cpp's
+#      own `-b 1` output byte for byte is near-conclusive; producing a third
+#      answer it never gives under any no-op is not explained by its
+#      instability at all. Those are now `near-tie` and `unstable`.
 #
 # # Why a mismatch is not automatically a bug
 #
@@ -111,6 +118,7 @@ llama_tokens() {
 name=$(basename "$MODEL")
 fail=0
 unstable=0
+near=0
 for p in "${PROMPTS[@]}"; do
   a=$("$BIGTEA" -m "$MODEL" -p "$p" -n "$N" --temp 0 --force 2>/dev/null | strip)
   b=$(ref "$p")
@@ -149,10 +157,22 @@ for p in "${PROMPTS[@]}"; do
   # So this stays honest only because of the cluster rule below: three or more
   # unstable in eight still exits non-zero and demands a look.
   e=$(ref "$p" -b 1)
+  # A COMPOSITION, because probing flags singly cannot see a prompt that only
+  # moves when two are combined. Measured on Phi-3, `The capital of France is`:
+  #
+  #   -b 1         : Paris. Paris is known for its rich history,
+  #   -fa off      : Paris.<|assistant|> Yes, that's correct
+  #   -b 1 -fa off : Paris.<|assistant|> That's correct! Paris   <- Bigtea's answer
+  #
+  # Neither flag alone reproduces it. A near-tie that needs two no-ops composed
+  # is invisible to a single-flag probe, and there is no reason to think that
+  # class is rare -- it is just the class nobody looked for.
+  f=$(ref "$p" -b 1 -fa off)
   c=${c#*"$p"}
   d=${d#*"$p"}
   e=${e#*"$p"}
-  if [ "$c" != "$b" ] || [ "$d" != "$b" ] || [ "$e" != "$b" ]; then
+  f=${f#*"$p"}
+  if [ "$c" != "$b" ] || [ "$d" != "$b" ] || [ "$e" != "$b" ] || [ "$f" != "$b" ]; then
     # Before shrugging: did the two engines even read the same prompt? A
     # near-tie is what a DIFFERENT INPUT looks like, so this is checked first.
     bt=$(bigtea_tokens "$p")
@@ -165,18 +185,45 @@ for p in "${PROMPTS[@]}"; do
       printf '  different input looks like -- so this is NOT a near-tie.\n'
       continue
     fi
-    unstable=$((unstable + 1))
-    printf 'unstable  %-36s %s\n' "$name" "$p"
     which=""
     [ "$c" != "$b" ] && which="$which -fa-off"
     [ "$d" != "$b" ] && which="$which --no-repack"
     [ "$e" != "$b" ] && which="$which -b-1"
+    [ "$f" != "$b" ] && which="$which -b-1+-fa-off"
     # WHICH configuration moved it, not merely that one did. "-b 1 only" is a
     # weaker claim than "every no-op moves it", and collapsing the two into one
     # word is how a cluster stops looking like a cluster.
+
+    # **Is OUR answer inside the band the reference spans?** This is a different
+    # question from "does the reference disagree with itself", and only the
+    # second one discriminates. The old code asked the first and reported it as
+    # if it answered the second: knowing llama.cpp is unstable here says nothing
+    # about whether OUR output is one of the things it is unstable BETWEEN.
+    #
+    # Landing on a value llama.cpp itself produces under a no-op is the
+    # strongest evidence available short of identity -- the answer is not merely
+    # plausible, it is the reference's own. Landing on a value it never produces
+    # under any of them is a different situation wearing the same word, and its
+    # instability no longer explains our disagreement at all.
+    inband=""
+    [ "$a" = "$c" ] && inband="-fa off"
+    [ "$a" = "$d" ] && inband="--no-repack"
+    [ "$a" = "$e" ] && inband="-b 1"
+    [ "$a" = "$f" ] && inband="-b 1 -fa off"
+    if [ -n "$inband" ]; then
+      near=$((near + 1))
+      printf 'near-tie  %-36s %s\n' "$name" "$p"
+      printf '  the reference disagrees with itself under:%s\n' "$which"
+      printf '  and Bigtea reproduces its `%s` output EXACTLY. Our answer is\n' "$inband"
+      printf '  one llama.cpp itself gives; this is a tie, not a divergence.\n'
+      continue
+    fi
+    unstable=$((unstable + 1))
+    printf 'unstable  %-36s %s\n' "$name" "$p"
     printf '  the reference disagrees with itself under:%s\n' "$which"
-    printf '  Both engines tokenized the prompt identically. Suspicious, not\n'
-    printf '  proof either way.\n'
+    printf '  but Bigtea matches NONE of its outputs -- a third answer, outside\n'
+    printf '  the band. Its instability does not explain ours. Both engines\n'
+    printf '  tokenized the prompt identically. Suspicious.\n'
     continue
   fi
 
@@ -186,15 +233,30 @@ for p in "${PROMPTS[@]}"; do
   printf '  llama.cpp: %s\n' "$(printf '%s' "$b" | head -c 200)"
 done
 
-if [ "$unstable" -gt 0 ]; then
-  printf '          %-36s %d of %d prompt(s) unstable\n' "$name" "$unstable" "${#PROMPTS[@]}"
+if [ "$near" -gt 0 ] || [ "$unstable" -gt 0 ]; then
+  printf '          %-36s %d of %d in-band, %d outside\n' \
+    "$name" "$near" "${#PROMPTS[@]}" "$unstable"
 fi
-# One near-tie in eight is ordinary. Three is not: nine of eleven `unstable`
-# verdicts in a single session turned out to be real bugs, so a cluster is
-# treated as one until someone shows otherwise.
+# The cluster rule now applies to the SHARPER class. Nine of eleven `unstable`
+# verdicts in one session were real bugs -- but that was measured when a single
+# word covered both situations. A prompt where Bigtea reproduces one of the
+# reference's own outputs byte for byte is explained; a prompt where it produces
+# a third answer nobody's reference gives is not, and only the second kind is
+# the thing those nine turned out to be.
 if [ "$unstable" -ge 3 ]; then
-  printf '          %-36s %d near-ties is a cluster, not chance -- treat as a bug\n' \
+  printf '          %-36s %d outside-band answers is a cluster, not chance -- treat as a bug\n' \
     "$name" "$unstable"
+  fail=1
+fi
+# **In-band is not a blank cheque.** Every configuration added widens the band,
+# so "in band" gets easier to reach as the probe grows -- exactly the direction
+# that turns a harness into a rubber stamp. A model that ties on almost every
+# prompt is systematically different even when each individual tie is explained,
+# so the count is bounded too.
+if [ "$near" -ge 6 ]; then
+  printf '          %-36s %d of %d prompts tie -- in-band each time, but that is\n' \
+    "$name" "$near" "${#PROMPTS[@]}"
+  printf '          %-36s not what a matching engine looks like\n' ""
   fail=1
 fi
 exit $fail
