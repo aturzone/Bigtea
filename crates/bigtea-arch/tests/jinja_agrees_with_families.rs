@@ -67,7 +67,20 @@ fn every_container_template_renders_the_same_both_ways() {
     let mut differ: Vec<String> = Vec::new();
     let mut checked = 0;
 
-    for path in models() {
+    // **Skip when the machine has no containers, rather than assert.** The
+    // `--ignored` CI step exists to prove exactly this path works: its own
+    // comment says "the container-backed tests skip themselves when no model is
+    // on disk. This proves the skip path works, not that the tests pass."
+    // Asserting instead failed on all three runners, none of which has
+    // `C:/Projects/models`, and it could only be seen from a pull request --
+    // a branch without one never builds here at all.
+    let containers = models();
+    if containers.is_empty() {
+        eprintln!("skipping: no model");
+        return;
+    }
+
+    for path in containers {
         let name = path
             .file_name()
             .unwrap_or_default()
@@ -140,8 +153,11 @@ fn every_container_template_renders_the_same_both_ways() {
     // Deliberately not asserting agreement yet. This test EXISTS to produce the
     // number that decides whether `--jinja` may be wired at all -- asserting a
     // result before measuring it would be deciding the answer in advance.
+    // Kept, and it still means something: reaching here proves containers WERE
+    // found, so zero checked is a broken discovery or a broken template match
+    // rather than an empty machine.
     assert!(
         checked > 0,
-        "no containers with a known template were found"
+        "containers were found but none had a known template"
     );
 }
