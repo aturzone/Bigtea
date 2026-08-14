@@ -149,3 +149,20 @@ with its own memory.
   do not claim it.
 - Whether `READER_HANDLES = 8` is right on a drive that is not this one. It is
   where *this* curve flattens; a self-configuring runner should measure it.
+
+## Checked against the activation regression, and clear
+
+**2026-08-12.** `ram-frontier-qwen3-30b-2026-08-12.md` established that a wrong
+FFN activation changes *which experts get selected*, and therefore that a cache
+measured on a model with the wrong one is measuring a different workload. Every
+MoE residency figure in this repository was re-examined.
+
+**This node is unaffected, twice over.** Everything measured here is
+`deepseek4` / V4-Flash, which never tripped the bug — its first layers are dense,
+so `blk.0.ffn_gate.weight` exists and the ungated-FFN detection saw a gate. And
+the regression landed in `3573786` on **2026-08-11**, after this node was
+written.
+
+The 3%-of-a-token expert matmul figure and the per-handle reader numbers are
+about bytes and syscalls rather than routing, so they would survive a routing
+change regardless.

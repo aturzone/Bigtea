@@ -5,9 +5,20 @@ generation speed against *owned* cache size for a model of this class — and th
 reason it can be swept at all is that this engine is told how much RAM to use.
 `mmap` cannot be asked for exactly N GiB.
 
-Links: [gpu-tier-smallest-honest-slice-2026-08-11.md](gpu-tier-smallest-honest-slice-2026-08-11.md) ·
+Links: [the-knee-moves-with-n-2026-08-14.md](the-knee-moves-with-n-2026-08-14.md) ·
+[gpu-tier-smallest-honest-slice-2026-08-11.md](gpu-tier-smallest-honest-slice-2026-08-11.md) ·
 [expert-cache-is-early-not-wrong-2026-08-08.md](expert-cache-is-early-not-wrong-2026-08-08.md) ·
 [v4flash-has-no-slack-2026-08-10.md](v4flash-has-no-slack-2026-08-10.md)
+
+> **2026-08-14 — this curve's headline holds only at `-n 16`.** Sweeping
+> generation length as a second axis found the working set growing with it:
+> 5.53 GiB at 16 tokens, 7.05 at 64, 10.14 at 256, so the knee moves 6 → 8 → 12
+> GiB and at 256 tokens the curve has not flattened by the largest budget
+> swept. Every number below is correct *for sixteen tokens*, and this node's
+> own closing section is what asked for that measurement — "where the curve
+> flattens is a property of the workload". It was, and the workload includes
+> how much you generate. See
+> [the-knee-moves-with-n-2026-08-14.md](the-knee-moves-with-n-2026-08-14.md).
 
 ## Read this before the numbers
 
@@ -19,6 +30,17 @@ SiLU); a smaller stable-reference divergence remains, four countries into the
 factual prompt. It is the only container on this machine in the size class where
 the curve is interesting, so the sweep is published with that stated rather than
 withheld or quietly labelled.
+
+**2026-08-14, re-run with `-b 1` in the harness's re-check set — it did not
+clear.** The remaining FAIL became `unstable`, exactly as predicted, because the
+reference does disagree with itself on that prompt once batching is probed. But
+the *count* held: 0 FAIL and **6 of 8 prompts unstable**, which
+`parity-check.sh` reads as a cluster rather than chance and exits non-zero on.
+Every prompt tokenizes identically in both engines, so it is not the input. The
+standing of this curve is therefore unchanged and slightly worse-founded than it
+read on the 12th: it is measured on a model whose divergence from llama.cpp is
+now **unexplained rather than excused**. The activation was one bug, it is
+fixed, and something else is still there.
 
 This matters more than a footnote, because **the activation fix changed the
 workload, not just the arithmetic.** The same sweep on the pre-fix build read:

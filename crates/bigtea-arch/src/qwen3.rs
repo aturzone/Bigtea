@@ -151,9 +151,28 @@ pub const VERIFIED_ARCHITECTURES: &[&str] = &[
     // Phi-3's otherwise-unexplained near-ties.
     //
     // Left out regardless, because the rule is that the diff passes — not that
-    // someone argues it should have. It goes back when the harness gains `-b 1`
-    // and the run comes out clean, which is a decision for the session that
-    // owns `scripts/`.
+    // someone argues it should have.
+    //
+    // # 2026-08-14: the harness gained `-b 1`, and the re-run did NOT clear it
+    //
+    // The prediction above held exactly: with `-b 1` in the re-check set the
+    // FAIL became `unstable`, because the reference now demonstrably disagrees
+    // with itself on that prompt. **The count did not move.** Eight prompts,
+    // 0 FAIL, and *six* unstable — the France prompt under `-b 1` alone, the
+    // other five under `-fa off --no-repack -b 1`. `parity-check.sh` exits
+    // non-zero and calls six a cluster rather than chance, which is the right
+    // reading: one near-tie in eight is a coin landing on its edge, six is
+    // something systematic that has not been found yet.
+    //
+    // So the entry stays out, and for a *better* reason than before. What
+    // widening the probe bought was not a pass — it was the removal of the
+    // explanation that made the failure look accounted for. The remaining
+    // divergence is now unexplained rather than excused, and every prompt
+    // tokenizes identically in both engines, so it is not the input.
+    //
+    // **Anything measured on this model is measured on a container that does
+    // not pass the diff** — the RAM-frontier and expert-cache work is all
+    // Qwen3-30B-A3B, and those nodes now say so.
     "stablelm",
     "starcoder2",
 ];
@@ -1316,8 +1335,11 @@ mod tests {
         //
         // **`qwen3moe` is absent because it was REMOVED**, not because nobody
         // tried. It sat here through a diff it had never been given, and the
-        // first eight-prompt run returned 1 FAIL + 6 unstable. This assertion
-        // is what would have caught someone quietly putting it back.
+        // first eight-prompt run returned 1 FAIL + 6 unstable. Re-run once the
+        // harness could probe `-b 1`, it came back 0 FAIL + **6 unstable** —
+        // the near-tie explanation survived and the divergence did not shrink.
+        // This assertion is what would have caught someone quietly putting it
+        // back on the strength of the FAIL turning into a softer word.
         for arch in [
             "gemma",
             "gemma3n",
