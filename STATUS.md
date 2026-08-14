@@ -1783,6 +1783,40 @@ which coerces**, and DeepSeek writes exactly that. The line is now **a defined
 scalar coerces, `none` still refuses** — the dangerous case was never `true`,
 it was a missing variable becoming the literal text `None`.
 
+## Adapters: loaded and checked, applied nowhere (2026-08-13)
+
+`--lora`, `--lora-scaled`, `--control-vector`, `--control-vector-scaled`,
+`--control-vector-layer-range`. `bigtea-model/src/adapter.rs`, 8 unit tests.
+
+**The loader is deliberately separate from the application.** Applying either is
+a change to the forward pass; deciding whether an adapter *belongs to this
+model* is arithmetic on shapes — and that is where the silent failures are:
+
+- A LoRA whose `lora_a` is stored untransposed **still multiplies**, against the
+  wrong axis, and gives a model that answers fluently and is not the fine-tune.
+  llama.cpp calls this one out by name and so does the error here.
+- **The scale is `alpha / rank`, not `alpha`.** A rank-64 adapter with alpha 16
+  scales by 0.25; using alpha alone applies it 4x too strongly — which does not
+  error, and produces a model that *is* recognisably the fine-tune and wrong in
+  degree. The hardest kind of wrong to notice.
+- A control vector for a 32-layer model applied to a 26-layer one shifts the
+  wrong residuals. `--control-vector-layer-range` **clears** out-of-range
+  layers rather than clamping, because clamping would apply a direction to a
+  layer the user excluded.
+
+**The run is refused, not warned.** A run that loaded an adapter and did not
+apply it would produce base-model output under a command line asking for a
+fine-tune, and nothing downstream could tell:
+
+```
+$ bigtea-run -m model.gguf --lora adapter.gguf
+bigtea-run: adapters are checked but NOT YET APPLIED -- the forward-pass half is
+unimplemented, so this run would give you base-model output. Drop the adapter
+flags to continue.
+```
+
+Flags: **170 implemented, 25 declined**, of 195 recognised. Tests **492**.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

@@ -535,6 +535,76 @@ fn framed(
     tokenizer.apply_chat_template(&messages, true)
 }
 
+/// What `--lora` and `--control-vector` were given, before anything is applied.
+#[derive(Debug, Default, Clone)]
+struct Adapters {
+    /// `(path, scale)`. llama.cpp allows several, and they compose by addition.
+    loras: Vec<(String, f32)>,
+    cvecs: Vec<(String, f32)>,
+    /// Inclusive `[start, end]` from `--control-vector-layer-range`.
+    cvec_range: Option<(usize, usize)>,
+}
+
+impl Adapters {
+    fn is_empty(&self) -> bool {
+        self.loras.is_empty() && self.cvecs.is_empty()
+    }
+}
+
+/// Load every adapter, check it against the model, and report what it would do.
+///
+/// **Refuses the run on a mismatch rather than warning.** An adapter built for
+/// another model does not error when applied -- it shifts the wrong tensors and
+/// the model keeps answering, which is the failure this project is most
+/// expensive at. Continuing with a warning would put the decision in a log line
+/// nobody reads.
+///
+/// Application itself is not implemented, and the runner says so once rather
+/// than pretending: a flag accepted and silently ignored is what `-t` cost this
+/// project for weeks.
+fn report_adapters(a: &Adapters, base: &Model) -> Result<(), Box<dyn std::error::Error>> {
+    use bigtea_model::adapter;
+
+    for (path, scale) in &a.loras {
+        let file = Model::open_split(path)?;
+        let lora = adapter::load_lora(&file, base).map_err(|e| format!("--lora {path}: {e}"))?;
+        let rank = lora.pairs.first().map(|p| p.rank()).unwrap_or(0);
+        bigtea_arch::info!(
+            "lora       {} tensors, rank {rank}, alpha {} -> scale {:.4}",
+            lora.pairs.len(),
+            lora.alpha,
+            lora.scale(*scale)
+        );
+    }
+
+    for (path, scale) in &a.cvecs {
+        let file = Model::open_split(path)?;
+        let n_embd = base.arch_u64("embedding_length").unwrap_or(0) as usize;
+        let n_layer = base.arch_u64("block_count").unwrap_or(0) as usize;
+        let mut cv = adapter::load_control_vector(&file, n_embd, n_layer)
+            .map_err(|e| format!("--control-vector {path}: {e}"))?;
+        if let Some((lo, hi)) = a.cvec_range {
+            cv.restrict(lo, hi);
+        }
+        cv.scale(*scale);
+        bigtea_arch::info!(
+            "cvector    {} of {n_layer} layers, n_embd {n_embd}, scale {scale}",
+            cv.active_layers()
+        );
+    }
+
+    // Said once, plainly, and it is why this returns an error rather than
+    // continuing: a run that loaded an adapter and did not apply it would
+    // produce base-model output under a command line that asked for a
+    // fine-tune, and nothing downstream could tell.
+    Err(
+        "adapters are checked but NOT YET APPLIED -- the forward-pass half is \
+         unimplemented, so this run would give you base-model output. Drop the \
+         adapter flags to continue."
+            .into(),
+    )
+}
+
 /// Render the chat prompt by evaluating the container's own template.
 ///
 /// `None` means the engine declined and the caller should use the family
@@ -1040,27 +1110,6 @@ const REFUSED: &[(&str, bool, &str)] = &[
     // --- adapters. Real work, not yet done; refusing is honest because a
     // silently unapplied LoRA is a model answering as though it were never
     // fine-tuned.
-    (
-        "--lora",
-        true,
-        "LoRA adapters are not implemented; the base model would answer unchanged",
-    ),
-    ("--lora-scaled", true, "LoRA adapters are not implemented"),
-    (
-        "--control-vector",
-        true,
-        "control vectors are not implemented",
-    ),
-    (
-        "--control-vector-scaled",
-        true,
-        "control vectors are not implemented",
-    ),
-    (
-        "--control-vector-layer-range",
-        true,
-        "control vectors are not implemented",
-    ),
     // --- architecture of the runner itself.
     (
         "--parallel",
@@ -1402,6 +1451,9 @@ fn main() -> ExitCode {
     let mut reasoning = Reasoning::default();
     let mut numa_isolate = false;
     let mut jinja = false;
+    let mut loras: Vec<(String, f32)> = Vec::new();
+    let mut cvecs: Vec<(String, f32)> = Vec::new();
+    let mut cvec_range: Option<(usize, usize)> = None;
     // llama.cpp defaults --fit to on; so does this. It only ever adjusts
     // arguments the user did NOT set, which is what makes a default-on
     // auto-configuration safe.
@@ -1876,6 +1928,65 @@ fn main() -> ExitCode {
                     }
                 }
                 i += 2;
+            }
+            // --- adapters -----------------------------------------------------
+            //
+            // Loaded and CHECKED, not applied. Applying either is a change to
+            // the forward pass and lives in `stream.rs`; deciding whether this
+            // adapter belongs to this model is arithmetic on shapes, and it is
+            // where the silent failures are. A LoRA whose `lora_a` is stored
+            // untransposed still multiplies -- against the wrong axis -- and
+            // gives a model that answers fluently and is not the fine-tune.
+            "--lora" => {
+                if let Some(p) = rest.get(i + 1) {
+                    loras.push((p.clone(), 1.0));
+                }
+                i += 2;
+            }
+            "--lora-scaled" => {
+                match (
+                    rest.get(i + 1),
+                    rest.get(i + 2).and_then(|v| v.parse().ok()),
+                ) {
+                    (Some(p), Some(sc)) => loras.push((p.clone(), sc)),
+                    _ => {
+                        eprintln!("bigtea-run: --lora-scaled needs a path and a scale");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 3;
+            }
+            "--control-vector" => {
+                if let Some(p) = rest.get(i + 1) {
+                    cvecs.push((p.clone(), 1.0));
+                }
+                i += 2;
+            }
+            "--control-vector-scaled" => {
+                match (
+                    rest.get(i + 1),
+                    rest.get(i + 2).and_then(|v| v.parse().ok()),
+                ) {
+                    (Some(p), Some(sc)) => cvecs.push((p.clone(), sc)),
+                    _ => {
+                        eprintln!("bigtea-run: --control-vector-scaled needs a path and a scale");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 3;
+            }
+            "--control-vector-layer-range" => {
+                match (
+                    rest.get(i + 1).and_then(|v| v.parse().ok()),
+                    rest.get(i + 2).and_then(|v| v.parse().ok()),
+                ) {
+                    (Some(a), Some(b)) => cvec_range = Some((a, b)),
+                    _ => {
+                        eprintln!("bigtea-run: --control-vector-layer-range needs START and END");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 3;
             }
             // --- template evaluation -----------------------------------------
             //
@@ -2655,6 +2766,11 @@ fn main() -> ExitCode {
         },
         reasoning,
         jinja,
+        Adapters {
+            loras,
+            cvecs,
+            cvec_range,
+        },
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -3389,6 +3505,7 @@ fn run(
     shift: Shift,
     reasoning: Reasoning,
     jinja: bool,
+    adapters: Adapters,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -3424,6 +3541,13 @@ fn run(
         model.override_metadata(key, value.clone());
     }
     let model = model;
+
+    // Adapters are CHECKED here and applied nowhere yet. Refusing a mismatched
+    // one at load is the half that prevents a silent wrong answer; the forward
+    // pass is the other session's file.
+    if !adapters.is_empty() {
+        report_adapters(&adapters, &model)?;
+    }
 
     // Values, not structure. Before the architecture check, because a container
     // whose numbers are ruined should say so rather than first being told its

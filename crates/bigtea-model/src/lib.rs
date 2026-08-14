@@ -30,6 +30,7 @@ use std::sync::Arc;
 use bigtea_gguf::{GgmlType, Gguf};
 use bigtea_io::{DirectFile, IoMode, SkewedBuf};
 
+pub mod adapter;
 pub mod catalogue;
 mod discover;
 pub mod download;
@@ -307,6 +308,22 @@ impl Model {
 
     pub fn get_u64(&self, key: &str) -> Option<u64> {
         self.metadata.get(key).and_then(bigtea_gguf::Value::as_u64)
+    }
+
+    /// An UNSCOPED string key, read exactly as given.
+    ///
+    /// Distinct from [`Self::arch_str`] on purpose: adapter metadata
+    /// (`adapter.type`, `adapter.lora.alpha`) is not prefixed by the
+    /// architecture, so the scoped accessor would look for
+    /// `llama.adapter.type`, find nothing, and report a perfectly good adapter
+    /// as not being one.
+    pub fn meta_str(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).and_then(bigtea_gguf::Value::as_str)
+    }
+
+    /// An unscoped float key. See [`Self::meta_str`].
+    pub fn meta_f32(&self, key: &str) -> Option<f32> {
+        self.metadata.get(key).and_then(bigtea_gguf::Value::as_f32)
     }
 
     /// Architecture-scoped metadata, e.g. `arch_u64("expert_count")`.
