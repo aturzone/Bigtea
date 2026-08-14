@@ -492,7 +492,7 @@ this audit, and the standard `-t` failed for weeks.
 | ~~`--warmup`/`--no-warmup`~~ | **retracted and implemented.** "Nothing is warmed" was wrong: the page cache, the repacked tensors, the arenas and the thread ladder all are. The default stays off, which is the honest part |
 | `--ubatch-size` | `-b` is the only batch dimension here |
 | `--fit`, `--fit-ctx`, `--fit-target` | `bigtea-model-info --budget` answers this question already, in its own spelling |
-| `--check-tensors` | the container work in r8 validates structure at open; a values-level NaN scan would have to dequantise every tensor and is not obviously worth it |
+| ~~`--check-tensors`~~ | **retracted and implemented.** "Would have to dequantise every tensor" was wrong: the f16 block scales are checkable without dequantising anything, and a bad scale is exactly where a ruined quantise shows up. See the 2026-08-11 entry above |
 
 ## Next batches, in order
 2. **RoPE / context (15)** — `--rope-freq-base`, `--rope-freq-scale`,

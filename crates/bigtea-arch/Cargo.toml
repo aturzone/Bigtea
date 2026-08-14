@@ -15,6 +15,7 @@ bigtea-io = { path = "../bigtea-io" }
 bigtea-model = { path = "../bigtea-model" }
 bigtea-probe = { path = "../bigtea-probe" }
 bigtea-grammar = { path = "../bigtea-grammar" }
+bigtea-jinja = { path = "../bigtea-jinja" }
 bigtea-tokenizer = { path = "../bigtea-tokenizer" }
 
 [[bin]]

@@ -11,6 +11,26 @@
 # Exits non-zero if any prompt disagrees *and* the reference agrees with
 # itself. Needs LLAMACPP_BIN pointing at a llama.cpp build's bin/.
 #
+# # `unstable` is a SUSPICION, not a verdict
+#
+# The re-check below compares the reference TO ITSELF under flags that only
+# reorder a sum. It cannot see that OUR INPUT differed -- and when the input
+# differs, a near-tie is exactly the symptom, because the model is answering a
+# slightly different question and lands on the other side of whatever was close.
+#
+# **Nine of eleven `unstable` verdicts in one session turned out to be bugs**:
+# Llama-3.2 rotating with the wrong RoPE (4), Falcon3 prefilled a token short
+# (5). So this script now does two more things before shrugging:
+#
+#   1. **Compares the tokenized prompt.** If llama.cpp turns the prompt into a
+#      different number of tokens than Bigtea does, the two engines are not
+#      answering the same question and the mismatch is a FAILURE, not a tie.
+#      That single check catches the whole class -- a missing BOS, a wrong
+#      pre-tokenizer, a byte-fallback that drops characters.
+#   2. **Counts them.** One near-tie in eight is ordinary. Three or more is a
+#      bug that has not been found yet, and the script exits non-zero saying so
+#      rather than printing eight reassuring lines.
+#
 # # Why a mismatch is not automatically a bug
 #
 # Greedy decoding is not stable under changes that are mathematically no-ops.
@@ -56,9 +76,35 @@ PROMPTS=(
   "Dear Sir or Madam, I am writing to"
 )
 
-strip() { sed 's/\x1b\[[0-9;]*m//g' | tr -d '\r'; }
+# Strip terminal colouring, CRs, and llama.cpp's own end-of-stream marker.
+#
+# `[end of text]` is printed by llama-completion when it hits EOS; Bigtea stops
+# silently. The GENERATED TOKENS ARE IDENTICAL -- this is the two CLIs framing
+# the same result differently, and leaving it in reported tinyllama's
+# `Q: What is 17 plus 25? A:` as a FAIL where both had answered ` 42`.
+#
+# A harness that cries wolf is worse than no harness. The whole value of this
+# script is that a FAIL means something, and the first thing anyone does with a
+# FAIL is go looking in the forward pass.
+strip() {
+  sed 's/\x1b\[[0-9;]*m//g' \
+    | tr -d '\r' \
+    | sed 's/ *\[end of text\] *$//'
+}
 
 ref() { "$REF" -m "$MODEL" -p "$1" -n "$N" --temp 0 --no-warmup -no-cnv "${@:2}" 2>/dev/null | strip; }
+
+# How many tokens each engine makes of a prompt. Different counts mean the two
+# are not answering the same question, and every difference downstream is
+# explained by that rather than by arithmetic.
+bigtea_tokens() {
+  "$BIGTEA" -m "$MODEL" -p "$1" -n 1 --temp 0 --force --verbose-prompt 2>&1 \
+    | strip | sed -n 's/^prompt .*-> \([0-9]*\) tokens$/\1/p' | head -1
+}
+llama_tokens() {
+  "$REF" -m "$MODEL" -p "$1" -n 1 --temp 0 --no-warmup -no-cnv --verbose-prompt 2>&1 \
+    | strip | sed -n 's/.*number of tokens in prompt = \([0-9]*\).*/\1/p' | head -1
+}
 
 name=$(basename "$MODEL")
 fail=0
@@ -84,13 +130,51 @@ for p in "${PROMPTS[@]}"; do
   # `--no-repack` both change only how a sum is ordered.
   c=$(ref "$p" -fa off)
   d=$(ref "$p" --no-repack)
+  # `-b 1` is the third no-op, and adding it was a deliberate decision rather
+  # than a convenience. Batching changes how many tokens a forward pass covers;
+  # for a correct engine that only reorders sums. llama.cpp disagrees with
+  # ITSELF under it -- on Qwen3-30B-A3B, `The capital of France is`:
+  #
+  #   default : ...Spain is Madrid. The capital of Germany is Berlin.
+  #   -b 1    : ...Spain is Madrid. The capital of Portugal is Lisbon.
+  #
+  # THE SET OF NO-OP CONFIGURATIONS TESTED HERE DECIDES WHAT COUNTS AS A BUG,
+  # and it cuts both ways: every configuration added makes `unstable` easier to
+  # reach, and `unstable` is where a real bug hides. Llama-3.2 reported FOUR
+  # unstable prompts for a day and all four were `rope_freqs.weight` being
+  # ignored -- the cluster was the signal, not the noise.
+  #
+  # So this stays honest only because of the cluster rule below: three or more
+  # unstable in eight still exits non-zero and demands a look.
+  e=$(ref "$p" -b 1)
   c=${c#*"$p"}
   d=${d#*"$p"}
-  if [ "$c" != "$b" ] || [ "$d" != "$b" ]; then
+  e=${e#*"$p"}
+  if [ "$c" != "$b" ] || [ "$d" != "$b" ] || [ "$e" != "$b" ]; then
+    # Before shrugging: did the two engines even read the same prompt? A
+    # near-tie is what a DIFFERENT INPUT looks like, so this is checked first.
+    bt=$(bigtea_tokens "$p")
+    lt=$(llama_tokens "$p")
+    if [ -n "$bt" ] && [ -n "$lt" ] && [ "$bt" != "$lt" ]; then
+      fail=1
+      printf 'FAIL      %-36s %s\n' "$name" "$p"
+      printf '  the prompt tokenized differently: bigtea %s tokens, llama.cpp %s.\n' "$bt" "$lt"
+      printf '  The reference also disagrees with itself here, which is what a\n'
+      printf '  different input looks like -- so this is NOT a near-tie.\n'
+      continue
+    fi
     unstable=$((unstable + 1))
     printf 'unstable  %-36s %s\n' "$name" "$p"
-    printf '  the reference disagrees with itself here (-fa off / --no-repack),\n'
-    printf '  so this prompt is a near-tie and proves nothing either way.\n'
+    which=""
+    [ "$c" != "$b" ] && which="$which -fa-off"
+    [ "$d" != "$b" ] && which="$which --no-repack"
+    [ "$e" != "$b" ] && which="$which -b-1"
+    # WHICH configuration moved it, not merely that one did. "-b 1 only" is a
+    # weaker claim than "every no-op moves it", and collapsing the two into one
+    # word is how a cluster stops looking like a cluster.
+    printf '  the reference disagrees with itself under:%s\n' "$which"
+    printf '  Both engines tokenized the prompt identically. Suspicious, not\n'
+    printf '  proof either way.\n'
     continue
   fi
 
@@ -100,5 +184,15 @@ for p in "${PROMPTS[@]}"; do
   printf '  llama.cpp: %s\n' "$(printf '%s' "$b" | head -c 200)"
 done
 
-[ "$unstable" -gt 0 ] && printf '          %-36s %d prompt(s) unstable in the reference itself\n' "$name" "$unstable"
+if [ "$unstable" -gt 0 ]; then
+  printf '          %-36s %d of %d prompt(s) unstable\n' "$name" "$unstable" "${#PROMPTS[@]}"
+fi
+# One near-tie in eight is ordinary. Three is not: nine of eleven `unstable`
+# verdicts in a single session turned out to be real bugs, so a cluster is
+# treated as one until someone shows otherwise.
+if [ "$unstable" -ge 3 ]; then
+  printf '          %-36s %d near-ties is a cluster, not chance -- treat as a bug\n' \
+    "$name" "$unstable"
+  fail=1
+fi
 exit $fail

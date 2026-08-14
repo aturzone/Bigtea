@@ -1326,6 +1326,445 @@ ungated FFN; and the pre-tokenizer default. Two traps worth carrying forward:
   made Phi-3 ungated and broke a verified architecture. `ne1 == 2*n_ff`
   separates them.
 
+## `--check-tensors` and `--fit` (2026-08-11) — four more off the declined list
+
+### `--check-tensors`, and the two bugs it found in itself first
+
+Container parsing validates **structure**. All of it can be perfect while the
+numbers are ruined, and the symptom is not a crash: the first NaN reaching a
+softmax makes every probability NaN, `argmax` returns index 0, and the model
+emits one token forever. That reads as a broken *model*, so the search starts in
+the forward pass instead of in the file.
+
+Verified by corrupting 4 KiB of a known-good container at a known offset:
+
+```
+check      blk.12.ffn_up.weight: non-finite block scale at block 72335
+bigtea-run: 1 tensor(s) hold non-finite values. This container is damaged
+```
+
+The refusal this retracts claimed a values-level scan "would have to dequantise
+every tensor". Wrong: the **f16 block scales** are floats, need no
+dequantisation, and are exactly where a ruined quantise shows up.
+
+Two bugs, both caught only by running it against a container **known to be
+healthy**:
+
+1. **Q4_K and Q5_K carry their scales at the start of the block, not the tail.**
+   Packed 4-bit quants at offset 140 read as `inf`, so the validator called a
+   healthy Qwen2 container damaged. Worse: **the unit test asserted the tail
+   too** — written from the same assumption as the code, so it proved only that
+   the two agreed. Both now cite `ggml-common.h`.
+2. **The 8 MiB chunk was not a multiple of 144 or 210 bytes**, so every chunk
+   after the first began mid-block. It failed at `token_embd.weight` "block
+   246754" — exactly where chunk one ended.
+
+An unknown quant type is **counted as uninspectable, never guessed at**: reading
+the wrong two bytes as a scale invents failures, and a validator that cries wolf
+is worse than none.
+
+### `--fit`, `--fit-target`, `--fit-ctx`
+
+The one flag group where Bigtea should be *ahead* rather than level: llama.cpp
+asks "will this fit in device memory" from outside the engine, and owning
+residency is this project's whole design.
+
+| | effect, measured |
+|---|---|
+| default (`--fit on`, target 1024 MiB) | 7.46 GiB expert cache |
+| `--fit-target 6144` | **2.44 GiB** — the headroom moved and the cache gave way |
+| `--fit off` | fixed 1.00 GiB, machine-independent |
+| `--cache 3` + `--fit-target 6144` | **3.00 GiB** — an explicit argument still wins |
+
+`--fit` only ever adjusts arguments the user did **not** set, which is what
+makes llama.cpp's default-on safe to match. `--fit off` gives a fixed 1 GiB
+rather than everything free, because the point of turning fitting off is
+reproducibility and "all of RAM" is the least reproducible number available.
+
+The 2 GiB headroom this file hardcoded is now `--fit-target`, and the header
+prints which value it used — **a headroom you cannot see is a headroom you
+cannot argue with.**
+
+`--fit-ctx` reports the question this project exists to answer: *given this
+machine, how much context is there room for?* Its first version answered "0
+tokens" on a machine with 8 GiB free, because it subtracted the expert cache —
+which is by construction everything left after headroom. **The cache is elastic
+and the KV cache is not**, so the honest answer is what fits once the cache has
+shrunk to its floor: 568,519 tokens for Qwen2-0.5B.
+
+Flags: **140 implemented, 47 declined**, of 187 recognised.
+
+## CPU affinity: six more off the declined list, and the mask reaches the metal
+
+`--cpu-mask`, `--cpu-range`, `--cpu-strict` and their three `-batch` variants.
+The proof they work is not that they parse:
+
+```
+--cpu-mask 0xf      prefill 151 tokens in 1.2s (122.85 tok/s)
+--cpu-mask 0xfffff  prefill 151 tokens in 0.5s (303.19 tok/s)
+```
+
+**2.5x from the mask alone** — the flag reaches the hardware, which is exactly
+what `-t` failed to do for weeks while being accepted and echoed.
+
+I refused these earlier for "no thread-affinity layer". **That premise was
+wrong in the same way `--prio`'s and `--warmup`'s were**: process affinity is
+one syscall, and every thread ggml spawns inherits it. Bigtea does not need to
+own a threadpool to pin one. Three refusals in a row have now turned out to
+rest on a wrong premise rather than a real limit — the pattern is refusing on
+*architecture* ("we have no X layer") when the flag only needs a *syscall*.
+
+What it genuinely cannot do is a different mask for prefill and generation,
+since ggml owns the pool. The `-batch` variants share the mask and the runner
+says so, rather than taking a second one and dropping it.
+
+### Two things the tests caught before the hardware did
+
+**`5` means different CPUs to the two flags.** It is CPUs 0 and 2 as a hex
+mask and CPU 5 as a range — which is *why* llama.cpp carries two flags. My one
+heuristic parser guessed hex and would have pinned `--cpu-range 5` to two cores
+instead of one, silently. Split into `parse_cpu_mask` and `parse_cpu_range`.
+
+**`--cpu-strict` capped generation threads and not prefill**, so a 4-CPU mask
+still ran 20 prefill threads. Oversubscription is the thing strict mode exists
+to prevent, and half-applying it is worse than not offering it — the header
+then reads as though it worked. Both counts now follow the mask, and an
+explicit `-t`/`-tb` still wins over both.
+
+Flags: **147 implemented, 44 declined**, of 191 recognised. Tests **435**.
+
+## Context shift: generation past the context limit (2026-08-11)
+
+`--context-shift` (default on), `--no-context-shift`, `--keep N`. 40 tokens
+generated under a 24-token limit:
+
+```
+$ bigtea-run -m m.gguf -p "Once upon a time" -n 40 -c 24 --keep 4
+shift      context full: kept 4, dropped 9. ...
+generated  40 tokens in 1.6s (25.10 tok/s)
+```
+
+**The shift was unreachable when first written.** The `-c` check refused the
+run before generation started — the exact case the shift exists to handle — so
+the flag fired zero times while being accepted and echoed. That check is now
+gated on `--no-context-shift`, and its message names the way forward instead of
+just the wall.
+
+### The limitation is stated at runtime, not buried
+
+```
+The shifted keys still carry the rotation of their ORIGINAL positions --
+llama.cpp re-ropes them and this build does not, so history past the first
+shift is approximate. --no-context-shift stops instead.
+```
+
+A key is computed with RoPE applied at its absolute position. After the slide it
+sits at a lower one, so every shifted key carries a rotation for a position it
+no longer occupies. llama.cpp corrects this (`llama_kv_cache_seq_add`); this
+does not. The output degrades visibly after a shift, and **saying so once, in
+the run itself, is the difference between a documented approximation and a
+silent one.** It is still better than refusing to generate, and it is the trade
+llama.cpp made before it added re-roping.
+
+`KvCache::shift_out` carries three unit tests, including one that checks a
+slid position holds what the *later* position held rather than what used to be
+in that slot — the failure mode that would look like plausible text.
+
+Flags: **150 implemented, 44 declined**, of 194 recognised. Tests **438**.
+
+## `unstable` was a verdict; it is a suspicion now (2026-08-11)
+
+The parity harness re-ran the reference under `-fa off` and `--no-repack` and,
+when llama.cpp disagreed with itself, called the prompt a near-tie and moved on.
+**Nine of eleven `unstable` verdicts in one session turned out to be bugs** —
+Llama-3.2 rotating with the wrong RoPE, Falcon3 prefilled a token short.
+
+The flaw is structural, not a threshold: **that re-check compares the reference
+to itself, and cannot see that OUR INPUT differed.** When the input differs, a
+near-tie is exactly the symptom — the model is answering a slightly different
+question and lands on the other side of whatever was close.
+
+Two changes:
+
+1. **On a mismatch, the tokenized prompt is compared.** Different token counts
+   mean the two engines are not answering the same question, and it is reported
+   as a **FAILURE** rather than a tie. One check catches the whole class: a
+   missing BOS, a wrong pre-tokenizer, a byte-fallback that drops characters.
+2. **Near-ties are counted, and three is a cluster.** One in eight is ordinary;
+   three is a bug nobody has found yet, and the script exits non-zero saying so
+   rather than printing eight reassuring lines.
+
+Phi-3's two survive both checks — identical tokenization, below the cluster
+threshold — which is the answer the harness should have been giving all along.
+
+## Reasoning blocks: six more off the declined list (2026-08-11)
+
+`--reasoning-format`, `--reasoning`, `--reasoning-budget`,
+`--reasoning-budget-message`, `--reasoning-preserve`,
+`--no-reasoning-preserve`. On Qwen3-4B, which thinks:
+
+```
+default                     <think>Okay, the user is asking...</think> 2 + 2 = 4
+--reasoning-format auto     2 + 2 = 4
+--reasoning-budget 20       reasoning  budget of 20 tokens reached while
+                                       still inside <think>; stopping
+```
+
+**Refused earlier as "downstream of Jinja".** That was wrong for the fourth
+time in the same shape: the block is delimited by ordinary text in the output,
+and finding it needs no template engine at all. The pattern in every one of
+these — `--prio`, `--warmup`, the affinity group, and now this — is refusing on
+*architecture* ("we have no X layer") when the feature only needs to read what
+is already there.
+
+Two decisions worth recording:
+
+**The tags are matched as text, not as token ids.** Qwen3 emits `<`, `think`,
+`>` as three tokens, and the tags are ordinary vocabulary in most models.
+Matching ids would have worked on one model and failed silently on the next —
+which is this project's signature failure.
+
+**Hitting the budget stops rather than forcing `</think>`.** Injecting a close
+tag means guessing a token id that differs per vocabulary, and a model still
+thinking at its budget has not produced an answer — cutting mid-thought and
+continuing would read as one. `--reasoning-budget-message` prints in its place
+so the truncation is visible as truncation.
+
+Flags: **156 implemented, 38 declined**, of 194 recognised.
+
+## `--load-mode` and `--numa isolate` (2026-08-11) — the fifth and sixth wrong premise
+
+```
+--load-mode dio          model qwen2 (direct (cache bypassed))
+--load-mode mmap         model qwen2 (buffered (page cache in use))
+--load-mode mmap+mlock   ... mlock 0.34 GiB pinned in physical memory
+--numa distribute        refused BY NAME, with what it would need
+```
+
+**`--load-mode` was refused for "`--direct-io`/`--no-direct-io` are the two
+modes that exist".** llama.cpp now marks `--mlock`, `--mmap` and `--direct-io`
+all *deprecated in favour of* `--load-mode`, and every one of its five modes
+maps onto a switch this build already had. The modes existed; the spelling did
+not. `mmap+mlock` is one mode, not two flags — that is the part a naive alias
+would have got wrong.
+
+**`--numa` was refused for "no NUMA-aware allocation to select between".** Half
+right, and the half that matters was wrong: `isolate` is a mask and a syscall,
+exactly like the affinity group. `distribute` and `numactl` place *individual
+threads* on chosen nodes and ggml owns the pool, so those two are refused **by
+name** with what they would need, rather than the whole flag being declined.
+
+On a single-node machine `isolate` reports that there is nothing to isolate.
+Silently pinning to "the whole machine" would have looked like it worked.
+
+**Six refusals in a row have now turned out to rest on a wrong premise** —
+`--prio`, `--warmup`, the affinity group, the reasoning group, `--load-mode`,
+`--numa`. The question that produced all six was "do we have a subsystem named
+after this?". The right one is "what does this actually require?".
+
+Flags: **158 implemented, 36 declined**, of 194 recognised.
+
+## `rope_freqs.weight` is ignored — every Llama-3.x model is wrong (2026-08-11)
+
+The eight-prompt sweep found it. Llama-3.2-1B:
+
+```
+FAIL  SELECT name, COUNT(*) FROM users WHERE
+  bigtea   :  age > 18 AND gender = 'male' GROUP BY name;
+  llama.cpp:  age > 18 GROUP BY name HAVING COUNT(*) > 1;
+```
+
+llama.cpp is **stable** on that prompt across `-fa on`, `-fa off`,
+`--no-repack` and `-t 4`, so it is not a near-tie.
+
+Llama-3.x containers ship a `rope_freqs.weight` tensor and llama.cpp passes it
+to `ggml_rope_ext` as `freq_factors`. **This build passes `None` at all four
+call sites** — and the parameter is already there as an `Option`, so nothing
+was missing except the value.
+
+**`llama` has been in `VERIFIED_ARCHITECTURES` since the beginning**, and
+TinyLlama passes 8/8 — because TinyLlama is Llama-2 and has no such tensor. One
+container in a family exercising a feature and another not is exactly the gap a
+three-prompt set leaves. Read `llama` as "verified on Llama-2-shaped
+containers" until this lands.
+
+Ticket: `docs/graph/backlog/rope-freqs-ignored.md`. The fix is three lines in
+`qwen3.rs`/`stream.rs`, which the other session owns.
+
+### The harness also cried wolf once, and that is worth as much
+
+TinyLlama reported a FAIL on `Q: What is 17 plus 25? A:` where both engines
+answered ` 42`. llama.cpp prints `[end of text]` on EOS and Bigtea stops
+silently — **the generated tokens were identical.** Stripped now.
+
+A harness that cries wolf is worse than no harness: the first thing anyone does
+with a FAIL is go looking in the forward pass. Two FAILs appeared in this sweep
+and exactly one was real; without checking both, the real one would have been
+dismissed along with the false one.
+
+## The eight-prompt sweep, re-run after the harness fix (2026-08-11)
+
+| container | ok | unstable | FAIL |
+|---|---:|---:|---:|
+| tinyllama-1.1b-chat | 8 | 0 | 0 |
+| Qwen2-0.5B-Instruct | 8 | 0 | 0 |
+| gemma-2-2b-it | 8 | 0 | 0 |
+| gemma-3-1b-it | 8 | 0 | 0 |
+| Qwen3-4B | 8 | 0 | 0 |
+| Phi-3-mini-4k-instruct | 6 | 2 | 0 |
+| **Llama-3.2-1B-Instruct** | 3 | 4 | **1** |
+
+**Gemma-3's arithmetic prompt and Gemma-2's are no longer unstable.** Both were
+the `[end of text]` artefact, not near-ties — the harness had been comparing
+llama.cpp's EOS marker against our silence. Five containers are now clean at
+eight prompts where three prompts had certified them.
+
+**Phi-3's two unstable prompts survive the harness fix**, which settles what
+they are: llama.cpp genuinely disagrees with itself on them under `--no-repack`.
+Gemma's did not survive it, so the two cases are different and only one was ever
+about the models.
+
+Llama-3.2 is the outlier twice over: the only FAIL (`rope_freqs.weight`,
+ticketed) and the only container with four genuine near-ties in eight.
+
+## The Jinja gap, scoped rather than guessed at (2026-08-11)
+
+`--jinja` is the last CLI capability that is not GPU, not a draft model and not
+an adapter. It has stayed unbuilt because of the rule in `chat.rs`: **a
+half-implemented Jinja silently produces the wrong framing.**
+
+Censusing all 12 `tokenizer.chat_template`s on disk makes the subset bounded:
+
+```
+if/endif 123 · set 98 · else 40 · for/endfor 31 · elif 21
+loop.index0 20 · loop.last 12 · loop.first 10
+namespace() 10 · raise_exception() 6 · strftime_now() 1
+filters: tojson 15, trim 6, length 5
+operators: in, not, is defined, is string, is not none
+```
+
+**No macros, no imports, no inheritance, three filters.** That is a
+self-contained crate with no dependencies, the same shape as `bigtea-grammar`
+— a weekend, not a quarter.
+
+The acceptance test already exists: `chat-templates.txt` is llama.cpp's own
+rendering of all 54 templates, and 52 of the family renderers are verified
+against it. A Jinja engine agreeing with them is a **cross-check between two
+independent implementations**, not a self-check.
+
+Ticket: `docs/graph/backlog/jinja-chat-templates.md`.
+
+## `-b 1` joins the no-op probe, and why that is a cost as well as a fix
+
+The other session asked for it and the principle holds: batching changes how
+many tokens a forward pass covers, which for a correct engine only reorders
+sums. llama.cpp disagrees with **itself** under it, verified here on
+Qwen3-30B-A3B:
+
+```
+default : ...Spain is Madrid. The capital of Germany is Berlin.
+-b 1    : ...Spain is Madrid. The capital of Portugal is Lisbon.
+```
+
+**The set of no-op configurations tested decides what counts as a bug**, and
+that cuts both ways. Every configuration added makes `unstable` easier to reach,
+and `unstable` is exactly where a real bug hides — Llama-3.2 reported **four**
+unstable prompts for a day and all four turned out to be `rope_freqs.weight`
+being ignored. The cluster was the signal, not the noise.
+
+So the harness now **names which configuration moved it**:
+
+```
+unstable  Phi-3-mini-4k-instruct  The capital of France is
+  the reference disagrees with itself under: -fa-off --no-repack -b-1
+```
+
+"`-b 1` only" is a weaker claim than "every no-op moves it", and collapsing the
+two into one word is how a cluster stops looking like a cluster. The rule that
+three or more unstable in eight exits non-zero is what keeps the addition
+honest.
+
+One correction back to that session: their report says `-b 1` reproduces **both**
+Phi-3 near-ties byte-identically against Bigtea. Re-run here, only the
+arithmetic prompt does; `The capital of France is` gives `Paris. Paris is known
+for its rich history` under `-b 1` against Bigtea's `Paris. <|assistant|> That's
+correct!`. The classification is unchanged — the reference is unstable there
+under all three configurations — but the stated reason was not reproducible.
+
+## `--jinja` is wired, and the fallback is the feature (2026-08-13)
+
+The container's own template is evaluated when asked, and **declines loudly** on
+anything the engine does not fully understand:
+
+```
+$ bigtea-run -m Qwen2-0.5B --jinja -sys SYS -p HI
+chat       template evaluated (--jinja)
+prompt     "<|im_start|>system
+SYS<|im_end|>
+<|im_start|>user
+HI<|im_end|>
+..."
+
+$ bigtea-run -m Llama-3.2-1B --jinja -sys SYS -p HI
+prompt     "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+
+            Cutting Knowledge Date: December 2023
+Today Date: 13 Aug 2026
+
+SYS..."
+
+$ bigtea-run -m Phi-3-mini --jinja -sys SYS -p HI
+chat       template has no system branch; merging it into the first user turn
+chat       template evaluated (--jinja)
+
+$ bigtea-run -m gemma-2-2b-it --jinja -sys SYS -p HI
+chat       --jinja declined: template rejected this conversation: System role not supported
+           falling back to the family matcher.
+```
+
+**Off by default, unlike llama.cpp.** The family renderers are verified
+byte-identical to llama.cpp's for 52 of its 54 names; making evaluation the
+default would change the prompt on models that are currently verified. That is
+a thing to opt into.
+
+Every decline names the construct. A fallback nobody can see is
+indistinguishable from a flag that does nothing — which is the failure `-t`
+already cost this project once.
+
+Gemma-2's decline is worth its own note: its template **raises** on a system
+turn, and falling back means the family matcher then accepts a conversation the
+model's own template forbids. The fallback is still the safe move; the family
+matcher's permissiveness is the open question.
+
+Flags: **165 implemented, 30 declined**, of 195 recognised. Tests **481**.
+
+## Jinja: every template on disk renders (2026-08-13)
+
+**15 containers: 6 agree with the family matcher, 8 differ, 1 refuses** — and
+the refusal is Gemma-2's template *correctly* raising on a system turn.
+
+Our rendering is **byte-identical to `llama-completion --jinja`** on Llama-3.2,
+date included. Two fixes got the last four tokens:
+
+- **`strftime_now`, and treating a built-in as `is defined`.** Llama-3 guards
+  with `if strftime_now is defined` and falls back to a hardcoded
+  `26 Jul 2024` — so answering `false` put a two-year-stale date in every
+  Llama-3 prompt.
+- **Jinja strips one trailing newline** (`keep_trailing_newline=False`), which
+  Llama-3's template depends on.
+
+The 8 "differ" rows are **not failures**: llama.cpp behaves identically, its
+`--no-jinja` matching our family matcher and its `--jinja` matching our engine.
+Hardcoded renderers drop content the templates specify — a property of the
+approach, not a bug in either engine.
+
+One judgement reversed: `'' + true` was refused on the principle that silent
+coercion is how a template prints `None`. llama.cpp evaluates with **minja,
+which coerces**, and DeepSeek writes exactly that. The line is now **a defined
+scalar coerces, `none` still refuses** — the dangerous case was never `true`,
+it was a missing variable becoming the literal text `None`.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**

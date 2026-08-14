@@ -497,7 +497,13 @@ fn parse_override(spec: &str) -> Option<(String, bigtea_gguf::Value)> {
 /// it continues it. Asked to "Write one sentence about the sea", Llama-3.2
 /// answered "The sentence should be concise and evocative", because it was
 /// completing an instruction rather than following one.
-fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool, system: Option<&str>) -> String {
+fn framed(
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    chat: bool,
+    system: Option<&str>,
+    jinja: bool,
+) -> String {
     // A system prompt is only meaningful inside a template — there is nowhere
     // to put it in raw completion — so asking for one implies chat framing
     // rather than being silently dropped.
@@ -518,7 +524,91 @@ fn framed(tokenizer: &Tokenizer, prompt: &str, chat: bool, system: Option<&str>)
         messages.push(Message::new("system", sys));
     }
     messages.push(Message::new("user", prompt));
+
+    if jinja {
+        if let Some(rendered) = render_with_jinja(tokenizer, system, prompt) {
+            return rendered;
+        }
+        // The message came from `render_with_jinja`; falling through is the
+        // designed path, not an error path.
+    }
     tokenizer.apply_chat_template(&messages, true)
+}
+
+/// Render the chat prompt by evaluating the container's own template.
+///
+/// `None` means the engine declined and the caller should use the family
+/// matcher. Every decline says why, because a silent fallback would make
+/// `--jinja` look like it worked while changing nothing.
+fn render_with_jinja(tokenizer: &Tokenizer, system: Option<&str>, prompt: &str) -> Option<String> {
+    use bigtea_jinja::Value;
+
+    let template = tokenizer.chat_template()?;
+    let mk = |role: &str, content: &str| {
+        let mut m = std::collections::HashMap::new();
+        m.insert("role".to_string(), Value::Str(role.to_string()));
+        m.insert("content".to_string(), Value::Str(content.to_string()));
+        Value::Map(m)
+    };
+    let mut raw = Vec::new();
+    if let Some(sys) = system {
+        raw.push(mk("system", sys));
+    }
+    raw.push(mk("user", prompt));
+
+    // llama.cpp's polyfill: a template with no system branch DROPS the system
+    // turn, so the content is merged into the first user turn instead. Phi-3's
+    // template does exactly that, and rendering it faithfully loses the system
+    // prompt with no error at all.
+    let messages = if bigtea_jinja::mentions_system_role(template) {
+        raw
+    } else {
+        if system.is_some() {
+            bigtea_arch::info!(
+                "chat       template has no system branch; merging it into the first user turn"
+            );
+        }
+        bigtea_jinja::merge_system_into_first_user(&raw, "\n")
+    };
+
+    let mut env = bigtea_jinja::Env::new();
+    env.set("messages", Value::List(messages));
+    env.set(
+        "bos_token",
+        Value::Str(
+            tokenizer
+                .bos
+                .and_then(|id| tokenizer.token_text(id))
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    );
+    env.set(
+        "eos_token",
+        Value::Str(
+            tokenizer
+                .eos
+                .and_then(|id| tokenizer.token_text(id))
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    );
+    env.set("add_generation_prompt", Value::Bool(true));
+
+    match bigtea_jinja::parse(template).and_then(|n| bigtea_jinja::render(&n, &mut env)) {
+        Ok(text) => {
+            bigtea_arch::info!("chat       template evaluated (--jinja)");
+            Some(text)
+        }
+        Err(e) => {
+            // Named, always. This is the fallback the crate exists to make
+            // safe, and a fallback nobody can see is indistinguishable from a
+            // flag that does nothing.
+            bigtea_arch::info!("chat       --jinja declined: {e}");
+            bigtea_arch::info!("           falling back to the family matcher.");
+            None
+        }
+    }
 }
 
 /// Perplexity over a corpus: the standard way to say a model still works.
@@ -729,54 +819,6 @@ fn print_hparams(c: &Qwen3Config) {
     );
 }
 
-fn dense_arena_bytes(config: &Qwen3Config, n: i64) -> usize {
-    let n = n.max(1) as u64;
-    let layers = config.n_layer.max(1) as u64;
-    // **Per layer**, and that is the whole point. One graph spans every block in
-    // a single context, and `ggml` frees nothing inside a context, so all 36
-    // layers' intermediates are alive at once. Sizing this for one layer is what
-    // made a 651-token prompt abort.
-    let per_layer = {
-        // Attention scores and their softmax: n x n per head, twice.
-        let scores = n * n * config.n_head as u64 * 4 * 2;
-        // Activations, Q/K/V, the FFN intermediates: roughly a dozen tensors of
-        // n_embd x n, plus the wider FFN ones.
-        let activations = n * config.n_embd as u64 * 4 * 12 + n * config.n_ff as u64 * 4 * 3;
-        // 25% over the counted tensors. The count is a reading of the graph and
-        // the graph changes; being 0.2% short still aborts, and being 25% over
-        // only refuses slightly sooner.
-        (scores + activations) * 5 / 4
-    };
-    // The logits are one row now, not `n` of them — see `build_graph`.
-    let head = config.vocab_size as u64 * 4 * 2;
-    // `ggml_graph_compute_with_ctx` allocates the graph struct **and its
-    // per-thread work buffer** out of this same arena, so the tensor data is
-    // not the whole requirement. Sizing for the data alone left it 0.1% short,
-    // which is still an abort.
-    let data = per_layer * layers + head;
-    (data + data / 8 + (512 << 20)) as usize
-}
-
-/// The longest prompt this machine can prefill in one graph, for this model.
-///
-/// The dense path builds one graph over every layer, so its arena grows with
-/// the sequence and there is a length past which it does not fit. Saying so is
-/// the difference between a clear refusal and `GGML_ASSERT` killing the process
-/// with no message this code can catch.
-fn dense_max_tokens(config: &Qwen3Config, budget: u64) -> i64 {
-    let mut lo = 1i64;
-    let mut hi = 32_768i64;
-    while lo < hi {
-        let mid = (lo + hi + 1) / 2;
-        if dense_arena_bytes(config, mid) as u64 <= budget {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    lo
-}
-
 /// A bash completion script, generated from the parser's own flag list.
 ///
 /// Generated rather than written out, because a hand-maintained completion
@@ -805,6 +847,141 @@ fn completion_bash() -> ExitCode {
 // written down: a hand-kept list drifted in both directions within an hour of
 // being written.
 include!(concat!(env!("OUT_DIR"), "/flags.rs"));
+
+/// llama.cpp's `--reasoning-*` group: what to do with a thinking block.
+///
+/// A reasoning model wraps its scratch work in `<think>...</think>` and then
+/// answers. Printing that verbatim is right for a human debugging the model and
+/// wrong for anything parsing the output — an agent asked for JSON gets several
+/// paragraphs of deliberation first, and a `--grammar` would reject the whole
+/// completion because the thinking is not JSON.
+#[derive(Debug, Clone)]
+struct Reasoning {
+    /// `false` keeps the block in the visible output, which is llama.cpp's
+    /// `--reasoning-format none` and this build's previous behaviour.
+    strip: bool,
+    /// Tokens the block may take. `0` suppresses thinking entirely; `-1` is
+    /// unlimited. A model that thinks forever produces no answer at all, and
+    /// that is the failure this bound exists for.
+    budget: i64,
+    /// Printed in place of a block that was cut short, so a truncated thought
+    /// is visible as truncation rather than as the model stopping mid-sentence.
+    budget_message: Option<String>,
+}
+
+impl Default for Reasoning {
+    fn default() -> Self {
+        // Off, matching llama.cpp's `--reasoning-format none` default for the
+        // CLI: a build that silently swallowed part of the output would be
+        // hiding exactly what a person runs the CLI to see.
+        Reasoning {
+            strip: false,
+            budget: -1,
+            budget_message: None,
+        }
+    }
+}
+
+/// Where a stream of tokens is, relative to a `<think>` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkState {
+    /// Before any `<think>`; ordinary output.
+    Before,
+    Inside,
+    /// Past `</think>`; ordinary output again.
+    After,
+}
+
+/// Follows `<think>`/`</think>` across token boundaries.
+///
+/// Byte-wise on the accumulated text rather than by token id, because the tags
+/// are ordinary text in most vocabularies and **split across tokens**: Qwen3
+/// emits `<`, `think`, `>` as three. Matching ids would work on one model and
+/// silently fail on the next.
+struct ThinkTracker {
+    state: ThinkState,
+    seen: String,
+    /// Tokens consumed since the block opened, for the budget.
+    inside_tokens: i64,
+}
+
+impl ThinkTracker {
+    fn new() -> Self {
+        ThinkTracker {
+            state: ThinkState::Before,
+            seen: String::new(),
+            inside_tokens: 0,
+        }
+    }
+
+    /// Feed one token's text. Returns whether it should be printed.
+    fn accept(&mut self, text: &str, strip: bool) -> bool {
+        self.seen.push_str(text);
+        // Only the tail can hold a partial tag, and holding the whole
+        // completion to search it would make this quadratic in the answer.
+        if self.seen.len() > 64 {
+            let cut = self.seen.len() - 32;
+            let cut = (0..=cut)
+                .rev()
+                .find(|&i| self.seen.is_char_boundary(i))
+                .unwrap_or(0);
+            self.seen.drain(..cut);
+        }
+        match self.state {
+            ThinkState::Before if self.seen.contains("<think>") => {
+                self.state = ThinkState::Inside;
+                self.seen.clear();
+                self.inside_tokens = 0;
+                !strip
+            }
+            ThinkState::Inside => {
+                self.inside_tokens += 1;
+                if self.seen.contains("</think>") {
+                    self.state = ThinkState::After;
+                    self.seen.clear();
+                }
+                !strip
+            }
+            _ => true,
+        }
+    }
+
+    fn over_budget(&self, budget: i64) -> bool {
+        budget >= 0 && self.state == ThinkState::Inside && self.inside_tokens > budget
+    }
+}
+
+/// llama.cpp's `--context-shift` / `--keep`.
+///
+/// The difference between a runner that stops at its context limit and one that
+/// keeps going. Default **on**, as in llama.cpp.
+#[derive(Debug, Clone, Copy)]
+struct Shift {
+    on: bool,
+    /// Tokens at the front that are never discarded — a system prompt, or the
+    /// instructions the whole conversation depends on. `0` keeps nothing,
+    /// which is llama.cpp's default too.
+    keep: usize,
+}
+
+/// llama.cpp's `--fit` group: adjust what the user did not set so the run fits.
+///
+/// The one flag group where this project should be ahead rather than level.
+/// llama.cpp asks "will this fit in device memory" from outside the engine;
+/// Bigtea owns residency, so it is the same question asked from inside.
+#[derive(Debug, Clone, Copy)]
+struct Fit {
+    /// Default **on**, matching llama.cpp. Safe as a default only because it
+    /// adjusts arguments the user left unset and nothing else.
+    on: bool,
+    /// Memory to leave free, in MiB. llama.cpp's default is 1024; this file
+    /// previously hardcoded 2048 with no way to move it.
+    target_mib: u64,
+    /// The smallest context `--fit` may settle on. Below this it reports that
+    /// the model does not fit rather than quietly running a context too short
+    /// to be useful -- llama.cpp's `--fit-ctx`, same reason.
+    min_ctx: usize,
+}
 
 /// llama.cpp flags this build declines, and why.
 ///
@@ -842,28 +1019,12 @@ const REFUSED: &[(&str, bool, &str)] = &[
     ("--split-mode", true, "no GPU backend exists"),
     ("--tensor-split", true, "no GPU backend exists"),
     ("--kv-offload", false, "the KV cache is always host memory"),
-    (
-        "--no-kv-offload",
-        false,
-        "the KV cache is always host memory; this is already the behaviour",
-    ),
     ("--op-offload", false, "no GPU backend exists"),
-    (
-        "--no-op-offload",
-        false,
-        "no GPU backend exists; this is already the behaviour",
-    ),
     (
         "--override-tensor",
         true,
         "buffer-type overrides select a backend, and there is only one",
     ),
-    (
-        "--cpu-moe",
-        false,
-        "experts are always on the CPU here; this is already the behaviour",
-    ),
-    ("--n-cpu-moe", true, "experts are always on the CPU here"),
     (
         "--backend-sampling",
         false,
@@ -933,73 +1094,17 @@ const REFUSED: &[(&str, bool, &str)] = &[
         false,
         "no Jinja engine; templates are matched by family (see --chat-template)",
     ),
-    (
-        "--skip-chat-parsing",
-        false,
-        "no Jinja engine, so there is no parsed chat to skip",
-    ),
-    (
-        "--no-skip-chat-parsing",
-        false,
-        "no Jinja engine, so there is no parsed chat to skip",
-    ),
     // --- reasoning-format parsing, which is downstream of Jinja.
-    (
-        "--reasoning-format",
-        true,
-        "reasoning-block parsing is not implemented; the block is emitted verbatim",
-    ),
-    (
-        "--reasoning",
-        true,
-        "reasoning-block parsing is not implemented",
-    ),
-    (
-        "--reasoning-budget",
-        true,
-        "reasoning-block parsing is not implemented",
-    ),
-    (
-        "--reasoning-budget-message",
-        true,
-        "reasoning-block parsing is not implemented",
-    ),
-    (
-        "--reasoning-preserve",
-        false,
-        "reasoning-block parsing is not implemented",
-    ),
-    (
-        "--no-reasoning-preserve",
-        false,
-        "reasoning-block parsing is not implemented",
-    ),
     // --- downloads. Implemented now -- see `resolve_model_source`. Only the
     // Docker registry stays out: it is a different protocol, not a URL.
     ("--docker-repo", true, "no Docker model registry support"),
     // --- NUMA and thread affinity.
-    ("--numa", true, "no NUMA-aware allocation to select between"),
     (
         "--poll",
         true,
         "ggml owns its threadpool here; `-t`/`-tb` are the levers that exist",
     ),
     ("--poll-batch", true, "ggml owns its threadpool here"),
-    (
-        "--cpu-mask",
-        true,
-        "no thread-affinity layer; `--prio` is the scheduling lever that exists",
-    ),
-    ("--cpu-mask-batch", true, "no thread-affinity layer"),
-    ("--cpu-range", true, "no thread-affinity layer"),
-    ("--cpu-range-batch", true, "no thread-affinity layer"),
-    ("--cpu-strict", true, "no thread-affinity layer"),
-    ("--cpu-strict-batch", true, "no thread-affinity layer"),
-    (
-        "--load-mode",
-        true,
-        "`--direct-io` / `--no-direct-io` are the two modes that exist",
-    ),
 ];
 
 /// Whether `flag` is refused, and the message if so.
@@ -1287,6 +1392,22 @@ fn main() -> ExitCode {
     let mut hf_token: Option<String> = None;
     let mut model_url: Option<String> = None;
     let mut offline = false;
+    let mut check_tensors = false;
+    let mut cpu_mask: Option<u64> = None;
+    let mut cpu_strict = false;
+    // llama.cpp defaults context shift ON. So does this -- see the shift block
+    // in the generation loop for what it costs.
+    let mut context_shift = true;
+    let mut n_keep: usize = 0;
+    let mut reasoning = Reasoning::default();
+    let mut numa_isolate = false;
+    let mut jinja = false;
+    // llama.cpp defaults --fit to on; so does this. It only ever adjusts
+    // arguments the user did NOT set, which is what makes a default-on
+    // auto-configuration safe.
+    let mut fit = true;
+    let mut fit_target_mib: u64 = 1024;
+    let mut fit_ctx: usize = 4096;
     let mut chat_template: Option<String> = None;
     let mut model_flag: Option<String> = None;
     let mut grammar_src: Option<String> = None;
@@ -1660,6 +1781,294 @@ fn main() -> ExitCode {
                     }
                 }
                 return ExitCode::SUCCESS;
+            }
+            // Read every tensor and check its values are finite. Structure is
+            // validated when the container opens; this is about the numbers,
+            // and the first NaN reaching a softmax makes every probability NaN
+            // -- argmax then returns index 0 and the model repeats one token
+            // forever, which reads as a broken model rather than a broken file.
+            // --- flags that ask for what this build already does --------------
+            //
+            // Refusing these was inconsistent with `--swa-full`, which reports
+            // "already the behaviour" and continues. A user asking for the
+            // thing they are going to get should not be stopped -- the reason
+            // to refuse a flag is that the run would quietly do LESS than the
+            // command line says, and here it does exactly what it says.
+            //
+            // Their positive forms (`--kv-offload`, `--op-offload`) ask for a
+            // GPU and are still declined: those WOULD do less.
+            "--no-kv-offload" | "-nkvo" => {
+                bigtea_arch::info!("offload    the KV cache is always host memory here");
+                i += 1;
+            }
+            "--no-op-offload" => {
+                bigtea_arch::info!("offload    every op runs on the host here");
+                i += 1;
+            }
+            "--cpu-moe" | "-cmoe" => {
+                bigtea_arch::info!("offload    experts always stream to host memory here");
+                i += 1;
+            }
+            // Takes a layer count. Reported rather than silently satisfied:
+            // asking for 8 and getting all of them is still not what was asked,
+            // even though it is a superset.
+            "--n-cpu-moe" | "-ncmoe" => {
+                if let Some(v) = rest.get(i + 1) {
+                    bigtea_arch::info!(
+                        "offload    --n-cpu-moe {v}: ALL experts are on the host here, not {v} layers"
+                    );
+                }
+                i += 2;
+            }
+            // --- loading mode -------------------------------------------------
+            //
+            // llama.cpp's unified replacement for --mlock, --mmap and
+            // --direct-io, all three of which it now marks DEPRECATED. Every
+            // mode maps onto a switch this build already had, which is why the
+            // earlier refusal ("--direct-io / --no-direct-io are the two modes
+            // that exist") was too narrow: the modes existed, the spelling did
+            // not. `mmap+mlock` is one mode, not two flags.
+            "-lm" | "--load-mode" => {
+                let Some(mode) = rest.get(i + 1) else {
+                    eprintln!("bigtea-run: --load-mode needs none|mmap|mlock|mmap+mlock|dio");
+                    return ExitCode::from(2);
+                };
+                for part in mode.split('+') {
+                    match part.trim() {
+                        "none" => std::env::set_var("BIGTEA_IO", "buffered"),
+                        "mmap" => std::env::set_var("BIGTEA_IO", "buffered"),
+                        "mlock" => mlock = true,
+                        "dio" | "direct-io" => std::env::set_var("BIGTEA_IO", "direct"),
+                        other => {
+                            eprintln!(
+                                "bigtea-run: --load-mode {other:?}: expected none, mmap, mlock, \
+                                 mmap+mlock or dio"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+                i += 2;
+            }
+            // --- NUMA ---------------------------------------------------------
+            //
+            // `isolate` is reachable for the same reason affinity was: it is a
+            // mask and a syscall. `distribute` and `numactl` place INDIVIDUAL
+            // THREADS on chosen nodes, and ggml owns the pool -- so those two
+            // are refused by name rather than accepted and ignored.
+            "--numa" => {
+                match rest.get(i + 1).map(String::as_str) {
+                    Some("isolate") => numa_isolate = true,
+                    Some(other @ ("distribute" | "numactl")) => {
+                        eprintln!(
+                            "bigtea-run: --numa {other} is not supported: it places individual \
+                             threads on chosen nodes, and ggml owns the threadpool here."
+                        );
+                        eprintln!("  --numa isolate works, and pins the process to one node.");
+                        return ExitCode::from(2);
+                    }
+                    other => {
+                        eprintln!(
+                            "bigtea-run: --numa {:?}: expected isolate, distribute or numactl",
+                            other.unwrap_or("")
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            // --- template evaluation -----------------------------------------
+            //
+            // Evaluate the container's own Jinja rather than matching it to a
+            // family. **Falls back, loudly, on any construct the engine does
+            // not fully understand** -- that fallback is the whole safety
+            // property, because a wrong framing does not error and the model
+            // answers fluently having never seen the prompt shape.
+            //
+            // Off by default, unlike llama.cpp: the family renderers are
+            // verified byte-identical to llama.cpp's for 52 of its 54 names,
+            // and 6 of 15 containers here evaluate cleanly. Making evaluation
+            // the default would change the prompt on models that are currently
+            // verified, which is a thing to opt into.
+            "--jinja" => {
+                jinja = true;
+                i += 1;
+            }
+            "--no-jinja" => {
+                jinja = false;
+                i += 1;
+            }
+            // llama.cpp parses a rendered chat back into structured turns.
+            // Nothing here does, so there is nothing to skip -- accepted rather
+            // than refused, in the same spirit as `--swa-full`.
+            "--skip-chat-parsing" | "--no-skip-chat-parsing" => {
+                i += 1;
+            }
+            // --- reasoning blocks --------------------------------------------
+            //
+            // Refused earlier as "downstream of Jinja". It is not: the block is
+            // delimited by ordinary text in the output, and finding it needs no
+            // template engine at all.
+            "--reasoning-format" | "--reasoning" => {
+                match rest.get(i + 1).map(String::as_str) {
+                    // llama.cpp's vocabulary. `none` keeps the block.
+                    Some("none") => reasoning.strip = false,
+                    Some("auto") | Some("deepseek") | Some("deepseek-legacy") => {
+                        reasoning.strip = true
+                    }
+                    other => {
+                        eprintln!(
+                            "bigtea-run: --reasoning-format {:?}: expected none, auto, deepseek \
+                             or deepseek-legacy",
+                            other.unwrap_or("")
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "--reasoning-budget" => {
+                reasoning.budget = rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1);
+                i += 2;
+            }
+            "--reasoning-budget-message" => {
+                reasoning.budget_message = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            // Preserve is the inverse of strip, and both spellings exist
+            // because llama.cpp's default differs between its CLI and server.
+            "--reasoning-preserve" => {
+                reasoning.strip = false;
+                i += 1;
+            }
+            "--no-reasoning-preserve" => {
+                reasoning.strip = true;
+                i += 1;
+            }
+            // --- context shift ----------------------------------------------
+            //
+            // What lets generation continue past the context limit: keep the
+            // first `--keep` tokens, discard the oldest half of the rest, and
+            // slide the remainder down.
+            "--context-shift" => {
+                context_shift = true;
+                i += 1;
+            }
+            "--no-context-shift" => {
+                context_shift = false;
+                i += 1;
+            }
+            "--keep" => {
+                if let Some(v) = rest.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                    n_keep = v;
+                }
+                i += 2;
+            }
+            // --- CPU affinity ------------------------------------------------
+            //
+            // Refused earlier on the premise that there is "no thread-affinity
+            // layer" here. That premise was wrong in the same way `--prio`'s
+            // and `--warmup`'s were: PROCESS affinity is one syscall and every
+            // thread ggml spawns inherits it, so Bigtea does not need to own a
+            // threadpool to pin one.
+            //
+            // What it genuinely cannot do is a DIFFERENT mask for prefill and
+            // generation, because ggml owns the pool. The `-batch` variants
+            // therefore share the mask and the runner says so, rather than
+            // taking a second one and dropping it.
+            "-C" | "--cpu-mask" | "-Cb" | "--cpu-mask-batch" => {
+                let Some(v) = rest.get(i + 1) else {
+                    eprintln!("bigtea-run: {} needs a hex mask, e.g. 0xff", rest[i]);
+                    return ExitCode::from(2);
+                };
+                match bigtea_io::lock::parse_cpu_mask(v) {
+                    Some(m) => cpu_mask = Some(cpu_mask.map_or(m, |old| old | m)),
+                    None => {
+                        eprintln!("bigtea-run: {}: {v:?} is not a hex mask", rest[i]);
+                        eprintln!("  A mask read wrongly pins to the wrong cores, which looks");
+                        eprintln!("  like a slowdown rather than a bad argument, so it refuses.");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "-Cr" | "--cpu-range" | "-Crb" | "--cpu-range-batch" => {
+                let Some(v) = rest.get(i + 1) else {
+                    eprintln!("bigtea-run: {} needs a range, e.g. 0-3", rest[i]);
+                    return ExitCode::from(2);
+                };
+                match bigtea_io::lock::parse_cpu_range(v) {
+                    Some(m) => cpu_mask = Some(cpu_mask.map_or(m, |old| old | m)),
+                    None => {
+                        eprintln!("bigtea-run: {}: {v:?} is not a CPU range", rest[i]);
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            // llama.cpp's strict mode means "use exactly these CPUs". Here the
+            // mask is already exact -- an inherited process affinity cannot be
+            // exceeded -- so this only controls whether the default thread
+            // count is cut to the mask's width.
+            "--cpu-strict" | "--cpu-strict-batch" => {
+                cpu_strict = rest
+                    .get(i + 1)
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .map(|v| v != 0)
+                    .unwrap_or(true);
+                i += 2;
+            }
+            // --- fitting the machine ----------------------------------------
+            //
+            // This is the one flag group where Bigtea should be ahead rather
+            // than level: owning residency is the whole design, and `--fit` is
+            // llama.cpp asking the same question from the outside. It adjusts
+            // only arguments left unset, so `--cache`, `-c` and `-b` still win
+            // when given.
+            "-fit" | "--fit" => {
+                // llama.cpp takes an optional on|off; a bare --fit means on.
+                match rest.get(i + 1).map(String::as_str) {
+                    Some("on") => {
+                        fit = true;
+                        i += 2;
+                    }
+                    Some("off") => {
+                        fit = false;
+                        i += 2;
+                    }
+                    _ => {
+                        fit = true;
+                        i += 1;
+                    }
+                }
+            }
+            "-fitt" | "--fit-target" => {
+                // Comma-separated per device in llama.cpp; there is one device
+                // here, so the first value is taken and the rest ignored --
+                // said out loud rather than silently, because a user passing
+                // three numbers is describing a machine this build cannot use.
+                if let Some(v) = rest.get(i + 1) {
+                    let first = v.split(',').next().unwrap_or(v);
+                    if v.contains(',') {
+                        bigtea_arch::info!(
+                            "fit        --fit-target has one device here; using {first} MiB"
+                        );
+                    }
+                    if let Ok(m) = first.trim().parse::<u64>() {
+                        fit_target_mib = m;
+                    }
+                }
+                i += 2;
+            }
+            "-fitc" | "--fit-ctx" => {
+                if let Some(v) = rest.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                    fit_ctx = v;
+                }
+                i += 2;
+            }
+            "--check-tensors" => {
+                check_tensors = true;
+                i += 1;
             }
             "--mmap" => {
                 std::env::set_var("BIGTEA_IO", "buffered");
@@ -2150,6 +2559,49 @@ fn main() -> ExitCode {
     bigtea_arch::log::configure(logcfg);
     // After the log is configured so the outcome is reported through it, and
     // before the model opens so the load itself runs at the asked-for priority.
+    // NUMA isolation narrows the same mask affinity uses, so it is resolved
+    // first and an explicit --cpu-mask still wins by intersecting with it.
+    if numa_isolate {
+        match bigtea_io::lock::numa_node_mask() {
+            Some(node) => {
+                cpu_mask = Some(cpu_mask.map_or(node, |m| m & node).max(1));
+                bigtea_arch::info!("numa       isolating to node mask {node:#x}");
+            }
+            // Not a failure: a single-node machine has nothing to isolate, and
+            // silently pinning to "the whole machine" would look like it worked.
+            None => bigtea_arch::info!(
+                "numa       one node only (or topology unavailable); nothing to isolate"
+            ),
+        }
+    }
+    // Before the model opens, so the load runs under the same mask.
+    if let Some(mask) = cpu_mask {
+        match bigtea_io::lock::set_affinity(mask) {
+            Ok(n) => {
+                bigtea_arch::info!("affinity   {n} CPUs (mask {mask:#x})");
+                // With `--cpu-strict`, the default thread count follows the
+                // mask. Without it, ggml still sees the machine's full core
+                // count and oversubscribes the CPUs it is allowed -- which is
+                // llama.cpp's behaviour too, and is why the flag exists.
+                if cpu_strict {
+                    // BOTH counts, not just generation. Leaving prefill at the
+                    // machine's core count put 20 threads on a 4-CPU mask --
+                    // oversubscription is exactly what strict mode exists to
+                    // prevent, and half-applying it is worse than not offering
+                    // it, because the header then reads as though it worked.
+                    if threads.is_none() {
+                        threads = Some(n as usize);
+                    }
+                    if threads_batch.is_none() {
+                        threads_batch = Some(n as usize);
+                    }
+                    bigtea_arch::info!("affinity   --cpu-strict: both thread counts set to {n}");
+                }
+            }
+            // Not fatal: the process still runs, on the CPUs it already had.
+            Err(e) => bigtea_arch::info!("affinity   not applied: {e}"),
+        }
+    }
     if let Some(level) = prio {
         match bigtea_io::lock::set_priority(level) {
             Ok(name) => bigtea_arch::info!("priority   {name}"),
@@ -2191,6 +2643,18 @@ fn main() -> ExitCode {
         warmup,
         infill,
         grammar_triggers,
+        check_tensors,
+        Fit {
+            on: fit,
+            target_mib: fit_target_mib,
+            min_ctx: fit_ctx,
+        },
+        Shift {
+            on: context_shift,
+            keep: n_keep,
+        },
+        reasoning,
+        jinja,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -2231,6 +2695,9 @@ fn run_streaming(
     warmup: bool,
     infill: bool,
     grammar_triggers: Vec<String>,
+    fit: Fit,
+    shift: Shift,
+    reasoning: Reasoning,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -2255,11 +2722,20 @@ fn run_streaming(
 
     // A context cap the user asked for, enforced before any work rather than
     // discovered as an arena abort partway through.
-    if let Some(limit) = ctx_size {
+    // Only when there is no way to make room. With context shift on -- the
+    // default, as in llama.cpp -- exceeding `-c` is the case the shift EXISTS
+    // to handle, and refusing here made the flag unreachable: it never fired
+    // once, because this check ran first.
+    if let Some(limit) = ctx_size.filter(|_| !shift.on) {
         if tokens.len() + n_predict > limit {
             return Err(format!(
-                "prompt is {} tokens and -n is {n_predict}, which exceeds the -c limit of {limit}",
-                tokens.len()
+                concat!(
+                    "prompt is {} tokens and -n is {}, which exceeds the -c limit of {}. ",
+                    "Drop --no-context-shift to let it make room instead."
+                ),
+                tokens.len(),
+                n_predict,
+                limit
             )
             .into());
         }
@@ -2278,7 +2754,12 @@ fn run_streaming(
     // tok/s and 8 GiB gives 1.56. The two things that genuinely scale are the
     // KV cache, which grows with context, and the arenas, which grow with the
     // prefill block. Everything else is the OS.
-    const BASE_HEADROOM: u64 = 2 * (1 << 30);
+    // llama.cpp calls this the fit target and defaults it to 1024 MiB; this
+    // defaulted to 2 GiB because the number was chosen here for a machine that
+    // also runs a browser. `--fit-target` now moves it, and the header prints
+    // whichever it used -- a headroom you cannot see is a headroom you cannot
+    // argue with.
+    let base_headroom: u64 = fit.target_mib << 20;
     // Two bytes per value: the KV cache is f16.
     let kv_per_position =
         (config.n_layer as u64) * (config.n_head_kv as u64) * (config.head_dim as u64) * 2 * 2;
@@ -2286,26 +2767,75 @@ fn run_streaming(
     // Arenas scale with the block: activations, Q/K/V and the router, roughly
     // a dozen n_embd-by-block matrices, doubled by `arena_for`.
     let arena_estimate = (config.n_embd as u64) * (prefill_block as u64) * 4 * 24;
-    let headroom = BASE_HEADROOM + kv_estimate + arena_estimate;
+    let headroom = base_headroom + kv_estimate + arena_estimate;
 
-    let budget = match cache_budget {
-        Some(bytes) => bytes,
-        None => {
+    let budget = match (cache_budget, fit.on) {
+        // An explicit --cache always wins: --fit adjusts what was NOT set.
+        (Some(bytes), _) => bytes,
+        (None, true) => {
             let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
             machine
                 .ram_available_bytes
                 .map(|avail| avail.saturating_sub(headroom).max(1 << 30))
                 .unwrap_or(1 << 30)
         }
+        // `--fit off` means "do not look at the machine". A fixed 1 GiB rather
+        // than everything free, because the point of turning fitting off is
+        // reproducibility across machines, and "all of RAM" is the least
+        // reproducible number available.
+        (None, false) => 1 << 30,
     };
     let mut runner = StreamingRunner::new(model, config.clone(), budget as usize);
     bigtea_arch::info!(
-        "cache      {:.2} GiB for experts (headroom {:.2} GiB: {:.2} kv + {:.2} arenas + 2.00 os)",
+        "cache      {:.2} GiB for experts (headroom {:.2} GiB: {:.2} kv + {:.2} arenas + {:.2} fit-target){}",
         budget as f64 / GIB,
         headroom as f64 / GIB,
         kv_estimate as f64 / GIB,
-        arena_estimate as f64 / GIB
+        arena_estimate as f64 / GIB,
+        base_headroom as f64 / GIB,
+        if fit.on { "" } else { " [--fit off]" }
     );
+
+    // `--fit-ctx` is the floor `--fit` may settle on, and this is the one
+    // question this project is built to answer: given this machine, how much
+    // context is there room for? Reported rather than assumed, and only when
+    // `-c` was not given -- an explicit context is the user's decision.
+    //
+    // **The expert cache does not compete with the KV cache for this answer.**
+    // Subtracting `budget` gave "room for 0 tokens" on a machine with 8 GiB
+    // free, because `budget` is by construction everything left after headroom.
+    // The cache is elastic and shrinks to its 1 GiB floor; the KV cache is not.
+    // So the question is what fits once the cache has given up all it can.
+    if fit.on && ctx_size.is_none() && kv_per_position > 0 {
+        let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
+        if let Some(avail) = machine.ram_available_bytes {
+            const CACHE_FLOOR: u64 = 1 << 30;
+            let for_kv = avail
+                .saturating_sub(base_headroom)
+                .saturating_sub(arena_estimate)
+                .saturating_sub(CACHE_FLOOR);
+            let max_ctx = (for_kv / kv_per_position) as usize;
+            if max_ctx < fit.min_ctx {
+                // Not fatal: this run may need far less than the floor and be
+                // perfectly fine. Saying so beats silence and beats a refusal
+                // the user did not ask for.
+                bigtea_arch::info!(
+                    concat!(
+                        "fit        room for {} tokens of context, under the --fit-ctx floor ",
+                        "of {}; this run needs {}"
+                    ),
+                    max_ctx,
+                    fit.min_ctx,
+                    tokens.len() + n_predict
+                );
+            } else {
+                bigtea_arch::detail!(
+                    "fit        room for {max_ctx} tokens of context (floor {})",
+                    fit.min_ctx
+                );
+            }
+        }
+    }
 
     let ctx = Context::new_no_alloc(64 << 20)?;
     let mut weights = WeightSet::new();
@@ -2565,6 +3095,20 @@ fn run_streaming(
         // matching would miss most of them. Reset per turn, or a stop string
         // from an earlier answer would end this one immediately.
         let mut generated_text = String::new();
+        // What "full" means here. An explicit -c wins; otherwise the model's
+        // own trained context, and failing that the prompt plus what was asked
+        // for, which never triggers and so never surprises anyone.
+        let shift_limit = ctx_size
+            .or(if config.rope_orig_ctx > 0 {
+                Some(config.rope_orig_ctx as usize)
+            } else {
+                None
+            })
+            .unwrap_or(usize::MAX);
+        let mut shifted_once = false;
+        // Follows <think>/</think> across token boundaries -- the tags are
+        // ordinary text and split across tokens, so this cannot key off ids.
+        let mut think = ThinkTracker::new();
         // A lazy grammar is off until a trigger appears; with no triggers the
         // grammar is armed from the first token, which is the ordinary case.
         let mut grammar_armed = grammar_triggers.is_empty();
@@ -2646,7 +3190,29 @@ fn run_streaming(
                 tokens.push(next);
                 break;
             }
-            writer.push_visible(tokenizer, next, &ui);
+            // The reasoning block, if there is one. `accept` decides whether
+            // this token is part of the answer or part of the scratch work, and
+            // `--reasoning-format none` (the default) prints both.
+            let piece = tokenizer.decode(std::slice::from_ref(&next));
+            let show = think.accept(&piece, reasoning.strip);
+            if think.over_budget(reasoning.budget) {
+                // Stopping is honest and forcing `</think>` would be a guess at
+                // a token id that differs per vocabulary. A model still
+                // thinking at its budget has not produced an answer, and
+                // pretending otherwise by cutting mid-thought would read as one.
+                if let Some(m) = reasoning.budget_message.as_deref() {
+                    println!("{m}");
+                }
+                bigtea_arch::info!(
+                    "reasoning  budget of {} tokens reached while still inside <think>; stopping",
+                    reasoning.budget
+                );
+                tokens.push(next);
+                break;
+            }
+            if show {
+                writer.push_visible(tokenizer, next, &ui);
+            }
             tokens.push(next);
             // Advance the grammar by what was actually emitted. Done after the
             // EOS check above, so a stop token never has to parse.
@@ -2667,6 +3233,35 @@ fn run_streaming(
             // Only the new token needs computing; history lives in the cache.
             // Skipped on the last step — nothing would read those logits.
             if step + 1 < this_turn {
+                // Context shift: the cache is about to outgrow what this build
+                // can attend over, so make room rather than stopping.
+                //
+                // llama.cpp's rule -- keep the first `--keep` tokens (a system
+                // prompt, usually) and discard the oldest half of what follows,
+                // so the cost is paid once per half-context rather than once
+                // per token.
+                if shift.on && pos + 1 >= shift_limit {
+                    let keep = shift.keep.min(pos.saturating_sub(1));
+                    let drop = ((pos - keep) / 2).max(1);
+                    cache.shift_out(keep, drop);
+                    pos -= drop;
+                    if !shifted_once {
+                        shifted_once = true;
+                        // Said once, and said plainly, because the output after
+                        // a shift is NOT equivalent to output without one.
+                        bigtea_arch::info!(
+                            concat!(
+                                "shift      context full: kept {}, dropped {}. The shifted keys ",
+                                "still carry the rotation of their ORIGINAL positions -- ",
+                                "llama.cpp re-ropes them and this build does not, so history ",
+                                "past the first shift is approximate. --no-context-shift stops ",
+                                "instead."
+                            ),
+                            keep,
+                            drop
+                        );
+                    }
+                }
                 logits = runner.forward_cached(&weights, &mut cache, &[next], pos)?;
                 pos += 1;
             }
@@ -2789,6 +3384,11 @@ fn run(
     warmup: bool,
     infill: bool,
     grammar_triggers: Vec<String>,
+    check_tensors: bool,
+    fit: Fit,
+    shift: Shift,
+    reasoning: Reasoning,
+    jinja: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -2824,6 +3424,34 @@ fn run(
         model.override_metadata(key, value.clone());
     }
     let model = model;
+
+    // Values, not structure. Before the architecture check, because a container
+    // whose numbers are ruined should say so rather than first being told its
+    // architecture is unverified -- the second message would send someone
+    // looking in the wrong place.
+    if check_tensors {
+        let t = std::time::Instant::now();
+        let report = bigtea_model::validate::check(&model, 8);
+        bigtea_arch::info!(
+            "check      {} in {:.1}s",
+            bigtea_model::validate::summary(&report),
+            t.elapsed().as_secs_f64()
+        );
+        if !report.ok() {
+            for (name, why) in &report.problems {
+                bigtea_arch::info!("check      {name}: {why}");
+            }
+            return Err(format!(
+                concat!(
+                    "{} tensor(s) hold non-finite values. This container is damaged -- ",
+                    "re-download it. Running anyway produces NaN logits, which look like ",
+                    "a broken model rather than a broken file."
+                ),
+                report.problems.len()
+            )
+            .into());
+        }
+    }
 
     // Refuse an architecture nobody has checked, rather than answering wrongly
     // and confidently. Gemma-2 loads through the generic dense path with no
@@ -2882,6 +3510,7 @@ fn run(
             prompt,
             chat || ui.conversation,
             system_prompt.as_deref(),
+            jinja,
         );
         run_deepseek4(
             &model,
@@ -2992,8 +3621,9 @@ fn run(
         prompt,
         chat || ui.conversation,
         system_prompt.as_deref(),
+        jinja,
     );
-    let mut tokens: Vec<u32> = tokenizer.encode(prompt);
+    let tokens: Vec<u32> = tokenizer.encode(prompt);
     bigtea_arch::info!("prompt     {prompt:?} -> {} tokens", tokens.len());
     if tokens.is_empty() {
         return Err("prompt encoded to zero tokens".into());
@@ -3010,164 +3640,48 @@ fn run(
     // routed experts, so "streaming" reduces to exactly that.
     // `BIGTEA_UNCACHED=1` keeps the old stateless path reachable, so the gain
     // can be measured rather than asserted.
-    if std::env::var("BIGTEA_UNCACHED").is_err() {
-        return run_streaming(
-            &model,
-            config,
-            &arch,
-            &tokenizer,
-            tokens,
-            n_predict,
-            prefill_block,
-            cache_budget,
-            sampler,
-            ctx_size,
-            stop,
-            perplexity,
-            ui,
-            show_perf,
-            kv_type,
-            mlock,
-            prompt_cache,
-            prompt_cache_all,
-            prompt_cache_ro,
-            grammar,
-            warmup,
-            infill,
-            grammar_triggers,
-            t0,
-        );
-    }
-
-    // --- weights -----------------------------------------------------------
-    // Metadata only: the data pointers reference buffers we own, so this arena
-    // holds tensor structs rather than weights.
-    let names = arch.required_tensors();
-    let weight_ctx = Context::new_no_alloc(64 << 20)?;
-    let mut weights = WeightSet::new();
-
-    let load_start = std::time::Instant::now();
-    let mut bound_bytes = 0u64;
-    for name in &names {
-        let loc = model
-            .location(name)
-            .ok_or_else(|| format!("missing tensor {name}"))?
-            .clone();
-        let data = model.read_tensor(name)?;
-        bound_bytes += data.len() as u64;
-        weights.bind(&weight_ctx, name, loc.ty, &loc.dims, data)?;
-    }
-    // The output projection is tied to the embeddings unless shipped separately.
-    if model.location("output.weight").is_some() && weights.get("output.weight").is_none() {
-        let loc = model.location("output.weight").expect("checked").clone();
-        let data = model.read_tensor("output.weight")?;
-        bound_bytes += data.len() as u64;
-        weights.bind(&weight_ctx, "output.weight", loc.ty, &loc.dims, data)?;
-    }
-    bigtea_arch::info!(
-        "weights    {} tensors, {:.2} GiB bound in {:.1}s (zero-copy)",
-        weights.len(),
-        bound_bytes as f64 / GIB,
-        load_start.elapsed().as_secs_f64()
-    );
-
-    // Say which counts are in use and why. The generation default is a
-    // measurement, and an unexplained "2" on a 20-thread machine looks like a
-    // bug rather than the 1.7x it is worth.
-    let threads = bigtea_arch::configured_threads();
-    let threads_batch = bigtea_arch::configured_threads_batch();
-    bigtea_arch::info!("threads    {threads} generating, {threads_batch} prefilling");
-
-    // --- generate ----------------------------------------------------------
-    println!("\n{prompt}");
-
-    let mut produced = String::new();
-    let gen_start = std::time::Instant::now();
-
-    // Refuse a prompt this machine cannot prefill, with the numbers — rather
-    // than letting ggml abort partway through, which is a `GGML_ASSERT` and
-    // kills the process with nothing this code can catch or report.
-    {
-        let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
-        let budget = machine
-            .ram_available_bytes
-            .unwrap_or(4 << 30)
-            .saturating_sub(1 << 30);
-        let need = dense_arena_bytes(&config, (tokens.len() + n_predict) as i64) as u64;
-        if need > budget {
-            return Err(format!(
-                "this prompt is {} tokens and needs {:.2} GiB of compute arena, but only \
-                 {:.2} GiB is free.\n           The dense path builds one graph over all {} \
-                 layers and ggml frees nothing inside a context, so the arena grows with the \
-                 sequence.\n           The longest that fits here is about {} tokens. Close \
-                 some applications, or use a shorter prompt.",
-                tokens.len(),
-                need as f64 / GIB,
-                budget as f64 / GIB,
-                config.n_layer,
-                dense_max_tokens(&config, budget),
-            )
-            .into());
-        }
-    }
-
-    let mut sampler = Sampler::new(sampler);
-    let mut writer = TokenWriter::new();
-    for step in 0..n_predict {
-        let n = tokens.len() as i64;
-        // A fresh compute arena per token: intermediates are dead once the
-        // token is chosen, and reclaiming them keeps peak memory flat rather
-        // than growing with the sequence.
-        //
-        // Sized from the sequence, not fixed. A flat 2 GiB **aborted** on a
-        // 651-token prompt — `ggml_new_object: not enough space`, which is a
-        // `GGML_ASSERT` and kills the process rather than returning an error
-        // this code could report. Attention holds `n * n * n_head` floats for
-        // the scores and again for their softmax, so the requirement is
-        // quadratic in the sequence and a constant can only ever be wrong at
-        // some length.
-        let arena = dense_arena_bytes(&config, n);
-        let ctx = Context::new(arena)?;
-
-        let tok = ctx.new_i32_1d(n)?;
-        tok.set_i32(&tokens.iter().map(|&t| t as i32).collect::<Vec<_>>())?;
-        let pos = ctx.new_i32_1d(n)?;
-        pos.set_i32(&(0..n as i32).collect::<Vec<_>>())?;
-
-        let logits = arch.build_graph(&ctx, &weights, &tok, &pos, n)?;
-        ctx.compute(&logits, threads)?;
-
-        // The final position's row. Greedy is still the default -- see
-        // `SamplerConfig::default` -- so a wrong forward pass stays diagnosable
-        // unless the caller opts into sampling.
-        let all = logits.to_vec_f32();
-        let vocab = config.vocab_size as usize;
-        if all.len() < vocab {
-            return Err(format!("logits too small: {} < vocab {}", all.len(), vocab).into());
-        }
-        let last = &all[all.len() - vocab..];
-        let next = sampler.sample(last, &tokens);
-        if Some(next) == tokenizer.eos {
-            println!("\n[end of sequence at step {step}]");
-            break;
-        }
-        writer.push(&tokenizer, next);
-        produced.push_str(&tokenizer.decode(std::slice::from_ref(&next)));
-        tokens.push(next);
-    }
-
-    let secs = gen_start.elapsed().as_secs_f64();
-    let count = tokens.len() - tokenizer.encode(prompt).len();
-    println!("\n");
-    bigtea_arch::info!(
-        "generated  {count} tokens in {secs:.1}s ({:.2} tok/s)",
-        count as f64 / secs.max(1e-9)
-    );
-    bigtea_arch::info!("total      {:.1}s", t0.elapsed().as_secs_f64());
-    if produced.trim().is_empty() {
-        println!("\n! produced no visible text -- check the forward pass");
-    }
-    Ok(())
+    //
+    // The stateless path is GONE, not merely unused.
+    //
+    // `BIGTEA_UNCACHED=1` kept it reachable so the KV cache's gain could be
+    // measured rather than asserted. That measurement was made and recorded.
+    // What remained was a SECOND FORWARD IMPLEMENTATION of the same model, and
+    // it had silently missed four fixes: the Qwen2 QKV bias, the Gemma
+    // activation, the post-norms and the logit soft caps. `bigtea-serve` shared
+    // it and answered "The capital of France is" with
+    // `eos-羲esteopes哞ALTH autoFocus`.
+    //
+    // An env var is not a safety rail. It is a way for a knowingly-wrong path
+    // to survive every later fix, and this one survived four.
+    run_streaming(
+        &model,
+        config,
+        &arch,
+        &tokenizer,
+        tokens,
+        n_predict,
+        prefill_block,
+        cache_budget,
+        sampler,
+        ctx_size,
+        stop,
+        perplexity,
+        ui,
+        show_perf,
+        kv_type,
+        mlock,
+        prompt_cache,
+        prompt_cache_all,
+        prompt_cache_ro,
+        grammar,
+        warmup,
+        infill,
+        grammar_triggers,
+        fit,
+        shift,
+        reasoning,
+        t0,
+    )
 }
 
 /// Prefill DeepSeek-V4-Flash and time it.

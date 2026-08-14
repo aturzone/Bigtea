@@ -1,0 +1,315 @@
+//! The Jinja subset GGUF chat templates actually use — and a refusal for
+//! everything else.
+//!
+//! # Why this is not a Jinja engine
+//!
+//! It deliberately is not. `chat.rs` has carried the same warning since it was
+//! written:
+//!
+//! > Evaluating Jinja properly means a whole expression language, and **a
+//! > half-implemented one silently produces the wrong framing**, which is the
+//! > failure mode this project is most expensive at.
+//!
+//! That is still true, and it is the reason this crate exists in the shape it
+//! does. A wrong chat framing does not error. The model answers, fluently,
+//! having been handed a prompt shape it has never seen — it comments on the
+//! question instead of answering it, or answers the system prompt. No test that
+//! checks "did it produce a string" can see that.
+//!
+//! So the contract is inverted from a normal template engine's: **anything this
+//! crate does not fully understand is an error**, and the caller falls back to
+//! the family matcher in `bigtea-tokenizer`, whose 54 renderers are verified
+//! byte-identical to llama.cpp for 52 of them. Refusing loudly loses nothing;
+//! guessing loses the answer.
+//!
+//! # Why the subset is this one
+//!
+//! Not guessed. Every `tokenizer.chat_template` on disk was censused — 12
+//! templates — and this is the whole language they use:
+//!
+//! ```text
+//! if/endif 123 · set 98 · else 40 · for/endfor 31 · elif 21
+//! loop.index0 20 · loop.last 12 · loop.first 10
+//! namespace() 10 · raise_exception() 6 · strftime_now() 1
+//! filters: tojson 15, trim 6, length 5
+//! operators: in, not, is defined, is string, is not none
+//! ```
+//!
+//! No macros, no imports, no inheritance, three filters. That bound is what
+//! makes "refuse everything else" a workable policy rather than a permanent
+//! fallback.
+
+use std::collections::HashMap;
+use std::fmt;
+
+/// A value flowing through a template.
+///
+/// Deliberately small. A chat template's environment is a list of maps, a few
+/// strings, and a bool — anything richer would be this crate accepting more
+/// than it can be checked against.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+    List(Vec<Value>),
+    Map(HashMap<String, Value>),
+    /// Jinja's `none`, and the thing `is defined` asks about.
+    None,
+}
+
+impl Value {
+    /// Jinja truthiness: empty string, empty list, zero and `none` are false.
+    pub fn truthy(&self) -> bool {
+        match self {
+            Value::Bool(b) => *b,
+            Value::Str(s) => !s.is_empty(),
+            Value::Int(i) => *i != 0,
+            Value::List(l) => !l.is_empty(),
+            Value::Map(m) => !m.is_empty(),
+            Value::None => false,
+        }
+    }
+
+    /// How a value prints inside `{{ }}`.
+    pub fn render(&self) -> String {
+        match self {
+            Value::Str(s) => s.clone(),
+            Value::Int(i) => i.to_string(),
+            // Jinja prints Python's spelling, and a template that concatenates
+            // this into a prompt would otherwise emit `true` where the model
+            // was trained on `True`.
+            Value::Bool(b) => (if *b { "True" } else { "False" }).to_string(),
+            Value::None => "None".to_string(),
+            Value::List(_) | Value::Map(_) => json(self),
+        }
+    }
+}
+
+/// Minimal JSON, for the `tojson` filter.
+pub(crate) fn json_public(v: &Value) -> String {
+    json(v)
+}
+
+fn json(v: &Value) -> String {
+    match v {
+        Value::Str(s) => {
+            let mut out = String::from("\"");
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+            out
+        }
+        Value::Int(i) => i.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::None => "null".to_string(),
+        Value::List(l) => {
+            let items: Vec<String> = l.iter().map(json).collect();
+            format!("[{}]", items.join(", "))
+        }
+        Value::Map(m) => {
+            // Sorted, so a rendered template is byte-stable across runs. A
+            // HashMap's order is not, and a prompt that changes between runs
+            // would make every parity comparison meaningless.
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let items: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{}: {}", json(&Value::Str((*k).clone())), json(&m[*k])))
+                .collect();
+            format!("{{{}}}", items.join(", "))
+        }
+    }
+}
+
+/// Does this template ever look at a `system` turn?
+///
+/// # Why a caller needs to know
+///
+/// Phi-3's template handles `user` and `assistant` and **silently drops
+/// anything else**. Render a conversation with a system turn through it and the
+/// system prompt simply vanishes — no error, and a model that ignores its
+/// instructions for a reason nothing reports.
+///
+/// llama.cpp does not fix this in the template. It fixes it *before* rendering:
+/// when the template has no system support it merges the system content into
+/// the first user turn. `--jinja` on Phi-3 emits
+/// `<|user|> SYS\nHI<|end|>`, where the template alone would emit
+/// `<|user|>\nHI<|end|>`.
+///
+/// So evaluating the template correctly is not sufficient to match the
+/// reference — the caller has to apply the same polyfill, and to do that it has
+/// to ask this question first.
+pub fn mentions_system_role(template: &str) -> bool {
+    // Substring rather than a parse: the question is whether the word appears
+    // at all, and a template that mentions it in a comment is one that its
+    // author thought about. False positives cost nothing here (the merge is
+    // simply not applied); a false negative silently drops the system prompt.
+    template.contains("'system'") || template.contains("\"system\"")
+}
+
+/// Merge the system turn into the first user turn, llama.cpp's polyfill.
+///
+/// Returns the messages unchanged when there is no system turn or no user turn
+/// to merge it into — dropping it on the floor would be the very failure this
+/// exists to prevent.
+pub fn merge_system_into_first_user(messages: &[Value], separator: &str) -> Vec<Value> {
+    let system: Option<String> = messages.iter().find_map(|m| match m {
+        Value::Map(f) if matches!(f.get("role"), Some(Value::Str(r)) if r == "system") => {
+            f.get("content").map(|c| c.render())
+        }
+        _ => None,
+    });
+    let Some(system) = system else {
+        return messages.to_vec();
+    };
+    let mut out = Vec::with_capacity(messages.len());
+    let mut merged = false;
+    for m in messages {
+        match m {
+            Value::Map(f) if matches!(f.get("role"), Some(Value::Str(r)) if r == "system") => {}
+            Value::Map(f)
+                if !merged && matches!(f.get("role"), Some(Value::Str(r)) if r == "user") =>
+            {
+                let mut f = f.clone();
+                let body = f.get("content").map(|c| c.render()).unwrap_or_default();
+                f.insert(
+                    "content".to_string(),
+                    Value::Str(format!("{system}{separator}{body}")),
+                );
+                out.push(Value::Map(f));
+                merged = true;
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    // No user turn to merge into: keep the system turn rather than lose it.
+    if merged {
+        out
+    } else {
+        messages.to_vec()
+    }
+}
+
+/// Why a template could not be rendered.
+///
+/// Every variant is a *refusal to guess*. `Unsupported` in particular is the
+/// crate's whole safety property: it is what sends the caller back to the
+/// family matcher rather than to a plausible-looking wrong answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Error {
+    /// A construct outside the censused subset. Carries what it was, so the
+    /// message names the thing rather than saying "parse error".
+    Unsupported(String),
+    Syntax(String),
+    /// The template itself called `raise_exception`. **Not a bug**: templates
+    /// use it to reject conversations they cannot express, and swallowing it
+    /// produces exactly the framing they exist to prevent.
+    Raised(String),
+    UndefinedVariable(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Unsupported(what) => write!(
+                f,
+                "unsupported Jinja construct: {what}. This build evaluates only the subset \
+                 GGUF chat templates use; the family matcher will be used instead."
+            ),
+            Error::Syntax(what) => write!(f, "template syntax: {what}"),
+            Error::Raised(msg) => write!(f, "template rejected this conversation: {msg}"),
+            Error::UndefinedVariable(name) => write!(f, "undefined variable `{name}`"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+mod lex;
+mod parse;
+mod render;
+
+pub use lex::{Token, TokenKind};
+pub use parse::{parse, Node};
+pub use render::{render, Env};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_template_without_a_system_branch_is_detected() {
+        // Phi-3's, trimmed. It handles user and assistant and drops the rest.
+        let phi3 = "{% for m in messages %}{% if (m['role'] == 'user') %}x{% endif %}{% endfor %}";
+        assert!(!mentions_system_role(phi3));
+        let chatml =
+            "{% for m in messages %}{% if m['role'] == 'system' %}y{% endif %}{% endfor %}";
+        assert!(mentions_system_role(chatml));
+    }
+
+    #[test]
+    fn the_system_turn_is_merged_rather_than_dropped() {
+        let mk = |role: &str, content: &str| {
+            let mut m = HashMap::new();
+            m.insert("role".to_string(), Value::Str(role.into()));
+            m.insert("content".to_string(), Value::Str(content.into()));
+            Value::Map(m)
+        };
+        let msgs = vec![mk("system", "SYS"), mk("user", "HI")];
+        let out = merge_system_into_first_user(&msgs, "\n");
+        assert_eq!(out.len(), 1);
+        let Value::Map(f) = &out[0] else { panic!() };
+        assert_eq!(f["role"], Value::Str("user".into()));
+        assert_eq!(f["content"], Value::Str("SYS\nHI".into()));
+    }
+
+    #[test]
+    fn with_no_user_turn_the_system_turn_survives() {
+        // Losing it would be the exact failure the polyfill exists to prevent.
+        let mut m = HashMap::new();
+        m.insert("role".to_string(), Value::Str("system".into()));
+        m.insert("content".to_string(), Value::Str("SYS".into()));
+        let msgs = vec![Value::Map(m)];
+        assert_eq!(merge_system_into_first_user(&msgs, "\n").len(), 1);
+    }
+
+    #[test]
+    fn truthiness_follows_jinja_not_rust() {
+        assert!(!Value::Str(String::new()).truthy());
+        assert!(Value::Str("x".into()).truthy());
+        assert!(!Value::List(vec![]).truthy());
+        assert!(!Value::None.truthy());
+        assert!(!Value::Int(0).truthy());
+    }
+
+    #[test]
+    fn a_bool_renders_pythons_spelling() {
+        // A template that writes `{{ add_generation_prompt }}` into a prompt
+        // must produce `True`, not `true` -- the model was trained on the
+        // former and a one-character difference is a different token.
+        assert_eq!(Value::Bool(true).render(), "True");
+        assert_eq!(Value::None.render(), "None");
+    }
+
+    #[test]
+    fn tojson_escapes_and_sorts() {
+        let mut m = HashMap::new();
+        m.insert("b".to_string(), Value::Int(2));
+        m.insert("a".to_string(), Value::Str("x\"y".into()));
+        // Sorted: a HashMap's order is not stable, and an unstable prompt makes
+        // every parity comparison meaningless.
+        assert_eq!(json(&Value::Map(m)), r#"{"a": "x\"y", "b": 2}"#);
+    }
+}

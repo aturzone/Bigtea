@@ -1,0 +1,256 @@
+//! Splitting a template into literal text, `{{ … }}` and `{% … %}`.
+//!
+//! # Whitespace control is not cosmetic here
+//!
+//! Jinja's `{%-` and `-%}` strip surrounding whitespace, and chat templates use
+//! them constantly — Llama-3's is written almost entirely in the `{{-` form. A
+//! stripped newline that should have survived, or a surviving one that should
+//! have been stripped, is a prompt the model was not trained on. It does not
+//! error; it shifts every following token.
+//!
+//! So the trimming is done here, at the token boundary, rather than left to the
+//! renderer where it would have to reason about what came before.
+
+use crate::{Error, Result};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenKind {
+    /// Literal text between tags.
+    Text(String),
+    /// `{{ expr }}` — the inside, untrimmed of its own spaces.
+    Output(String),
+    /// `{% stmt %}` — likewise.
+    Stmt(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Token {
+    pub kind: TokenKind,
+    /// Byte offset in the source, for error messages that can be located.
+    pub at: usize,
+}
+
+/// Split `src` into tokens, applying `-` whitespace control.
+pub fn lex(src: &str) -> Result<Vec<Token>> {
+    // Jinja's `keep_trailing_newline` defaults to FALSE: exactly one newline at
+    // the very end of a template is dropped. Llama-3's template ends with
+    // `{%- endif %}\n`, and keeping it put a third newline after the assistant
+    // header where llama.cpp --jinja emits two -- a one-token difference in
+    // every prompt, invisible unless byte-compared.
+    let src = src.strip_suffix('\n').unwrap_or(src);
+    let b = src.as_bytes();
+    let mut out: Vec<Token> = Vec::new();
+    let mut i = 0usize;
+    let mut text_start = 0usize;
+    // Set when the previous tag ended with `-%}` or `-}}`: the *next* run of
+    // literal text loses its leading whitespace.
+    let mut trim_next_leading = false;
+
+    while i < b.len() {
+        if b[i] == b'{'
+            && i + 1 < b.len()
+            && (b[i + 1] == b'{' || b[i + 1] == b'%' || b[i + 1] == b'#')
+        {
+            let is_output = b[i + 1] == b'{';
+            let is_comment = b[i + 1] == b'#';
+            // Literal text before this tag.
+            let mut text = &src[text_start..i];
+            // `{{-` / `{%-` strips the whitespace *before* the tag.
+            let strip_before = i + 2 < b.len() && b[i + 2] == b'-';
+            if strip_before {
+                text = text.trim_end();
+            }
+            let mut owned = text.to_string();
+            if trim_next_leading {
+                owned = owned.trim_start().to_string();
+            }
+            // `lstrip_blocks`: for a BLOCK tag, indentation between the last
+            // newline and the tag is dropped. Hugging Face's
+            // `apply_chat_template` enables it, so a template written with
+            // indented `{% if %}` lines -- which is most of them -- renders
+            // without that indentation reaching the prompt.
+            if !is_output && !is_comment && !strip_before {
+                let keep = owned.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                if owned[keep..].chars().all(|c| c == ' ' || c == '\t') {
+                    owned.truncate(keep);
+                }
+            }
+            trim_next_leading = false;
+            if !owned.is_empty() {
+                out.push(Token {
+                    kind: TokenKind::Text(owned),
+                    at: text_start,
+                });
+            }
+
+            let close: &[u8] = if is_output {
+                b"}}"
+            } else if is_comment {
+                b"#}"
+            } else {
+                b"%}"
+            };
+            let body_start = i + if strip_before { 3 } else { 2 };
+            let Some(rel) = find(&b[body_start..], close) else {
+                return Err(Error::Syntax(format!(
+                    "unterminated {} at byte {i}",
+                    if is_output { "{{" } else { "{%" }
+                )));
+            };
+            let mut body_end = body_start + rel;
+            // `-%}` / `-}}` strips the whitespace *after* the tag.
+            if body_end > body_start && b[body_end - 1] == b'-' {
+                body_end -= 1;
+                trim_next_leading = true;
+            }
+            let body = src[body_start..body_end].trim().to_string();
+            if !is_comment {
+                out.push(Token {
+                    kind: if is_output {
+                        TokenKind::Output(body)
+                    } else {
+                        TokenKind::Stmt(body)
+                    },
+                    at: i,
+                });
+            }
+            i = body_start + rel + 2;
+            // `trim_blocks`: one newline immediately AFTER a block tag is
+            // dropped, also on by default in Hugging Face. Without both rules
+            // TinyLlama's template -- whose tags each sit on their own line --
+            // emitted a newline per tag, six extra in a two-message prompt.
+            if !is_output && !is_comment && b.get(i) == Some(&b'\n') {
+                i += 1;
+            }
+            text_start = i;
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut tail = src[text_start..].to_string();
+    if trim_next_leading {
+        tail = tail.trim_start().to_string();
+    }
+    if !tail.is_empty() {
+        out.push(Token {
+            kind: TokenKind::Text(tail),
+            at: text_start,
+        });
+    }
+    Ok(out)
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds(src: &str) -> Vec<TokenKind> {
+        lex(src).unwrap().into_iter().map(|t| t.kind).collect()
+    }
+
+    #[test]
+    fn plain_text_is_one_token() {
+        assert_eq!(kinds("hello"), vec![TokenKind::Text("hello".into())]);
+    }
+
+    #[test]
+    fn output_and_statement_are_separated_from_text() {
+        assert_eq!(
+            kinds("a{{ x }}b{% if y %}c"),
+            vec![
+                TokenKind::Text("a".into()),
+                TokenKind::Output("x".into()),
+                TokenKind::Text("b".into()),
+                TokenKind::Stmt("if y".into()),
+                TokenKind::Text("c".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_leading_dash_strips_whitespace_before_the_tag() {
+        // Llama-3's template is written almost entirely in this form, and a
+        // newline that survives when it should not shifts every later token.
+        assert_eq!(
+            kinds("a  \n{{- x }}"),
+            vec![TokenKind::Text("a".into()), TokenKind::Output("x".into())]
+        );
+    }
+
+    #[test]
+    fn a_trailing_dash_strips_whitespace_after_the_tag() {
+        assert_eq!(
+            kinds("{{ x -}}\n  b"),
+            vec![TokenKind::Output("x".into()), TokenKind::Text("b".into())]
+        );
+    }
+
+    #[test]
+    fn whitespace_without_a_dash_is_kept_exactly() {
+        // The inverse mistake: stripping when not asked. Gemma's template
+        // depends on the newline after its `<start_of_turn>` line surviving.
+        assert_eq!(
+            kinds("a\n{{ x }}\nb"),
+            vec![
+                TokenKind::Text("a\n".into()),
+                TokenKind::Output("x".into()),
+                TokenKind::Text("\nb".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn comments_vanish_entirely() {
+        assert_eq!(
+            kinds("a{# note #}b"),
+            vec![TokenKind::Text("a".into()), TokenKind::Text("b".into())]
+        );
+    }
+
+    #[test]
+    fn block_tags_trim_their_own_line() {
+        // `trim_blocks` + `lstrip_blocks`, both on in Hugging Face's
+        // apply_chat_template. A template whose tags each sit on their own
+        // indented line must not emit a newline and an indent per tag --
+        // TinyLlama's produced six extra newlines in a two-message prompt.
+        assert_eq!(
+            kinds("a\n  {% if x %}\nb"),
+            vec![
+                TokenKind::Text("a\n".into()),
+                TokenKind::Stmt("if x".into()),
+                TokenKind::Text("b".into()),
+            ]
+        );
+        // An OUTPUT tag is untouched by either rule: `{{ x }}` on its own line
+        // keeps the newline, which is how ChatML's per-turn newline survives.
+        assert_eq!(
+            kinds("a\n{{ x }}\nb"),
+            vec![
+                TokenKind::Text("a\n".into()),
+                TokenKind::Output("x".into()),
+                TokenKind::Text("\nb".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_trailing_newline_is_dropped_and_only_one() {
+        // Jinja's keep_trailing_newline=False. Llama-3's template ends with a
+        // newline after `{%- endif %}` and keeping it added a third blank line
+        // after the assistant header.
+        assert_eq!(kinds("a\n"), vec![TokenKind::Text("a".into())]);
+        assert_eq!(kinds("a\n\n"), vec![TokenKind::Text("a\n".into())]);
+        assert_eq!(kinds("a"), vec![TokenKind::Text("a".into())]);
+    }
+
+    #[test]
+    fn an_unterminated_tag_is_an_error_not_a_silent_truncation() {
+        let e = lex("a{{ x").unwrap_err();
+        assert!(matches!(e, Error::Syntax(_)), "{e:?}");
+    }
+}
