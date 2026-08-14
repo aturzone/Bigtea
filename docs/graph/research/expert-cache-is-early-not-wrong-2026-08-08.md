@@ -124,3 +124,27 @@ the budget bound.
 - **Hit rate is not tok/s.** Both are reported above, next to the footprint,
   because this project has already measured a 71%-hit cache being its slowest
   configuration.
+
+## Checked against the activation regression, and clear
+
+**2026-08-12.** `ram-frontier-qwen3-30b-2026-08-12.md` established that **a wrong
+activation is a wrong residency benchmark**: fixing GELU-for-SiLU on Qwen3-30B-A3B
+moved streamed bytes 7.00 → 5.53 GiB and hit rate 80% → 70%, because different
+FFN outputs are different router inputs and therefore select **different
+experts**. Every MoE cache measurement in this repository was re-examined against
+that.
+
+**This node is unaffected.** The regression was introduced by the ungated-FFN
+detection in `3573786` on **2026-08-11**; the Qwen3-30B-A3B figures above
+(8.48 GiB cache, 4.87 GiB streamed, 43% hits, 0 evictions, 1.46 tok/s) were taken
+on **2026-08-08**, three days earlier, on a build that ran SiLU correctly.
+
+The V4-Flash figures are unaffected for a second, independent reason: `deepseek4`
+never tripped the bug at all. Its first layers are dense, so
+`blk.0.ffn_gate.weight` exists and the detection saw a gate. Being saved by which
+layer happens to be numbered zero is not a check, but it is a fact, and it holds
+here.
+
+**What does carry forward is the rule, not a correction:** any future cache or
+residency number taken on an MoE model has to state the build it was measured
+on, because the workload is downstream of the activation.
