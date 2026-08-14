@@ -2410,3 +2410,44 @@ round-over-round drift of ~25% with free RAM stable and the cause unidentified;
 and **Qwen3-30B-A3B is not in `VERIFIED_ARCHITECTURES`** — it was delisted the
 same day for a remaining stable-reference divergence, and it is the only
 container here in the size class where the curve is interesting.
+
+## The knee moves with `-n` — the slice above was the flattering one
+
+`research/the-knee-moves-with-n-2026-08-14.md`, 2026-08-14. The measurement the
+section above asked for: the second axis, 3 rounds × `-n` {16, 64, 256} ×
+`--cache` {1, 2, 4, 6, 8, 12}, interleaved on both, free RAM every row.
+
+**The working set grows with what you generate.** Read off the `evictions = 0`
+rows, where `streamed` is the whole distinct working set:
+
+| `-n` | working set | first budget with 0 evictions | best tok/s |
+|---|---|---|---|
+| 16 | 5.53 GiB | 6 | 3.13 |
+| 64 | 7.05 GiB | 8 | 4.38 |
+| 256 | 10.14 GiB | 12 | 4.70 |
+
+So **"the frontier is flat after 6 GiB" was a statement about sixteen tokens.**
+At 256 the knee is 12 GiB and tok/s is still climbing there — it had not
+flattened by the largest budget swept. Growth is strongly sublinear (16× the
+tokens, 1.83× the set, ≈`n^0.22`), but it extrapolates a 2048-token generation to
+**~14–18 GiB of expert cache on a 15.7 GiB machine**. The honest product claim
+is *the largest model at the speed you want, **for the length you generate***.
+
+**More cache made it slower at identical work.** At `-n 16`, budgets 6/8/12 read
+the same 5.53 GiB, hit the same 70% and evict nothing — byte-identical work — and
+run 3.13/3.02/2.91. That is 7% lost to memory the OS could have used: the
+page-fault-wearing-a-hit's-disguise effect, measured under control rather than
+inferred, and invisible to the hit counter. It appears only where the budget
+*exceeds* the working set; at `-n 256` more is monotonically better.
+
+**Two methodological results.** `streamed`, `hit%` and `evictions` were
+**bit-identical across all three rounds** — the workload is deterministic and
+only wall-clock moves, which is what makes 18 cells from 2 clean rounds
+trustworthy. And **contamination is a property of the period, so discard the
+round, not the row**: round 1 ran at 0.25 tok/s where the clean rounds agree on
+2.48, and a naive "free ≥ 4 GiB" row filter still admitted a row showing 7.45
+GiB free that ran 5× slow.
+
+Same caveats as the slice it extends, plus one more: the sweep needs `--force`,
+because **`qwen3moe` now refuses to run without it** — 0 FAIL but 6 of 8 prompts
+unstable under the widened harness, unexplained.
