@@ -1817,6 +1817,39 @@ flags to continue.
 
 Flags: **170 implemented, 25 declined**, of 195 recognised. Tests **492**.
 
+## RWKV: the fifth tokenizer family (2026-08-13)
+
+llama.cpp has five real vocabulary types — SPM, BPE, WPM, UGM, RWKV. This had
+four. `crates/bigtea-tokenizer/src/rwkv.rs`, 8 unit tests plus 6 through the
+public `from_metadata` path.
+
+It is **greedy longest match over a trie of raw byte strings**: no merge table,
+no scores, no pre-tokenizer. Two details are easy to get subtly wrong and
+neither raises:
+
+- **The vocabulary is stored escaped.** `\n`, `\t` and `\xNN` appear as literal
+  backslash sequences, so a loader that keeps the stored text builds a trie
+  keyed on the *text of the escape*. A real newline then never matches, and
+  every line break becomes an unknown token. Decoding has the inverse problem —
+  emitting the stored text puts a literal backslash-n where the model produced
+  a newline. Both directions are tested.
+- **Longest match is the last node *with a value*, not the deepest reached.**
+  With `ab` and `abcd` present and `abc` absent, the walk descends past the
+  answer; taking the deepest node would emit nothing at all.
+
+`\xNN` can denote a byte that is not valid UTF-8 alone, which is why the
+unescape works in bytes rather than `char`s. An empty vocabulary entry is
+skipped at build time — it matches at every position with length zero, so the
+loop would hang on real input rather than merely answer wrongly.
+
+**Implemented is not verified**, and the parity row says so. There is no RWKV
+container on this machine, so the family is exercised against a hand-built
+vocabulary through the real loading path — not against llama.cpp. This project
+has already shipped `gemma2` as "verified" while it ran the wrong activation.
+Loading is not evidence, and neither is a test I wrote myself.
+
+Tests **492 → 507**.
+
 ## Known limitations
 
 - **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
