@@ -2487,5 +2487,45 @@ round, not the row**: round 1 ran at 0.25 tok/s where the clean rounds agree on
 GiB free that ran 5× slow.
 
 Same caveats as the slice it extends, plus one more: the sweep needs `--force`,
-because **`qwen3moe` now refuses to run without it** — 0 FAIL but 6 of 8 prompts
-unstable under the widened harness, unexplained.
+because **`qwen3moe` refuses to run without it** — 0 FAIL but 6 of 8 prompts
+unstable under the widened harness.
+
+## `unstable` was answering the wrong question — 6 of 8 is really 2 of 8
+
+**2026-08-15, and it corrects the line directly above.** The harness classified a
+disagreement by asking *"does llama.cpp disagree with itself here?"* and the
+report read as though that settled *"is Bigtea's output one of the things it
+disagrees between?"* Those come apart precisely where it matters, and **the nine
+of eleven `unstable` verdicts that turned out to be real bugs were all the second
+kind**. Same model, same prompts, same build, with the two separated:
+
+| | |
+|---|---|
+| `ok` — matches the default | **2** |
+| `near-tie` — reproduces one of llama.cpp's *own* no-op outputs **byte for byte** | **4** |
+| `unstable` — a **third** answer it never gives | **2** |
+
+**Four of the six were never unexplained.** So the evidence for a defect in the
+`qwen3moe` path is **2 of 8, not 6 of 8** — below the cluster threshold rather
+than absent, and the harness now exits 0.
+
+**The variation is the evidence, more than the count.** Which configuration we
+land on is not constant: `-b 1` twice, `-fa off` once, `-b 1 -fa off` once. A
+systematic defect would be systematic — quietly running batch-1 semantics would
+reproduce `-b 1` on *every* such prompt. Three different configurations across
+four prompts is what a real near-tie looks like. **So the discriminator is a
+diagnostic and not only a verdict:** a *constant* answer would name the behaviour
+we share, and would be the lead.
+
+Two prompts are still outside the band, `Q: What is 17 plus 25? A:` first because
+arithmetic has a right answer. Every reference configuration emits **42** before
+reasoning, in three different framings; Bigtea appears to go straight to the
+reasoning. **Not established** — the two sides were captured with different
+truncation and the confirming run was interrupted. `research/parity-band-discriminator-2026-08-15.md`
+has the exact command to settle it. Do not cite it until someone has.
+
+The threshold moved without moving: three-in-eight still fails, but on the
+sharper class, which is *stricter* — everything excusable has been taken out of
+it. And a bound was added the other way, because every configuration added widens
+the band and "in band" gets cheaper as the probe grows: six ties in eight now
+fails too.
