@@ -144,7 +144,108 @@ special tokens, so no fragment ever follows one. None of the 104 prompts behind
 "102 exact" could have caught this, and it affects every chat-framed request the
 server handles.
 
-## Still open: three genuine rendering differences
+## internlm2: the detector asked whether the word appears, again
+
+`mentions_system_role` tested for the literal `'system'`. ChatML templates never
+write it:
+
+```jinja
+{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' }}
+```
+
+The role is **interpolated**, so every role is handled — system included — and
+the word is nowhere in the template. We reported "no system branch", merged the
+system turn into the user turn, and rendered **two** turns where llama.cpp
+rendered three.
+
+**The role has to be emitted, not merely compared, and that is the whole
+difficulty.** Phi-3 also contains `['role']`, inside `{% if message['role'] ==
+'user' %}`, and genuinely has no system branch — it must still be merged. A
+substring test anywhere in the template fixes internlm2 by breaking Phi-3. So the
+check scans `{{ … }}` blocks only: where a template *emits* rather than
+*decides*.
+
+That is the second guard in one day that asked "does the word appear?" instead
+of "does this template handle a system turn?" — the first being the Gemma
+polyfill, which fired only when the template never mentions system and so could
+not see the one template that mentions it in order to **reject** it. Same
+question, two wrong answers, opposite directions.
+
+## Where it settled: 9 of 14, and why the last five are not bugs
+
+| | |
+|---|---|
+| `OLMo`, `starcoder2`, `all-MiniLM` | **no chat template.** llama.cpp passes the text through; we impose `System:/User:/Assistant:`. A product decision, recorded above |
+| `Falcon3`, `tinyllama` | **family path only — our `--jinja` matches llama.cpp's `--jinja` on both.** Two hardcoded shortcuts disagreeing |
+
+The last row is worth being precise about rather than counting as a defect.
+Both models resolve to our `Zephyr` family renderer, which emits
+`<|role|>\ncontent<eos>\n`. That matches **tinyllama's** template, which does
+emit an EOS between turns, and not **Falcon3's**, which does not — and llama.cpp
+classifies the two differently, so its shortcut disagrees with ours on Falcon3
+and with the *template* on tinyllama.
+
+**One hardcoded renderer cannot be right for two models whose templates differ,
+which is the entire argument for `--jinja`.** We have a `ChatFormat::Falcon3` arm
+that reproduces llama.cpp's `LLM_CHAT_TEMPLATE_FALCON_3` exactly
+(`<|role|>\ncontent\n`); the detector sends Falcon3 to `Zephyr` before reaching
+it. Re-ordering detection to llama.cpp's rule (`<|assistant|>` + `<|user|>` +
+`</s>` → Falcon-3, checked *before* zephyr) is the fix, and it is deferred rather
+than guessed: tinyllama's template appears to satisfy the same gate, and a
+detector change that silently re-classifies a model whose framing is currently
+correct is exactly the trade this file has now recorded twice.
+
+**The exact path already agrees.** Anyone who needs byte-parity with the
+reference on these two models has `--jinja` today.
+
+## Two more tokenizer classes, isolated but NOT fixed
+
+`scripts/tokenizer-parity.py` found these on its first full run — 17 awkward
+strings × 13 containers. They are open, and the isolation below is the whole
+head start:
+
+**Double space — `gemma-2`, `gemma-3`, `OLMo`.** Only a run of *exactly two*
+diverges. On OLMo:
+
+```
+spaces=1  ours [66, 270]         llama 66,270        ✓
+spaces=2  ours [66, 209, 270]    llama 66,50276,67   ✗
+spaces=3  ours [66, 50275, 67]   llama 66,50275,67   ✓
+spaces=4  ours [66, 50274, 67]   llama 66,50274,67   ✓
+spaces=5  ours [66, 50273, 67]   llama 66,50273,67   ✓
+```
+
+We split `a  b` into `a` / `" "` / `" b"`; llama.cpp makes `a` / `"  "` / `b`.
+The `\s+(?!\S)` rule in `pretok.rs` "gives the last character back, because that
+character is the next piece's leading space" — the real GPT-2 rule, and the one
+llama.cpp does not apply here.
+
+**Do not fix this from the `pretok.rs` source alone.** Tracing that function by
+hand predicts `a` / `"  "` / `" b"` for three spaces, and three spaces *matches
+the reference*, so there is a second pass involved (the `default_gpt2` comment
+mentions one) and the obvious edit is against a model of the code that is
+demonstrably wrong. Change it, then re-run the table above; the empirical answer
+is cheap and the reasoned one has already been wrong once.
+
+**Emoji — `stablelm`, `starcoder2`.** llama.cpp merges the leading space and the
+emoji into one token; we emit three:
+
+```
+hi <emoji> there   ours  [6151, 220, 76460, 222, 1070]
+                   llama [6151, 91416, 1070]
+```
+
+Likely the same root as the whitespace case — a piece boundary falling where the
+reference's does not — but **that is a guess and is marked as one**. gemma is
+SPM and OLMo is BPE, so at minimum the whitespace symptom spans two code paths
+and may be two bugs.
+
+**Neither is reachable from `parity-check.sh`**, whose eight prompts contain no
+double space and no emoji. That is now the third time a tokenizer bug has lived
+behind that harness, which is the argument for the new script rather than a
+larger prompt list.
+
+## Earlier: three genuine rendering differences
 
 | model | what differs |
 |---|---|

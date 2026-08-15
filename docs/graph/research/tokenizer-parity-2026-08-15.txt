@@ -1,0 +1,28 @@
+ok     Llama-3.2-1B-Instruct-Q4_K_M.gguf  (17 cases)
+ok     tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf  (17 cases)
+ok     Qwen2-0.5B-Instruct-Q4_K_M.gguf  (17 cases)
+ok     Qwen3-4B-Q4_K_M.gguf  (17 cases)
+ok     Phi-3-mini-4k-instruct-q4.gguf  (17 cases)
+ok     Falcon3-1B-Instruct-q4_k_m.gguf  (17 cases)
+DIFFER gemma-2-2b-it-Q4_K_M.gguf  (1 of 17)
+  double space
+    bigtea   : [2, 235250, 235248, 518]
+    llama.cpp: [2, 235250, 139, 235268]
+DIFFER gemma-3-1b-it-Q4_K_M.gguf  (1 of 17)
+  double space
+    bigtea   : [2, 236746, 236743, 518]
+    llama.cpp: [2, 236746, 138, 236763]
+DIFFER stablelm-2-1_6b-chat.Q4_K_M.gguf  (1 of 17)
+  emoji
+    bigtea   : [6151, 220, 76460, 222, 1070]
+    llama.cpp: [6151, 91416, 1070]
+DIFFER starcoder2-3b-Q4_K_M.gguf  (1 of 17)
+  emoji
+    bigtea   : [5001, 244, 36570, 246, 2038]
+    llama.cpp: [5001, 18445, 246, 2038]
+DIFFER OLMo-1B.Q4_K_M.gguf  (1 of 17)
+  double space
+    bigtea   : [66, 209, 270]
+    llama.cpp: [66, 50276, 67]
+ok     internlm2-math-plus-1_8b.Q4_K.gguf  (17 cases)
+skip   baichuan2-7b-chat.Q4_K_M.gguf: one of the engines declined to load it
