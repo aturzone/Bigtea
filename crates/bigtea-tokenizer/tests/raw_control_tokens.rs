@@ -116,3 +116,56 @@ fn text_with_no_control_characters_is_untouched() {
     let t = Tokenizer::from_metadata(&meta()).unwrap();
     assert_eq!(t.encode("ab"), vec![0, 1]);
 }
+
+/// A vocabulary that gives runs of spaces their own ids, the way OLMo does.
+fn runs_meta() -> BTreeMap<String, Value> {
+    let mut m = meta();
+    let tokens = ["a", "b", "\n", "Ġc", "\t", "  ", "   "];
+    m.insert(
+        "tokenizer.ggml.tokens".to_string(),
+        Value::Array(tokens.iter().map(|t| Value::String((*t).into())).collect()),
+    );
+    m.insert(
+        "tokenizer.ggml.token_type".to_string(),
+        Value::Array(vec![
+            Value::I32(1),
+            Value::I32(1),
+            Value::I32(4),
+            Value::I32(1),
+            Value::I32(4),
+            // The run tokens are USER_DEFINED, as they are in OLMo.
+            Value::I32(4),
+            Value::I32(4),
+        ]),
+    );
+    m
+}
+
+#[test]
+fn a_short_whitespace_run_with_its_own_id_is_matched_not_split() {
+    // `specials` excluded anything under three bytes, so a TWO-space token was
+    // skipped while three, four and five were kept. On OLMo that showed as
+    // exactly one broken length:
+    //
+    //   a  b   ours [66, 245, 67]     llama [66, 50276, 67]
+    //   a   b  ours [66, 50275, 67]   llama [66, 50275, 67]   (already right)
+    //
+    // Whitespace cannot slice ordinary text apart -- it is already a boundary --
+    // which is why the length guard is relaxed for it and nothing else.
+    let t = Tokenizer::from_metadata(&runs_meta()).unwrap();
+    assert_eq!(t.encode("a  b"), vec![0, 5, 1], "two-space run was split");
+    assert_eq!(
+        t.encode("a   b"),
+        vec![0, 6, 1],
+        "three-space run was split"
+    );
+}
+
+#[test]
+fn a_single_space_is_not_turned_into_a_special() {
+    // The relaxation must not promote every space: a lone one has no id of its
+    // own here and must still go through the ordinary path.
+    let t = Tokenizer::from_metadata(&runs_meta()).unwrap();
+    let ids = t.encode("a b");
+    assert!(!ids.contains(&5) && !ids.contains(&6), "{ids:?}");
+}

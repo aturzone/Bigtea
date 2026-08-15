@@ -205,6 +205,18 @@ fn gpt2_rule(text: &str) -> Vec<String> {
         }
         // `\s+(?!\S)` — a run with something after it gives its last character
         // back, because that character is the next piece's leading space.
+        //
+        // **This was briefly changed to emit the run whole, and that was
+        // wrong.** OLMo's `a  b` does tokenize as `'a' '  ' 'b'` in the
+        // reference, and it looked like this rule handing a space forward — but
+        // the cause is one layer up. OLMo gives runs of spaces their own token
+        // ids, and `specials` excluded the short ones *by length*, so a
+        // two-space run never reached the splitter as a unit at all. Fixing that
+        // guard fixed the tokens with this rule untouched, and reverting here is
+        // what leaves every other GPT-2-family container alone.
+        //
+        // The lesson is the attribution: the symptom showed in this function's
+        // output and the bug was in what was handed to it.
         if ws > 1 && i + ws < n {
             let j = i + ws - 1;
             out.push(chars[i..j].iter().collect());
