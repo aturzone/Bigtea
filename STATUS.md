@@ -2641,3 +2641,53 @@ sharper class, which is *stricter* — everything excusable has been taken out o
 it. And a bound was added the other way, because every configuration added widens
 the band and "in band" gets cheaper as the probe grows: six ties in eight now
 fails too.
+
+## The GPU tier, step 1: the card works — 25.6x, and it is llama.cpp's number
+
+`research/gpu-the-card-works-vulkan-not-cuda-2026-08-15.md`, 2026-08-15.
+
+**GPU is still 0%.** Nothing here is Bigtea. This is the precondition the ticket
+set — *if llama.cpp cannot use the card, we cannot either* — answered in an hour
+rather than three days, which is what step 1 was for.
+
+**CUDA is not installable here without a toolchain migration.** `nvcc` on Windows
+supports only MSVC as its host compiler, and this machine has **no MSVC at all**,
+while everything the project builds with is MSYS2 mingw64 (`cc.exe`, `c++.exe`,
+`cmake.exe`, gcc 16.1.0). The CUDA route is: install Visual Studio Build Tools,
+build `ggml-cuda` with MSVC, then link an MSVC static library into a **GNU-target**
+Rust binary — against the `.cargo/config.toml` workaround `CLAUDE.md` says not to
+delete. That is a decision, not a step 1.
+
+**ggml's Vulkan backend compiles with the compiler already in use.** Eight MSYS2
+packages, verified first not to touch gcc/binutils/CRT; the driver already shipped
+the loader; built into a separate `build-vulkan` so the 507 tests keep pointing at
+the CPU ggml. `-D_WIN32_WINNT=0x0A00` is required — vendored `cpp-httplib` calls
+`::CreateFile2` from `common`, so `-DLLAMA_BUILD_SERVER=OFF` does not avoid it.
+
+Qwen3-4B-Q4_K_M (2.32 GiB, fits VRAM), llama.cpp `daef2b3`, one session, `-r 2`:
+
+| config | pp512 | tg128 |
+|---|---:|---:|
+| CPU, 20 threads | 79.65 ± 5.93 | 3.65 ± 0.10 |
+| CPU, 4 threads | 40.25 ± 0.95 | **6.39 ± 0.08** |
+| **RTX 3050, `-ngl 99`** | **2042.60 ± 5.52** | **56.53 ± 0.04** |
+| Intel iGPU, `-ngl 99` | 38.13 ± 2.09 | 3.26 ± 0.03 |
+| RTX 3050, `-ngl 0` | 497.82 ± 243.16 | 3.42 ± 0.08 |
+
+**Against the best CPU configuration of each: prefill 25.6x, generation 8.8x.**
+
+**Two traps that would have inflated that.** `-ngl 0` on the Vulkan build is not a
+CPU baseline — it reads *below* real CPU with a ±49% error bar, and quoting it
+buys a fake 16x. And the `-t`/`-tb` split reproduces on llama.cpp itself, so
+llama-bench's default 10 threads would have reported 30.1x.
+
+**The Intel iGPU is not a second tier.** It has more free memory than the discrete
+card (7387 vs 5233 MiB) and is UMA, so the upload problem would not exist there —
+and it is *slower than the CPU*. The tempting "put the experts on the 8 GB UMA
+device and skip the copy" cost one command to kill.
+
+**Blocker (b) is untouched and is still the whole ticket.** A Vulkan tensor is
+filled by `ggml_backend_tensor_set`, which copies, exactly as CUDA would. Vulkan
+removes an MSVC migration from *in front of* the work; it does not touch the work.
+And 76% of a token on the MoE path is disk, which no GPU fixes — the 25.6x above
+is prefill on a model that fits in VRAM, the one slice this card can plausibly win.
