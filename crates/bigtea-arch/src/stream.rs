@@ -1144,9 +1144,9 @@ impl<'m> StreamingRunner<'m> {
         ctx: &'a Context,
         weights: &mut WeightSet<'a>,
     ) -> Result<(u64, bigtea_ggml::DeviceBuffer, bigtea_ggml::UploadReport)> {
-        let backend = self.device.as_ref().ok_or_else(|| {
-            ArchError::Unimplemented("no device opened; call use_device first".into())
-        })?;
+        let backend = self.device.as_ref().ok_or(ArchError::Unimplemented(
+            "no device opened; call use_device first",
+        ))?;
         let mut total = 0u64;
         for name in self.resident_tensor_names() {
             let loc = self
