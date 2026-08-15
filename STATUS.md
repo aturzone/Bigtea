@@ -2676,15 +2676,27 @@ Qwen3-4B-Q4_K_M (2.32 GiB, fits VRAM), llama.cpp `daef2b3`, one session, `-r 2`:
 
 **Against the best CPU configuration of each: prefill 25.6x, generation 8.8x.**
 
-**Two traps that would have inflated that.** `-ngl 0` on the Vulkan build is not a
-CPU baseline — it reads *below* real CPU with a ±49% error bar, and quoting it
-buys a fake 16x. And the `-t`/`-tb` split reproduces on llama.cpp itself, so
-llama-bench's default 10 threads would have reported 30.1x.
+**Two rules, not footnotes** — this project has retracted a competitive claim
+before. **(1) The baseline must come from the baseline's build.** `-ngl 0` on a
+GPU build is the GPU backend with nothing offloaded, not the CPU path: it reads
+3.42 tg128, *below* the real CPU 6.39, with a ±49% error bar on prefill, and
+quoting it buys a fake 16x. A disabled accelerator is not a control.
+**(2) Tune the baseline before you beat it.** `llama-bench` defaulted to 10
+threads, which is wrong for both phases; against that default this would have
+read 30.1x instead of 25.6x.
 
-**The Intel iGPU is not a second tier.** It has more free memory than the discrete
-card (7387 vs 5233 MiB) and is UMA, so the upload problem would not exist there —
-and it is *slower than the CPU*. The tempting "put the experts on the 8 GB UMA
-device and skip the copy" cost one command to kill.
+**Our `-t`/`-tb` finding reproduces on the reference.** Prefill 40.25 → 79.65
+going 4 → 20 threads, generation 6.39 → 3.65 going the other way — the same two
+levers pulling opposite ways, at the same crossover, on llama.cpp's own binary.
+That is independent confirmation of the threading work, not a quirk of our
+scheduler.
+
+**The Intel iGPU is not a second tier, and it is the attractive idea.** It has
+more free memory than the discrete card (7387 vs 5233 MiB) and `uma: 1`, so the
+upload problem would not exist there — and it runs 0.48x the CPU on prefill and
+0.51x on generation. It has no matrix cores and it shares the DRAM the CPU path
+already saturates: **a UMA device removes the copy, not the bottleneck.** Full
+node: `research/the-igpu-is-not-a-tier-2026-08-15.md`.
 
 **Blocker (b) is untouched and is still the whole ticket.** A Vulkan tensor is
 filled by `ggml_backend_tensor_set`, which copies, exactly as CUDA would. Vulkan

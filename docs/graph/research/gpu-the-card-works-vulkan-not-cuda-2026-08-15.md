@@ -102,17 +102,30 @@ Qwen3-4B-Q4_K_M (2.32 GiB, fits VRAM with 2.9 GiB spare), llama.cpp build
 
 **Against the best CPU configuration of each: prefill 25.6x, generation 8.8x.**
 
-Two traps in that table, both of which would have inflated the headline:
+## Two rules, not footnotes
 
-- **`-ngl 0` on the Vulkan build is not a CPU baseline.** It reads 3.42 tok/s,
-  *below* the real CPU figure, and its pp512 error bar is ±49%. Quoting it would
-  have bought a fake 16x on generation. The CPU number has to come from the CPU
-  build.
-- **The thread split is real on llama.cpp too**, so a single-threads baseline is
-  a mistuned one. Prefill 40.25 → 79.65 going 4 → 20 threads; generation 6.39 →
-  3.65 going the other way. This project's own `-t`/`-tb` finding, reproduced on
-  the reference. Comparing against 10 threads (llama-bench's default here) would
-  have reported 30.1x instead of 25.6x.
+Both of these were live in the table above and both would have inflated the
+headline. This project has retracted a competitive claim before, so they are
+written as rules.
+
+> **RULE 1 — the baseline must come from the baseline's build.** `-ngl 0` on a
+> GPU build is not the CPU path. It is the GPU backend with nothing offloaded,
+> and here it reads **3.42 tg128 — *below* the real CPU figure of 6.39** — with
+> a ±49% error bar on prefill. Quoting it buys a fake **16x** on generation
+> instead of the true 8.8x. A disabled accelerator is not a control.
+
+> **RULE 2 — tune the baseline before you beat it.** The `-t`/`-tb` split is not
+> ours alone: on llama.cpp, prefill goes **40.25 → 79.65** from 4 to 20 threads
+> and generation goes **6.39 → 3.65** the other way. `llama-bench` defaulted to
+> 10 threads on this machine, which is wrong for *both* phases; comparing
+> against it would have reported **30.1x instead of 25.6x**. Take the best
+> configuration of the thing you are beating, not its default.
+
+Rule 2 carries a second result worth having on its own: **our `-t`/`-tb` finding
+reproduces on the reference implementation.** The two-levers-pulling-opposite-ways
+shape was measured here on our engine and is visible, at the same crossover, on
+llama.cpp — independent confirmation of the threading work rather than a quirk of
+our scheduler.
 
 ## The iGPU is not a second tier
 
