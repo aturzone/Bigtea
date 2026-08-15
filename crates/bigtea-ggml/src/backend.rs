@@ -359,6 +359,39 @@ impl Compute<'_> {
         }
     }
 
+    /// Give a graph its storage from a **planned** allocation.
+    ///
+    /// The same position in the sequence as [`Self::realize`] — after the graph
+    /// is built, before anything is written into it — but it plans instead of
+    /// handing every tensor its own bytes. Tensors whose lifetimes do not
+    /// overlap share storage, which is what makes a resident forward pass fit:
+    /// the naive route needs ~4.3 GB of intermediates on Qwen3-4B against
+    /// 2.79 GiB of free VRAM.
+    ///
+    /// Weights are untouched. They already carry device pointers from
+    /// `load_resident_on_device`, and a graph allocator only assigns tensors
+    /// that still need storage — the same split llama.cpp uses.
+    ///
+    /// The returned planner owns the allocation and must outlive the compute.
+    pub fn realize_graph(
+        &self,
+        ctx: &Context,
+        outputs: &[&Tensor<'_>],
+    ) -> Result<Option<GraphAllocator>, GgmlError> {
+        match self {
+            Compute::Cpu { .. } => Ok(None),
+            Compute::Device(b) => {
+                let t = std::time::Instant::now();
+                let galloc = GraphAllocator::new(b)?;
+                galloc.reserve(ctx, outputs)?;
+                galloc.alloc(ctx, outputs)?;
+                timing::add(&timing::REALIZE_NS, t);
+                timing::REALIZE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(Some(galloc))
+            }
+        }
+    }
+
     pub fn set_f32(&self, t: &Tensor<'_>, values: &[f32]) -> Result<(), GgmlError> {
         match self {
             Compute::Cpu { .. } => t.set_f32(values),
