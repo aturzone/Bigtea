@@ -70,7 +70,7 @@ jobs:
           cmake -S llama.cpp -B llama.cpp/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
-            -DLLAMA_BUILD_SERVER=OFF -DGGML_NATIVE=OFF
+            -DLLAMA_BUILD_SERVER=OFF -DGGML_NATIVE=OFF -DGGML_METAL=OFF -DGGML_BLAS=OFF
           cmake --build llama.cpp/build --target ggml ggml-base ggml-cpu -j
           mkdir -p ggml-libs
           find llama.cpp/build \( -name 'libggml*.a' -o -name 'ggml*.a' \) -print | while read -r f; do
@@ -88,7 +88,7 @@ jobs:
           cmake -S llama.cpp -B llama.cpp/build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
-            -DLLAMA_BUILD_SERVER=OFF -DGGML_NATIVE=OFF
+            -DLLAMA_BUILD_SERVER=OFF -DGGML_NATIVE=OFF -DGGML_METAL=OFF -DGGML_BLAS=OFF
           cmake --build llama.cpp/build --config Release --target ggml ggml-base ggml-cpu -j
           mkdir -p ggml-libs
           find llama.cpp/build \( -name 'libggml*.a' -o -name 'ggml*.a' \) -print | while read -r f; do

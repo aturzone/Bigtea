@@ -22,10 +22,20 @@ use std::fmt;
 
 use bigtea_gguf::GgmlType;
 
+#[cfg(have_ggml)]
+pub mod backend;
+pub mod device;
 mod graph;
 pub mod repack;
 mod weights;
 
+#[cfg(have_ggml)]
+pub use backend::{download, download_f32, upload, upload_f32, Backend, DeviceBuffer};
+// `device` is unconditional, unlike everything around it: it answers
+// `Unavailable` rather than vanishing when ggml is absent, so a caller can ask
+// "is there a GPU here?" in a build that cannot use one and get an answer
+// instead of a missing symbol.
+pub use device::{best_offload_device, devices, vulkan_available, DeviceInfo, DeviceKind};
 #[cfg(have_ggml)]
 pub use graph::{arena_for, f16_to_f32, f32_to_f16, Context, RopeParams, Tensor};
 pub use repack::{is_repackable, Repacked};
@@ -48,6 +58,16 @@ pub enum GgmlError {
     ArenaExhausted,
     /// Graph execution returned a non-zero status.
     ComputeFailed(i32),
+    /// No device at that index in the backend registry.
+    NoSuchDevice(usize),
+    /// The device exists but refused to produce a backend or a buffer type.
+    DeviceInitFailed(usize),
+    /// The device could not allocate a buffer for the context's tensors.
+    ///
+    /// Distinct from `ArenaExhausted`, which is host memory: this one means the
+    /// *card* is full, and the answer is a smaller model or fewer resident
+    /// layers rather than a bigger arena.
+    DeviceOutOfMemory,
 }
 
 impl fmt::Display for GgmlError {
@@ -79,6 +99,16 @@ impl fmt::Display for GgmlError {
             GgmlError::ComputeFailed(s) => {
                 write!(f, "ggml graph computation failed with status {s}")
             }
+            GgmlError::NoSuchDevice(i) => {
+                write!(f, "no compute device at index {i}")
+            }
+            GgmlError::DeviceInitFailed(i) => {
+                write!(f, "device {i} refused to initialise a backend")
+            }
+            GgmlError::DeviceOutOfMemory => f.write_str(
+                "the device could not allocate the requested tensors; it is out of memory, \
+                 which needs a smaller model rather than a bigger arena",
+            ),
         }
     }
 }
