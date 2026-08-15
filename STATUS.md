@@ -36,9 +36,10 @@ own output byte for byte. See the discriminator section below.
 thirteen models*. `starcoder2` once passed 3/3 while running the wrong
 pre-tokenizer, and V4-Flash is not swept here at all.
 
-**#60 and #63 are merged and everything is on `main`, verified on `main`
-itself**: 423 tests, clippy `--workspace -D warnings` 0, fmt clean, and the
-parity sweep re-run after the merge.
+**Current**: **526 tests**, clippy `--workspace --all-targets -D warnings` 0, fmt
+clean. `#60`, `#63` and `#64` are merged; `#65` is open and green. The counts in
+dated sections further down are what was true on their date and are left alone —
+this line is the one to read.
 
 **`VERIFIED_ARCHITECTURES` is thirteen** — `baichuan`, `internlm2` and `olmo`
 added on `ticket/r14-architectures`, each diffed at **eight** prompts. Widening
