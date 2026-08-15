@@ -144,7 +144,61 @@ special tokens, so no fragment ever follows one. None of the 104 prompts behind
 "102 exact" could have caught this, and it affects every chat-framed request the
 server handles.
 
-## Still open: three genuine rendering differences
+## internlm2: the detector asked whether the word appears, again
+
+`mentions_system_role` tested for the literal `'system'`. ChatML templates never
+write it:
+
+```jinja
+{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' }}
+```
+
+The role is **interpolated**, so every role is handled — system included — and
+the word is nowhere in the template. We reported "no system branch", merged the
+system turn into the user turn, and rendered **two** turns where llama.cpp
+rendered three.
+
+**The role has to be emitted, not merely compared, and that is the whole
+difficulty.** Phi-3 also contains `['role']`, inside `{% if message['role'] ==
+'user' %}`, and genuinely has no system branch — it must still be merged. A
+substring test anywhere in the template fixes internlm2 by breaking Phi-3. So the
+check scans `{{ … }}` blocks only: where a template *emits* rather than
+*decides*.
+
+That is the second guard in one day that asked "does the word appear?" instead
+of "does this template handle a system turn?" — the first being the Gemma
+polyfill, which fired only when the template never mentions system and so could
+not see the one template that mentions it in order to **reject** it. Same
+question, two wrong answers, opposite directions.
+
+## Where it settled: 9 of 14, and why the last five are not bugs
+
+| | |
+|---|---|
+| `OLMo`, `starcoder2`, `all-MiniLM` | **no chat template.** llama.cpp passes the text through; we impose `System:/User:/Assistant:`. A product decision, recorded above |
+| `Falcon3`, `tinyllama` | **family path only — our `--jinja` matches llama.cpp's `--jinja` on both.** Two hardcoded shortcuts disagreeing |
+
+The last row is worth being precise about rather than counting as a defect.
+Both models resolve to our `Zephyr` family renderer, which emits
+`<|role|>\ncontent<eos>\n`. That matches **tinyllama's** template, which does
+emit an EOS between turns, and not **Falcon3's**, which does not — and llama.cpp
+classifies the two differently, so its shortcut disagrees with ours on Falcon3
+and with the *template* on tinyllama.
+
+**One hardcoded renderer cannot be right for two models whose templates differ,
+which is the entire argument for `--jinja`.** We have a `ChatFormat::Falcon3` arm
+that reproduces llama.cpp's `LLM_CHAT_TEMPLATE_FALCON_3` exactly
+(`<|role|>\ncontent\n`); the detector sends Falcon3 to `Zephyr` before reaching
+it. Re-ordering detection to llama.cpp's rule (`<|assistant|>` + `<|user|>` +
+`</s>` → Falcon-3, checked *before* zephyr) is the fix, and it is deferred rather
+than guessed: tinyllama's template appears to satisfy the same gate, and a
+detector change that silently re-classifies a model whose framing is currently
+correct is exactly the trade this file has now recorded twice.
+
+**The exact path already agrees.** Anyone who needs byte-parity with the
+reference on these two models has `--jinja` today.
+
+## Earlier: three genuine rendering differences
 
 | model | what differs |
 |---|---|
