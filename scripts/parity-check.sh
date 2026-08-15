@@ -22,11 +22,14 @@
 # Llama-3.2 rotating with the wrong RoPE (4), Falcon3 prefilled a token short
 # (5). So this script now does two more things before shrugging:
 #
-#   1. **Compares the tokenized prompt.** If llama.cpp turns the prompt into a
-#      different number of tokens than Bigtea does, the two engines are not
+#   1. **Compares the tokenized prompt, ID for ID.** If llama.cpp turns the
+#      prompt into different tokens than Bigtea does, the two engines are not
 #      answering the same question and the mismatch is a FAILURE, not a tie.
-#      That single check catches the whole class -- a missing BOS, a wrong
-#      pre-tokenizer, a byte-fallback that drops characters.
+#      **This compared COUNTS until 2026-08-15, and a count cannot see the bug
+#      it was written for**: `starcoder2` passed 3/3 while running the wrong
+#      pre-tokenizer, and a different split of the same text usually produces
+#      the same *number* of tokens. A missing BOS moves the count and was
+#      caught; a wrong merge table does not and was not.
 #   2. **Counts them.** One near-tie in eight is ordinary. Three or more is a
 #      bug that has not been found yet, and the script exits non-zero saying so
 #      rather than printing eight reassuring lines.
@@ -103,16 +106,25 @@ ref() {
   "$REF" -m "$MODEL" -p "$1" -n "$N" --temp 0 --no-warmup -no-cnv "${@:2}" 2>/dev/null | strip
 }
 
-# How many tokens each engine makes of a prompt. Different counts mean the two
-# are not answering the same question, and every difference downstream is
-# explained by that rather than by arithmetic.
+# The token IDs each engine makes of a prompt, as `1,450,7483,...`.
+#
+# **The IDs, not the count.** This compared counts, and a count cannot see the
+# failure it was written for. `starcoder2` passed 3/3 while running the WRONG
+# PRE-TOKENIZER — a different split of the same text usually yields the same
+# number of tokens, so the check was blind to exactly the bug that motivated it.
+# A missing BOS changes the count and was caught; a wrong merge table does not.
+#
+# Both engines print the IDs under `--verbose-prompt`; llama.cpp one per line as
+# `<id> -> '<text>'`, prefixed with its log timestamp. Matching on the arrow and
+# taking the number before it survives token texts containing quotes.
 bigtea_tokens() {
   "$BIGTEA" -m "$MODEL" -p "$1" -n 1 --temp 0 --force --verbose-prompt 2>&1 \
-    | strip | sed -n 's/^prompt .*-> \([0-9]*\) tokens$/\1/p' | head -1
+    | strip | sed -n 's/^prompt  *[0-9]* tokens: \[\(.*\)\]$/\1/p' | head -1 | tr -d ' '
 }
 llama_tokens() {
   "$REF" -m "$MODEL" -p "$1" -n 1 --temp 0 --no-warmup -no-cnv --verbose-prompt 2>&1 \
-    | strip | sed -n 's/.*number of tokens in prompt = \([0-9]*\).*/\1/p' | head -1
+    | strip | grep -oE "^[0-9.]+ I +[0-9]+ -> " | grep -oE '[0-9]+ -> $' \
+    | grep -oE '^[0-9]+' | paste -sd, -
 }
 
 name=$(basename "$MODEL")
@@ -180,7 +192,9 @@ for p in "${PROMPTS[@]}"; do
     if [ -n "$bt" ] && [ -n "$lt" ] && [ "$bt" != "$lt" ]; then
       fail=1
       printf 'FAIL      %-36s %s\n' "$name" "$p"
-      printf '  the prompt tokenized differently: bigtea %s tokens, llama.cpp %s.\n' "$bt" "$lt"
+      printf '  the prompt tokenized differently -- the IDs, not just the count:\n'
+      printf '    bigtea   : %s\n' "$(printf '%s' "$bt" | head -c 160)"
+      printf '    llama.cpp: %s\n' "$(printf '%s' "$lt" | head -c 160)"
       printf '  The reference also disagrees with itself here, which is what a\n'
       printf '  different input looks like -- so this is NOT a near-tie.\n'
       continue
