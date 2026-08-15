@@ -227,18 +227,35 @@ mentions one) and the obvious edit is against a model of the code that is
 demonstrably wrong. Change it, then re-run the table above; the empirical answer
 is cheap and the reasoned one has already been wrong once.
 
-**Emoji — `stablelm`, `starcoder2`.** llama.cpp merges the leading space and the
-emoji into one token; we emit three:
+**Double space: FIXED 2026-08-15.** The cause was the `specials` length guard,
+not the splitter — OLMo gives runs of spaces their own ids and the guard excluded
+the short ones, so three spaces was partitioned and two was not. OLMo, gemma-2
+and gemma-3 are now 17/17.
+
+**Emoji — still open, `stablelm` and `starcoder2`.**
 
 ```
-hi <emoji> there   ours  [6151, 220, 76460, 222, 1070]
-                   llama [6151, 91416, 1070]
+stablelm     ours  [6151, 220, 76460, 222, 1070]      llama [6151, 91416, 1070]
+starcoder2   ours  [5001, 244, 36570, 246, 2038]      llama [5001, 18445, 246, 2038]
 ```
 
-Likely the same root as the whitespace case — a piece boundary falling where the
-reference's does not — but **that is a guess and is marked as one**. gemma is
-SPM and OLMo is BPE, so at minimum the whitespace symptom spans two code paths
-and may be two bugs.
+**Two things ruled out, so nobody repeats them:**
+
+* **Not `ignore_merges`.** ` 😀` is a single token (91416) in stablelm's
+  vocabulary, so "look the whole piece up before merging" is the obvious fix —
+  and it changes nothing, because the piece we hand to BPE is not that string.
+  The code was written, measured, and reverted rather than left in doing nothing.
+* **Not "llama.cpp emits one token".** On starcoder2 it emits **two**
+  (`18445, 246`) where we emit three. So the reference is not treating the emoji
+  as atomic either; it is splitting it in a *different place*.
+
+That points at the pre-tokenizer's handling of a 4-byte codepoint — a boundary
+falling one position out — rather than at the merge table. `hi 😀 there` under
+the `gpt2` rule gives `["hi", " 😀", " there"]` here, which looks right, so the
+divergence is either in a different pre rule (neither model declares `gpt2`) or
+in the byte-encoding of the astral character. **Check which pre-tokenizer each of
+these two actually resolves to first** — that was not established, and assuming
+it is where the last two hours went.
 
 **Neither is reachable from `parity-check.sh`**, whose eight prompts contain no
 double space and no emoji. That is now the third time a tokenizer bug has lived

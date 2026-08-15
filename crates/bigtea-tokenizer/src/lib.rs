@@ -219,7 +219,23 @@ impl Tokenizer {
                     // A single character marked USER_DEFINED is not a marker
                     // worth partitioning on, and matching one would slice
                     // ordinary text apart.
-                    if text.len() > 2 {
+                    //
+                    // **Except when it is whitespace.** A vocabulary that gives
+                    // runs of spaces their own ids -- OLMo has one per length --
+                    // needs them matched literally, and the length guard kept
+                    // exactly the short ones out. It showed as a run of TWO
+                    // spaces tokenizing differently while three, four and five
+                    // were correct:
+                    //
+                    //   a  b   ours [66, 245, 67]     llama [66, 50276, 67]
+                    //   a   b  ours [66, 50275, 67]   llama [66, 50275, 67]
+                    //
+                    // Three spaces cleared `len > 2` and was partitioned; two
+                    // did not and fell through to BPE, which found the ordinary
+                    // `ĠĠ` merge instead of the dedicated token. Whitespace
+                    // cannot "slice ordinary text apart" in the way the guard
+                    // was protecting against — it is already a boundary.
+                    if text.len() > 2 || (!text.is_empty() && text.trim().is_empty()) {
                         specials.push((text.clone(), i as u32));
                     }
                 }

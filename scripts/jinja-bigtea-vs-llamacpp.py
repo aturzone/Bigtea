@@ -76,10 +76,29 @@ def main() -> int:
     models = [Path(a) for a in args] if args else sorted(
         p for d in MODELS.iterdir() if d.is_dir() for p in d.glob("*.gguf")
     )
+    # **Models with NO chat template are not comparable through this script and
+    # are skipped rather than counted as differences.**
+    #
+    # `llama-completion -sys X -p Y` on such a container does RAW COMPLETION --
+    # it emits the user text and nothing else, because there is no template to
+    # apply. Bigtea's `-cnv` applies its neutral framing. Reporting that as a
+    # disagreement compares our chat path against the reference's completion
+    # path, and it counted three models as broken that are not.
+    #
+    # llama.cpp's actual fallback for a missing template is ChatML
+    # (`common/chat.cpp`: `template_default` "always set (defaults to chatml)"),
+    # but it lives on the conversation path, which this script does not drive.
+    # Comparing against it needs `llama-server` or an interactive session.
+    no_template = {"OLMo-1B", "starcoder2-3b", "all-MiniLM-L6-v2"}
+
     seen: set[str] = set()
     worst = 0
     agree = differ = skipped = 0
     for m in models:
+        if any(m.stem.startswith(t) for t in no_template):
+            print(f"skip   {m.name}: no chat template -- see the note in this script")
+            skipped += 1
+            continue
         # One shard is enough: the template is metadata and identical across
         # shards, and loading a 144 GB model five times to read one string is a
         # waste.

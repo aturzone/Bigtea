@@ -112,7 +112,7 @@ fn every_container_template_renders_the_same_both_ways() {
         // Phi-3's does exactly that. Comparing without it compares two
         // different conversations.
         let raw = vec![msg("system", "SYS"), msg("user", "HI")];
-        let prepared = if bigtea_jinja::mentions_system_role(template) {
+        let prepared = if bigtea_jinja::supports_system_role(template) {
             raw
         } else {
             bigtea_jinja::merge_system_into_first_user(

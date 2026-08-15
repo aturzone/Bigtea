@@ -205,6 +205,18 @@ fn gpt2_rule(text: &str) -> Vec<String> {
         }
         // `\s+(?!\S)` — a run with something after it gives its last character
         // back, because that character is the next piece's leading space.
+        //
+        // **This was briefly changed to emit the run whole, and that was
+        // wrong.** OLMo's `a  b` does tokenize as `'a' '  ' 'b'` in the
+        // reference, and it looked like this rule handing a space forward — but
+        // the cause is one layer up. OLMo gives runs of spaces their own token
+        // ids, and `specials` excluded the short ones *by length*, so a
+        // two-space run never reached the splitter as a unit at all. Fixing that
+        // guard fixed the tokens with this rule untouched, and reverting here is
+        // what leaves every other GPT-2-family container alone.
+        //
+        // The lesson is the attribution: the symptom showed in this function's
+        // output and the bug was in what was handed to it.
         if ws > 1 && i + ws < n {
             let j = i + ws - 1;
             out.push(chars[i..j].iter().collect());
@@ -247,10 +259,33 @@ fn gpt2_rule(text: &str) -> Vec<String> {
 /// disagreement with llama.cpp.
 fn default_gpt2(text: &str) -> Vec<String> {
     // Pass 1: runs of punctuation and the listed symbols, taken whole.
-    let is_punct_run = |c: char| {
+    //
+    // The non-ASCII arm approximates `\p{P}`, which Rust's std cannot test for.
+    // **`\p{P}` is punctuation, not symbols**, and the difference is not
+    // academic: an emoji is `So`, so llama.cpp's first pass does not match one
+    // and its second pass gets to attach the leading space. Ours matched it,
+    // cut the emoji into its own run first, and the space was left behind:
+    //
+    //   hi 😀 there   ours  ["hi", " ", "😀", " there"]
+    //                 llama ["hi", " 😀", " there"]     -> one token, id 91416
+    //
+    // Symbol ranges are therefore excluded from the approximation. This is
+    // narrower than `\p{P}` still is, and deliberately so: widening it to a real
+    // category table would change every CJK container at once, and those agree
+    // today.
+    let is_symbol = |c: char| {
+        matches!(c as u32,
+            // Arrows through dingbats: this span already contains Miscellaneous
+            // Symbols (0x2600) and Dingbats (0x2700), so they are not listed
+            // again — clippy catches the duplicate as an unreachable pattern.
+            0x2190..=0x2BFF
+            | 0x1F000..=0x1FAFF  // mahjong through the emoji blocks
+            | 0xFE0F) // variation selector-16, the emoji presenter
+    };
+    let is_punct_run = move |c: char| {
         c.is_ascii_punctuation() && !matches!(c, '$' | '+' | '<' | '=' | '>' | '^' | '~' | '|')
             || matches!(c, '$' | '+' | '<' | '=' | '>' | '^' | '~' | '|')
-            || (!c.is_alphanumeric() && !c.is_whitespace() && !c.is_ascii())
+            || (!c.is_alphanumeric() && !c.is_whitespace() && !c.is_ascii() && !is_symbol(c))
     };
     let mut pieces = split_runs(text, is_punct_run);
 

@@ -242,7 +242,30 @@ impl ChatFormat {
             }
         } else if t.contains("<|end|>") && t.contains("<|assistant|>") {
             ChatFormat::Phi3
+        } else if t.contains("<|assistant|>") && t.contains("<|user|>") {
+            // **Both tags present is llama.cpp's Falcon-3/GLMEdge branch, and it
+            // is checked BEFORE zephyr there.** We sent everything with either
+            // tag to `Zephyr`, which appends the EOS between turns — right for
+            // no model in this repository:
+            //
+            //   ours     <|system|>\nSYS<eos>\n<|user|>\nHI<eos>\n<|assistant|>\n
+            //   llama    <|system|>\nSYS<|user|>\nHI<|assistant|>
+            //
+            // Both `tinyllama` and `Falcon3` land here, and **neither contains a
+            // literal `</s>`** — tinyllama writes `eos_token`, the variable — so
+            // both are GLMEdge rather than Falcon-3. That was the whole of the
+            // remaining chat-framing disagreement, and it was one substring.
+            if t.contains("<|tool_declare|>") {
+                ChatFormat::ExaoneMoe
+            } else if t.contains("</s>") {
+                ChatFormat::Falcon3
+            } else {
+                ChatFormat::GlmEdge
+            }
         } else if t.contains("<|user|>") || t.contains("<|assistant|>") {
+            // Only one of the two tags. llama.cpp reaches zephyr on
+            // `<|user|>` + `<|endoftext|>`; anything else with a single tag has
+            // no better home here.
             ChatFormat::Zephyr
         } else if t.contains("### Instruction") {
             ChatFormat::Alpaca
@@ -1065,6 +1088,24 @@ impl ChatFormat {
                 // Plain and readable. Not a guess at a family — a deliberate
                 // neutral framing, so a caller can report that the template was
                 // not recognised instead of quietly using someone else's.
+                //
+                // **ChatML was tried here and reverted.** `common/chat.cpp`
+                // keeps a `template_default` that is "always set (defaults to
+                // chatml)", so matching the reference looked like the obvious
+                // move. Two things stopped it, and both are worth keeping:
+                //
+                //   * that fallback is on llama.cpp's *conversation* path, and
+                //     `llama-completion -sys X -p Y` on a template-less model
+                //     does raw completion — it emits `HI` and nothing else. The
+                //     comparison that motivated the change was between our chat
+                //     framing and its raw completion, which is not a comparison.
+                //   * `<|im_start|>` is not in these models' vocabularies. On
+                //     OLMo it costs **41 tokens where this framing costs 12**,
+                //     all of them sequences the model has never seen.
+                //
+                // Matching a reference into a worse result is not parity, so
+                // this stays until someone measures llama.cpp's conversation
+                // path directly.
                 for m in messages {
                     out.push_str(&format!("{}: {}\n", m.role, m.content));
                 }
@@ -1124,7 +1165,17 @@ mod tests {
     // strings would prove only that the matcher matches itself.
 
     #[test]
-    fn tinyllama_is_detected_as_zephyr() {
+    fn tinyllama_is_glmedge_not_zephyr() {
+        // **This test asserted `Zephyr` and that was our behaviour, not the
+        // reference's.** llama.cpp checks `<|assistant|>` AND `<|user|>` before
+        // it ever reaches zephyr, and within that branch picks Falcon-3 only on
+        // a literal `</s>`. tinyllama writes `eos_token`, the *variable*, so it
+        // is GLMEdge — and GLMEdge appends no EOS between turns:
+        //
+        //   ours (zephyr)  <|system|>\nSYS</s>\n<|user|>\nHi.</s>\n<|assistant|>\n
+        //   llama.cpp      <|system|>\nSYS<|user|>\nHi.<|assistant|>
+        //
+        // Measured on the real container, token for token, before this changed.
         let real = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n\
                     {{ '<|user|>\n' + message['content'] + eos_token }}\n\
                     {% elif message['role'] == 'system' %}\n\
@@ -1132,11 +1183,20 @@ mod tests {
                     {% endif %}\n{% if loop.last and add_generation_prompt %}\n\
                     {{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}";
         let f = ChatFormat::detect(Some(real));
-        assert_eq!(f, ChatFormat::Zephyr);
+        assert_eq!(f, ChatFormat::GlmEdge);
         assert_eq!(
             f.apply(&convo(), "</s>", true),
-            "<|system|>\nYou are terse.</s>\n<|user|>\nHi.</s>\n<|assistant|>\n"
+            "<|system|>\nYou are terse.<|user|>\nHi.<|assistant|>"
         );
+    }
+
+    #[test]
+    fn a_literal_eos_in_the_template_still_means_falcon3() {
+        // The same branch, the other side of it. Writing `</s>` out rather than
+        // referring to `eos_token` is what separates Falcon-3 from GLMEdge in
+        // the reference, and it is a one-substring difference in both.
+        let t = "{{ '<|user|>\n' + message['content'] + '</s>' }}{{ '<|assistant|>' }}";
+        assert_eq!(ChatFormat::detect(Some(t)), ChatFormat::Falcon3);
     }
 
     #[test]
