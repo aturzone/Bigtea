@@ -240,6 +240,54 @@ pub fn upload_f32(tensor: &Tensor<'_>, values: &[f32]) -> Result<(), GgmlError> 
     upload(tensor, &bytes)
 }
 
+/// Cumulative device time, split by what it was spent on.
+///
+/// Exists because the first device measurement came in at 0.42x and the
+/// obvious explanation — PCIe transfers — does not survive arithmetic: the
+/// activations moved per prefill are about 1.4 GB, which is under a second at
+/// the measured 2 GiB/s, against a gap of nearly ten. So the cost is measured
+/// per operation rather than attributed to the most plausible-sounding one.
+pub mod timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static REALIZE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static DOWNLOAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COMPUTE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static REALIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static COMPUTE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn add(counter: &AtomicU64, started: std::time::Instant) {
+        counter.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Seconds in realize / upload / download / compute, and the call counts.
+    pub fn snapshot() -> (f64, f64, f64, f64, u64, u64) {
+        let s = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e9;
+        (
+            s(&REALIZE_NS),
+            s(&UPLOAD_NS),
+            s(&DOWNLOAD_NS),
+            s(&COMPUTE_NS),
+            REALIZE_CALLS.load(Ordering::Relaxed),
+            COMPUTE_CALLS.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn reset() {
+        for c in [
+            &REALIZE_NS,
+            &UPLOAD_NS,
+            &DOWNLOAD_NS,
+            &COMPUTE_NS,
+            &REALIZE_CALLS,
+            &COMPUTE_CALLS,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Where a graph runs, and everything that differs because of it.
 ///
 /// # Why this exists
@@ -289,14 +337,25 @@ impl Compute<'_> {
     pub fn realize(&self, ctx: &Context) -> Result<Option<DeviceBuffer>, GgmlError> {
         match self {
             Compute::Cpu { .. } => Ok(None),
-            Compute::Device(b) => b.alloc(ctx).map(Some),
+            Compute::Device(b) => {
+                let t = std::time::Instant::now();
+                let out = b.alloc(ctx).map(Some);
+                timing::add(&timing::REALIZE_NS, t);
+                timing::REALIZE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                out
+            }
         }
     }
 
     pub fn set_f32(&self, t: &Tensor<'_>, values: &[f32]) -> Result<(), GgmlError> {
         match self {
             Compute::Cpu { .. } => t.set_f32(values),
-            Compute::Device(_) => upload_f32(t, values),
+            Compute::Device(_) => {
+                let started = std::time::Instant::now();
+                let r = upload_f32(t, values);
+                timing::add(&timing::UPLOAD_NS, started);
+                r
+            }
         }
     }
 
@@ -323,7 +382,12 @@ impl Compute<'_> {
     pub fn set_bytes(&self, t: &Tensor<'_>, data: &[u8]) -> Result<(), GgmlError> {
         match self {
             Compute::Cpu { .. } => t.set_bytes(data),
-            Compute::Device(_) => upload(t, data),
+            Compute::Device(_) => {
+                let started = std::time::Instant::now();
+                let r = upload(t, data);
+                timing::add(&timing::UPLOAD_NS, started);
+                r
+            }
         }
     }
 
@@ -346,14 +410,25 @@ impl Compute<'_> {
     pub fn to_vec_f32(&self, t: &Tensor<'_>) -> Result<Vec<f32>, GgmlError> {
         match self {
             Compute::Cpu { .. } => Ok(t.to_vec_f32()),
-            Compute::Device(_) => download_f32(t),
+            Compute::Device(_) => {
+                let started = std::time::Instant::now();
+                let r = download_f32(t);
+                timing::add(&timing::DOWNLOAD_NS, started);
+                r
+            }
         }
     }
 
     pub fn run(&self, ctx: &Context, outputs: &[&Tensor<'_>]) -> Result<(), GgmlError> {
         match self {
             Compute::Cpu { threads } => ctx.compute_many(outputs, *threads),
-            Compute::Device(b) => b.compute(ctx, outputs),
+            Compute::Device(b) => {
+                let t = std::time::Instant::now();
+                let r = b.compute(ctx, outputs);
+                timing::add(&timing::COMPUTE_NS, t);
+                timing::COMPUTE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                r
+            }
         }
     }
 

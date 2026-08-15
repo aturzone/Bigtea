@@ -268,7 +268,10 @@ prefill {} tokens, same prompt, same session",
         cpu.load_seconds + cpu.prefill_seconds
     );
 
+    bigtea_ggml::backend::timing::reset();
     let gpu = prefill_once(&model, &config, &prompt, Some(index))?;
+    let (realize_s, up_s, down_s, comp_s, realize_n, comp_n) =
+        bigtea_ggml::backend::timing::snapshot();
     println!(
         "  device   {:>8.2} tok/s   load {:>5.2}s   first token at {:>6.2}s",
         gpu.tok_s,
@@ -287,6 +290,16 @@ prefill {} tokens, same prompt, same session",
         gpu.load_seconds + gpu.prefill_seconds,
         (gpu.load_seconds + gpu.prefill_seconds) - (cpu.load_seconds + cpu.prefill_seconds)
     );
+    // Where the device time actually went. Measured rather than attributed:
+    // the transfer volume alone does not explain the gap.
+    println!(
+        "
+  device time"
+    );
+    println!("    realize  {realize_s:>6.2}s  ({realize_n} allocations)");
+    println!("    compute  {comp_s:>6.2}s  ({comp_n} graph submissions)");
+    println!("    upload   {up_s:>6.2}s");
+    println!("    download {down_s:>6.2}s");
     // A wrong device path returns plausible logits, never an error, so the two
     // runs are compared rather than trusted.
     println!(
