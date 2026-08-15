@@ -507,6 +507,33 @@ Two details that would have been wrong quietly:
 - Streaming re-uses the UTF-8 buffering rule: a chunk is emitted only at a
   character boundary, so a multi-byte character never becomes `�` mid-stream.
 
+### Chat framing against llama.cpp, both paths — one bug, four open (2026-08-15)
+
+`scripts/jinja-vs-llamacpp.py` claims in its docstring to compare "Bigtea's Jinja
+rendering against `llama.cpp --jinja`" and **never runs Bigtea** — it runs
+llama.cpp twice, `--jinja` against `--no-jinja`. That measurement is real and
+worth keeping (the reference disagrees with **itself** on 5 of 18 containers) but
+it was being cited for a claim it does not test. Same failure as the `REFUSED`
+row: a description that outlived the code.
+
+`scripts/jinja-bigtea-vs-llamacpp.py` runs the four-way that does, on **token IDs
+rather than rendered text**. It found a real bug on its first execution: **BOS was
+being emitted twice** under `--jinja`, because the template contains the literal
+`<bos>` *and* `encode` prepended one. gemma-3, Llama-3.2, internlm2, Phi-3 were
+all prefilled a token **long** — the exact mirror of Falcon3, which was a token
+short. Fixed; agreement went **4 → 6** of 14 loadable containers.
+
+Three of the remaining eight are models with **no chat template** (`OLMo`,
+`starcoder2`, `all-MiniLM`), where llama.cpp passes the text through untouched
+and we impose a `System:/User:/Assistant:` framing. Deliberate and announced, but
+a divergence, and feeding a base model invented structure is the mirror of the
+bug that made instruct models continue rather than answer. **Not changed** — it
+is a product decision, recorded so it gets made rather than inherited. One more
+(`tinyllama`, family path) is us matching the model's template where llama.cpp's
+hardcoded renderer does not. Four are genuine whitespace/turn-structure
+differences, `Phi-3` first. Full table:
+`research/chat-framing-vs-llamacpp-2026-08-15.md`.
+
 ### `/v1/embeddings` — the fifth endpoint, implemented 2026-08-15
 
 It answered **501** with a reason that was half true: *"this runner's graph
