@@ -1116,22 +1116,22 @@ struct Fit {
 const REFUSED: &[(&str, bool, &str)] = &[
     // (flag, takes an argument, why)
 
-    // --- GPU. No GPU code exists at all: `bigtea-probe` detects the card and
-    // nothing uses it. A VRAM tier needs a CUDA-enabled ggml *and* a
-    // non-zero-copy binding path, because weights are bound here by handing
-    // ggml a host pointer.
-    (
-        "--device",
-        true,
-        "no GPU backend exists; every tensor is bound to host memory",
-    ),
-    (
-        "--list-devices",
-        false,
-        "no GPU backend exists; `bigtea-probe` reports the hardware instead",
-    ),
-    ("--gpu-layers", true, "no GPU backend exists"),
-    ("--n-gpu-layers", true, "no GPU backend exists"),
+    // --- GPU. **`--device` and `--list-devices` came OUT of this table** once
+    // the Vulkan binding path landed and a full Qwen3-4B prefill ran on the card
+    // at 1.73x the CPU. The rest stay, and the reason is now specific rather
+    // than "no GPU backend exists":
+    //
+    // The residency choice is **per tensor and all-or-nothing per model**. A
+    // mixed host/device context binds and builds correctly and then dies in
+    // `ggml_backend_graph_compute` with `STATUS_ACCESS_VIOLATION`, because the
+    // backend dereferences the host pointer as device memory — no error, no
+    // refusal, no fallback. Splitting *layers* across devices needs
+    // `ggml_backend_sched`, which does not exist here yet.
+    //
+    // So `-ngl 20` cannot mean twenty layers, and accepting it as "all or
+    // nothing, rounded" is exactly the lie this table exists to prevent.
+    ("--gpu-layers", true, "layer-level offload needs a scheduler; this build is all-or-nothing per model -- use --device"),
+    ("--n-gpu-layers", true, "layer-level offload needs a scheduler; this build is all-or-nothing per model -- use --device"),
     ("--main-gpu", true, "no GPU backend exists"),
     ("--split-mode", true, "no GPU backend exists"),
     ("--tensor-split", true, "no GPU backend exists"),
@@ -1499,6 +1499,10 @@ fn main() -> ExitCode {
     let mut n_keep: usize = 0;
     let mut reasoning = Reasoning::default();
     let mut numa_isolate = false;
+    // Compute device index for the whole model, or `None` for the CPU path.
+    // One value, not a per-layer count: residency is all-or-nothing per model
+    // until `ggml_backend_sched` exists. See the `REFUSED` note on `-ngl`.
+    let mut gpu_device: Option<usize> = None;
     let mut jinja = false;
     let mut loras: Vec<(String, f32)> = Vec::new();
     let mut cvecs: Vec<(String, f32)> = Vec::new();
@@ -1976,6 +1980,50 @@ fn main() -> ExitCode {
                         return ExitCode::from(2);
                     }
                 }
+                i += 2;
+            }
+            // --- compute device -------------------------------------------------
+            //
+            // `--list-devices` answers before anything is loaded, because "what
+            // hardware is here" is a fair question to ask of a build that turns
+            // out not to be able to use it.
+            "--list-devices" => {
+                match bigtea_ggml::devices() {
+                    Ok(list) if list.is_empty() => {
+                        println!("no compute devices (this build has no GPU backend linked)");
+                    }
+                    Ok(list) => {
+                        println!(
+                            "{:<4} {:<10} {:>9} {:>9}  description",
+                            "idx", "name", "free", "total"
+                        );
+                        for (idx, d) in list.iter().enumerate() {
+                            println!(
+                                "{:<4} {:<10} {:>7.2}G {:>7.2}G  {} ({:?})",
+                                idx,
+                                d.name,
+                                d.free_gib(),
+                                d.total_gib(),
+                                d.description,
+                                d.kind
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("bigtea-run: --list-devices: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                return ExitCode::SUCCESS;
+            }
+            "--device" => {
+                let Some(v) = rest.get(i + 1).and_then(|v| v.parse::<usize>().ok()) else {
+                    eprintln!(
+                        "bigtea-run: --device needs a device index; --list-devices shows them"
+                    );
+                    return ExitCode::from(2);
+                };
+                gpu_device = Some(v);
                 i += 2;
             }
             // --- flash attention ----------------------------------------------
@@ -2897,6 +2945,7 @@ fn main() -> ExitCode {
             cvecs,
             cvec_range,
         },
+        gpu_device,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -2940,6 +2989,7 @@ fn run_streaming(
     fit: Fit,
     shift: Shift,
     reasoning: Reasoning,
+    gpu_device: Option<usize>,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -3079,10 +3129,41 @@ fn run_streaming(
         }
     }
 
+    // **The device, if one was asked for.** Selected before loading, because
+    // the weights go straight into device memory rather than being uploaded
+    // afterwards — `load_resident_on_device` allocates through the backend's
+    // buffer type, and there is no path that moves an already-host-resident set.
+    if let Some(index) = gpu_device {
+        match runner.use_device(index) {
+            Ok(()) => bigtea_arch::info!("device     {index}, weights resident on it"),
+            Err(e) => return Err(format!("--device {index}: {e}").into()),
+        }
+    }
+
     let ctx = Context::new_no_alloc(64 << 20)?;
     let mut weights = WeightSet::new();
     let load_start = std::time::Instant::now();
-    let resident = runner.load_resident(&ctx, &mut weights)?;
+    // Held for the run: dropping the device buffer frees the weights out from
+    // under every graph that binds them.
+    let _device_buffer;
+    let resident = if runner.device_in_use().is_some() {
+        let (bytes, buffer, report) = runner.load_resident_on_device(&ctx, &mut weights)?;
+        _device_buffer = Some(buffer);
+        // The upload is the tier's real cost and the one number a reader will
+        // want next to the speedup, so it is printed rather than folded into
+        // the load time.
+        bigtea_arch::info!(
+            "upload     {:.2} GiB over {} tensors in {:.2}s ({:.2} GiB/s)",
+            report.gib(),
+            report.tensors,
+            report.seconds,
+            report.gib() / report.seconds.max(1e-9)
+        );
+        bytes
+    } else {
+        _device_buffer = None;
+        runner.load_resident(&ctx, &mut weights)?
+    };
     if mlock {
         let report = lock_resident(&weights);
         if report.ok() {
@@ -3632,6 +3713,7 @@ fn run(
     reasoning: Reasoning,
     jinja: bool,
     adapters: Adapters,
+    gpu_device: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -3930,6 +4012,7 @@ fn run(
         fit,
         shift,
         reasoning,
+        gpu_device,
         t0,
     )
 }
