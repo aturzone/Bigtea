@@ -82,6 +82,8 @@ mod ffi {
     pub type BackendT = *mut c_void;
     pub type BufferT = *mut c_void;
     pub type BufferTypeT = *mut c_void;
+    /// `ggml_gallocr_t` — owns a reusable allocation plan for one graph shape.
+    pub type GallocT = *mut c_void;
 
     // Transcribed together from one revision of ggml-backend.h / ggml-alloc.h.
     extern "C" {
@@ -109,6 +111,16 @@ mod ffi {
             size: usize,
         );
         pub fn ggml_backend_graph_compute(backend: BackendT, cgraph: *mut c_void) -> c_int;
+
+        // The GRAPH allocator, from ggml-alloc.h. Different model from the
+        // context allocator above: that one gives every tensor its own bytes
+        // and keeps them for the buffer's life, this one computes a plan and
+        // REUSES storage between tensors whose lifetimes do not overlap.
+        pub fn ggml_gallocr_new(buft: BufferTypeT) -> GallocT;
+        pub fn ggml_gallocr_free(galloc: GallocT);
+        pub fn ggml_gallocr_reserve(galloc: GallocT, graph: *mut c_void) -> bool;
+        pub fn ggml_gallocr_alloc_graph(galloc: GallocT, graph: *mut c_void) -> bool;
+        pub fn ggml_gallocr_get_buffer_size(galloc: GallocT, buffer_id: c_int) -> usize;
     }
 }
 
@@ -347,6 +359,39 @@ impl Compute<'_> {
         }
     }
 
+    /// Give a graph its storage from a **planned** allocation.
+    ///
+    /// The same position in the sequence as [`Self::realize`] — after the graph
+    /// is built, before anything is written into it — but it plans instead of
+    /// handing every tensor its own bytes. Tensors whose lifetimes do not
+    /// overlap share storage, which is what makes a resident forward pass fit:
+    /// the naive route needs ~4.3 GB of intermediates on Qwen3-4B against
+    /// 2.79 GiB of free VRAM.
+    ///
+    /// Weights are untouched. They already carry device pointers from
+    /// `load_resident_on_device`, and a graph allocator only assigns tensors
+    /// that still need storage — the same split llama.cpp uses.
+    ///
+    /// The returned planner owns the allocation and must outlive the compute.
+    pub fn realize_graph(
+        &self,
+        ctx: &Context,
+        outputs: &[&Tensor<'_>],
+    ) -> Result<Option<GraphAllocator>, GgmlError> {
+        match self {
+            Compute::Cpu { .. } => Ok(None),
+            Compute::Device(b) => {
+                let t = std::time::Instant::now();
+                let galloc = GraphAllocator::new(b)?;
+                galloc.reserve(ctx, outputs)?;
+                galloc.alloc(ctx, outputs)?;
+                timing::add(&timing::REALIZE_NS, t);
+                timing::REALIZE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(Some(galloc))
+            }
+        }
+    }
+
     pub fn set_f32(&self, t: &Tensor<'_>, values: &[f32]) -> Result<(), GgmlError> {
         match self {
             Compute::Cpu { .. } => t.set_f32(values),
@@ -441,6 +486,131 @@ impl Compute<'_> {
         match self {
             Compute::Cpu { .. } => crate::Residency::Host,
             Compute::Device(_) => crate::Residency::Device,
+        }
+    }
+}
+
+/// A reusable allocation plan for one graph shape.
+///
+/// # Why this exists beside [`Backend::alloc`]
+///
+/// [`Backend::alloc`] gives **every tensor in a context its own bytes**, held
+/// for the buffer's life. That is right for weights, which all have to be live
+/// at once. It is wrong for a forward pass: keeping `x` resident across layers
+/// means every layer's context stays alive, and on Qwen3-4B at 512 tokens that
+/// is roughly 120 MB of intermediates per layer — **~4.3 GB across 36 layers
+/// against 2.79 GiB of free VRAM.** It does not fit and trimming does not save
+/// it.
+///
+/// A graph allocator computes a *plan* instead: tensors whose lifetimes do not
+/// overlap share storage. That is why llama.cpp runs a whole-model graph in a
+/// modest buffer, and it is the precondition for keeping activations on the
+/// device across layers.
+///
+/// # The proof that it worked is the buffer size
+///
+/// `reserve` then [`Self::buffer_bytes`] is the whole check. A plan that
+/// allocates the naive total has reused nothing, and the failure mode is not an
+/// error — it is an out-of-memory on the card at some later layer. So the size
+/// is exposed rather than kept private.
+pub struct GraphAllocator {
+    #[cfg(have_ggml)]
+    raw: NonNull<std::os::raw::c_void>,
+}
+
+#[cfg(have_ggml)]
+impl Drop for GraphAllocator {
+    fn drop(&mut self) {
+        // SAFETY: `raw` came from `ggml_gallocr_new` and is freed exactly once.
+        unsafe { ffi::ggml_gallocr_free(self.raw.as_ptr()) };
+    }
+}
+
+impl GraphAllocator {
+    /// A planner for graphs allocated from `backend`'s buffer type.
+    pub fn new(backend: &Backend) -> Result<Self, GgmlError> {
+        #[cfg(not(have_ggml))]
+        {
+            let _ = backend;
+            Err(GgmlError::Unavailable)
+        }
+        #[cfg(have_ggml)]
+        {
+            // SAFETY: the device is registry-owned and outlives the process;
+            // the buffer type it returns is owned by the backend, not by us.
+            let dev = unsafe { ffi::ggml_backend_dev_get(backend.device_index()) };
+            let buft = unsafe { ffi::ggml_backend_dev_buffer_type(dev) };
+            if buft.is_null() {
+                return Err(GgmlError::DeviceInitFailed(backend.device_index()));
+            }
+            // SAFETY: `buft` is a live buffer type from the registry.
+            let raw = unsafe { ffi::ggml_gallocr_new(buft) };
+            NonNull::new(raw)
+                .map(|raw| Self { raw })
+                .ok_or(GgmlError::DeviceOutOfMemory)
+        }
+    }
+
+    /// Plan storage for every tensor in `outputs`' graph, without running it.
+    ///
+    /// Call before [`Self::alloc`]: reserving measures the plan and sizes the
+    /// buffer, which is what makes [`Self::buffer_bytes`] meaningful.
+    pub fn reserve(&self, ctx: &Context, outputs: &[&Tensor<'_>]) -> Result<(), GgmlError> {
+        #[cfg(not(have_ggml))]
+        {
+            let (_, _) = (ctx, outputs);
+            Err(GgmlError::Unavailable)
+        }
+        #[cfg(have_ggml)]
+        {
+            let graph = ctx.build_forward(outputs)?;
+            // SAFETY: `graph` lives in `ctx`'s arena and is valid for this call.
+            if unsafe { ffi::ggml_gallocr_reserve(self.raw.as_ptr(), graph) } {
+                Ok(())
+            } else {
+                Err(GgmlError::DeviceOutOfMemory)
+            }
+        }
+    }
+
+    /// Give the graph's tensors their planned storage.
+    ///
+    /// **Every tensor's data pointer is assigned here**, including inputs — so
+    /// this replaces `Compute::realize` on the graph-allocated path, and the
+    /// same ordering rule applies: after the graph is built, before anything is
+    /// written into it.
+    pub fn alloc(&self, ctx: &Context, outputs: &[&Tensor<'_>]) -> Result<(), GgmlError> {
+        #[cfg(not(have_ggml))]
+        {
+            let (_, _) = (ctx, outputs);
+            Err(GgmlError::Unavailable)
+        }
+        #[cfg(have_ggml)]
+        {
+            let graph = ctx.build_forward(outputs)?;
+            // SAFETY: as above; the plan was reserved for a graph of this shape.
+            if unsafe { ffi::ggml_gallocr_alloc_graph(self.raw.as_ptr(), graph) } {
+                Ok(())
+            } else {
+                Err(GgmlError::DeviceOutOfMemory)
+            }
+        }
+    }
+
+    /// How many bytes the plan actually needs on the device.
+    ///
+    /// The number that proves reuse is real. Compare it against the sum of the
+    /// graph's tensor sizes: equal means nothing was shared.
+    pub fn buffer_bytes(&self) -> usize {
+        #[cfg(not(have_ggml))]
+        {
+            0
+        }
+        #[cfg(have_ggml)]
+        {
+            // SAFETY: buffer 0 always exists once reserved; before reserving,
+            // ggml reports zero rather than faulting.
+            unsafe { ffi::ggml_gallocr_get_buffer_size(self.raw.as_ptr(), 0) }
         }
     }
 }

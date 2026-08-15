@@ -1459,7 +1459,7 @@ impl<'m> StreamingRunner<'m> {
             // After the graph, before the inputs: on a device this allocates
             // every tensor in the context, which cannot happen until they all
             // exist and must happen before anything is written into them.
-            let _dev = cmp.realize(&ctx)?;
+            let _dev = cmp.realize_graph(&ctx, &[&rows])?;
             cmp.set_i32(&tok, &ids)?;
             cmp.run(&ctx, &[&rows])?;
             if trace {
@@ -1600,7 +1600,7 @@ impl<'m> StreamingRunner<'m> {
                 // products and tiny.
                 let t = std::time::Instant::now();
                 // After the graph, before the inputs.
-                let _dev = cmp.realize(&ctx)?;
+                let _dev = cmp.realize_graph(&ctx, &[&q, &k, &v])?;
                 cmp.set_f32(&xt, &xt_values)?;
                 cmp.set_i32(&pos, &positions)?;
                 cmp.run(&ctx, &[&q, &k, &v])?;
@@ -1729,7 +1729,7 @@ impl<'m> StreamingRunner<'m> {
                     self.arch
                         .add_bias(&ctx, weights, out, &format!("blk.{il}.attn_output"))?;
                 let t = std::time::Instant::now();
-                let _dev = cmp.realize(&ctx)?;
+                let _dev = cmp.realize_graph(&ctx, &[&out])?;
                 cmp.set_f32(&q, &q_v)?;
                 cmp.set_bytes(&k_all, k_bytes)?;
                 cmp.set_bytes(&v_all, v_bytes)?;
@@ -1814,7 +1814,7 @@ impl<'m> StreamingRunner<'m> {
                     };
                     let out = ctx.add(&ffn, &xt)?;
                     let t = std::time::Instant::now();
-                    let _dev = cmp.realize(&ctx)?;
+                    let _dev = cmp.realize_graph(&ctx, &[&out])?;
                     cmp.set_f32(&xt, &ffn_input)?;
                     cmp.run(&ctx, &[&out])?;
                     if trace {
@@ -1830,7 +1830,7 @@ impl<'m> StreamingRunner<'m> {
                 )?;
                 let probs = ctx.soft_max_ext(&logits, None, 1.0, 0.0)?;
                 let t = std::time::Instant::now();
-                let _dev = cmp.realize(&ctx)?;
+                let _dev = cmp.realize_graph(&ctx, &[&normed, &probs])?;
                 cmp.set_f32(&xt, &ffn_input)?;
                 cmp.run(&ctx, &[&normed, &probs])?;
                 self.stats.ffn_seconds += t.elapsed().as_secs_f64();
@@ -1878,7 +1878,7 @@ impl<'m> StreamingRunner<'m> {
         // between any two models; after the matmul it is a distribution over
         // tokens, not an embedding at all.
         if self.want_embedding {
-            let _dev = cmp.realize(&ctx)?;
+            let _dev = cmp.realize_graph(&ctx, &[&normed])?;
             cmp.set_f32(&xt, &head_input)?;
             cmp.run(&ctx, &[&normed])?;
             self.last_embedding = Some(cmp.to_vec_f32(&normed)?);
@@ -1897,7 +1897,7 @@ impl<'m> StreamingRunner<'m> {
         // Gemma bounds the final logits smoothly rather than clipping them.
         // Without it every sampling decision is made on the wrong scale.
         let out = ctx.softcap(&out, c.final_logit_softcap)?;
-        let _dev = cmp.realize(&ctx)?;
+        let _dev = cmp.realize_graph(&ctx, &[&out])?;
         cmp.set_f32(&xt, &head_input)?;
         cmp.run(&ctx, &[&out])?;
         if trace {

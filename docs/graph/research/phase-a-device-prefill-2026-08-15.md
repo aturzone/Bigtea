@@ -72,6 +72,33 @@ line and the output in a doc. **The missing half of that rule is repeats**: a
 single run of a path with warm-up behaviour is not a measurement, and the first
 run of any GPU path is a different program from the second.
 
+## 2026-08-16: planned allocation takes it to 2.5x
+
+Wiring `ggml_gallocr` into the device path — every graph gets *planned* storage
+instead of every tensor getting its own bytes — moved it again:
+
+| | cpu median | device median | ratio |
+|---|---:|---:|---:|
+| context allocation | 52.68 | 80.02 | 1.33–1.52x |
+| **planned allocation** | **73.91** | **183.86** | **2.49–2.65x** |
+
+Both columns moved because the machine was quieter, which is exactly why the
+ratio is the claim and the medians are printed beside it.
+
+**Logit checksums did not move at all** — cpu 625.0074, device 621.1722, the same
+values as before the change. The device computes the same answer faster and the
+CPU path is untouched. That is the gate: a wrong device path returns plausible
+numbers, never an error.
+
+Weights were not involved. They already carry device pointers from
+`load_resident_on_device`, and a graph allocator only assigns tensors that still
+need storage — the split llama.cpp uses.
+
+What is left is transfers: **upload 2.01s, download 1.85s** across three runs.
+Removing them needs `x` to stay a tensor across the layer boundary and `q` to
+stop round-tripping, both of which require the QKV and attention graphs to share
+a context. See `backlog/activations-resident-across-layers.md`.
+
 ## The numbers
 
 Qwen3-4B-Q4_K_M, every weight resident on the device, same process, same

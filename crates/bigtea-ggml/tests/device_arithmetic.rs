@@ -305,3 +305,56 @@ fn one_graph_body_gives_the_same_answer_on_cpu_and_device() {
         );
     }
 }
+
+/// The graph allocator reuses storage, and the buffer size is the proof.
+///
+/// This is the precondition for keeping activations on the device across
+/// layers. `Backend::alloc` gives every tensor its own bytes and holds them for
+/// the buffer's life, which on Qwen3-4B at 512 tokens works out at ~120 MB of
+/// intermediates per layer — **~4.3 GB across 36 layers against 2.79 GiB of
+/// free VRAM.** A graph allocator plans instead, sharing storage between
+/// tensors whose lifetimes do not overlap.
+///
+/// A plan that reused nothing would still *work* here and then run out of
+/// memory on a real model at some later layer, so the assertion is on the size,
+/// not on success.
+#[test]
+fn the_graph_allocator_reuses_storage_between_stages() {
+    let _guard = one_at_a_time();
+    let Some(index) = discrete_gpu() else {
+        eprintln!("skipping: no discrete GPU");
+        return;
+    };
+    let Ok(backend_handle) = Backend::open(index) else {
+        eprintln!("skipping: device {index} would not initialise");
+        return;
+    };
+
+    let ctx = Context::new_no_alloc(64 * 1024 * 1024).expect("context");
+    // A chain, deliberately: each step consumes the previous and nothing else
+    // refers back to it, which is exactly the shape a forward pass has and
+    // exactly what a planner can collapse.
+    let n = 512i64;
+    let a = ctx.new_f32_2d(n, n).expect("a");
+    let mut chain = ctx.mul_mat(&a, &a).expect("step 0");
+    for _ in 0..5 {
+        chain = ctx.mul_mat(&a, &chain).expect("step");
+    }
+
+    let galloc = bigtea_ggml::GraphAllocator::new(&backend_handle).expect("planner");
+    galloc.reserve(&ctx, &[&chain]).expect("reserve");
+    let planned = galloc.buffer_bytes();
+
+    // What the naive allocator would need: every tensor, all at once.
+    let one = (n * n * 4) as usize;
+    let naive = one * 7; // `a` plus six chained results
+
+    eprintln!("planned {planned} bytes vs naive {naive} bytes ({one} per tensor)");
+    assert!(planned > 0, "planner reserved nothing at all");
+    assert!(
+        planned < naive,
+        "graph allocator reused NOTHING: planned {planned} >= naive {naive}. \
+         Keeping activations resident across layers depends on this reuse; \
+         without it the forward pass needs ~4.3 GB against 2.79 GiB of VRAM."
+    );
+}

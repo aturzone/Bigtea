@@ -1,6 +1,20 @@
 # Phase 2: keep activations on the device across layers
 
-**Status: open, designed, sized, not started.** Approved route: one context per
+**Status: step 0 DONE (2026-08-16), 1.33-1.52x -> 2.49-2.65x. Steps 1-3 open.**
+
+`ggml_gallocr` is in, wired at all seven call sites via `Compute::realize_graph`,
+and the reuse is measured: a seven-tensor chain plans into 3 MB against a naive
+7 MB. Logit checksums are unchanged, so the speedup cost no correctness.
+
+**What remains is transfers — upload 2.01s, download 1.85s across three runs.**
+Steps 1-3 below all need the same thing: the QKV and attention graphs sharing a
+context, so `q` (8.4 MB each way, 605 MB per prefill) stops round-tripping and
+the residual can be a graph op. Today attention builds in a scratch-buffer
+context sized for the CPU path's memory reuse, and merging them naively would
+grow host arenas for every architecture. That is the open design question, and
+it is the reason steps 1-3 did not follow step 0 immediately.
+
+**Original status:** open, designed, sized, not started. Approved route: one context per
 pass. Explicitly **not** a device-only duplicate of the layer body — this project
 has deleted five dead forward paths and must not grow a sixth.
 
