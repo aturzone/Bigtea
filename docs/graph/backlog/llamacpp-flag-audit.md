@@ -12,6 +12,43 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 182
 ```
 
+## 2026-08-14: 182 of 182 recognised — and one of them was being eaten
+
+The count is now **computed from the two sources rather than tallied by hand**,
+which is why it can be stated exactly:
+
+```
+$ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u   # 182
+  intersected with bigtea-run's match arms                                      # 158 implemented
+  intersected with its REFUSED table                                            #  24 declined
+  in neither                                                                    #   0
+```
+
+Every number this document carried before today was counted by reading, and one
+of them was wrong in a way reading could not catch (see the `REFUSED` note at
+the end — `--jinja` was in the table *and* implemented, and the table won).
+
+**The zero is the part that was not free.** `--flash-attn`/`-fa` was in neither
+set, and the consequence was not "the flag errors". The fallback arm took any
+leftover token as the prompt, so:
+
+```
+$ bigtea-run -m model.gguf -fa off "hello"
+```
+
+set `prompt = "-fa"`, discarded `"hello"`, exited **0**, and fluently completed
+the wrong text. No message. This is the same failure the `REFUSED` table was
+built to prevent, arriving through the gap the table does not cover: a table can
+only decline flags someone thought of.
+
+An unknown token starting with `-` is now an error, with `--` as the escape
+hatch for a prompt that really does begin with a dash. `-fa on|auto` is accepted
+— it describes what this build does, since `attention_flash` is the only
+attention path — and `-fa off` is refused by name, because there is no `mul_mat`
+path to switch to and **`-fa off` is one of the controls `parity-check.sh`
+passes to the reference**. Silently ignoring it would have turned a parity check
+into a comparison of a run with itself.
+
 | bucket | flags | state |
 |---|---:|---|
 | **have** | **106** | done |
@@ -24,7 +61,7 @@ $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u | 
 | fetch / Hugging Face | 9 | partly covered by `bigtea-pull`, different spelling |
 | reasoning / speculative draft | 8 | gap |
 | KV cache type / prompt cache | 7 | **done 2026-08-11** -- both halves |
-| chat template | 6 | 3 done; `--jinja`/`--chat-template-file` **won't**, see below |
+| chat template | 6 | **6 done** — `--jinja`/`--chat-template-file` were "won't" and are implemented; the retraction is below |
 | LoRA / control vectors | 5 | gap |
 | grammar / JSON schema | 4 | **done 2026-08-11** — wired into the CLI, verified against llama.cpp |
 | meta (`--help`, `--version`) | 4 | 3 done |
@@ -417,11 +454,21 @@ Applied on **both** engine paths. The dense path and V4-Flash build their
 tokenizers separately, and a flag honoured on only one of them is exactly the
 failure `-t` had for weeks — so it is one helper called twice, not two copies.
 
-**`--chat-template-file` and `--jinja` are refused.** They supply a Jinja
-template to be *evaluated*; this build identifies a format by matching the
-template text and then renders with its own code. Accepting a file and matching
-it against the same nine patterns would honour some files and silently ignore
-others, which is worse than declining.
+~~**`--chat-template-file` and `--jinja` are refused.**~~ **Retracted — both are
+implemented.** The original reasoning was that they supply a Jinja template to be
+*evaluated*, while this build matched template text against nine patterns and
+rendered with its own code, so accepting a file would honour some and silently
+ignore others.
+
+The objection was right and the conclusion was wrong: silently ignoring some was
+never the only alternative to declining all. `crates/bigtea-jinja` evaluates the
+container's own template and **refuses, loudly and by name, any construct outside
+the subset it implements** — so a template it cannot handle produces an error,
+not a quiet fallback to the wrong framing. That is the property the refusal was
+protecting, obtained without the refusal.
+
+This paragraph outlived the code by three commits and was still being cited. The
+`REFUSED` row for `--jinja` outlived it too; see the table at the end.
 
 ### `--mlock` - done 2026-08-11, and it is not one call
 
@@ -483,16 +530,32 @@ missing.
 These are declined rather than accepted-and-ignored. That is the whole point of
 this audit, and the standard `-t` failed for weeks.
 
+**This table is now checked by a test, because it had stopped being true.**
+`REFUSED` is consulted from the fallback arm of the argument match, so any flag
+that later gains an explicit arm *shadows* its own row and the row goes
+unreachable while still reading as a statement about the binary. `--jinja` sat
+in exactly that state — the row said "no Jinja engine" while `bigtea-jinja`
+evaluated templates one arm above it. Nothing failed; the table simply lied, and
+this document, generated from it, lied too.
+
+`declined_flags_actually_decline` extracts the table from `bigtea-run.rs` at test
+time and runs the binary once per row. **The exit code alone does not
+discriminate** — a shadowed flag parses fine and then dies on the missing model,
+exiting 2 exactly as a refusal does. The message is the evidence, so the test
+requires `is not supported` and not merely a status.
+
 | flag | why |
 |---|---|
-| `--numa` | no NUMA-aware allocation to select between |
 | `--parallel` | one sequence at a time by design: one weight set, one KV cache |
-| `--cpu-mask`, `--cpu-range`, `--cpu-strict`, `--poll` | no thread-affinity layer; `-t`/`-tb` are the levers that exist. **`--prio` moved out of this row and is implemented** — process priority needed no affinity layer, only one syscall |
+| `--poll`, `--poll-batch` | ggml owns its threadpool; there is no spin/yield knob to forward a value to |
 | `--defrag-thold` | the KV cache is append-only and never fragments |
 | ~~`--warmup`/`--no-warmup`~~ | **retracted and implemented.** "Nothing is warmed" was wrong: the page cache, the repacked tensors, the arenas and the thread ladder all are. The default stays off, which is the honest part |
-| `--ubatch-size` | `-b` is the only batch dimension here |
-| `--fit`, `--fit-ctx`, `--fit-target` | `bigtea-model-info --budget` answers this question already, in its own spelling |
 | ~~`--check-tensors`~~ | **retracted and implemented.** "Would have to dequantise every tensor" was wrong: the f16 block scales are checkable without dequantising anything, and a bad scale is exactly where a ruined quantise shows up. See the 2026-08-11 entry above |
+| ~~`--cpu-mask`, `--cpu-range`, `--cpu-strict`~~ | **retracted and implemented.** "No thread-affinity layer" described the code, not the difficulty: it is `SetThreadAffinityMask` and `sched_setaffinity`, one syscall each. `--poll` stayed behind because it is genuinely about ggml's threadpool internals |
+| ~~`--ubatch-size`~~ | **retracted and implemented.** "`-b` is the only batch dimension here" was true and still is — so `-ub` takes the *smaller* of the two and says which it took, which is what the flag means on one dimension |
+| ~~`--fit`, `--fit-ctx`, `--fit-target`~~ | **retracted and implemented.** "`bigtea-model-info --budget` answers this already" was an argument for a different spelling, not against the flag. A user with a llama.cpp command line cannot reach a second binary |
+| ~~`--numa`~~ | **partly implemented.** `--numa isolate` binds to one node's CPUs and is real. `distribute` and `numactl` place *individual threads* on chosen nodes, which needs the threadpool ggml owns — those two are refused by name, in their own message |
+| ~~`--jinja`, `--chat-template-file`~~ | **retracted and implemented.** The argument was "a half-implemented Jinja silently produces the wrong framing" — correct, and answered by building an engine that **refuses what it cannot evaluate** rather than guessing. See the Jinja section above |
 
 ## Next batches, in order
 2. **RoPE / context (15)** — `--rope-freq-base`, `--rope-freq-scale`,

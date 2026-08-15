@@ -129,6 +129,17 @@ pub struct Tokenizer {
     max_token_len: usize,
     /// SentencePiece's `remove_extra_whitespaces`.
     remove_extra_whitespaces: bool,
+    /// Whether whitespace *following* a special token is dropped.
+    ///
+    /// llama.cpp's `LLAMA_TOKEN_ATTR_RSTRIP`. **It is not in the container.**
+    /// llama.cpp sets it from the model's *name string* — `_contains_any(
+    /// model_name, {"phi-3", "phi3"})` — in `llama-vocab.cpp`, alongside
+    /// `<mask>` LSTRIP rules keyed on `jina-v2-*` and `modern-bert`. Nothing in
+    /// the tokenizer metadata distinguishes a Phi-3 vocabulary from any other
+    /// SPM one, so matching the reference means keying on the same string it
+    /// keys on. That is worth writing down rather than rediscovering: the
+    /// tokenizer's behaviour depends on `general.name`.
+    rstrip_specials: bool,
     /// Built once, on first use. A 65k-entry trie is not worth constructing for
     /// a tokenizer that will never take the RWKV path.
     rwkv_trie: std::sync::OnceLock<rwkv::Trie>,
@@ -299,6 +310,15 @@ impl Tokenizer {
                 Some(Value::Bool(v)) => *v,
                 _ => true,
             },
+            // Keyed on the model NAME, because that is what llama.cpp keys on
+            // and there is nothing in the tokenizer metadata to key on instead.
+            rstrip_specials: match meta.get("general.name") {
+                Some(Value::String(n)) => {
+                    let n = n.to_ascii_lowercase();
+                    n.contains("phi-3") || n.contains("phi3")
+                }
+                _ => false,
+            },
             // 11 for a BPE vocabulary that names no BOS. That is not a guess:
             // llama.cpp's `tokenizer_model == "gpt2"` branch sets
             // `special_bos_id = special_eos_id = 11` before the container's own
@@ -357,6 +377,20 @@ impl Tokenizer {
 
     pub fn id_of(&self, token: &str) -> Option<u32> {
         self.ids.get(token).copied()
+    }
+
+    /// Whether `text` already begins with the BOS token written out.
+    ///
+    /// Only the *literal* spelling counts. A prompt that merely starts with the
+    /// same characters as some other token is untouched, and a model with no
+    /// BOS, or one whose BOS has empty text, always answers `false` rather than
+    /// matching at every position.
+    fn opens_with_bos(&self, text: &str) -> bool {
+        let Some(bos) = self.bos else { return false };
+        let Some(spelling) = self.token_text(bos) else {
+            return false;
+        };
+        !spelling.is_empty() && text.starts_with(spelling)
     }
 
     /// Whether `id` is a control token — `<|im_end|>`, `<s>`, `[CLS]`.
@@ -424,7 +458,22 @@ impl Tokenizer {
     /// to their own ids rather than merged — see [`Self::specials`].
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
-        if self.add_bos {
+        // **Not when the text already opens with it.** A chat template
+        // evaluated by `--jinja` often emits the BOS token itself — Gemma's
+        // begins with a literal `<bos>`, Llama-3's with `<|begin_of_text|>` —
+        // and `partition_specials` below correctly maps that to its own id. Add
+        // one here as well and the model is prefilled a token LONG:
+        //
+        //   bigtea --jinja : [2, 2, 105, 2364, ...]
+        //   llama.cpp      : [2,    105, 2364, ...]
+        //
+        // Measured on gemma-3, Llama-3.2, internlm2 and Phi-3. It is the mirror
+        // of the Falcon3 bug, which was prefilled a token SHORT, and it is just
+        // as quiet: the model answers fluently from a position nobody trained.
+        // The hardcoded family renderers were unaffected because they do not
+        // emit the BOS text, which is why this only appeared once a real Jinja
+        // engine started evaluating the container's own template.
+        if self.add_bos && !self.opens_with_bos(text) {
             out.extend(self.bos);
         }
         // Split on control tokens first, then run the ordinary algorithm on the
@@ -442,6 +491,12 @@ impl Tokenizer {
     }
 
     /// Cut `text` into ordinary spans and control tokens, in order.
+    /// The three Phi-3 specials llama.cpp explicitly exempts from RSTRIP after
+    /// setting it on every other one (`llama-vocab.cpp`). `<s>` matters most:
+    /// it opens the prompt, and stripping after it would eat the space SPM's
+    /// dummy prefix depends on.
+    const NEVER_RSTRIP: &[&str] = &["<unk>", "<s>", "<|endoftext|>"];
+
     fn partition_specials(&self, text: &str) -> Vec<(String, Option<u32>)> {
         if self.specials.is_empty() || text.is_empty() {
             return vec![(text.to_string(), None)];
@@ -466,6 +521,21 @@ impl Tokenizer {
                     }
                     out.push((tok.clone(), Some(id)));
                     rest = &rest[at + tok.len()..];
+                    // **RSTRIP: whitespace after a special token is dropped.**
+                    // llama.cpp's `LLAMA_TOKEN_ATTR_RSTRIP`, applied in
+                    // `tokenizer_st_partition`. Without it a chat template's
+                    // `<|user|>\n` keeps that newline, and because SPM then
+                    // prefixes the fragment with `▁` the following word is
+                    // tokenized differently:
+                    //
+                    //   <|user|>\nSYS   ours   [32010, 29871, 13, 14816, 29903]
+                    //                   llama  [32010, 317, 21554]
+                    //
+                    // Eight tokens against fourteen on one Phi-3 chat turn. It
+                    // does not raise and it does not look wrong.
+                    if self.rstrip_specials && !Self::NEVER_RSTRIP.contains(&tok.as_str()) {
+                        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                    }
                 }
                 None => {
                     out.push((rest.to_string(), None));

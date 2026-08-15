@@ -5,12 +5,41 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-11 · **Version**: v0.0.2 · **Branch**: `main` at
-`f0c7a42` · **Open PRs**: `ticket/r14-architectures`.
+**Last updated**: 2026-08-15 · **Version**: v0.0.2 · **Branch**:
+`ticket/r15-parity-discriminator` · **Open PRs**: #65.
 
-**#60 and #63 are merged and everything is on `main`, verified on `main`
-itself**: 423 tests, clippy `--workspace -D warnings` 0, fmt clean, and the
-parity sweep re-run after the merge.
+## The parity scoreboard, re-scored under the discriminator (2026-08-15)
+
+**All thirteen dense architectures re-swept**, eight prompts each, against
+`llama-completion` at `--temp 0`, with the harness that separates *"the
+reference wobbles"* from *"our answer is a third one"*:
+
+| | prompts |
+|---|---:|
+| **exact** — byte-identical to llama.cpp's default | **102** |
+| **near-tie** — byte-identical to one of llama.cpp's *own* no-op outputs | **2** |
+| **outside the band** — a third answer | **0** |
+| **FAIL** | **0** |
+
+**13 of 13 models exit 0.** The two near-ties are both Phi-3, and one of them
+reproduces llama.cpp's `-b 1 -fa off` output — a **composed** configuration that
+neither flag alone accounts for, which is exactly the class the r14 session
+identified and the single-flag probe could not see.
+
+`qwen3moe` is the fourteenth and is **not** in that table: 2 exact, 4 near-tie,
+2 outside. It stays off `VERIFIED_ARCHITECTURES`. What changed is the size of the
+question — the evidence for a defect there is **2 of 8, not the 6 of 8** that two
+sessions independently reported, because four of those six reproduce llama.cpp's
+own output byte for byte. See the discriminator section below.
+
+**What this is not.** It is evidence about *these eight prompts* on *these
+thirteen models*. `starcoder2` once passed 3/3 while running the wrong
+pre-tokenizer, and V4-Flash is not swept here at all.
+
+**Current**: **526 tests**, clippy `--workspace --all-targets -D warnings` 0, fmt
+clean. `#60`, `#63` and `#64` are merged; `#65` is open and green. The counts in
+dated sections further down are what was true on their date and are left alone —
+this line is the one to read.
 
 **`VERIFIED_ARCHITECTURES` is thirteen** — `baichuan`, `internlm2` and `olmo`
 added on `ticket/r14-architectures`, each diffed at **eight** prompts. Widening
@@ -478,6 +507,80 @@ Two details that would have been wrong quietly:
   because a stop string can straddle a token boundary.
 - Streaming re-uses the UTF-8 buffering rule: a chunk is emitted only at a
   character boundary, so a multi-byte character never becomes `�` mid-stream.
+
+### Chat framing against llama.cpp, both paths — one bug, four open (2026-08-15)
+
+`scripts/jinja-vs-llamacpp.py` claims in its docstring to compare "Bigtea's Jinja
+rendering against `llama.cpp --jinja`" and **never runs Bigtea** — it runs
+llama.cpp twice, `--jinja` against `--no-jinja`. That measurement is real and
+worth keeping (the reference disagrees with **itself** on 5 of 18 containers) but
+it was being cited for a claim it does not test. Same failure as the `REFUSED`
+row: a description that outlived the code.
+
+`scripts/jinja-bigtea-vs-llamacpp.py` runs the four-way that does, on **token IDs
+rather than rendered text**. It found a real bug on its first execution: **BOS was
+being emitted twice** under `--jinja`, because the template contains the literal
+`<bos>` *and* `encode` prepended one. gemma-3, Llama-3.2, internlm2, Phi-3 were
+all prefilled a token **long** — the exact mirror of Falcon3, which was a token
+short. Fixed; agreement went **4 → 6** of 14 loadable containers.
+
+**A second silent bug, in the tokenizer.** A Phi-3 chat turn was **14 tokens
+where llama.cpp makes 8** — identical input. llama.cpp drops whitespace
+*following* a special token (`LLAMA_TOKEN_ATTR_RSTRIP`), and SPM's dummy prefix
+then re-tokenizes the next word. **The attribute is not in the container**:
+`llama-vocab.cpp` sets it from `_contains_any(model_name, {"phi-3", "phi3"})` —
+the tokenizer's behaviour depends on `general.name`. Matched, with the same three
+exemptions (`<unk>`, `<s>`, `<|endoftext|>`) and a test that any *other* model
+keeps its whitespace. Agreement **6 → 7**; Phi-3 now matches on both paths.
+
+**Neither bug was reachable from the parity sweep**, which uses plain prompts
+with no special tokens — so none of the 104 prompts behind "102 exact" could have
+found either, and both affect every chat-framed request the server handles. Two
+different checks, two different bug classes.
+
+Of the seven that still differ, three are models with **no chat template**
+(`OLMo`, `starcoder2`, `all-MiniLM`), where llama.cpp passes the text through
+untouched and we impose a `System:/User:/Assistant:` framing. Deliberate and
+announced, but a divergence, and feeding a base model invented structure is the
+mirror of the bug that made instruct models continue rather than answer. **Not
+changed** — a product decision, recorded so it gets made rather than inherited.
+One (`tinyllama`, family path) is us matching the model's template where
+llama.cpp's hardcoded renderer does not. Three are genuine rendering differences
+(`Falcon3`, `gemma-2`, `internlm2`). Full table:
+`research/chat-framing-vs-llamacpp-2026-08-15.md`.
+
+### `/v1/embeddings` — the fifth endpoint, implemented 2026-08-15
+
+It answered **501** with a reason that was half true: *"this runner's graph
+returns logits, not hidden states."* True of what the graph **returned**, false
+about what it **computed** — the pre-projection hidden state is the input to the
+vocabulary matmul and was being discarded one line later. A refusal that cites a
+missing capability should be checked against the code, not against the last
+person who wrote it down.
+
+Taken **after `output_norm` and before the vocabulary projection**, which is
+where llama.cpp takes it. Earlier, the vector carries a per-model scale that
+makes similarity between two models meaningless; later, it is a distribution over
+tokens rather than an embedding. Opt-in per pass (`set_want_embedding`), so
+generation does not pay for a `compute` the sampler never reads.
+
+**Verified semantically, not just structurally** — the old message warned that a
+vector derived from the wrong place "would look like an embedding and behave like
+noise", so returning 2048 plausible floats proves nothing:
+
+```
+cos(cat, dog) = 0.5867
+cos(cat, SQL) = 0.2063
+cos(dog, SQL) = 0.1585      L2 norms: 1.0, 1.0, 1.0
+```
+
+`input` is accepted as a **string or an array of strings**, both of which are in
+real client code, and each input gets a **fresh KV cache** — sharing one would
+make every vector after the first depend on the texts before it, and they would
+still look plausible while silently encoding the batch order.
+
+Still refused, by name: the **V4-Flash** path, whose forward pass does not expose
+a hidden state. That is a different engine, not a missing line.
 
 **The server now serves any supported architecture.** It refused everything
 except V4-Flash, which made the one component an agent actually talks to
@@ -1208,15 +1311,39 @@ than from metadata keys, because containers disagree about which keys they set
 while the token text is stable. Qwen3-4B: 4 tokens found. Qwen2-0.5B: 0, and it
 says `0` rather than pretending.
 
-## Every llama.cpp flag is now recognised — 128 implemented, 57 declined
+## Every llama.cpp flag is now recognised — 158 implemented, 24 declined
 
-`bigtea-run` accepts **185 long flags** against llama.cpp's 182. **That is not
-flag parity and must not be quoted as one:**
+**Updated 2026-08-14, and the previous headline was false.** It read "every
+llama.cpp flag is now recognised" while `--flash-attn`/`-fa` was in neither the
+implemented set nor the declined one — and an unrecognised flag was not an
+error, it became the *prompt*. `bigtea-run -m m.gguf -fa off "hello"` ran with
+`prompt = "-fa"`, discarded `"hello"`, and exited **0**. The claim was checked by
+reading a table; the gap was in the code the table does not describe.
+
+The counts are now **computed from both sources** rather than tallied:
+
+```
+llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u   # 182
+```
+
+intersected with `bigtea-run`'s match arms and with its `REFUSED` table:
 
 | | count |
 |---|---:|
-| implemented — the flag changes something observable | **128** |
-| declined with a reason — recognised, exits 2, names what is missing | **57** |
+| implemented — the flag changes something observable | **158** |
+| declined with a reason — recognised, exits 2, names what is missing | **24** |
+| in neither — silently swallowed | **0** |
+
+**That is still not flag parity and must not be quoted as one.** 24 flags do
+nothing here, and 15 of them are GPU.
+
+An unknown `-` token is now an error, with `--` as the escape hatch for a prompt
+that genuinely starts with a dash. `declined_flags_actually_decline` extracts the
+`REFUSED` table from source at test time and runs the binary once per row, so the
+table cannot drift from the binary again — it had, silently: `--jinja` sat in the
+table claiming "no Jinja engine" while `bigtea-jinja` evaluated templates one
+match arm above it, and because `REFUSED` is consulted from the *fallback* arm,
+the explicit arm shadowed the row. Dead code that lies.
 
 A command line copied from llama.cpp now runs or explains itself, instead of
 dying on an unknown flag. What it never does is quietly do less than it says:
@@ -1237,16 +1364,30 @@ cheap defence against repeating that.
 
 What is declined, and the honest reason:
 
-| group | why |
-|---|---|
-| 15 GPU flags | **no GPU backend exists.** `bigtea-probe` detects the card and nothing uses it; a VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer (`weights.rs:286`). Scoped 2026-08-11 in `research/gpu-tier-smallest-honest-slice-2026-08-11.md`: this machine has **no CUDA toolkit at all**, and dense-layers-in-VRAM is a 1.10x ceiling on the model where it fits and doesn't fit on the model where it would matter |
-| 4 draft-model flags | speculative decoding measured ~1.4x here, not the literature's 2.2x, and is a net loss below ~0.75 acceptance |
-| 5 adapter flags | LoRA and control vectors are real work not yet done, and a silently unapplied LoRA is a model answering as though never fine-tuned |
-| 6 Jinja / chat-parsing | no Jinja engine. Templates are matched by family and verified byte-identical to llama.cpp for 52 of 54 names; a half-implemented Jinja would silently produce the wrong framing |
-| 6 reasoning-format | downstream of Jinja |
-| 8 download flags | `bigtea-pull` is the tool; wiring it in needs resumable, verified downloads rather than an alias |
-| 9 affinity / NUMA / poll | ggml owns its threadpool here; `-t`, `-tb` and `--prio` are the levers that exist |
-| 4 runner-shape | one sequence by design, an append-only KV cache that cannot fragment, no self-extend |
+All 24, by group — the counts add up to 24 because they are the table's rows,
+not a summary of it:
+
+| n | flags | why |
+|---:|---|---|
+| 10 | `--device`, `--list-devices`, `--gpu-layers`, `--n-gpu-layers`, `--main-gpu`, `--split-mode`, `--tensor-split`, `--kv-offload`, `--op-offload`, `--override-tensor` | **no GPU backend exists.** `bigtea-probe` detects the card and nothing uses it; a VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer (`weights.rs:286`). Scoped 2026-08-11 in `research/gpu-tier-smallest-honest-slice-2026-08-11.md`: this machine has **no CUDA toolkit at all**, and dense-layers-in-VRAM is a 1.10x ceiling on the model where it fits and doesn't fit on the model where it would matter |
+| 4 | `--cache-type-{k,v}-draft`, `--spec-draft-type-{k,v}` | speculative decoding measured ~1.4x here, not the literature's 2.2x, and is a net loss below ~0.75 acceptance |
+| 2 | `--grp-attn-n`, `--grp-attn-w` | self-extend, which needs a change to `stream.rs` |
+| 2 | `--parallel`, `--defrag-thold` | one sequence by design; an append-only KV cache that cannot fragment |
+| 2 | `--poll`, `--poll-batch` | spin-vs-yield inside ggml's threadpool, which ggml owns. Affinity, NUMA-isolate and `--prio` all moved *out* of this row and are implemented — they were one syscall each, and "no affinity layer" described the code rather than the difficulty |
+| 2 | `--no-host`, `--no-mmproj` | a host buffer type and a multimodal projector, neither of which exists here |
+| 1 | `--backend-sampling` | a GPU concept |
+| 1 | `--docker-repo` | a different protocol, not a URL. `-hf`, `--hf-repo` and `--model-url` are implemented |
+
+**`-fa off` is refused too but is not in that table**, because it is a refused
+*value* of an implemented flag: one attention path exists and it is the flash
+one. It is declined by name rather than accepted, since `-fa off` is a control
+`parity-check.sh` passes to the *reference* — ignoring it would silently turn a
+parity check into a comparison of a run with itself.
+
+Jinja, reasoning-format, the download flags, affinity and the adapters **left
+this table**. The 57 → 24 move is mostly those, not a change of standard: the
+adapter flags now load and shape-check a LoRA, though nothing applies it yet, and
+that gap is stated where the flag is documented rather than by declining it.
 
 Three more implemented in the same batch: `--mmap` (the default, spelled out),
 `--ubatch-size` (takes the smaller of it and `-b`, and says which), and
@@ -2449,5 +2590,54 @@ round, not the row**: round 1 ran at 0.25 tok/s where the clean rounds agree on
 GiB free that ran 5× slow.
 
 Same caveats as the slice it extends, plus one more: the sweep needs `--force`,
-because **`qwen3moe` now refuses to run without it** — 0 FAIL but 6 of 8 prompts
-unstable under the widened harness, unexplained.
+because **`qwen3moe` refuses to run without it** — 0 FAIL but 6 of 8 prompts
+unstable under the widened harness.
+
+## `unstable` was answering the wrong question — 6 of 8 is really 2 of 8
+
+**2026-08-15, and it corrects the line directly above.** The harness classified a
+disagreement by asking *"does llama.cpp disagree with itself here?"* and the
+report read as though that settled *"is Bigtea's output one of the things it
+disagrees between?"* Those come apart precisely where it matters, and **the nine
+of eleven `unstable` verdicts that turned out to be real bugs were all the second
+kind**. Same model, same prompts, same build, with the two separated:
+
+| | |
+|---|---|
+| `ok` — matches the default | **2** |
+| `near-tie` — reproduces one of llama.cpp's *own* no-op outputs **byte for byte** | **4** |
+| `unstable` — a **third** answer it never gives | **2** |
+
+**Four of the six were never unexplained.** So the evidence for a defect in the
+`qwen3moe` path is **2 of 8, not 6 of 8** — below the cluster threshold rather
+than absent, and the harness now exits 0.
+
+**The variation is the evidence, more than the count.** Which configuration we
+land on is not constant: `-b 1` twice, `-fa off` once, `-b 1 -fa off` once. A
+systematic defect would be systematic — quietly running batch-1 semantics would
+reproduce `-b 1` on *every* such prompt. Three different configurations across
+four prompts is what a real near-tie looks like. **So the discriminator is a
+diagnostic and not only a verdict:** a *constant* answer would name the behaviour
+we share, and would be the lead.
+
+Two prompts are still outside the band. `Q: What is 17 plus 25? A:` was examined
+first because arithmetic has a right answer, and **it came back the opposite way
+to the guess**: Bigtea emits `42`, exactly as every reference configuration does.
+The earlier "it skips the answer" reading was an artefact of capturing the two
+sides with different tail-truncation. It was flagged as not citable before anyone
+acted on it, which is the only reason it cost nothing.
+
+The reference spans **three distinct outputs across five configurations** on that
+prompt — `42`, `A: 42` on its own line, and `17 + 25 = 42` — so the continuation
+after the answer is barely determined at all. Bigtea is a fourth, agreeing with
+`-fa off` at the token where the reference splits. **That is weak evidence of a
+defect, not strong**: the bugs this harness has caught (Llama-3.2's RoPE,
+Falcon3's short prefill) broke prompts that had a determined answer, and this one
+gets the determined part right. `research/parity-band-discriminator-2026-08-15.md`
+carries the full table.
+
+The threshold moved without moving: three-in-eight still fails, but on the
+sharper class, which is *stricter* — everything excusable has been taken out of
+it. And a bound was added the other way, because every configuration added widens
+the band and "in band" gets cheaper as the probe grows: six ties in eight now
+fails too.

@@ -22,9 +22,9 @@ the real distance to "any model", and it is far larger than the performance gap.
 | | Bigtea | llama.cpp |
 |---|---|---|
 | architectures | **10** (`deepseek4`, `gemma2`, `gemma3`, `llama`, `phi3`, `qwen2`, `qwen3`, `qwen3moe`, `stablelm`, `starcoder2`) — each diffed against llama.cpp on **eight** prompts, because three certified `starcoder2` while its pre-tokenizer was wrong | ~100. Every entry is diffed against llama.cpp token for token; `gemma2` sat here for weeks without that and was **wrong** — see `../research/gemma-was-running-silu-2026-08-11.md` |
-| tokenizer families | **2** (`gpt2` BPE, `llama` SPM) | 6 (spm, bpe, wpm, ugm, rwkv, plamo2) |
+| tokenizer families | **5** (spm, bpe, wpm, ugm, rwkv) — RWKV is *implemented, not verified*: no container on this machine, so it is tested against a hand-built vocabulary through the real loading path, never against llama.cpp | 6 (spm, bpe, wpm, ugm, rwkv, plamo2) |
 | quant types | all ggml can decode | same |
-| CLI flags | **195 recognised — 170 implemented, 25 declined with a reason.** Generated from the parser by `build.rs`, so it cannot drift from what is accepted | **182** (counted, not estimated: `llamacpp-flag-audit.md`) |
+| CLI flags | **182 of 182 recognised — 158 implemented, 24 declined with a reason, 0 swallowed.** Computed 2026-08-15 by intersecting `llama-completion --help` with the parser's match arms and its `REFUSED` table, not tallied — the previous "195 recognised, 170 implemented, 25 declined" was counted by reading and was wrong three ways: it counted short aliases into the denominator, it double-counted `--jinja` as both implemented and declined, and it missed that `--flash-attn` was in **neither** and was being silently taken as the prompt | **182** (counted, not estimated: `llamacpp-flag-audit.md`) |
 | chat templates | **54 names, 52 verified byte-identical** against a captured llama.cpp fixture | **54** (counted from `llama-chat.cpp`'s own table, not estimated) |
 | samplers | **20** | **20** (counted from `llama_sampler_init_*` in `llama.h`) |
 | backends | CPU | CPU, CUDA, Metal, Vulkan, ROCm, SYCL |
