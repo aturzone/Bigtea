@@ -446,6 +446,37 @@ impl Context {
             .ok_or(GgmlError::ContextAlloc { bytes: buf.len() })
     }
 
+    /// The raw `ggml_context*`, for the backend path in `backend.rs`.
+    ///
+    /// `pub(crate)` and no further: handing this out publicly would let a
+    /// caller allocate tensor data behind the arena's back, which is the one
+    /// thing the whole memory design depends on not happening.
+    pub(crate) fn as_raw(&self) -> *mut c_void {
+        self.raw.as_ptr()
+    }
+
+    /// Build a forward graph over `outputs` and hand back the raw `ggml_cgraph*`.
+    ///
+    /// Split out of `compute_many` because a *device* backend runs the same
+    /// graph through `ggml_backend_graph_compute` instead of
+    /// `ggml_graph_compute_with_ctx`. The graph itself is identical — only who
+    /// executes it differs, which is the point of ggml's backend split.
+    ///
+    /// The returned pointer lives in this context's arena and must not outlive
+    /// it; it is not freed separately.
+    pub(crate) fn build_forward(&self, outputs: &[&Tensor<'_>]) -> Result<*mut c_void, GgmlError> {
+        // SAFETY: valid context; the graph lives in the same arena.
+        let graph = unsafe { ggml_new_graph(self.raw.as_ptr()) };
+        if graph.is_null() {
+            return Err(GgmlError::ArenaExhausted);
+        }
+        for out in outputs {
+            // SAFETY: `graph` is non-null and every output was built here.
+            unsafe { ggml_build_forward_expand(graph, out.raw.as_ptr()) };
+        }
+        Ok(graph.cast())
+    }
+
     fn tensor<'a>(&'a self, raw: *mut ggml_tensor) -> Result<Tensor<'a>, GgmlError> {
         NonNull::new(raw)
             .map(|raw| Tensor {
@@ -1188,6 +1219,11 @@ pub struct Tensor<'a> {
 }
 
 impl Tensor<'_> {
+    /// The raw `ggml_tensor*`, for the backend path in `backend.rs`.
+    pub(crate) fn as_raw(&self) -> *mut c_void {
+        self.raw.as_ptr()
+    }
+
     pub fn len(&self) -> i64 {
         // SAFETY: valid tensor pointer for the context's lifetime.
         unsafe { ggml_nelements(self.raw.as_ptr()) }
