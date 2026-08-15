@@ -126,6 +126,42 @@ The second outside-band prompt, `Dear Sir or Madam, I am writing to`, is open
 prose with no checkable answer and is therefore the weaker of the two to reason
 from. It has not been examined token by token.
 
+## Every architecture, re-scored under it
+
+All thirteen dense architectures, eight prompts each, `-n 32`, `--temp 0`,
+against `llama-completion`:
+
+| model | exact | near-tie | outside | exit |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B-Instruct | 8 | 0 | 0 | 0 |
+| tinyllama-1.1b-chat | 8 | 0 | 0 | 0 |
+| Qwen2-0.5B-Instruct | 8 | 0 | 0 | 0 |
+| Qwen3-4B | 8 | 0 | 0 | 0 |
+| **Phi-3-mini-4k** | 6 | **2** | 0 | 0 |
+| Falcon3-1B-Instruct | 8 | 0 | 0 | 0 |
+| gemma-2-2b-it | 8 | 0 | 0 | 0 |
+| gemma-3-1b-it | 8 | 0 | 0 | 0 |
+| stablelm-2-1_6b-chat | 8 | 0 | 0 | 0 |
+| starcoder2-3b | 8 | 0 | 0 | 0 |
+| OLMo-1B | 8 | 0 | 0 | 0 |
+| internlm2-math-plus-1_8b | 8 | 0 | 0 | 0 |
+| baichuan2-7b-chat | 8 | 0 | 0 | 0 |
+| **total** | **102** | **2** | **0** | 13/13 |
+
+**Nothing lands outside the band on any of the thirteen.** Both near-ties are
+Phi-3, and one of them reproduces llama.cpp's `-b 1 -fa off` output — the
+composed configuration, on a model it was derived from, confirming that the class
+is real rather than an artefact of the model it was found on.
+
+`qwen3moe` is the fourteenth and is scored above: 2 exact, 4 near-tie, 2 outside.
+It is the only model with anything outside the band, which is itself worth
+noting — whatever is happening there is specific to it and not a property of the
+harness or of the engine in general.
+
+**This is evidence about these eight prompts on these thirteen models**, and
+nothing more. `starcoder2` passed 3/3 once while running the wrong pre-tokenizer.
+V4-Flash is not swept here.
+
 ## The threshold moved without moving
 
 Three-in-eight still fails, but it now counts the sharper class, and that is a
