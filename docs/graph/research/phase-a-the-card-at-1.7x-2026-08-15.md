@@ -136,27 +136,11 @@ does not move for free either.
   taken; it exists because "works at 1, dies at 512" and "dies at 1" are
   different bugs.
 
-## Three segfaults, one cause, and the API that was supposed to prevent it
+## Three segfaults, one cause — split into its own node
 
-Every crash on the way to this number was the same mistake: **writing a tensor
-before the context was realized.** On a device a tensor has no memory until
-`ggml_backend_alloc_ctx_tensors_from_buft` runs, and that cannot run until the
-graph is complete — so any `set_*` before that point writes through a null
-pointer and the process dies with no Rust backtrace.
-
-`Compute::realize` exists precisely to make that ordering explicit, and it still
-happened three times:
-
-1. `pos.set_i32` in the QKV builder — died at layer 0, immediately after the
-   embedding.
-2. `mask.set_bytes` **inside** `attention_flash` — the function built part of
-   the graph and wrote to it, so the caller could not have ordered it correctly.
-   It now returns the mask tensor unwritten.
-3. The original mixed host/device experiment, which is the same fault seen from
-   the other side.
-
-The lesson is not "remember to call realize". It is that **a function which both
-builds graph nodes and writes into them cannot be used on a device**, because
-those two operations must be separated by an allocation the function does not
-control. Any future builder has to return its input tensors rather than fill
-them.
+Every crash on the way to this number was the same fault: a tensor written
+before its context was realized, which on a device writes through a null
+pointer. The full account, and the rule it produced — *a function that both
+builds graph nodes and writes into them cannot be used on a device* — is in
+[mixed-residency-segfaults-2026-08-15.md](mixed-residency-segfaults-2026-08-15.md),
+because it is the obvious thing to try and it costs a day.
