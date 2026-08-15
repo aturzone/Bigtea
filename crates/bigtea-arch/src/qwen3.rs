@@ -850,7 +850,7 @@ impl Qwen3Model {
         n_new: i64,
         n_total: i64,
         mask_f16: &[u8],
-    ) -> Result<Tensor<'a>> {
+    ) -> Result<(Tensor<'a>, Tensor<'a>)> {
         let c = &self.config;
 
         // ggml wants [head_dim, n_batch, n_head] for q and [head_dim, n_kv,
@@ -861,8 +861,13 @@ impl Qwen3Model {
         let k = ctx.cont(&ctx.permute(k_all, [0, 2, 1, 3])?)?;
         let v = ctx.cont(&ctx.permute(v_all, [0, 2, 1, 3])?)?;
 
+        // **The mask tensor is returned, not written here.** On a device it has
+        // no memory until the whole context is realized, and realizing cannot
+        // happen until the graph is finished -- which is after this function
+        // returns. Writing it here segfaulted at layer 0 the moment the device
+        // path reached attention. The caller writes it alongside q, k and v.
         let mask = ctx.new_typed_2d(bigtea_gguf::GgmlType(1), n_total, n_new)?;
-        mask.set_bytes(mask_f16)?;
+        let _ = mask_f16;
 
         // [head_dim, n_head, n_new], already permuted for the reshape.
         // See `prescale_q`: same algebra, different rounding, and the rounding
@@ -873,7 +878,10 @@ impl Qwen3Model {
             (q, c.attn_scale())
         };
         let out = ctx.flash_attn_ext(&q, &k, &v, &mask, scale, c.attn_logit_softcap)?;
-        Ok(ctx.reshape_2d(&ctx.cont(&out)?, (c.head_dim * c.n_head) as i64, n_new)?)
+        Ok((
+            ctx.reshape_2d(&ctx.cont(&out)?, (c.head_dim * c.n_head) as i64, n_new)?,
+            mask,
+        ))
     }
 
     /// Normalise then scale by a learned weight — the pattern every norm

@@ -300,6 +300,49 @@ impl Compute<'_> {
         }
     }
 
+    /// Token ids, which are `i32` and go in the same way floats do.
+    pub fn set_i32(&self, t: &Tensor<'_>, values: &[i32]) -> Result<(), GgmlError> {
+        match self {
+            Compute::Cpu { .. } => t.set_i32(values),
+            Compute::Device(_) => {
+                let mut bytes = Vec::with_capacity(values.len() * 4);
+                for v in values {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                upload(t, &bytes)
+            }
+        }
+    }
+
+    /// Raw bytes, whatever the tensor's type — the KV cache's route in.
+    ///
+    /// On a device this is a genuine bus transfer of the cached history, and it
+    /// happens per layer per step because the cache itself is host-resident.
+    /// That cost is real and belongs in the measurement rather than being
+    /// designed around before anyone has seen how large it is.
+    pub fn set_bytes(&self, t: &Tensor<'_>, data: &[u8]) -> Result<(), GgmlError> {
+        match self {
+            Compute::Cpu { .. } => t.set_bytes(data),
+            Compute::Device(_) => upload(t, data),
+        }
+    }
+
+    /// A context inside a caller-owned host buffer.
+    ///
+    /// The buffer holds tensor *metadata* either way. What changes is whether
+    /// tensor **data** also comes from it: on the CPU it does, and on a device
+    /// it must not, or the graph would compute over host addresses the card
+    /// cannot reach — which is the access violation the mixed-residency test
+    /// recorded.
+    ///
+    /// # Safety
+    /// `buf` must outlive the returned context and no other context may be live
+    /// on it, exactly as for [`Context::in_buffer`].
+    pub unsafe fn context_in_buffer<'a>(&self, buf: &'a mut [u8]) -> Result<Context, GgmlError> {
+        let _ = std::marker::PhantomData::<&'a ()>;
+        Context::in_buffer(buf, matches!(self, Compute::Device(_)))
+    }
+
     pub fn to_vec_f32(&self, t: &Tensor<'_>) -> Result<Vec<f32>, GgmlError> {
         match self {
             Compute::Cpu { .. } => Ok(t.to_vec_f32()),

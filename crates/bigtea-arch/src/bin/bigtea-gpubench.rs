@@ -24,8 +24,66 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bigtea_arch::{KvCache, Qwen3Config, StreamingRunner};
 use bigtea_ggml::{devices, Context, DeviceKind, Residency, WeightSet};
 use bigtea_model::Model;
+
+/// Long enough that prefill is compute-bound rather than fixed-cost bound.
+const PREFILL_TOKENS: usize = 512;
+
+struct Prefill {
+    tok_s: f64,
+    load_seconds: f64,
+    prefill_seconds: f64,
+    logits_agree_within: f64,
+}
+
+/// One prefill, loading the model fresh so `load_seconds` is honest.
+fn prefill_once(
+    model: &Model,
+    config: &Qwen3Config,
+    tokens: &[u32],
+    device: Option<usize>,
+) -> Result<Prefill, Box<dyn std::error::Error>> {
+    let load_start = Instant::now();
+    let mut runner = StreamingRunner::new(model, config.clone(), 0);
+    if let Some(i) = device {
+        runner.use_device(i)?;
+    }
+    let ctx = Context::new_no_alloc(64 << 20)?;
+    let mut weights = WeightSet::new();
+    let _held = if device.is_some() {
+        let (_bytes, buffer, _report) = runner.load_resident_on_device(&ctx, &mut weights)?;
+        Some(buffer)
+    } else {
+        runner.load_resident(&ctx, &mut weights)?;
+        None
+    };
+    let load_seconds = load_start.elapsed().as_secs_f64();
+
+    let mut cache = KvCache::new(
+        config.n_layer as usize,
+        config.n_head_kv as usize,
+        config.head_dim as usize,
+    );
+    let started = Instant::now();
+    let logits = runner.forward_cached(&weights, &mut cache, tokens, 0)?;
+    let prefill_seconds = started.elapsed().as_secs_f64();
+
+    // Kept so the two runs can be compared: a device path that is subtly wrong
+    // produces plausible logits, never an error.
+    let checksum = logits
+        .iter()
+        .take(64)
+        .map(|v| v.abs())
+        .fold(0.0f64, |a, b| a + b as f64);
+    Ok(Prefill {
+        tok_s: tokens.len() as f64 / prefill_seconds.max(1e-9),
+        load_seconds,
+        prefill_seconds,
+        logits_agree_within: checksum,
+    })
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -177,9 +235,63 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         read_seconds,
         report.seconds
     );
+    drop(buffer);
+    drop(ws);
+    drop(ctx);
+
+    // ---- the other half of the gate: prefill, both targets, one session ----
+    //
+    // Back to back in the same process on the same prompt. The CPU side gets
+    // ALL the threads, because prefill is compute-bound and a mistuned baseline
+    // inflates the ratio -- the trap that would have turned llama.cpp's 25.6x
+    // into 30.1x, pointing the other way.
+    // Overridable so a crash can be bisected by length: the device path's
+    // shapes change with the token count, and "works at 1, dies at 512" says
+    // something different from "dies at 1".
+    let n_prompt: usize = std::env::var("BIGTEA_PREFILL_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(PREFILL_TOKENS);
+    let prompt: Vec<u32> = (0..n_prompt).map(|i| (i % 3000 + 10) as u32).collect();
+    let config = Qwen3Config::from_model(&model)?;
     println!(
-        "\nThis is the upload half of the Phase A gate. It is NOT prefill tok/s \
-         with the card working, so the GPU bar does not move on it."
+        "
+prefill {} tokens, same prompt, same session",
+        prompt.len()
+    );
+
+    let cpu = prefill_once(&model, &config, &prompt, None)?;
+    println!(
+        "  cpu      {:>8.2} tok/s   load {:>5.2}s   first token at {:>6.2}s",
+        cpu.tok_s,
+        cpu.load_seconds,
+        cpu.load_seconds + cpu.prefill_seconds
+    );
+
+    let gpu = prefill_once(&model, &config, &prompt, Some(index))?;
+    println!(
+        "  device   {:>8.2} tok/s   load {:>5.2}s   first token at {:>6.2}s",
+        gpu.tok_s,
+        gpu.load_seconds,
+        gpu.load_seconds + gpu.prefill_seconds
+    );
+
+    println!(
+        "
+  prefill ratio         {:.2}x",
+        gpu.tok_s / cpu.tok_s.max(1e-9)
+    );
+    println!(
+        "  load-to-first-token   {:.2}s cpu vs {:.2}s device ({:+.2}s)",
+        cpu.load_seconds + cpu.prefill_seconds,
+        gpu.load_seconds + gpu.prefill_seconds,
+        (gpu.load_seconds + gpu.prefill_seconds) - (cpu.load_seconds + cpu.prefill_seconds)
+    );
+    // A wrong device path returns plausible logits, never an error, so the two
+    // runs are compared rather than trusted.
+    println!(
+        "  logit checksum        cpu {:.4} vs device {:.4}",
+        cpu.logits_agree_within, gpu.logits_agree_within
     );
     Ok(())
 }

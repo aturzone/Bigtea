@@ -245,6 +245,14 @@ pub struct StreamingRunner<'m> {
     /// Walks a ladder of thread counts over the first generated tokens and
     /// then settles. `None` once settled, or immediately when `-t` was given.
     tuner: Option<ThreadTuner>,
+    /// A compute device, when one has been opened. `None` is the CPU path,
+    /// which is every existing caller.
+    ///
+    /// Held rather than passed per call because it must outlive the weights
+    /// uploaded into it: dropping the backend frees the device memory every
+    /// bound tensor points at, and reading freed device memory does not fault
+    /// reliably -- it returns numbers.
+    device: Option<bigtea_ggml::Backend>,
     pub stats: StreamStats,
     /// Keep the pre-projection hidden state from each forward pass.
     ///
@@ -430,6 +438,7 @@ impl<'m> StreamingRunner<'m> {
             } else {
                 ThreadTuner::new(cores)
             },
+            device: None,
             stats: StreamStats::default(),
             want_embedding: false,
             last_embedding: None,
@@ -473,6 +482,35 @@ impl<'m> StreamingRunner<'m> {
     /// compute-bound and wants every core. Deciding from the token count rather
     /// than the call site means a path used by both phases — `forward_cached`
     /// is — cannot get it wrong.
+    /// Run this model's graphs on compute device `index`.
+    ///
+    /// Additive on purpose: every existing caller keeps the CPU path with no
+    /// change, and nothing here alters what the graphs compute -- only who
+    /// executes them and where the tensors live.
+    pub fn use_device(&mut self, index: usize) -> Result<()> {
+        self.device = Some(bigtea_ggml::Backend::open(index)?);
+        Ok(())
+    }
+
+    pub fn device_in_use(&self) -> Option<usize> {
+        self.device.as_ref().map(|b| b.device_index())
+    }
+
+    /// Where a graph over `n_tokens` runs.
+    ///
+    /// The thread count is still chosen per token-count on the CPU path, since
+    /// prefill and generation want opposite ends of the ladder. On a device the
+    /// count is meaningless and the variant carries no threads at all.
+    fn compute_with(
+        device: Option<&bigtea_ggml::Backend>,
+        threads: usize,
+    ) -> bigtea_ggml::Compute<'_> {
+        match device {
+            Some(b) => bigtea_ggml::Compute::Device(b),
+            None => bigtea_ggml::Compute::Cpu { threads },
+        }
+    }
+
     fn threads_for(&self, n_tokens: usize) -> usize {
         if n_tokens > 1 {
             self.threads_batch
@@ -1087,6 +1125,50 @@ impl<'m> StreamingRunner<'m> {
     }
 
     /// Bind every resident tensor into `ctx`, reporting what it cost.
+    /// Load every resident weight **onto the compute device**.
+    ///
+    /// Separate from [`Self::load_resident`] rather than a flag on it, because
+    /// two things differ and both are load-bearing.
+    ///
+    /// **No repacking.** Repacking rearranges a quantised tensor into the
+    /// layout the *CPU* kernels want. It is worth 1.39x on the CPU prefill and
+    /// it is meaningless on a device, whose kernels expect the ordinary layout.
+    /// Repacking here would not be a slow path; it would be a wrong one.
+    ///
+    /// **The returned buffer owns the device memory.** Every tensor in
+    /// `weights` points into it, so dropping it while the weights are alive
+    /// leaves the graph reading freed device memory — which does not fault
+    /// reliably, it returns numbers. Hold it exactly as long as `weights`.
+    pub fn load_resident_on_device<'a>(
+        &mut self,
+        ctx: &'a Context,
+        weights: &mut WeightSet<'a>,
+    ) -> Result<(u64, bigtea_ggml::DeviceBuffer, bigtea_ggml::UploadReport)> {
+        let backend = self.device.as_ref().ok_or_else(|| {
+            ArchError::Unimplemented("no device opened; call use_device first".into())
+        })?;
+        let mut total = 0u64;
+        for name in self.resident_tensor_names() {
+            let loc = self
+                .model
+                .location(&name)
+                .ok_or_else(|| ArchError::MissingTensor(name.clone()))?
+                .clone();
+            let data = self.model.read_tensor(&name)?;
+            total += data.len() as u64;
+            weights.bind_shared_at(
+                ctx,
+                &name,
+                loc.ty,
+                &loc.dims,
+                std::sync::Arc::new(data),
+                bigtea_ggml::Residency::Device,
+            )?;
+        }
+        let (buffer, report) = weights.place_on_device(backend, ctx)?;
+        Ok((total, buffer, report))
+    }
+
     pub fn load_resident<'a>(
         &mut self,
         ctx: &'a Context,
@@ -1237,14 +1319,19 @@ impl<'m> StreamingRunner<'m> {
         // Only single-token steps are tuned. A prefill block runs on the batch
         // count, which is a different question with a different answer.
         if tokens.len() != 1 || self.tuner.is_none() {
-            return self.forward_cached_inner(weights, cache, tokens, pos_start);
+            let device = self.device.take();
+            let out = self.forward_cached_inner(weights, cache, tokens, pos_start, device.as_ref());
+            self.device = device;
+            return out;
         }
         if let Some(t) = self.tuner.as_ref() {
             self.threads = t.candidate();
         }
         let start = std::time::Instant::now();
         let disk_before = self.stats.read_seconds;
-        let out = self.forward_cached_inner(weights, cache, tokens, pos_start);
+        let device = self.device.take();
+        let out = self.forward_cached_inner(weights, cache, tokens, pos_start, device.as_ref());
+        self.device = device;
         // Time the thread count can actually affect. On a streaming MoE model
         // most of a token is disk, and how much varies per token with cache
         // hits and warming — on Qwen3-30B that noise swamped the signal
@@ -1277,8 +1364,10 @@ impl<'m> StreamingRunner<'m> {
         cache: &mut KvCache,
         tokens: &[u32],
         pos_start: usize,
+        device: Option<&bigtea_ggml::Backend>,
     ) -> Result<Vec<f32>> {
         let c = self.arch.config.clone();
+        let trace = std::env::var("BIGTEA_GPU_TRACE").is_ok();
         let n_new = tokens.len() as i64;
         let n_embd = c.n_embd as i64;
         let head_dim = c.head_dim as i64;
@@ -1351,9 +1440,10 @@ impl<'m> StreamingRunner<'m> {
             // Sized from the prompt, not a constant: `get_rows` materialises
             // n_embd * n_new floats, and ggml aborts the process when an arena
             // runs out rather than returning an error we could catch.
-            let ctx = Context::new(arena_for(&[(n_embd, n_new)], 8))?;
+            let cmp = Self::compute_with(device, threads);
+            let ctx = cmp.context(arena_for(&[(n_embd, n_new)], 8))?;
             let tok = ctx.new_i32_1d(n_new)?;
-            tok.set_i32(&tokens.iter().map(|&t| t as i32).collect::<Vec<_>>())?;
+            let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
             let emb = weights
                 .get("token_embd.weight")
                 .ok_or_else(|| ArchError::MissingTensor("token_embd.weight".into()))?;
@@ -1366,8 +1456,16 @@ impl<'m> StreamingRunner<'m> {
             } else {
                 rows
             };
-            ctx.compute(&rows, threads)?;
-            rows.to_vec_f32()
+            // After the graph, before the inputs: on a device this allocates
+            // every tensor in the context, which cannot happen until they all
+            // exist and must happen before anything is written into them.
+            let _dev = cmp.realize(&ctx)?;
+            cmp.set_i32(&tok, &ids)?;
+            cmp.run(&ctx, &[&rows])?;
+            if trace {
+                eprintln!("TRACE: embedding ok");
+            }
+            cmp.to_vec_f32(&rows)?
         };
 
         for il in 0..c.n_layer {
@@ -1376,11 +1474,12 @@ impl<'m> StreamingRunner<'m> {
             };
 
             // Phase 1: Q, K and V for the new positions only.
-            let (q_v, k_v, v_v, residual) = {
+            let (q_v, k_v, v_v, residual, qkv_secs) = {
                 // Was a fixed 256 MiB, which aborted at a 4096-token block:
                 // ggml asked for 318,787,536 bytes and got told 268,435,456.
                 // Every arena in this function has to scale with the block.
-                let ctx = Context::new(arena_for(
+                let cmp = Self::compute_with(device, threads);
+                let ctx = cmp.context(arena_for(
                     &[
                         (n_embd, n_new),                     // input activations
                         (n_embd, n_new),                     // normalised
@@ -1403,9 +1502,12 @@ impl<'m> StreamingRunner<'m> {
                     32,
                 ))?;
                 let xt = ctx.new_f32_2d(n_embd, n_new)?;
-                xt.set_f32(&x)?;
+                let xt_values = x.clone();
                 let pos = ctx.new_i32_1d(n_new)?;
-                pos.set_i32(&positions)?;
+                // Written after `realize`, with `xt`, and NOT here. On a device
+                // this tensor has no memory until the context is realized, and
+                // writing early is a segfault rather than an error -- which is
+                // exactly what it was, at layer 0, right after the embedding.
 
                 let normed =
                     self.arch
@@ -1497,10 +1599,27 @@ impl<'m> StreamingRunner<'m> {
                 // fixed costs dominate, because the matmuls are matrix-vector
                 // products and tiny.
                 let t = std::time::Instant::now();
-                ctx.compute_many(&[&q, &k, &v], threads)?;
-                self.stats.qkv_seconds += t.elapsed().as_secs_f64();
-                (q.to_vec_f32(), k.to_vec_f32(), v.to_vec_f32(), x.clone())
+                // After the graph, before the inputs.
+                let _dev = cmp.realize(&ctx)?;
+                cmp.set_f32(&xt, &xt_values)?;
+                cmp.set_i32(&pos, &positions)?;
+                cmp.run(&ctx, &[&q, &k, &v])?;
+                if trace {
+                    eprintln!("TRACE: qkv ok (layer)");
+                }
+                // Carried out of the block rather than added here: `cmp`
+                // borrows `self` for as long as it lives, so the stats write
+                // has to happen after it is dropped.
+                let qkv_secs = t.elapsed().as_secs_f64();
+                (
+                    cmp.to_vec_f32(&q)?,
+                    cmp.to_vec_f32(&k)?,
+                    cmp.to_vec_f32(&v)?,
+                    x.clone(),
+                    qkv_secs,
+                )
             };
+            self.stats.qkv_seconds += qkv_secs;
 
             // K and V for these positions never change again, so store them.
             for t in 0..tokens.len() {
@@ -1566,9 +1685,14 @@ impl<'m> StreamingRunner<'m> {
                 // SAFETY: `buf` is a local outliving `ctx`, and no other context
                 // is live on it — the Q/K/V context above was dropped and its
                 // results copied out before this point.
-                let ctx = unsafe { Context::in_buffer(&mut buf, false)? };
+                let cmp = Self::compute_with(device, threads);
+                // The scratch buffer holds tensor METADATA on both paths. What
+                // differs is whether tensor DATA also comes from it: on a
+                // device it must not, or the graph would compute over host
+                // addresses the card cannot reach — the access violation the
+                // mixed-residency test recorded.
+                let ctx = unsafe { cmp.context_in_buffer(&mut buf)? };
                 let q = ctx.new_f32_3d(head_dim, n_head, n_new)?;
-                q.set_f32(&q_v)?;
 
                 // Whatever the cache stores, handed over unchanged — no
                 // conversion on this path at all. ggml's fused attention
@@ -1584,26 +1708,37 @@ impl<'m> StreamingRunner<'m> {
                     n_kv,
                     n_total,
                 )?;
-                k_all.set_bytes(cache.keys(il as usize))?;
+                let k_bytes = cache.keys(il as usize);
                 let v_all = ctx.reshape_3d(
                     &ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?,
                     head_dim,
                     n_kv,
                     n_total,
                 )?;
-                v_all.set_bytes(cache.values(il as usize))?;
+                let v_bytes = cache.values(il as usize);
                 let kv_secs = tkv.elapsed().as_secs_f64();
 
-                let out =
+                // The mask tensor comes back unwritten: it has no device memory
+                // until this context is realized, which cannot happen until the
+                // graph is complete.
+                let (attn, mask_t) =
                     arch.attention_flash(&ctx, &q, &k_all, &v_all, n_new, n_total, layer_mask)?;
-                let out = ctx.mul_mat(&out_w, &out)?;
+                let out = ctx.mul_mat(&out_w, &attn)?;
                 // StarCoder2 carries a bias here; most architectures do not.
                 let out =
                     self.arch
                         .add_bias(&ctx, weights, out, &format!("blk.{il}.attn_output"))?;
                 let t = std::time::Instant::now();
-                ctx.compute(&out, threads)?;
-                Ok((out.to_vec_f32(), kv_secs, t.elapsed().as_secs_f64()))
+                let _dev = cmp.realize(&ctx)?;
+                cmp.set_f32(&q, &q_v)?;
+                cmp.set_bytes(&k_all, k_bytes)?;
+                cmp.set_bytes(&v_all, v_bytes)?;
+                cmp.set_bytes(&mask_t, layer_mask)?;
+                cmp.run(&ctx, &[&out])?;
+                if trace {
+                    eprintln!("TRACE: attention ok (layer)");
+                }
+                Ok((cmp.to_vec_f32(&out)?, kv_secs, t.elapsed().as_secs_f64()))
             })();
             self.scratch = buf;
             let (attn_out, kv_secs, attn_secs) = attn_result?;
@@ -1660,9 +1795,9 @@ impl<'m> StreamingRunner<'m> {
                 if c.post_norms {
                     shapes.extend([(n_embd, n_new), (n_embd, n_new)]);
                 }
-                let ctx = Context::new(arena_for(&shapes, 24))?;
+                let cmp = Self::compute_with(device, threads);
+                let ctx = cmp.context(arena_for(&shapes, 24))?;
                 let xt = ctx.new_f32_2d(n_embd, n_new)?;
-                xt.set_f32(&ffn_input)?;
                 let normed =
                     self.arch
                         .norm_named(&ctx, weights, &xt, &format!("blk.{il}.ffn_norm"))?;
@@ -1679,9 +1814,14 @@ impl<'m> StreamingRunner<'m> {
                     };
                     let out = ctx.add(&ffn, &xt)?;
                     let t = std::time::Instant::now();
-                    ctx.compute(&out, threads)?;
+                    let _dev = cmp.realize(&ctx)?;
+                    cmp.set_f32(&xt, &ffn_input)?;
+                    cmp.run(&ctx, &[&out])?;
+                    if trace {
+                        eprintln!("TRACE: dense ffn ok (layer)");
+                    }
                     self.stats.ffn_seconds += t.elapsed().as_secs_f64();
-                    x = out.to_vec_f32();
+                    x = cmp.to_vec_f32(&out)?;
                     continue;
                 }
                 let logits = ctx.mul_mat(
@@ -1690,9 +1830,11 @@ impl<'m> StreamingRunner<'m> {
                 )?;
                 let probs = ctx.soft_max_ext(&logits, None, 1.0, 0.0)?;
                 let t = std::time::Instant::now();
-                ctx.compute(&probs, threads)?;
+                let _dev = cmp.realize(&ctx)?;
+                cmp.set_f32(&xt, &ffn_input)?;
+                cmp.run(&ctx, &[&normed, &probs])?;
                 self.stats.ffn_seconds += t.elapsed().as_secs_f64();
-                (normed.to_vec_f32(), probs.to_vec_f32())
+                (cmp.to_vec_f32(&normed)?, cmp.to_vec_f32(&probs)?)
             };
 
             let mut next = ffn_input;
@@ -1715,12 +1857,13 @@ impl<'m> StreamingRunner<'m> {
         // again for results nothing reads.
         let t_out = std::time::Instant::now();
         let last = x.len() - n_embd as usize;
-        let ctx = Context::new(arena_for(
+        let cmp = Self::compute_with(device, threads);
+        let ctx = cmp.context(arena_for(
             &[(n_embd, 1), (n_embd, 1), (c.vocab_size as i64, 1)],
             16,
         ))?;
         let xt = ctx.new_f32_2d(n_embd, 1)?;
-        xt.set_f32(&x[last..])?;
+        let head_input: Vec<f32> = x[last..].to_vec();
         let normed = self.arch.norm_named(&ctx, weights, &xt, "output_norm")?;
         // **The embedding is this tensor, one step before the projection.**
         // `/v1/embeddings` used to answer 501 saying "this runner's graph
@@ -1735,8 +1878,10 @@ impl<'m> StreamingRunner<'m> {
         // between any two models; after the matmul it is a distribution over
         // tokens, not an embedding at all.
         if self.want_embedding {
-            ctx.compute(&normed, threads)?;
-            self.last_embedding = Some(normed.to_vec_f32());
+            let _dev = cmp.realize(&ctx)?;
+            cmp.set_f32(&xt, &head_input)?;
+            cmp.run(&ctx, &[&normed])?;
+            self.last_embedding = Some(cmp.to_vec_f32(&normed)?);
         }
         let out_name = if weights.get("output.weight").is_some() {
             "output.weight"
@@ -1752,8 +1897,13 @@ impl<'m> StreamingRunner<'m> {
         // Gemma bounds the final logits smoothly rather than clipping them.
         // Without it every sampling decision is made on the wrong scale.
         let out = ctx.softcap(&out, c.final_logit_softcap)?;
-        ctx.compute(&out, threads)?;
-        let logits = out.to_vec_f32();
+        let _dev = cmp.realize(&ctx)?;
+        cmp.set_f32(&xt, &head_input)?;
+        cmp.run(&ctx, &[&out])?;
+        if trace {
+            eprintln!("TRACE: output head ok");
+        }
+        let logits = cmp.to_vec_f32(&out)?;
         self.stats.other_seconds += t_out.elapsed().as_secs_f64();
         Ok(logits)
     }
