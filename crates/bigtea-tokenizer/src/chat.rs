@@ -1065,6 +1065,24 @@ impl ChatFormat {
                 // Plain and readable. Not a guess at a family — a deliberate
                 // neutral framing, so a caller can report that the template was
                 // not recognised instead of quietly using someone else's.
+                //
+                // **ChatML was tried here and reverted.** `common/chat.cpp`
+                // keeps a `template_default` that is "always set (defaults to
+                // chatml)", so matching the reference looked like the obvious
+                // move. Two things stopped it, and both are worth keeping:
+                //
+                //   * that fallback is on llama.cpp's *conversation* path, and
+                //     `llama-completion -sys X -p Y` on a template-less model
+                //     does raw completion — it emits `HI` and nothing else. The
+                //     comparison that motivated the change was between our chat
+                //     framing and its raw completion, which is not a comparison.
+                //   * `<|im_start|>` is not in these models' vocabularies. On
+                //     OLMo it costs **41 tokens where this framing costs 12**,
+                //     all of them sequences the model has never seen.
+                //
+                // Matching a reference into a worse result is not parity, so
+                // this stays until someone measures llama.cpp's conversation
+                // path directly.
                 for m in messages {
                     out.push_str(&format!("{}: {}\n", m.role, m.content));
                 }
