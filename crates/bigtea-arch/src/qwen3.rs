@@ -45,11 +45,19 @@ fn rope_type_for(arch: &str) -> (i32, bool) {
         // `LLM_ARCH_LLAMA`. `olmo` was previously in the NEOX arm below **with
         // `known = true`** — a guess wearing the label of a checked fact, and
         // wrong. Nothing had ever been run against the reference for it.
-        "llama" | "llama4" | "baichuan" | "deci" | "mistral" | "olmo" | "internlm2" => {
+        "llama" | "llama4" | "baichuan" | "deci" | "mistral" | "olmo" | "internlm2" | "minicpm" => {
             (ROPE_TYPE_NORM, true)
         }
         "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "phi3" | "gemma" | "gemma2" | "gemma3"
-        | "stablelm" | "starcoder2" => (ROPE_TYPE_NEOX, true),
+        | "stablelm" | "starcoder2" | "falcon" | "phi2" | "gptneox" => (ROPE_TYPE_NEOX, true),
+        // **`mpt` and `bloom` are deliberately absent.** llama.cpp returns
+        // `LLAMA_ROPE_TYPE_NONE` for both: they position with ALiBi instead of
+        // rotation, and this engine refuses ALiBi rather than silently running
+        // a model without positional information — see `uses_alibi` in
+        // `verify`. Falling through to the `_` arm would mark them "unknown"
+        // and the runner would warn, which is right, but writing them here as
+        // NEOX would be a guess wearing the label of a checked fact. That is
+        // the exact mistake `olmo` cost.
         _ => (ROPE_TYPE_NEOX, false),
     }
 }
@@ -1205,6 +1213,17 @@ mod tests {
         // been run against the reference for it. These four are now diffed at
         // eight prompts each.
         assert_eq!(rope_type_for("olmo"), (ROPE_TYPE_NORM, true));
+        // Read out of llama.cpp's `llama_model_rope_type`: MINICPM sits in the
+        // NORM arm beside LLAMA, while FALCON, PHI2 and GPTNEOX are in the
+        // NEOX arm below it.
+        assert_eq!(rope_type_for("minicpm"), (ROPE_TYPE_NORM, true));
+        assert_eq!(rope_type_for("falcon"), (ROPE_TYPE_NEOX, true));
+        assert_eq!(rope_type_for("phi2"), (ROPE_TYPE_NEOX, true));
+        assert_eq!(rope_type_for("gptneox"), (ROPE_TYPE_NEOX, true));
+        // ALiBi models: llama.cpp says ROPE_TYPE_NONE, so they must stay
+        // UNKNOWN here rather than be given a rotation they do not use.
+        assert!(!rope_type_for("mpt").1);
+        assert!(!rope_type_for("bloom").1);
         assert_eq!(rope_type_for("internlm2"), (ROPE_TYPE_NORM, true));
         assert_eq!(rope_type_for("baichuan"), (ROPE_TYPE_NORM, true));
         assert_eq!(rope_type_for("starcoder2"), (ROPE_TYPE_NEOX, true));
