@@ -631,7 +631,7 @@ fn render_with_jinja(tokenizer: &Tokenizer, system: Option<&str>, prompt: &str) 
     // template does exactly that, and rendering it faithfully loses the system
     // prompt with no error at all.
     let messages = if bigtea_jinja::mentions_system_role(template) {
-        raw
+        raw.clone()
     } else {
         if system.is_some() {
             bigtea_arch::info!(
@@ -665,10 +665,45 @@ fn render_with_jinja(tokenizer: &Tokenizer, system: Option<&str>, prompt: &str) 
     );
     env.set("add_generation_prompt", Value::Bool(true));
 
-    match bigtea_jinja::parse(template).and_then(|n| bigtea_jinja::render(&n, &mut env)) {
+    let node = match bigtea_jinja::parse(template) {
+        Ok(n) => n,
+        Err(e) => {
+            bigtea_arch::info!("chat       --jinja declined: {e}");
+            bigtea_arch::info!("           falling back to the family matcher.");
+            return None;
+        }
+    };
+
+    match bigtea_jinja::render(&node, &mut env) {
         Ok(text) => {
             bigtea_arch::info!("chat       template evaluated (--jinja)");
             Some(text)
+        }
+        // **A template that REFUSES a system role gets the polyfill, not the
+        // fallback.** Gemma's calls `raise_exception('System role not
+        // supported')`, and honouring that faithfully is correct — but it is
+        // not what the reference does with the result. minja catches it, merges
+        // the system turn into the first user turn, and re-renders; llama.cpp
+        // answers `SYS\nHI` where we were dropping to the family matcher and
+        // answering `SYS\n\nHI`.
+        //
+        // The merge already existed and was reached only when the template
+        // never mentions a system role at all. Gemma's mentions it in order to
+        // reject it, so the one case the polyfill was written for was the one
+        // case it could not see.
+        Err(e) if system.is_some() && mentions_system_rejection(&e.to_string()) => {
+            bigtea_arch::info!("chat       template rejects a system role: {e}");
+            bigtea_arch::info!("           merging it into the first user turn, as llama.cpp does");
+            let merged = bigtea_jinja::merge_system_into_first_user(&raw, "\n");
+            env.set("messages", Value::List(merged));
+            match bigtea_jinja::render(&node, &mut env) {
+                Ok(text) => Some(text),
+                Err(e) => {
+                    bigtea_arch::info!("chat       --jinja declined after merging: {e}");
+                    bigtea_arch::info!("           falling back to the family matcher.");
+                    None
+                }
+            }
         }
         Err(e) => {
             // Named, always. This is the fallback the crate exists to make
@@ -679,6 +714,18 @@ fn render_with_jinja(tokenizer: &Tokenizer, system: Option<&str>, prompt: &str) 
             None
         }
     }
+}
+
+/// Whether a render error is a template *rejecting a system role*, rather than
+/// any other failure.
+///
+/// Matched on the message because that is all `raise_exception` carries — the
+/// template author writes the string. Kept narrow deliberately: retrying every
+/// failed render with different messages would turn one honest error into two,
+/// and hide whichever one was real.
+fn mentions_system_rejection(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("system") && (m.contains("not supported") || m.contains("role"))
 }
 
 /// Perplexity over a corpus: the standard way to say a model still works.
