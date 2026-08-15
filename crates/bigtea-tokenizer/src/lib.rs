@@ -598,6 +598,32 @@ impl Tokenizer {
         }
         for piece in pre_tokenize(text, self.pre) {
             let encoded = bytes::encode(piece.as_bytes());
+            // **Some vocabularies store a control character RAW, not
+            // byte-encoded.** Falcon3 holds a literal newline at id 12, where a
+            // byte-level vocabulary would hold `Ċ`. Encoding first and looking
+            // up `Ċ` finds nothing, and the per-character fallback below looks
+            // up the same missing key — so **every newline was silently
+            // dropped**, on a model that passed 8/8 parity because those eight
+            // prompts contain none:
+            //
+            //   a\nb   ours [11, 2088, 2089]   llama.cpp [11, 2088, 12, 2089]
+            //
+            // These tokens are USER_DEFINED and would be partitioned out before
+            // BPE ran, except that `specials` excludes anything under three
+            // bytes — deliberately, because matching a one-character marker
+            // would slice ordinary text apart. So the guard that keeps short
+            // markers from cutting text is the same guard that loses this one.
+            //
+            // Resolved here instead, and only as a FALLBACK: the raw form is
+            // consulted just when the byte-encoded form is absent from the
+            // vocabulary, so no model that already tokenizes correctly can
+            // change.
+            if !self.ids.contains_key(&encoded) {
+                if let Some(&id) = self.ids.get(piece.as_str()) {
+                    out.push(id);
+                    continue;
+                }
+            }
             for token in self.bpe(&encoded) {
                 match self.ids.get(&token) {
                     Some(&id) => out.push(id),

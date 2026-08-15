@@ -1,0 +1,99 @@
+//! A vocabulary that stores a control character **raw** must still tokenize it.
+//!
+//! # The bug
+//!
+//! Falcon3 holds a literal newline at id 12. A byte-level BPE vocabulary would
+//! hold `Ċ` instead, so encoding the text first and looking up `Ċ` found
+//! nothing — and the per-character fallback looked up the same missing key.
+//! **Every newline was silently dropped:**
+//!
+//! ```text
+//! a\nb    ours [11, 2088, 2089]    llama.cpp [11, 2088, 12, 2089]
+//! ```
+//!
+//! It passed 8/8 parity because none of those eight prompts contains a newline,
+//! and it broke every chat template on the model, all of which do.
+//!
+//! # Why the existing machinery missed it
+//!
+//! These tokens are USER_DEFINED and would have been partitioned out before BPE
+//! ran — except `specials` excludes anything under three bytes, deliberately,
+//! because matching a one-character marker would slice ordinary text apart. The
+//! guard that stops short markers from cutting text is the same guard that loses
+//! this one, so the fix belongs in the encoder rather than in that guard.
+
+use std::collections::BTreeMap;
+
+use bigtea_gguf::Value;
+use bigtea_tokenizer::Tokenizer;
+
+/// A byte-level BPE vocabulary that stores its newline **raw** rather than as
+/// `Ċ`, the way Falcon3 does.
+fn meta() -> BTreeMap<String, Value> {
+    let mut m = BTreeMap::new();
+    m.insert(
+        "tokenizer.ggml.model".to_string(),
+        Value::String("gpt2".into()),
+    );
+    // id 0 `a`, id 1 `b`, id 2 a RAW newline, id 3 the byte-encoded space form.
+    let tokens = ["a", "b", "\n", "Ġc"];
+    m.insert(
+        "tokenizer.ggml.tokens".to_string(),
+        Value::Array(tokens.iter().map(|t| Value::String((*t).into())).collect()),
+    );
+    m.insert(
+        "tokenizer.ggml.token_type".to_string(),
+        // 4 = USER_DEFINED for the raw newline, 1 = NORMAL for the rest.
+        Value::Array(vec![
+            Value::I32(1),
+            Value::I32(1),
+            Value::I32(4),
+            Value::I32(1),
+        ]),
+    );
+    m.insert(
+        "tokenizer.ggml.add_bos_token".to_string(),
+        Value::Bool(false),
+    );
+    // Named explicitly: the pre-tokenizer decides where the pieces fall, so a
+    // fixture that leaves it to a default is testing whichever default is
+    // current rather than the thing it means to.
+    m.insert(
+        "tokenizer.ggml.pre".to_string(),
+        Value::String("gpt2".into()),
+    );
+    // Without a merge, `Ġ` and `c` never join and `Ġc` is unreachable however
+    // the lookup is written — the fixture would "pass" for the wrong reason.
+    m.insert(
+        "tokenizer.ggml.merges".to_string(),
+        Value::Array(vec![Value::String("Ġ c".into())]),
+    );
+    m
+}
+
+#[test]
+fn a_raw_newline_in_the_vocabulary_is_found_rather_than_dropped() {
+    let t = Tokenizer::from_metadata(&meta()).unwrap();
+    let ids = t.encode("a\nb");
+    assert!(
+        ids.contains(&2),
+        "the raw newline token was dropped: {ids:?}"
+    );
+    assert_eq!(ids, vec![0, 2, 1], "{ids:?}");
+}
+
+#[test]
+fn the_byte_encoded_form_still_wins_when_the_vocabulary_has_it() {
+    // The raw lookup is a FALLBACK, consulted only when the byte-encoded form is
+    // absent. A vocabulary holding `Ġc` must keep using it, or every model that
+    // already tokenizes correctly would change.
+    let t = Tokenizer::from_metadata(&meta()).unwrap();
+    let ids = t.encode(" c");
+    assert_eq!(ids, vec![3], "byte-encoded form was bypassed: {ids:?}");
+}
+
+#[test]
+fn text_with_no_control_characters_is_untouched() {
+    let t = Tokenizer::from_metadata(&meta()).unwrap();
+    assert_eq!(t.encode("ab"), vec![0, 1]);
+}
