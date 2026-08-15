@@ -129,6 +129,17 @@ pub struct Tokenizer {
     max_token_len: usize,
     /// SentencePiece's `remove_extra_whitespaces`.
     remove_extra_whitespaces: bool,
+    /// Whether whitespace *following* a special token is dropped.
+    ///
+    /// llama.cpp's `LLAMA_TOKEN_ATTR_RSTRIP`. **It is not in the container.**
+    /// llama.cpp sets it from the model's *name string* — `_contains_any(
+    /// model_name, {"phi-3", "phi3"})` — in `llama-vocab.cpp`, alongside
+    /// `<mask>` LSTRIP rules keyed on `jina-v2-*` and `modern-bert`. Nothing in
+    /// the tokenizer metadata distinguishes a Phi-3 vocabulary from any other
+    /// SPM one, so matching the reference means keying on the same string it
+    /// keys on. That is worth writing down rather than rediscovering: the
+    /// tokenizer's behaviour depends on `general.name`.
+    rstrip_specials: bool,
     /// Built once, on first use. A 65k-entry trie is not worth constructing for
     /// a tokenizer that will never take the RWKV path.
     rwkv_trie: std::sync::OnceLock<rwkv::Trie>,
@@ -298,6 +309,15 @@ impl Tokenizer {
             remove_extra_whitespaces: match meta.get("tokenizer.ggml.remove_extra_whitespaces") {
                 Some(Value::Bool(v)) => *v,
                 _ => true,
+            },
+            // Keyed on the model NAME, because that is what llama.cpp keys on
+            // and there is nothing in the tokenizer metadata to key on instead.
+            rstrip_specials: match meta.get("general.name") {
+                Some(Value::String(n)) => {
+                    let n = n.to_ascii_lowercase();
+                    n.contains("phi-3") || n.contains("phi3")
+                }
+                _ => false,
             },
             // 11 for a BPE vocabulary that names no BOS. That is not a guess:
             // llama.cpp's `tokenizer_model == "gpt2"` branch sets
@@ -471,6 +491,12 @@ impl Tokenizer {
     }
 
     /// Cut `text` into ordinary spans and control tokens, in order.
+    /// The three Phi-3 specials llama.cpp explicitly exempts from RSTRIP after
+    /// setting it on every other one (`llama-vocab.cpp`). `<s>` matters most:
+    /// it opens the prompt, and stripping after it would eat the space SPM's
+    /// dummy prefix depends on.
+    const NEVER_RSTRIP: &[&str] = &["<unk>", "<s>", "<|endoftext|>"];
+
     fn partition_specials(&self, text: &str) -> Vec<(String, Option<u32>)> {
         if self.specials.is_empty() || text.is_empty() {
             return vec![(text.to_string(), None)];
@@ -495,6 +521,21 @@ impl Tokenizer {
                     }
                     out.push((tok.clone(), Some(id)));
                     rest = &rest[at + tok.len()..];
+                    // **RSTRIP: whitespace after a special token is dropped.**
+                    // llama.cpp's `LLAMA_TOKEN_ATTR_RSTRIP`, applied in
+                    // `tokenizer_st_partition`. Without it a chat template's
+                    // `<|user|>\n` keeps that newline, and because SPM then
+                    // prefixes the fragment with `▁` the following word is
+                    // tokenized differently:
+                    //
+                    //   <|user|>\nSYS   ours   [32010, 29871, 13, 14816, 29903]
+                    //                   llama  [32010, 317, 21554]
+                    //
+                    // Eight tokens against fourteen on one Phi-3 chat turn. It
+                    // does not raise and it does not look wrong.
+                    if self.rstrip_specials && !Self::NEVER_RSTRIP.contains(&tok.as_str()) {
+                        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                    }
                 }
                 None => {
                     out.push((rest.to_string(), None));
