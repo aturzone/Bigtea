@@ -1,6 +1,6 @@
 ---
-topic: "Bigtea's chat framing against llama.cpp's, both paths, on token IDs — one bug found and fixed, three models where we invent a template llama.cpp does not"
-status: measured 2026-08-15, four rendering differences open
+topic: "Bigtea's chat framing against llama.cpp's, both paths, on token IDs — two silent bugs found and fixed, three models where we invent a template llama.cpp does not"
+status: measured 2026-08-15, three rendering differences open
 links: [llamacpp-flag-audit.md, parity-band-discriminator-2026-08-15.md]
 ---
 
@@ -99,20 +99,66 @@ renderer drops it, and ours does not. This is one of the 5 containers where
 llama.cpp disagrees with itself, and on this one **we match its template rather
 than its shortcut.** Left alone.
 
-## Still open: four genuine rendering differences
+## Phi-3: not Jinja at all, and the mechanism is worth remembering
+
+Feeding **both engines the same literal string** ruled out the template and put
+it in the tokenizer:
+
+```
+input      <|user|>\nSYS\nHI<|end|>\n<|assistant|>\n
+llama.cpp  [1, 32010, 317, 21554, 13, 17628, 32007, 32001]                       8 tokens
+bigtea     [1, 32010, 29871, 13, 14816, 29903, 13, 17628, 32007, 29871, 13, ...] 14
+```
+
+llama.cpp drops whitespace **following a special token**
+(`LLAMA_TOKEN_ATTR_RSTRIP`, applied in `tokenizer_st_partition`). SPM then
+prefixes the fragment with `▁`, so the *next word* tokenizes differently — `▁SYS`
+as `317,21554` against our `▁`, `\n`, `SY`, `S`.
+
+**The attribute is not in the container.** `llama-vocab.cpp` sets it from the
+model's *name*:
+
+```cpp
+} else if (_contains_any(model_name, {"phi-3", "phi3"})) {
+    for (auto id : cache_special_tokens) {
+        _set_tokenid_attr(id, LLAMA_TOKEN_ATTR_RSTRIP, true);
+    }
+    for (const auto * token : {"<unk>", "<s>", "<|endoftext|>"}) {
+        _set_token_attr(token, LLAMA_TOKEN_ATTR_RSTRIP, false);
+    }
+}
+```
+
+Nothing in the tokenizer metadata separates a Phi-3 vocabulary from any other SPM
+one, so matching the reference means keying on the same string it keys on —
+alongside `<mask>` LSTRIP rules keyed on `jina-v2-*` and `modern-bert`. **A
+tokenizer whose behaviour depends on `general.name` is the kind of fact that
+costs a day to rediscover.**
+
+Fixed and tested, including the negative case: a model *not* named phi-3 keeps
+its whitespace, because applying this everywhere would silently change every SPM
+chat model. Phi-3 now agrees on **both** paths; agreement went 6 → 7 of 14.
+
+**Why the parity sweep never saw it**: that sweep uses plain prompts with no
+special tokens, so no fragment ever follows one. None of the 104 prompts behind
+"102 exact" could have caught this, and it affects every chat-framed request the
+server handles.
+
+## Still open: three genuine rendering differences
 
 | model | what differs |
 |---|---|
 | `Falcon3-1B` | llama.cpp's Jinja emits a trailing newline after every turn; ours does not — a block-trimming difference, not a content one |
 | `gemma-2-2b` | the system text is merged into the first user turn (Gemma has no system role) and we join with `\n\n` where the template joins with `\n` |
 | `internlm2` | llama.cpp's Jinja renders an extra turn ours does not; the template's default-system branch is the likely cause |
-| `Phi-3-mini` | we insert a newline after `<\|user\|>` where llama.cpp inserts a space, which re-tokenizes `SYS` (`317,21554` against `14816,29903`) |
 
-None of these is a BOS-class silent-position bug: each is a whitespace or
-turn-structure difference in the rendered template. All four are reachable from
-`python scripts/jinja-bigtea-vs-llamacpp.py <model.gguf>`, which prints both
-sides' token IDs.
+**Phi-3 was the fourth of these and turned out not to belong in the list at all**
+— it was the tokenizer, not the template, which is why feeding both engines the
+same literal string was the step that mattered. The remaining three are genuinely
+in the rendering, and none is a silent-position bug of the BOS or RSTRIP kind.
 
-**Phi-3 is the one to start on** — a whitespace difference that changes the
-tokenization of the surrounding text is the kind that moves output, and Phi-3 is
-also the only model in the parity sweep with near-ties.
+All three are reachable from `python scripts/jinja-bigtea-vs-llamacpp.py
+<model.gguf>`, which prints both sides' token IDs. **Rule out the tokenizer
+first**: render the prompt, feed the identical string to both engines with `-p`,
+and see whether they still disagree. Two of the three bugs found today were on
+the far side of that check.

@@ -523,15 +523,29 @@ being emitted twice** under `--jinja`, because the template contains the literal
 all prefilled a token **long** — the exact mirror of Falcon3, which was a token
 short. Fixed; agreement went **4 → 6** of 14 loadable containers.
 
-Three of the remaining eight are models with **no chat template** (`OLMo`,
-`starcoder2`, `all-MiniLM`), where llama.cpp passes the text through untouched
-and we impose a `System:/User:/Assistant:` framing. Deliberate and announced, but
-a divergence, and feeding a base model invented structure is the mirror of the
-bug that made instruct models continue rather than answer. **Not changed** — it
-is a product decision, recorded so it gets made rather than inherited. One more
-(`tinyllama`, family path) is us matching the model's template where llama.cpp's
-hardcoded renderer does not. Four are genuine whitespace/turn-structure
-differences, `Phi-3` first. Full table:
+**A second silent bug, in the tokenizer.** A Phi-3 chat turn was **14 tokens
+where llama.cpp makes 8** — identical input. llama.cpp drops whitespace
+*following* a special token (`LLAMA_TOKEN_ATTR_RSTRIP`), and SPM's dummy prefix
+then re-tokenizes the next word. **The attribute is not in the container**:
+`llama-vocab.cpp` sets it from `_contains_any(model_name, {"phi-3", "phi3"})` —
+the tokenizer's behaviour depends on `general.name`. Matched, with the same three
+exemptions (`<unk>`, `<s>`, `<|endoftext|>`) and a test that any *other* model
+keeps its whitespace. Agreement **6 → 7**; Phi-3 now matches on both paths.
+
+**Neither bug was reachable from the parity sweep**, which uses plain prompts
+with no special tokens — so none of the 104 prompts behind "102 exact" could have
+found either, and both affect every chat-framed request the server handles. Two
+different checks, two different bug classes.
+
+Of the seven that still differ, three are models with **no chat template**
+(`OLMo`, `starcoder2`, `all-MiniLM`), where llama.cpp passes the text through
+untouched and we impose a `System:/User:/Assistant:` framing. Deliberate and
+announced, but a divergence, and feeding a base model invented structure is the
+mirror of the bug that made instruct models continue rather than answer. **Not
+changed** — a product decision, recorded so it gets made rather than inherited.
+One (`tinyllama`, family path) is us matching the model's template where
+llama.cpp's hardcoded renderer does not. Three are genuine rendering differences
+(`Falcon3`, `gemma-2`, `internlm2`). Full table:
 `research/chat-framing-vs-llamacpp-2026-08-15.md`.
 
 ### `/v1/embeddings` — the fifth endpoint, implemented 2026-08-15
