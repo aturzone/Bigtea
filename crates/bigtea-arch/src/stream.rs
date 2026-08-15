@@ -246,6 +246,15 @@ pub struct StreamingRunner<'m> {
     /// then settles. `None` once settled, or immediately when `-t` was given.
     tuner: Option<ThreadTuner>,
     pub stats: StreamStats,
+    /// Keep the pre-projection hidden state from each forward pass.
+    ///
+    /// Off by default and deliberately opt-in: it costs an extra `compute` on a
+    /// tensor the sampling path never reads, so a generation run should not pay
+    /// for it. `/v1/embeddings` turns it on for the one pass it needs.
+    want_embedding: bool,
+    /// The hidden state of the last position of the most recent pass, present
+    /// only when `want_embedding` was set for it.
+    last_embedding: Option<Vec<f32>>,
 }
 
 fn env_threads(name: &str) -> Option<usize> {
@@ -422,11 +431,40 @@ impl<'m> StreamingRunner<'m> {
                 ThreadTuner::new(cores)
             },
             stats: StreamStats::default(),
+            want_embedding: false,
+            last_embedding: None,
         }
     }
 
     pub fn config(&self) -> &Qwen3Config {
         &self.arch.config
+    }
+
+    /// Ask each forward pass to keep the pre-projection hidden state.
+    ///
+    /// Costs one extra `compute` per pass on a tensor the sampler never reads,
+    /// so it stays off for generation.
+    pub fn set_want_embedding(&mut self, on: bool) {
+        self.want_embedding = on;
+        if !on {
+            self.last_embedding = None;
+        }
+    }
+
+    /// The embedding of the most recent forward pass, if one was kept.
+    ///
+    /// **L2-normalised**, which is what `/v1/embeddings` consumers expect and
+    /// what makes a dot product a cosine similarity. A zero vector is returned
+    /// unchanged rather than divided by zero -- it cannot arise from a real
+    /// forward pass, but returning `NaN`s to an HTTP client would turn an
+    /// impossible case into an unreadable one.
+    pub fn last_embedding(&self) -> Option<Vec<f32>> {
+        let v = self.last_embedding.as_ref()?;
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm == 0.0 || !norm.is_finite() {
+            return Some(v.clone());
+        }
+        Some(v.iter().map(|x| x / norm).collect())
     }
 
     /// The thread count for a step over `n_tokens` positions.
@@ -1684,6 +1722,22 @@ impl<'m> StreamingRunner<'m> {
         let xt = ctx.new_f32_2d(n_embd, 1)?;
         xt.set_f32(&x[last..])?;
         let normed = self.arch.norm_named(&ctx, weights, &xt, "output_norm")?;
+        // **The embedding is this tensor, one step before the projection.**
+        // `/v1/embeddings` used to answer 501 saying "this runner's graph
+        // returns logits, not hidden states" -- true of what was *returned*,
+        // but the hidden state is computed here either way and was being thrown
+        // away. Taking it costs one `compute` on a tensor already in the graph,
+        // and only when asked for.
+        //
+        // Deliberately taken AFTER `output_norm` and BEFORE the vocabulary
+        // matmul, which is where llama.cpp takes it. Before the norm the vector
+        // is on a per-model scale that makes cosine similarity meaningless
+        // between any two models; after the matmul it is a distribution over
+        // tokens, not an embedding at all.
+        if self.want_embedding {
+            ctx.compute(&normed, threads)?;
+            self.last_embedding = Some(normed.to_vec_f32());
+        }
         let out_name = if weights.get("output.weight").is_some() {
             "output.weight"
         } else {

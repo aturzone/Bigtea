@@ -387,17 +387,16 @@ fn handle(
             }
         }
         // Embeddings are a different computation, not a cheaper completion:
-        // they need the model's hidden state rather than its logits, and this
-        // runner's graph returns only logits. Saying so is better than
-        // returning a plausible vector that is not an embedding.
-        ("POST", "/v1/embeddings") => (
-            501,
-            error_json(concat!(
-                "embeddings are not implemented: this runner's graph returns logits, ",
-                "not hidden states. A vector derived from logits would look like an ",
-                "embedding and behave like noise, so it is refused rather than faked."
-            )),
-        ),
+        // they need the model's hidden state rather than its logits. This used
+        // to be a 501 saying the graph returns only logits -- true of what it
+        // returned, false about what it computed. See `embed`.
+        ("POST", "/v1/embeddings") => match embed(&req.body, engine, tokenizer) {
+            Ok((vectors, prompt_tokens)) => (
+                200,
+                embeddings_json(engine.model_name(), &vectors, prompt_tokens),
+            ),
+            Err(e) => (400, error_json(&e.to_string())),
+        },
         _ => (404, error_json("no such endpoint")),
     };
 
@@ -709,6 +708,89 @@ fn generate_raw(
     run_prompt(&prompt, engine, tokenizer, params, emit)
 }
 
+/// `/v1/embeddings`: the hidden state, not the logits.
+///
+/// # Why this stopped being a 501
+///
+/// The refusal said "this runner's graph returns logits, not hidden states".
+/// That was true of what the graph *returned* and false about what it computed:
+/// the pre-projection hidden state is the input to the vocabulary matmul and was
+/// being discarded a line later. `set_want_embedding` keeps it, at the cost of
+/// one `compute` on a tensor already in the graph, and only when asked.
+///
+/// Taken **after `output_norm` and before the vocabulary projection**, which is
+/// where llama.cpp takes it. Earlier and the vector carries a per-model scale
+/// that makes similarity between two models meaningless; later and it is a
+/// distribution over tokens rather than an embedding.
+///
+/// Each input gets a **fresh KV cache**. Sharing one would make every embedding
+/// after the first a function of the texts before it — the vectors would still
+/// look plausible, and they would silently encode the batch order.
+///
+/// One vector per input, and the total prompt tokens for the `usage` field.
+type Embeddings = (Vec<Vec<f32>>, usize);
+
+fn embed(
+    body: &str,
+    engine: &Engine<'_>,
+    tokenizer: &Tokenizer,
+) -> Result<Embeddings, Box<dyn std::error::Error>> {
+    let inputs = extract_inputs(body)
+        .ok_or("no `input` in the request body: expected a string or an array of strings")?;
+    if inputs.is_empty() {
+        return Err("`input` is empty".into());
+    }
+
+    let Engine::Dense {
+        runner,
+        weights,
+        config,
+        ..
+    } = engine
+    else {
+        // Deepseek4 runs a different forward path whose output stage this does
+        // not reach. Named rather than dressed up as a generic failure.
+        return Err(
+            "embeddings are implemented for the dense path only; this model uses the \
+             V4-Flash path, whose forward pass does not expose a hidden state yet"
+                .into(),
+        );
+    };
+
+    let mut vectors = Vec::with_capacity(inputs.len());
+    let mut prompt_tokens = 0usize;
+    for text in &inputs {
+        let tokens: Vec<u32> = tokenizer.encode(text);
+        if tokens.is_empty() {
+            return Err("one of the inputs is empty".into());
+        }
+        if tokens.len() > engine.context_limit() {
+            return Err(format!(
+                "an input is {} tokens and this path holds {}",
+                tokens.len(),
+                engine.context_limit()
+            )
+            .into());
+        }
+        prompt_tokens += tokens.len();
+
+        let mut kv = bigtea_arch::KvCache::new(
+            config.n_layer as usize,
+            config.n_head_kv as usize,
+            config.head_dim as usize,
+        );
+        let mut r = runner.borrow_mut();
+        r.set_want_embedding(true);
+        let _logits = r.forward_cached(weights, &mut kv, &tokens, 0)?;
+        let v = r
+            .last_embedding()
+            .ok_or("the forward pass produced no hidden state")?;
+        r.set_want_embedding(false);
+        vectors.push(v);
+    }
+    Ok((vectors, prompt_tokens))
+}
+
 /// The shared body of both completion endpoints.
 fn run_prompt(
     prompt: &str,
@@ -899,6 +981,40 @@ fn advance(
         }
         _ => Err("engine and state disagree -- this is a bug".into()),
     }
+}
+
+/// The `/v1/embeddings` response body.
+///
+/// Floats are written with `{:?}`, which gives Rust's shortest representation
+/// that round-trips exactly. A fixed number of decimal places would silently
+/// quantise every vector the server ever returns.
+fn embeddings_json(model: &str, vectors: &[Vec<f32>], prompt_tokens: usize) -> String {
+    let mut data = String::new();
+    for (i, v) in vectors.iter().enumerate() {
+        if i > 0 {
+            data.push(',');
+        }
+        let mut nums = String::with_capacity(v.len() * 12);
+        for (j, x) in v.iter().enumerate() {
+            if j > 0 {
+                nums.push(',');
+            }
+            // Non-finite values are not legal JSON. They cannot come out of a
+            // healthy forward pass, so emitting 0 would hide a real fault --
+            // `null` is at least visible to the client as "not a number".
+            if x.is_finite() {
+                nums.push_str(&format!("{x:?}"));
+            } else {
+                nums.push_str("null");
+            }
+        }
+        data.push_str(&format!(
+            r#"{{"object":"embedding","index":{i},"embedding":[{nums}]}}"#
+        ));
+    }
+    format!(
+        r#"{{"object":"list","model":"{model}","data":[{data}],"usage":{{"prompt_tokens":{prompt_tokens},"total_tokens":{prompt_tokens}}}}}"#
+    )
 }
 
 /// The non-streaming response body.
@@ -1162,6 +1278,41 @@ fn extract_json_string(body: &str, key: &str) -> Option<String> {
     let rest = after.strip_prefix(':')?.trim_start();
     let body = rest.strip_prefix('"')?;
     read_json_string(body).ok().map(|(s, _)| s)
+}
+
+/// `input` for `/v1/embeddings`, which OpenAI defines as **either** a string or
+/// an array of strings.
+///
+/// Both spellings are in real client code, and a server that takes only the
+/// scalar form fails on the batch one with "no input" — which reads like the
+/// request was empty rather than like the shape was unsupported.
+fn extract_inputs(body: &str) -> Option<Vec<String>> {
+    let needle = "\"input\"";
+    let at = body.find(needle)?;
+    let after = body[at + needle.len()..].trim_start();
+    let rest = after.strip_prefix(':')?.trim_start();
+
+    if let Some(one) = rest.strip_prefix('"') {
+        return read_json_string(one).ok().map(|(s, _)| vec![s]);
+    }
+    // The array form. Walked with the same string reader rather than split on
+    // commas, because an input containing a comma is ordinary text.
+    let mut cur = rest.strip_prefix('[')?.trim_start();
+    let mut out = Vec::new();
+    loop {
+        if let Some(end) = cur.strip_prefix(']') {
+            let _ = end;
+            return Some(out);
+        }
+        let s = cur.strip_prefix('"')?;
+        let (text, used) = read_json_string(s).ok()?;
+        out.push(text);
+        cur = s[used..].trim_start();
+        cur = match cur.strip_prefix(',') {
+            Some(next) => next.trim_start(),
+            None => return cur.strip_prefix(']').map(|_| out),
+        };
+    }
 }
 
 /// Read a JSON number as `f64`. Accepts integers too, since `temperature: 1`
@@ -1474,5 +1625,57 @@ then stop"}"#;
 then stop"
             )
         );
+    }
+
+    #[test]
+    fn input_accepts_both_the_string_and_the_array_form() {
+        // OpenAI defines `input` as either. A server that takes only the scalar
+        // form fails the batch one with "no input", which reads like an empty
+        // request rather than an unsupported shape.
+        assert_eq!(
+            extract_inputs(r#"{"input":"hello"}"#),
+            Some(vec!["hello".to_string()])
+        );
+        assert_eq!(
+            extract_inputs(r#"{"input":["a","b","c"]}"#),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_input_containing_a_comma_is_one_input() {
+        // The array is walked with the JSON string reader rather than split on
+        // commas, because a comma inside a text is ordinary.
+        assert_eq!(
+            extract_inputs(r#"{"input":["one, two","three"]}"#),
+            Some(vec!["one, two".to_string(), "three".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_empty_input_array_is_recognised_rather_than_rejected_as_absent() {
+        // `[]` parses to zero inputs; the handler rejects it with "`input` is
+        // empty", which is a different message from "no `input`".
+        assert_eq!(extract_inputs(r#"{"input":[]}"#), Some(vec![]));
+        assert_eq!(extract_inputs(r#"{"model":"x"}"#), None);
+    }
+
+    #[test]
+    fn an_embedding_response_is_shaped_like_openais() {
+        let json = embeddings_json("m", &[vec![1.0, -0.5]], 3);
+        assert!(json.contains(r#""object":"list""#), "{json}");
+        assert!(json.contains(r#""object":"embedding""#), "{json}");
+        assert!(json.contains(r#""index":0"#), "{json}");
+        assert!(json.contains("[1.0,-0.5]"), "{json}");
+        assert!(json.contains(r#""prompt_tokens":3"#), "{json}");
+    }
+
+    #[test]
+    fn a_non_finite_value_becomes_null_rather_than_invalid_json() {
+        // NaN and inf are not legal JSON. They cannot come out of a healthy
+        // forward pass, so emitting 0 would hide a fault -- `null` is at least
+        // visible to the client as "not a number".
+        let json = embeddings_json("m", &[vec![f32::NAN, 1.0]], 1);
+        assert!(json.contains("[null,1.0]"), "{json}");
     }
 }
