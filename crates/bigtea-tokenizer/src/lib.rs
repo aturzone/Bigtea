@@ -359,6 +359,20 @@ impl Tokenizer {
         self.ids.get(token).copied()
     }
 
+    /// Whether `text` already begins with the BOS token written out.
+    ///
+    /// Only the *literal* spelling counts. A prompt that merely starts with the
+    /// same characters as some other token is untouched, and a model with no
+    /// BOS, or one whose BOS has empty text, always answers `false` rather than
+    /// matching at every position.
+    fn opens_with_bos(&self, text: &str) -> bool {
+        let Some(bos) = self.bos else { return false };
+        let Some(spelling) = self.token_text(bos) else {
+            return false;
+        };
+        !spelling.is_empty() && text.starts_with(spelling)
+    }
+
     /// Whether `id` is a control token — `<|im_end|>`, `<s>`, `[CLS]`.
     ///
     /// These are framing, not output. `decode` deliberately drops most of them,
@@ -424,7 +438,22 @@ impl Tokenizer {
     /// to their own ids rather than merged — see [`Self::specials`].
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
-        if self.add_bos {
+        // **Not when the text already opens with it.** A chat template
+        // evaluated by `--jinja` often emits the BOS token itself — Gemma's
+        // begins with a literal `<bos>`, Llama-3's with `<|begin_of_text|>` —
+        // and `partition_specials` below correctly maps that to its own id. Add
+        // one here as well and the model is prefilled a token LONG:
+        //
+        //   bigtea --jinja : [2, 2, 105, 2364, ...]
+        //   llama.cpp      : [2,    105, 2364, ...]
+        //
+        // Measured on gemma-3, Llama-3.2, internlm2 and Phi-3. It is the mirror
+        // of the Falcon3 bug, which was prefilled a token SHORT, and it is just
+        // as quiet: the model answers fluently from a position nobody trained.
+        // The hardcoded family renderers were unaffected because they do not
+        // emit the BOS text, which is why this only appeared once a real Jinja
+        // engine started evaluating the container's own template.
+        if self.add_bos && !self.opens_with_bos(text) {
             out.extend(self.bos);
         }
         // Split on control tokens first, then run the ordinary algorithm on the
