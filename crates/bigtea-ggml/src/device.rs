@@ -53,6 +53,9 @@ pub enum DeviceKind {
 }
 
 impl DeviceKind {
+    // Only reachable through `devices()`, which returns early without ggml, so
+    // a ggml-free build sees this as dead. Same idiom as `GGML_TYPE_F32`.
+    #[cfg_attr(not(have_ggml), allow(dead_code))]
     fn from_raw(v: i32) -> Self {
         match v {
             0 => Self::Cpu,

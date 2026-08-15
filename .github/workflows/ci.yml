@@ -126,7 +126,7 @@ jobs:
         shell: msys2 {0}
         run: |
           git clone --depth 1 https://github.com/ggml-org/llama.cpp
-          cmake -S llama.cpp -B llama.cpp/build -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DBUILD_SHARED_LIBS=OFF             -DLLAMA_BUILD_TESTS=OFF             -DLLAMA_BUILD_EXAMPLES=OFF             -DLLAMA_BUILD_SERVER=OFF             -DGGML_NATIVE=OFF
+          cmake -S llama.cpp -B llama.cpp/build -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DBUILD_SHARED_LIBS=OFF             -DLLAMA_BUILD_TESTS=OFF             -DLLAMA_BUILD_EXAMPLES=OFF             -DLLAMA_BUILD_SERVER=OFF             -DGGML_NATIVE=OFF -DGGML_METAL=OFF -DGGML_BLAS=OFF
           cmake --build llama.cpp/build --target ggml ggml-base ggml-cpu -j
           mkdir -p ggml-libs
           find llama.cpp/build \( -name 'libggml*.a' -o -name 'ggml*.a' \) -print | while read -r f; do
@@ -137,6 +137,16 @@ jobs:
             test -f "ggml-libs/$lib.a"               || { echo "::error::ggml-libs/$lib.a missing after building ggml"; exit 1; }
           done
 
+      # GGML_METAL / GGML_BLAS are OFF on purpose, and not as a size saving.
+      # ggml's cmake enables both by default on Apple, and `ggml.a` contains
+      # `ggml-backend-reg.cpp`, which names the registration symbol of every
+      # ENABLED backend. Building only the three CPU archives while leaving
+      # them on links fine right up until something touches the device
+      # registry -- then macOS fails with
+      #   Undefined symbols: _ggml_backend_metal_reg, _ggml_backend_blas_reg
+      # which reads as a missing library rather than as a build that promised
+      # backends it did not produce. Enable a backend here only alongside
+      # building and staging its archive.
       - name: Build ggml (Unix)
         if: runner.os != 'Windows' && steps.ggml-cache.outputs.cache-hit != 'true'
         shell: bash
@@ -148,7 +158,7 @@ jobs:
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_SERVER=OFF \
-            -DGGML_NATIVE=OFF
+            -DGGML_NATIVE=OFF -DGGML_METAL=OFF -DGGML_BLAS=OFF
           cmake --build llama.cpp/build --config Release --target ggml ggml-base ggml-cpu -j
           mkdir -p ggml-libs
           # Archive names and locations differ between generators, so collect

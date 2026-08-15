@@ -10,7 +10,11 @@
 //! ones — and the first symptom is a model that answers slightly wrongly. So
 //! the acceptance test is an exact comparison against the path we already trust.
 //!
-//! Skips itself when there is no GPU, which is every CI runner.
+//! Skips itself when there is no GPU, which is every CI runner — and compiles
+//! away entirely without ggml, since `Backend` and `Context` do not exist
+//! there. `real_weights.rs` needs no such gate because it imports only the
+//! always-present entry points; this one is built on the ggml-only types.
+#![cfg(have_ggml)]
 
 use bigtea_ggml::{backend, devices, Backend, Context, DeviceKind};
 

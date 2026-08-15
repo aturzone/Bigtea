@@ -18,6 +18,12 @@ fn main() {
     // rather than 10 "unexpected cfg condition" warnings in every build
     // that does not have ggml -- which is the build a newcomer runs first.
     println!("cargo::rustc-check-cfg=cfg(have_ggml)");
+    // Declared here rather than beside the code that sets it: this function
+    // returns early on several paths (no GGML_LIB_DIR, missing archives), and a
+    // cfg declared only at the end is undeclared on exactly the builds that
+    // take those paths -- which is where the "unexpected cfg condition" warning
+    // showed up.
+    println!("cargo::rustc-check-cfg=cfg(have_vulkan)");
 
     let Some(dir) = std::env::var_os("GGML_LIB_DIR").map(PathBuf::from) else {
         println!(
@@ -72,28 +78,65 @@ fn main() {
     // GGML_LIB_DIR that has no `ggml-vulkan.a`, and the failure lands at link
     // time as undefined `ggml_backend_vk_*` symbols, which reads like a broken
     // toolchain rather than "you pointed at the wrong build".
-    let vulkan = dir.join("ggml-vulkan").join("ggml-vulkan.a");
-    if vulkan.exists() {
-        let to = staged.join("libggml-vulkan.a");
-        match std::fs::copy(&vulkan, &to) {
-            Ok(_) => {
-                println!("cargo:rerun-if-changed={}", vulkan.display());
-                println!("cargo:rustc-link-lib=static=ggml-vulkan");
-                // The loader, not the driver: `vulkan-1` on Windows, `vulkan`
-                // everywhere else. Dynamic in both cases — it ships with the
-                // driver and must not be statically bound to one version.
+    // **Every backend the ggml build enabled must be linked, not just the one
+    // we call.** `ggml.a` contains `ggml-backend-reg.cpp`, which names the
+    // registration symbol of each enabled backend — so the moment anything
+    // touches the device registry, that object is pulled in and every one of
+    // those symbols has to resolve.
+    //
+    // This is not hypothetical: adding device enumeration turned macOS CI red
+    // with `Undefined symbols: _ggml_backend_metal_reg, _ggml_backend_blas_reg`,
+    // because ggml's cmake enables Metal and BLAS by default on Apple while CI
+    // built only the three CPU archives. Before that commit nothing referenced
+    // the registry, the object was never pulled in, and the gap was invisible.
+    //
+    // A macOS user building normally hits exactly the same wall, so the fix
+    // belongs here and not only in the workflow: link whichever sibling
+    // archives exist, with the system libraries each one needs.
+    for backend in ["vulkan", "metal", "blas", "cuda"] {
+        let archive = dir
+            .join(format!("ggml-{backend}"))
+            .join(format!("ggml-{backend}.a"));
+        if !archive.exists() {
+            continue;
+        }
+        let to = staged.join(format!("libggml-{backend}.a"));
+        if let Err(e) = std::fs::copy(&archive, &to) {
+            println!("cargo:warning=cannot copy {}: {e}", archive.display());
+            continue;
+        }
+        println!("cargo:rerun-if-changed={}", archive.display());
+        println!("cargo:rustc-link-lib=static=ggml-{backend}");
+
+        match backend {
+            // The Vulkan *loader*, not a driver: `vulkan-1` on Windows and
+            // `vulkan` elsewhere. Dynamic in both cases — it ships with the
+            // driver and must not be statically bound to one version.
+            //
+            // Only this one sets a cfg, because it is the only backend this
+            // crate has code for. Metal and BLAS are linked so the registry
+            // resolves; nothing calls into them.
+            "vulkan" => {
                 if target_os_is_windows() {
                     println!("cargo:rustc-link-lib=dylib=vulkan-1");
                 } else {
                     println!("cargo:rustc-link-lib=dylib=vulkan");
                 }
-                println!("cargo::rustc-check-cfg=cfg(have_vulkan)");
                 println!("cargo:rustc-cfg=have_vulkan");
             }
-            Err(e) => println!("cargo:warning=cannot copy {}: {e}", vulkan.display()),
+            // Apple frameworks, named explicitly for the same reason the
+            // Accelerate note below gives: the link error lists Apple's
+            // symbols, which reads as a ggml problem and is not one.
+            "metal" => {
+                for fw in ["Metal", "MetalKit", "Foundation", "QuartzCore"] {
+                    println!("cargo:rustc-link-lib=framework={fw}");
+                }
+            }
+            // Accelerate is already linked on Apple targets further down; on
+            // other platforms ggml-blas expects the system BLAS the build
+            // found, which its own cmake recorded.
+            _ => {}
         }
-    } else {
-        println!("cargo::rustc-check-cfg=cfg(have_vulkan)");
     }
 
     println!("cargo:rustc-link-lib=static=ggml-cpu");
