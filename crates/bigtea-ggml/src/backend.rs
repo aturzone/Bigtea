@@ -239,3 +239,208 @@ pub fn upload_f32(tensor: &Tensor<'_>, values: &[f32]) -> Result<(), GgmlError> 
     }
     upload(tensor, &bytes)
 }
+
+/// Cumulative device time, split by what it was spent on.
+///
+/// Exists because the first device measurement came in at 0.42x and the
+/// obvious explanation — PCIe transfers — does not survive arithmetic: the
+/// activations moved per prefill are about 1.4 GB, which is under a second at
+/// the measured 2 GiB/s, against a gap of nearly ten. So the cost is measured
+/// per operation rather than attributed to the most plausible-sounding one.
+pub mod timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static REALIZE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static DOWNLOAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COMPUTE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static REALIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static COMPUTE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn add(counter: &AtomicU64, started: std::time::Instant) {
+        counter.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Seconds in realize / upload / download / compute, and the call counts.
+    pub fn snapshot() -> (f64, f64, f64, f64, u64, u64) {
+        let s = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e9;
+        (
+            s(&REALIZE_NS),
+            s(&UPLOAD_NS),
+            s(&DOWNLOAD_NS),
+            s(&COMPUTE_NS),
+            REALIZE_CALLS.load(Ordering::Relaxed),
+            COMPUTE_CALLS.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn reset() {
+        for c in [
+            &REALIZE_NS,
+            &UPLOAD_NS,
+            &DOWNLOAD_NS,
+            &COMPUTE_NS,
+            &REALIZE_CALLS,
+            &COMPUTE_CALLS,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Where a graph runs, and everything that differs because of it.
+///
+/// # Why this exists
+///
+/// The forward pass is identical on both paths — same tensors, same operations,
+/// same order. What differs is four mechanical things: how a context is
+/// created, whether its tensors need device memory, how values get in and out,
+/// and who executes the graph. Threading a `Compute` through means the graph
+/// code above it does not change, which was the condition the GPU tier was
+/// approved under.
+///
+/// # The ordering this encodes
+///
+/// [`Self::realize`] must be called **after the graph is built and before any
+/// input is set**. On the CPU it does nothing. On a device it allocates memory
+/// for every tensor in the context, which cannot happen before the tensors
+/// exist, and inputs cannot be uploaded before that memory exists. Call sites
+/// that get this wrong write into a null pointer, so the sequence is stated
+/// here once rather than rediscovered per site.
+pub enum Compute<'b> {
+    Cpu { threads: usize },
+    Device(&'b Backend),
+}
+
+impl Compute<'_> {
+    /// A context sized `arena`, allocating or not as the target requires.
+    ///
+    /// The device wants `no_alloc` — its tensors are filled by
+    /// [`Self::realize`] — while the CPU path wants ggml's own arena, exactly
+    /// as it has always had.
+    pub fn context(&self, arena: usize) -> Result<Context, GgmlError> {
+        match self {
+            Compute::Cpu { .. } => Context::new(arena),
+            // Metadata only: a few hundred bytes per tensor, because the bytes
+            // live on the card.
+            Compute::Device(_) => Context::new_no_alloc(arena),
+        }
+    }
+
+    /// Give every tensor in `ctx` somewhere to live. **After the graph, before
+    /// the inputs.**
+    ///
+    /// The returned buffer owns the device allocation and must outlive every
+    /// tensor in the context — dropping it early leaves the graph pointing at
+    /// freed device memory, which is the same obligation the host path has for
+    /// its byte buffers.
+    pub fn realize(&self, ctx: &Context) -> Result<Option<DeviceBuffer>, GgmlError> {
+        match self {
+            Compute::Cpu { .. } => Ok(None),
+            Compute::Device(b) => {
+                let t = std::time::Instant::now();
+                let out = b.alloc(ctx).map(Some);
+                timing::add(&timing::REALIZE_NS, t);
+                timing::REALIZE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                out
+            }
+        }
+    }
+
+    pub fn set_f32(&self, t: &Tensor<'_>, values: &[f32]) -> Result<(), GgmlError> {
+        match self {
+            Compute::Cpu { .. } => t.set_f32(values),
+            Compute::Device(_) => {
+                let started = std::time::Instant::now();
+                let r = upload_f32(t, values);
+                timing::add(&timing::UPLOAD_NS, started);
+                r
+            }
+        }
+    }
+
+    /// Token ids, which are `i32` and go in the same way floats do.
+    pub fn set_i32(&self, t: &Tensor<'_>, values: &[i32]) -> Result<(), GgmlError> {
+        match self {
+            Compute::Cpu { .. } => t.set_i32(values),
+            Compute::Device(_) => {
+                let mut bytes = Vec::with_capacity(values.len() * 4);
+                for v in values {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                upload(t, &bytes)
+            }
+        }
+    }
+
+    /// Raw bytes, whatever the tensor's type — the KV cache's route in.
+    ///
+    /// On a device this is a genuine bus transfer of the cached history, and it
+    /// happens per layer per step because the cache itself is host-resident.
+    /// That cost is real and belongs in the measurement rather than being
+    /// designed around before anyone has seen how large it is.
+    pub fn set_bytes(&self, t: &Tensor<'_>, data: &[u8]) -> Result<(), GgmlError> {
+        match self {
+            Compute::Cpu { .. } => t.set_bytes(data),
+            Compute::Device(_) => {
+                let started = std::time::Instant::now();
+                let r = upload(t, data);
+                timing::add(&timing::UPLOAD_NS, started);
+                r
+            }
+        }
+    }
+
+    /// A context inside a caller-owned host buffer.
+    ///
+    /// The buffer holds tensor *metadata* either way. What changes is whether
+    /// tensor **data** also comes from it: on the CPU it does, and on a device
+    /// it must not, or the graph would compute over host addresses the card
+    /// cannot reach — which is the access violation the mixed-residency test
+    /// recorded.
+    ///
+    /// # Safety
+    /// `buf` must outlive the returned context and no other context may be live
+    /// on it, exactly as for [`Context::in_buffer`].
+    pub unsafe fn context_in_buffer<'a>(&self, buf: &'a mut [u8]) -> Result<Context, GgmlError> {
+        let _ = std::marker::PhantomData::<&'a ()>;
+        Context::in_buffer(buf, matches!(self, Compute::Device(_)))
+    }
+
+    pub fn to_vec_f32(&self, t: &Tensor<'_>) -> Result<Vec<f32>, GgmlError> {
+        match self {
+            Compute::Cpu { .. } => Ok(t.to_vec_f32()),
+            Compute::Device(_) => {
+                let started = std::time::Instant::now();
+                let r = download_f32(t);
+                timing::add(&timing::DOWNLOAD_NS, started);
+                r
+            }
+        }
+    }
+
+    pub fn run(&self, ctx: &Context, outputs: &[&Tensor<'_>]) -> Result<(), GgmlError> {
+        match self {
+            Compute::Cpu { threads } => ctx.compute_many(outputs, *threads),
+            Compute::Device(b) => {
+                let t = std::time::Instant::now();
+                let r = b.compute(ctx, outputs);
+                timing::add(&timing::COMPUTE_NS, t);
+                timing::COMPUTE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                r
+            }
+        }
+    }
+
+    /// Which residency weights should be bound at for this target.
+    ///
+    /// Phase A says "all device" and this returns exactly that. It is a method
+    /// rather than a constant because Phase C answers per tensor, and the call
+    /// sites that ask should keep asking.
+    pub fn weight_residency(&self) -> crate::Residency {
+        match self {
+            Compute::Cpu { .. } => crate::Residency::Host,
+            Compute::Device(_) => crate::Residency::Device,
+        }
+    }
+}

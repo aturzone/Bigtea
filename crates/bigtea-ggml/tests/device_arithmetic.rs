@@ -160,3 +160,148 @@ fn opening_a_device_that_does_not_exist_is_an_error() {
         "opening device {far_past_the_end} should fail, not succeed"
     );
 }
+
+/// A mixed host/device context: allocation is safe, **computing it is not**.
+///
+/// Phase C — dense weights resident on the card, routed experts streaming from
+/// disk — is per-tensor residency by construction, so the question is whether
+/// ggml runs a two-place graph when nothing has told it to. Measured, in
+/// stages:
+///
+/// | step | outcome |
+/// |---|---|
+/// | bind one host, one device | fine |
+/// | build the graph | fine |
+/// | `place_on_device` | **fine, and correct** — uploads only the device tensor |
+/// | `ggml_backend_graph_compute` | **STATUS_ACCESS_VIOLATION** |
+///
+/// So `ggml_backend_alloc_ctx_tensors_from_buft` really does skip a tensor that
+/// already has a host pointer — the mixed context builds exactly as intended —
+/// and then the Vulkan backend dereferences that host pointer as device memory
+/// and the process dies. There is no error and no refusal.
+///
+/// **`ggml_backend_sched` is therefore mandatory for Phase C, not optional**,
+/// and this is the cheapest possible way to have learned it.
+///
+/// The compute step is not executed here on purpose. An access violation takes
+/// the whole test binary down and loses every other result — the failure mode
+/// CLAUDE.md records for the V4-Flash aborts — so it is written down rather
+/// than re-run. What IS asserted is the half that must keep working: the split
+/// itself, and that a host-bound tensor is never uploaded.
+#[test]
+fn a_mixed_context_uploads_only_the_device_half() {
+    let _guard = one_at_a_time();
+    let Some(index) = discrete_gpu() else {
+        eprintln!("skipping: no discrete GPU");
+        return;
+    };
+    let Ok(backend_handle) = Backend::open(index) else {
+        eprintln!("skipping: device {index} would not initialise");
+        return;
+    };
+
+    let (k, m, n) = (4usize, 3usize, 2usize);
+    let ctx = Context::new_no_alloc(16 * 1024 * 1024).expect("context");
+    let mut ws = bigtea_ggml::WeightSet::new();
+    let f32_ty = bigtea_gguf::GgmlType(0);
+
+    let a_bytes: Vec<u8> = (0..k * m).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let b_bytes: Vec<u8> = (0..k * n).flat_map(|i| (i as f32).to_le_bytes()).collect();
+
+    ws.bind_shared_at(
+        &ctx,
+        "a",
+        f32_ty,
+        &[k as u64, m as u64],
+        std::sync::Arc::new(a_bytes),
+        bigtea_ggml::Residency::Host,
+    )
+    .expect("bind host");
+    ws.bind_shared_at(
+        &ctx,
+        "b",
+        f32_ty,
+        &[k as u64, n as u64],
+        std::sync::Arc::new(b_bytes),
+        bigtea_ggml::Residency::Device,
+    )
+    .expect("bind device");
+    assert_eq!(
+        ws.pending_uploads(),
+        1,
+        "only the device tensor should wait"
+    );
+
+    let (_buffer, report) = ws
+        .place_on_device(&backend_handle, &ctx)
+        .expect("device placement");
+
+    assert_eq!(
+        report.tensors, 1,
+        "a host-bound tensor was uploaded; the zero-copy path is the whole          memory design and must never be silently copied to the card"
+    );
+    assert_eq!(
+        report.bytes,
+        k * n * 4,
+        "uploaded the wrong number of bytes"
+    );
+}
+
+/// The same graph, written once, run on both targets — and they must agree.
+///
+/// This is the contract `stream.rs` will lean on: the forward pass is identical
+/// on both paths, and only context creation, allocation, transfer and execution
+/// differ. If those four are right, one body of graph code serves both. If they
+/// are not, the difference shows up here rather than as a model that answers
+/// slightly wrongly.
+#[test]
+fn one_graph_body_gives_the_same_answer_on_cpu_and_device() {
+    let _guard = one_at_a_time();
+
+    let (k, m, n) = (4usize, 3usize, 2usize);
+    let a: Vec<f32> = (0..k * m).map(|i| (i as f32) * 0.5 - 1.0).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| 2.0 - (i as f32) * 0.25).collect();
+
+    // Written once, closed over by both runs. That is the whole point: if this
+    // needed two versions, the abstraction would not be earning its place.
+    let evaluate = |compute: &bigtea_ggml::Compute<'_>| -> Vec<f32> {
+        let ctx = compute.context(16 * 1024 * 1024).expect("context");
+        let ta = ctx.new_f32_2d(k as i64, m as i64).expect("a");
+        let tb = ctx.new_f32_2d(k as i64, n as i64).expect("b");
+        let out = ctx.mul_mat(&ta, &tb).expect("mul_mat");
+        // After the graph, before the inputs.
+        let _buffer = compute.realize(&ctx).expect("realize");
+        compute.set_f32(&ta, &a).expect("set a");
+        compute.set_f32(&tb, &b).expect("set b");
+        compute.run(&ctx, &[&out]).expect("run");
+        compute.to_vec_f32(&out).expect("read back")
+    };
+
+    let on_cpu = evaluate(&bigtea_ggml::Compute::Cpu { threads: 4 });
+    let want = reference_mul_mat(&a, &b, k, m, n);
+    for (i, (g, w)) in on_cpu.iter().zip(&want).enumerate() {
+        assert!((g - w).abs() < 1e-4, "cpu element {i}: {g} vs {w}");
+    }
+
+    let Some(index) = discrete_gpu() else {
+        eprintln!("skipping the device half: no discrete GPU");
+        return;
+    };
+    let Ok(backend_handle) = Backend::open(index) else {
+        eprintln!("skipping the device half: device {index} would not initialise");
+        return;
+    };
+    let on_device = evaluate(&bigtea_ggml::Compute::Device(&backend_handle));
+
+    assert_eq!(
+        on_cpu.len(),
+        on_device.len(),
+        "shapes diverged between targets"
+    );
+    for (i, (c, d)) in on_cpu.iter().zip(&on_device).enumerate() {
+        assert!(
+            (c - d).abs() < 1e-4,
+            "element {i}: cpu {c}, device {d}\n  cpu    {on_cpu:?}\n  device {on_device:?}"
+        );
+    }
+}

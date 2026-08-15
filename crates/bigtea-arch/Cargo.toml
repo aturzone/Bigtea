@@ -37,6 +37,13 @@ path = "src/bin/bigtea-spectrum.rs"
 test = false
 
 [[bin]]
+name = "bigtea-gpubench"
+path = "src/bin/bigtea-gpubench.rs"
+# `test = false` like its neighbours: an empty harness is pointless, and Smart
+# App Control blocks unsigned fresh binaries on Windows.
+test = false
+
+[[bin]]
 name = "bigtea-kernelbench"
 path = "src/bin/bigtea-kernelbench.rs"
 test = false
