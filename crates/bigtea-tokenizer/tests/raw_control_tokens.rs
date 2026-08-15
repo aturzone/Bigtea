@@ -35,20 +35,22 @@ fn meta() -> BTreeMap<String, Value> {
         "tokenizer.ggml.model".to_string(),
         Value::String("gpt2".into()),
     );
-    // id 0 `a`, id 1 `b`, id 2 a RAW newline, id 3 the byte-encoded space form.
-    let tokens = ["a", "b", "\n", "Ġc"];
+    // id 0 `a`, id 1 `b`, id 2 a RAW newline, id 3 the byte-encoded space form,
+    // id 4 a RAW tab — the two whitespace characters Falcon3 stores unencoded.
+    let tokens = ["a", "b", "\n", "Ġc", "\t"];
     m.insert(
         "tokenizer.ggml.tokens".to_string(),
         Value::Array(tokens.iter().map(|t| Value::String((*t).into())).collect()),
     );
     m.insert(
         "tokenizer.ggml.token_type".to_string(),
-        // 4 = USER_DEFINED for the raw newline, 1 = NORMAL for the rest.
+        // 4 = USER_DEFINED for the raw whitespace, 1 = NORMAL for the rest.
         Value::Array(vec![
             Value::I32(1),
             Value::I32(1),
             Value::I32(4),
             Value::I32(1),
+            Value::I32(4),
         ]),
     );
     m.insert(
@@ -90,6 +92,23 @@ fn the_byte_encoded_form_still_wins_when_the_vocabulary_has_it() {
     let t = Tokenizer::from_metadata(&meta()).unwrap();
     let ids = t.encode(" c");
     assert_eq!(ids, vec![3], "byte-encoded form was bypassed: {ids:?}");
+}
+
+#[test]
+fn a_run_of_them_is_not_lost_the_way_a_single_one_was_fixed() {
+    // The first fix resolved the whole PIECE against the vocabulary, which
+    // handled `a\nb` and nothing else: the piece a pre-tokenizer hands over is
+    // rarely the bare character. `a\n\nb`, `a\tb`, a CRLF and every indented
+    // code block still lost their whitespace, on a model that reported the
+    // single-newline case as fixed.
+    let t = Tokenizer::from_metadata(&meta()).unwrap();
+    assert_eq!(t.encode("a\n\nb"), vec![0, 2, 2, 1], "a run was collapsed");
+    assert_eq!(t.encode("a\tb"), vec![0, 4, 1], "the tab was dropped");
+    assert_eq!(
+        t.encode("a\n\tb"),
+        vec![0, 2, 4, 1],
+        "mixed whitespace was dropped"
+    );
 }
 
 #[test]

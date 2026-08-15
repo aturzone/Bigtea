@@ -633,6 +633,28 @@ impl Tokenizer {
                         for ch in token.chars() {
                             if let Some(&id) = self.ids.get(&ch.to_string()) {
                                 out.push(id);
+                                continue;
+                            }
+                            // **"a byte-level vocabulary always covers" is not
+                            // true of every vocabulary.** Falcon3 stores its
+                            // whitespace RAW -- a literal newline at id 12, a
+                            // literal tab at 13 -- where a byte-level vocabulary
+                            // stores `Ċ` and `ĉ`. Looking up the encoded form
+                            // finds nothing and the character was DROPPED, with
+                            // no unknown token and no error.
+                            //
+                            // The single-newline case looked like a whole-piece
+                            // problem and was first fixed as one. It is not:
+                            // `a\n\nb`, `a\tb`, a CRLF and any indented code
+                            // block all still lost their whitespace, because the
+                            // piece the pre-tokenizer hands over is rarely the
+                            // bare character. The fallback belongs HERE, per
+                            // character, which subsumes the piece-level case.
+                            if let Some(byte) = bytes::char_to_byte(ch) {
+                                let raw = (byte as char).to_string();
+                                if let Some(&id) = self.ids.get(&raw) {
+                                    out.push(id);
+                                }
                             }
                         }
                     }
