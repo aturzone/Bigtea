@@ -198,6 +198,53 @@ correct is exactly the trade this file has now recorded twice.
 **The exact path already agrees.** Anyone who needs byte-parity with the
 reference on these two models has `--jinja` today.
 
+## Two more tokenizer classes, isolated but NOT fixed
+
+`scripts/tokenizer-parity.py` found these on its first full run — 17 awkward
+strings × 13 containers. They are open, and the isolation below is the whole
+head start:
+
+**Double space — `gemma-2`, `gemma-3`, `OLMo`.** Only a run of *exactly two*
+diverges. On OLMo:
+
+```
+spaces=1  ours [66, 270]         llama 66,270        ✓
+spaces=2  ours [66, 209, 270]    llama 66,50276,67   ✗
+spaces=3  ours [66, 50275, 67]   llama 66,50275,67   ✓
+spaces=4  ours [66, 50274, 67]   llama 66,50274,67   ✓
+spaces=5  ours [66, 50273, 67]   llama 66,50273,67   ✓
+```
+
+We split `a  b` into `a` / `" "` / `" b"`; llama.cpp makes `a` / `"  "` / `b`.
+The `\s+(?!\S)` rule in `pretok.rs` "gives the last character back, because that
+character is the next piece's leading space" — the real GPT-2 rule, and the one
+llama.cpp does not apply here.
+
+**Do not fix this from the `pretok.rs` source alone.** Tracing that function by
+hand predicts `a` / `"  "` / `" b"` for three spaces, and three spaces *matches
+the reference*, so there is a second pass involved (the `default_gpt2` comment
+mentions one) and the obvious edit is against a model of the code that is
+demonstrably wrong. Change it, then re-run the table above; the empirical answer
+is cheap and the reasoned one has already been wrong once.
+
+**Emoji — `stablelm`, `starcoder2`.** llama.cpp merges the leading space and the
+emoji into one token; we emit three:
+
+```
+hi <emoji> there   ours  [6151, 220, 76460, 222, 1070]
+                   llama [6151, 91416, 1070]
+```
+
+Likely the same root as the whitespace case — a piece boundary falling where the
+reference's does not — but **that is a guess and is marked as one**. gemma is
+SPM and OLMo is BPE, so at minimum the whitespace symptom spans two code paths
+and may be two bugs.
+
+**Neither is reachable from `parity-check.sh`**, whose eight prompts contain no
+double space and no emoji. That is now the third time a tokenizer bug has lived
+behind that harness, which is the argument for the new script rather than a
+larger prompt list.
+
 ## Earlier: three genuine rendering differences
 
 | model | what differs |
