@@ -149,6 +149,63 @@ fn json(v: &Value) -> String {
 /// So evaluating the template correctly is not sufficient to match the
 /// reference — the caller has to apply the same polyfill, and to do that it has
 /// to ask this question first.
+/// Does this template actually *accept* a system turn?
+///
+/// **Decided by rendering one and looking for it, not by reading the source.**
+/// A template can refuse a system turn in two completely different ways, and
+/// only one of them is visible lexically:
+///
+/// ```text
+/// gemma-2:  raises   {{ raise_exception('System role not supported') }}
+/// Phi-3:    DROPS IT silently -- no system branch, no error, no output
+/// ```
+///
+/// So neither a lexical scan nor a check for [`Error::Raised`] is enough. The
+/// first was measured wrong on gemma-2, which names the role only to reject it;
+/// the second was measured wrong on Phi-3, which says nothing at all and simply
+/// loses the turn. Both produce a prompt the model was never trained on, and
+/// neither fails loudly.
+///
+/// The question that survives both is: **did the system content come out the
+/// other side?** That is what the caller actually needs to know before deciding
+/// whether to merge the system turn into the first user message.
+///
+/// llama.cpp settles it behaviourally too. A template that rejects or drops a
+/// system turn is not broken — that is how a template *says* it has no system
+/// slot — and the correct response is the merge polyfill, not an error.
+pub fn supports_system_role(template: &str) -> bool {
+    let Ok(nodes) = parse(template) else {
+        // Not our question to answer; let the real render report it.
+        return true;
+    };
+    // Distinctive enough that it cannot appear from the template's own text.
+    const PROBE: &str = "ZQSYSPROBEQZ";
+    let mut env = Env::new();
+    let mut sys = std::collections::HashMap::new();
+    sys.insert("role".to_string(), Value::Str("system".to_string()));
+    sys.insert("content".to_string(), Value::Str(PROBE.to_string()));
+    let mut usr = std::collections::HashMap::new();
+    usr.insert("role".to_string(), Value::Str("user".to_string()));
+    usr.insert("content".to_string(), Value::Str("U".to_string()));
+    env.set(
+        "messages",
+        Value::List(vec![Value::Map(sys), Value::Map(usr)]),
+    );
+    env.set("bos_token", Value::Str(String::new()));
+    env.set("eos_token", Value::Str(String::new()));
+    env.set("add_generation_prompt", Value::Bool(true));
+
+    match render(&nodes, &mut env) {
+        // Rendered: supported only if the content actually survived.
+        Ok(out) => out.contains(PROBE),
+        // Raised: the template said no in the loud way.
+        Err(Error::Raised(_)) => false,
+        // Anything else is a different problem -- an unsupported construct, an
+        // undefined variable -- and must not be reported as "no system role".
+        Err(_) => true,
+    }
+}
+
 pub fn mentions_system_role(template: &str) -> bool {
     // Naming the role literally is the obvious way to support it.
     if template.contains("'system'") || template.contains("\"system\"") {

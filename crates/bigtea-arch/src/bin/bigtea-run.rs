@@ -630,7 +630,7 @@ fn render_with_jinja(tokenizer: &Tokenizer, system: Option<&str>, prompt: &str) 
     // turn, so the content is merged into the first user turn instead. Phi-3's
     // template does exactly that, and rendering it faithfully loses the system
     // prompt with no error at all.
-    let messages = if bigtea_jinja::mentions_system_role(template) {
+    let messages = if bigtea_jinja::supports_system_role(template) {
         raw.clone()
     } else {
         if system.is_some() {
