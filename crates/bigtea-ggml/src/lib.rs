@@ -22,10 +22,16 @@ use std::fmt;
 
 use bigtea_gguf::GgmlType;
 
+pub mod device;
 mod graph;
 pub mod repack;
 mod weights;
 
+// Unconditional, unlike the re-exports around it: `device` answers
+// `Unavailable` rather than vanishing when ggml is absent, so a caller can ask
+// "is there a GPU here?" in a build with no ggml and get an answer instead of a
+// missing symbol.
+pub use device::{best_offload_device, devices, vulkan_available, DeviceInfo, DeviceKind};
 #[cfg(have_ggml)]
 pub use graph::{arena_for, f16_to_f32, f32_to_f16, Context, RopeParams, Tensor};
 pub use repack::{is_repackable, Repacked};

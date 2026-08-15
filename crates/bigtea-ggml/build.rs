@@ -60,6 +60,42 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", staged.display());
     // Order matters for static archives: dependents before dependencies.
     println!("cargo:rustc-link-lib=static=ggml");
+
+    // **The Vulkan backend is opt-in by what is on disk, not by a feature.**
+    // A ggml built with `-DGGML_VULKAN=ON` emits one extra archive, in a
+    // subdirectory, and its `ggml.a` has the backend registered. So the
+    // presence of that file *is* the configuration: point `GGML_LIB_DIR` at a
+    // Vulkan-enabled build and the GPU path compiles; point it at the CPU
+    // build and it does not, with no flag to get wrong in between.
+    //
+    // Deliberately NOT a cargo feature. A feature can be enabled against a
+    // GGML_LIB_DIR that has no `ggml-vulkan.a`, and the failure lands at link
+    // time as undefined `ggml_backend_vk_*` symbols, which reads like a broken
+    // toolchain rather than "you pointed at the wrong build".
+    let vulkan = dir.join("ggml-vulkan").join("ggml-vulkan.a");
+    if vulkan.exists() {
+        let to = staged.join("libggml-vulkan.a");
+        match std::fs::copy(&vulkan, &to) {
+            Ok(_) => {
+                println!("cargo:rerun-if-changed={}", vulkan.display());
+                println!("cargo:rustc-link-lib=static=ggml-vulkan");
+                // The loader, not the driver: `vulkan-1` on Windows, `vulkan`
+                // everywhere else. Dynamic in both cases — it ships with the
+                // driver and must not be statically bound to one version.
+                if target_os_is_windows() {
+                    println!("cargo:rustc-link-lib=dylib=vulkan-1");
+                } else {
+                    println!("cargo:rustc-link-lib=dylib=vulkan");
+                }
+                println!("cargo::rustc-check-cfg=cfg(have_vulkan)");
+                println!("cargo:rustc-cfg=have_vulkan");
+            }
+            Err(e) => println!("cargo:warning=cannot copy {}: {e}", vulkan.display()),
+        }
+    } else {
+        println!("cargo::rustc-check-cfg=cfg(have_vulkan)");
+    }
+
     println!("cargo:rustc-link-lib=static=ggml-cpu");
     println!("cargo:rustc-link-lib=static=ggml-base");
 
@@ -179,4 +215,14 @@ fn link_static_runtime_dir() -> Option<String> {
         dir = Some(parent.display().to_string());
     }
     dir
+}
+
+/// Is the *target* Windows?
+///
+/// `cfg!(windows)` here would answer for the host, which is the same build-script
+/// trap the runtime-linking code above already documents: it silently picks the
+/// wrong loader name when cross-compiling. Cargo passes the target's own
+/// configuration in the environment, so ask that.
+fn target_os_is_windows() -> bool {
+    std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
 }
