@@ -2517,12 +2517,21 @@ four prompts is what a real near-tie looks like. **So the discriminator is a
 diagnostic and not only a verdict:** a *constant* answer would name the behaviour
 we share, and would be the lead.
 
-Two prompts are still outside the band, `Q: What is 17 plus 25? A:` first because
-arithmetic has a right answer. Every reference configuration emits **42** before
-reasoning, in three different framings; Bigtea appears to go straight to the
-reasoning. **Not established** — the two sides were captured with different
-truncation and the confirming run was interrupted. `research/parity-band-discriminator-2026-08-15.md`
-has the exact command to settle it. Do not cite it until someone has.
+Two prompts are still outside the band. `Q: What is 17 plus 25? A:` was examined
+first because arithmetic has a right answer, and **it came back the opposite way
+to the guess**: Bigtea emits `42`, exactly as every reference configuration does.
+The earlier "it skips the answer" reading was an artefact of capturing the two
+sides with different tail-truncation. It was flagged as not citable before anyone
+acted on it, which is the only reason it cost nothing.
+
+The reference spans **three distinct outputs across five configurations** on that
+prompt — `42`, `A: 42` on its own line, and `17 + 25 = 42` — so the continuation
+after the answer is barely determined at all. Bigtea is a fourth, agreeing with
+`-fa off` at the token where the reference splits. **That is weak evidence of a
+defect, not strong**: the bugs this harness has caught (Llama-3.2's RoPE,
+Falcon3's short prefill) broke prompts that had a determined answer, and this one
+gets the determined part right. `research/parity-band-discriminator-2026-08-15.md`
+carries the full table.
 
 The threshold moved without moving: three-in-eight still fails, but on the
 sharper class, which is *stricter* — everything excusable has been taken out of

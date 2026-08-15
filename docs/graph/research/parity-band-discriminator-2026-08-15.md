@@ -81,26 +81,50 @@ had looked for.
 
 ## What is still open
 
-Two prompts produce a third answer. `Q: What is 17 plus 25? A:` is the one to
-start on, because arithmetic has a right answer and prose does not:
+Two prompts produce a third answer. `Q: What is 17 plus 25? A:` was the one to
+start on, because arithmetic has a right answer and prose does not.
+
+**Measured, `-n 14`, identical post-processing on both sides:**
 
 ```
-llama.cpp default : 42\n\nOkay, so I need to figure out what 17 plus 25 is. Let me think.
-llama.cpp -fa off : 42 A: 42\n\nOkay, let's
-llama.cpp --no-repack : 17 + 25 = 42\n\nOkay,
-bigtea            : \nOkay, let's see. The user is asking "What is 17 plus 25?" ...
+default        ' 42\n\nOkay, so I need to figure out what '
+-b 1           ' 42\n\nOkay, so I need to figure out what '
+-b 1 -fa off   ' 42\n\nOkay, so I need to figure out what '
+-fa off        " 42\nA: 42\n\nOkay, let's"
+--no-repack    ' 17 + 25 = 42\n\nOkay,'
+BIGTEA         "\n 42\n\nOkay, let's see. The user is asking"
 ```
 
-Every reference configuration emits **42** before it starts reasoning, in three
-different framings. Bigtea appears to go straight to the reasoning. If that holds
-it is a real divergence and not a tie — the reference varies in *how* it states
-the answer while always stating it, and we would be omitting it.
+**Bigtea emits `42`.** The earlier reading — that it skipped the answer and went
+straight to reasoning — was **wrong, and was an artefact of the measurement**:
+the two sides had been captured with different tail-truncation, so Bigtea's first
+line was cut off and the reference's was not. This node flagged that claim as not
+citable before anyone acted on it, which is the only reason it cost nothing.
 
-**This is not yet established.** The comparison above was captured with different
-tail-truncation on the two sides and the confirming run was interrupted, so a
-leading `42` on Bigtea's side cannot be ruled out from this evidence. The
-measurement to run, at `-n 14` with identical post-processing on both sides, is
-the first thing to do on this node. Do not cite it until then.
+What the corrected data shows:
+
+* **Every engine and every configuration answers 42.** On the single
+  outside-band prompt that has a checkable answer, our answer is correct and
+  identical to the reference's. The disagreement is entirely in the prose after
+  it.
+* **The reference spans three distinct outputs across five configurations here**
+  — including `A: 42` repeated on its own line under `-fa off`, and
+  `17 + 25 = 42` under `--no-repack`. This prompt sits in a high-entropy region
+  *after* the answer, where the continuation is barely determined at all.
+* Bigtea is a fourth output, so `outside the band` is correct as classified. But
+  it agrees with `-fa off` on the token where the reference splits (`Okay,
+  let's` against `Okay, so`) and differs from it only by the repeated `A: 42`
+  line.
+
+**This is now weak evidence of a defect, not strong.** A wrong forward pass that
+survives to token 14 with the arithmetic intact, on a prompt where the reference
+cannot agree with itself three ways, is not the shape of the bugs this harness
+has caught before — Llama-3.2's RoPE and Falcon3's short prefill both broke
+prompts that had a determined answer.
+
+The second outside-band prompt, `Dear Sir or Madam, I am writing to`, is open
+prose with no checkable answer and is therefore the weaker of the two to reason
+from. It has not been examined token by token.
 
 ## The threshold moved without moving
 
