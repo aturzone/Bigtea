@@ -2703,3 +2703,48 @@ filled by `ggml_backend_tensor_set`, which copies, exactly as CUDA would. Vulkan
 removes an MSVC migration from *in front of* the work; it does not touch the work.
 And 76% of a token on the MoE path is disk, which no GPU fixes — the 25.6x above
 is prefill on a model that fits in VRAM, the one slice this card can plausibly win.
+
+## The GPU tier, Phase A: the card runs a full prefill — at 1.33–1.52x
+
+`research/phase-a-device-prefill-2026-08-15.md`, 2026-08-15. Bigtea's own binary
+runs a complete Qwen3-4B prefill on an RTX 3050 through Vulkan, every weight
+resident on the card.
+
+```bash
+bigtea-gpubench C:/Projects/models/qwen3-4b/Qwen3-4B-Q4_K_M.gguf --repeat 3
+```
+
+| | cpu (`-t 20`) | device | ratio |
+|---|---:|---:|---:|
+| median | 52.68 tok/s | 80.02 tok/s | **1.33–1.52x** across invocations |
+| range | 48.84–59.93 | 73.09–80.27 | warm-up discarded |
+
+Logit checksums agree (625.01 vs 621.17), so it is the same answer, faster.
+
+**Two figures from the same day are retracted, and the second one reached a
+merge-commit headline.** `#68` merged as "…at 1.73x"; that came from one prefill
+per process. **The repeat harness says 1.33–1.52x and that is the number.** An
+earlier 0.42x was a cold Vulkan pipeline cache — the driver persists compiled
+shaders to disk, so run 1 of any GPU path is a different program from run 2.
+
+**Two rules came out of it, both now enforced by `bigtea-gpubench` itself.**
+A GPU measurement needs **repeats** — `--repeat 1` is refused without `--force`.
+And **nothing expensive belongs inside the timed region**: the first harness
+reloaded 2.32 GiB per run and swung the CPU baseline 26.48–67.35 tok/s, a 2.5x
+spread that buried the effect being measured.
+
+**Where the device time goes**, measured per operation rather than attributed:
+compute 1.80s over 110 graph submissions, upload 1.04s, download 0.66s, device
+allocation 0.64s over 110 allocations. Transfers are 36% and allocation 14%, so
+half the device's time is structural overhead rather than arithmetic.
+
+**This is not a differentiator and STATUS must not claim it is.** llama.cpp does
+2042 pp512 on the same card and model with the same ggml underneath, because it
+runs one graph for the whole pass with no host round trips. We submit 110. The
+gap is our design, not the kernels — `backlog/activations-resident-across-layers.md`
+sizes closing it at 2.5–3x, still far short of llama.cpp.
+
+**`ggml_backend_sched` is mandatory for Phase C, proven not assumed**:
+`research/mixed-residency-segfaults-2026-08-15.md`. And Phase C's ceiling is
+revised **down** from 1.3x — that estimate assumed the compute moved for free,
+and Phase A shows it does not.

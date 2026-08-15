@@ -4,7 +4,7 @@
 pass. Explicitly **not** a device-only duplicate of the layer body — this project
 has deleted five dead forward paths and must not grow a sixth.
 
-Links: [../research/phase-a-the-card-at-1.7x-2026-08-15.md](../research/phase-a-the-card-at-1.7x-2026-08-15.md) ·
+Links: [../research/phase-a-device-prefill-2026-08-15.md](../research/phase-a-device-prefill-2026-08-15.md) ·
 [../research/mixed-residency-segfaults-2026-08-15.md](../research/mixed-residency-segfaults-2026-08-15.md)
 
 ## What it is worth, measured not guessed

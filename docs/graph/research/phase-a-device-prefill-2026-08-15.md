@@ -1,11 +1,46 @@
-# Phase A: the card runs the model at 1.7x — and the first number was wrong
+# Phase A: the card runs the model, and the number was wrong twice
 
 **2026-08-15.** The GPU bar moves: Bigtea's own binary runs a full Qwen3-4B
-prefill on an RTX 3050 at **1.62-1.78x the CPU path**.
+prefill on an RTX 3050. **The current figure is 1.33-1.52x**, from the repeat
+harness. Two earlier figures from this same day are retracted below — 0.42x and
+1.62-1.78x — and the second one reached a merge-commit headline before it was
+corrected.
+
+**This file no longer carries a number in its name.** It used to be
+`phase-a-the-card-at-1.7x-2026-08-15.md`, and that number was wrong within
+hours. A filename cannot be corrected in place the way a body can, and it gets
+quoted by people who never open the file.
 
 Links: [gpu-the-card-works-vulkan-not-cuda-2026-08-15.md](gpu-the-card-works-vulkan-not-cuda-2026-08-15.md) ·
 [the-igpu-is-not-a-tier-2026-08-15.md](the-igpu-is-not-a-tier-2026-08-15.md) ·
 [the-knee-moves-with-n-2026-08-14.md](the-knee-moves-with-n-2026-08-14.md)
+
+## RETRACTED TWICE, and the second retraction is the more useful one
+
+**1.62-1.78x is also retracted.** It was measured one prefill per process, and
+`#68`'s merge commit headline says 1.73x on the strength of it. Run through the
+repeat harness — one load per target, a discarded warm-up, three timed prefills
+— the same code reads:
+
+```
+run 1    cpu   59.93  device   80.27 tok/s   1.34x
+run 2    cpu   52.68  device   80.02 tok/s   1.52x
+run 3    cpu   48.84  device   73.09 tok/s   1.50x
+
+cpu     median    52.68 tok/s   (48.84-59.93)
+device  median    80.02 tok/s   (73.09-80.27, warm-up discarded)
+```
+
+Three prefills in one process is a different measurement from one prefill per
+process, and the harness that repeats is the one that counts. The cause of the
+gap was found by building that harness: **the first version loaded the model
+inside the timed loop.** Each load reads 2.32 GiB; eight back to back thrashed
+the page cache and the drive and swung the CPU baseline 26.48-67.35 tok/s — a
+2.5x spread that buried the effect being measured.
+
+So the rule this node produced needs a second clause: **repeats, AND nothing
+expensive inside the timed region.** The warm-up discard fixes the shader cache
+and does nothing about a 2.32 GiB read sitting in the loop.
 
 ## RETRACTED: the 0.42x in the first version of this node
 
@@ -47,11 +82,15 @@ which is what prefill wants — a mistuned baseline would flatter the card.
 bigtea-gpubench C:/Projects/models/qwen3-4b/Qwen3-4B-Q4_K_M.gguf
 ```
 
-| run | cpu tok/s | device tok/s | ratio | load-to-first-token |
-|---|---:|---:|---:|---|
-| 1 | 60.92 | 108.45 | **1.78x** | 12.48s cpu vs 8.50s device |
-| 2 | 60.34 | 104.36 | **1.73x** | 12.17s cpu vs 8.56s device |
-| 3 | 67.16 | 108.85 | **1.62x** | 11.77s cpu vs 8.56s device |
+| run | cpu tok/s | device tok/s | ratio |
+|---|---:|---:|---:|
+| 1 | 59.93 | 80.27 | **1.34x** |
+| 2 | 52.68 | 80.02 | **1.52x** |
+| 3 | 48.84 | 73.09 | **1.50x** |
+
+Medians: cpu 52.68, device 80.02, **ratio 1.33-1.52x across invocations**. The
+1.62-1.78x rows this table used to hold were single-shot per process and are
+retracted above.
 
 Logit checksums agree (625.01 cpu vs 621.17 device), so this is the same answer,
 faster. **Load-to-first-token is better on the device too** — about 3.5s better
@@ -103,7 +142,7 @@ the cold-cache run and says nothing.
 
 ## What this does and does not retire
 
-**The tier is real but half-built.** 1.7x is worth having and it is not what
+**The tier is real but half-built.** 1.4x is worth having and it is not what
 this hardware can do: half the device's time goes to transfers and allocations
 that exist only because the forward pass hands host `Vec<f32>` between stages.
 Keeping activations resident across a layer — and then across layers — is the

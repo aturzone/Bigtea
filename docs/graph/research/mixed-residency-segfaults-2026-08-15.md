@@ -1,10 +1,10 @@
 # A mixed host/device context builds correctly and then segfaults
 
 **2026-08-15.** Split out of
-[phase-a-the-card-at-1.7x-2026-08-15.md](phase-a-the-card-at-1.7x-2026-08-15.md)
+[phase-a-device-prefill-2026-08-15.md](phase-a-device-prefill-2026-08-15.md)
 because it is the obvious thing to try and it costs a day.
 
-Links: [phase-a-the-card-at-1.7x-2026-08-15.md](phase-a-the-card-at-1.7x-2026-08-15.md) ·
+Links: [phase-a-device-prefill-2026-08-15.md](phase-a-device-prefill-2026-08-15.md) ·
 [gpu-tier-smallest-honest-slice-2026-08-11.md](gpu-tier-smallest-honest-slice-2026-08-11.md)
 
 ## The obvious thing
