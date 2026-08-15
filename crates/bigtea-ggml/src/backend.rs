@@ -239,3 +239,90 @@ pub fn upload_f32(tensor: &Tensor<'_>, values: &[f32]) -> Result<(), GgmlError> 
     }
     upload(tensor, &bytes)
 }
+
+/// Where a graph runs, and everything that differs because of it.
+///
+/// # Why this exists
+///
+/// The forward pass is identical on both paths — same tensors, same operations,
+/// same order. What differs is four mechanical things: how a context is
+/// created, whether its tensors need device memory, how values get in and out,
+/// and who executes the graph. Threading a `Compute` through means the graph
+/// code above it does not change, which was the condition the GPU tier was
+/// approved under.
+///
+/// # The ordering this encodes
+///
+/// [`Self::realize`] must be called **after the graph is built and before any
+/// input is set**. On the CPU it does nothing. On a device it allocates memory
+/// for every tensor in the context, which cannot happen before the tensors
+/// exist, and inputs cannot be uploaded before that memory exists. Call sites
+/// that get this wrong write into a null pointer, so the sequence is stated
+/// here once rather than rediscovered per site.
+pub enum Compute<'b> {
+    Cpu { threads: usize },
+    Device(&'b Backend),
+}
+
+impl Compute<'_> {
+    /// A context sized `arena`, allocating or not as the target requires.
+    ///
+    /// The device wants `no_alloc` — its tensors are filled by
+    /// [`Self::realize`] — while the CPU path wants ggml's own arena, exactly
+    /// as it has always had.
+    pub fn context(&self, arena: usize) -> Result<Context, GgmlError> {
+        match self {
+            Compute::Cpu { .. } => Context::new(arena),
+            // Metadata only: a few hundred bytes per tensor, because the bytes
+            // live on the card.
+            Compute::Device(_) => Context::new_no_alloc(arena),
+        }
+    }
+
+    /// Give every tensor in `ctx` somewhere to live. **After the graph, before
+    /// the inputs.**
+    ///
+    /// The returned buffer owns the device allocation and must outlive every
+    /// tensor in the context — dropping it early leaves the graph pointing at
+    /// freed device memory, which is the same obligation the host path has for
+    /// its byte buffers.
+    pub fn realize(&self, ctx: &Context) -> Result<Option<DeviceBuffer>, GgmlError> {
+        match self {
+            Compute::Cpu { .. } => Ok(None),
+            Compute::Device(b) => b.alloc(ctx).map(Some),
+        }
+    }
+
+    pub fn set_f32(&self, t: &Tensor<'_>, values: &[f32]) -> Result<(), GgmlError> {
+        match self {
+            Compute::Cpu { .. } => t.set_f32(values),
+            Compute::Device(_) => upload_f32(t, values),
+        }
+    }
+
+    pub fn to_vec_f32(&self, t: &Tensor<'_>) -> Result<Vec<f32>, GgmlError> {
+        match self {
+            Compute::Cpu { .. } => Ok(t.to_vec_f32()),
+            Compute::Device(_) => download_f32(t),
+        }
+    }
+
+    pub fn run(&self, ctx: &Context, outputs: &[&Tensor<'_>]) -> Result<(), GgmlError> {
+        match self {
+            Compute::Cpu { threads } => ctx.compute_many(outputs, *threads),
+            Compute::Device(b) => b.compute(ctx, outputs),
+        }
+    }
+
+    /// Which residency weights should be bound at for this target.
+    ///
+    /// Phase A says "all device" and this returns exactly that. It is a method
+    /// rather than a constant because Phase C answers per tensor, and the call
+    /// sites that ask should keep asking.
+    pub fn weight_residency(&self) -> crate::Residency {
+        match self {
+            Compute::Cpu { .. } => crate::Residency::Host,
+            Compute::Device(_) => crate::Residency::Device,
+        }
+    }
+}

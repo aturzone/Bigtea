@@ -30,7 +30,7 @@ pub mod repack;
 mod weights;
 
 #[cfg(have_ggml)]
-pub use backend::{download, download_f32, upload, upload_f32, Backend, DeviceBuffer};
+pub use backend::{download, download_f32, upload, upload_f32, Backend, Compute, DeviceBuffer};
 // `device` is unconditional, unlike everything around it: it answers
 // `Unavailable` rather than vanishing when ggml is absent, so a caller can ask
 // "is there a GPU here?" in a build that cannot use one and get an answer

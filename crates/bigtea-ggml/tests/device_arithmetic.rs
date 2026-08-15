@@ -246,3 +246,62 @@ fn a_mixed_context_uploads_only_the_device_half() {
         "uploaded the wrong number of bytes"
     );
 }
+
+/// The same graph, written once, run on both targets — and they must agree.
+///
+/// This is the contract `stream.rs` will lean on: the forward pass is identical
+/// on both paths, and only context creation, allocation, transfer and execution
+/// differ. If those four are right, one body of graph code serves both. If they
+/// are not, the difference shows up here rather than as a model that answers
+/// slightly wrongly.
+#[test]
+fn one_graph_body_gives_the_same_answer_on_cpu_and_device() {
+    let _guard = one_at_a_time();
+
+    let (k, m, n) = (4usize, 3usize, 2usize);
+    let a: Vec<f32> = (0..k * m).map(|i| (i as f32) * 0.5 - 1.0).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| 2.0 - (i as f32) * 0.25).collect();
+
+    // Written once, closed over by both runs. That is the whole point: if this
+    // needed two versions, the abstraction would not be earning its place.
+    let evaluate = |compute: &bigtea_ggml::Compute<'_>| -> Vec<f32> {
+        let ctx = compute.context(16 * 1024 * 1024).expect("context");
+        let ta = ctx.new_f32_2d(k as i64, m as i64).expect("a");
+        let tb = ctx.new_f32_2d(k as i64, n as i64).expect("b");
+        let out = ctx.mul_mat(&ta, &tb).expect("mul_mat");
+        // After the graph, before the inputs.
+        let _buffer = compute.realize(&ctx).expect("realize");
+        compute.set_f32(&ta, &a).expect("set a");
+        compute.set_f32(&tb, &b).expect("set b");
+        compute.run(&ctx, &[&out]).expect("run");
+        compute.to_vec_f32(&out).expect("read back")
+    };
+
+    let on_cpu = evaluate(&bigtea_ggml::Compute::Cpu { threads: 4 });
+    let want = reference_mul_mat(&a, &b, k, m, n);
+    for (i, (g, w)) in on_cpu.iter().zip(&want).enumerate() {
+        assert!((g - w).abs() < 1e-4, "cpu element {i}: {g} vs {w}");
+    }
+
+    let Some(index) = discrete_gpu() else {
+        eprintln!("skipping the device half: no discrete GPU");
+        return;
+    };
+    let Ok(backend_handle) = Backend::open(index) else {
+        eprintln!("skipping the device half: device {index} would not initialise");
+        return;
+    };
+    let on_device = evaluate(&bigtea_ggml::Compute::Device(&backend_handle));
+
+    assert_eq!(
+        on_cpu.len(),
+        on_device.len(),
+        "shapes diverged between targets"
+    );
+    for (i, (c, d)) in on_cpu.iter().zip(&on_device).enumerate() {
+        assert!(
+            (c - d).abs() < 1e-4,
+            "element {i}: cpu {c}, device {d}\n  cpu    {on_cpu:?}\n  device {on_device:?}"
+        );
+    }
+}
