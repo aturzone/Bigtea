@@ -150,11 +150,43 @@ fn json(v: &Value) -> String {
 /// reference — the caller has to apply the same polyfill, and to do that it has
 /// to ask this question first.
 pub fn mentions_system_role(template: &str) -> bool {
-    // Substring rather than a parse: the question is whether the word appears
-    // at all, and a template that mentions it in a comment is one that its
-    // author thought about. False positives cost nothing here (the merge is
-    // simply not applied); a false negative silently drops the system prompt.
-    template.contains("'system'") || template.contains("\"system\"")
+    // Naming the role literally is the obvious way to support it.
+    if template.contains("'system'") || template.contains("\"system\"") {
+        return true;
+    }
+    // **And the non-obvious way: emitting the role instead of testing it.**
+    // ChatML templates write
+    //
+    //   {{ '<|im_start|>' + message['role'] + '\n' + message['content'] ... }}
+    //
+    // which handles *every* role, system included, without the word appearing
+    // anywhere. internlm2 does exactly this, and asking only for the literal
+    // said "no system branch" — so the system turn was merged into the user
+    // turn on a template that would have rendered it correctly, and llama.cpp
+    // emitted three turns where we emitted two.
+    //
+    // **The role has to be OUTPUT, not merely compared.** Phi-3 also contains
+    // `['role']`, in `{% if message['role'] == 'user' %}` conditions, and it
+    // genuinely has no system branch — it must still be merged. Testing for the
+    // substring anywhere would fix internlm2 by breaking Phi-3, which is the
+    // same trade the old test made in the other direction.
+    output_blocks(template).any(|b| b.contains("['role']") || b.contains("[\"role\"]"))
+}
+
+/// The contents of each `{{ … }}` block, which is where a template *emits*
+/// rather than *decides*.
+fn output_blocks(template: &str) -> impl Iterator<Item = &str> {
+    let mut rest = template;
+    std::iter::from_fn(move || {
+        let open = rest.find("{{")?;
+        let after = &rest[open + 2..];
+        // An unterminated `{{` is a broken template; the parser will say so
+        // properly. Nothing more to scan here.
+        let close = after.find("}}")?;
+        let block = &after[..close];
+        rest = &after[close + 2..];
+        Some(block)
+    })
 }
 
 /// Merge the system turn into the first user turn, llama.cpp's polyfill.
@@ -257,6 +289,41 @@ mod tests {
         let chatml =
             "{% for m in messages %}{% if m['role'] == 'system' %}y{% endif %}{% endfor %}";
         assert!(mentions_system_role(chatml));
+    }
+
+    #[test]
+    fn a_template_that_emits_the_role_supports_every_role_including_system() {
+        // internlm2's, and every ChatML template's: the role is INTERPOLATED,
+        // so system is handled without the word appearing anywhere. Asking only
+        // for the literal reported "no system branch", merged the system turn
+        // into the user turn, and produced two turns where llama.cpp produced
+        // three.
+        let chatml = "{% for m in messages %}{{'<|im_start|>' + m['role'] + '\\n' \
+                      + m['content'] + '<|im_end|>'}}{% endfor %}";
+        assert!(mentions_system_role(chatml));
+        assert!(mentions_system_role(
+            "{% for m in messages %}{{ m[\"role\"] }}{% endfor %}"
+        ));
+    }
+
+    #[test]
+    fn the_role_must_be_emitted_not_merely_compared() {
+        // The whole difficulty. Phi-3 also contains `['role']` -- inside an
+        // `{% if %}` condition -- and genuinely has no system branch, so it
+        // must still be merged. A substring test anywhere in the template would
+        // fix internlm2 by breaking Phi-3, which is the same trade the old
+        // version made in the other direction.
+        let compares_only =
+            "{% for m in messages %}{% if m['role'] == 'user' %}x{% endif %}{% endfor %}";
+        assert!(!mentions_system_role(compares_only));
+    }
+
+    #[test]
+    fn an_unterminated_output_block_does_not_hang_or_panic() {
+        // A broken template is the parser's business to report properly; this
+        // must not loop forever looking for a `}}` that never arrives.
+        assert!(!mentions_system_role("{{ m['role']"));
+        assert!(!mentions_system_role("{{"));
     }
 
     #[test]
