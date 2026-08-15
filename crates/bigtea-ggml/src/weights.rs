@@ -88,8 +88,56 @@ where
 /// Weights bound into a `ggml` context, backed by memory we own.
 ///
 /// Buffers are held here so they outlive every tensor pointing into them.
+/// Where one tensor's bytes live.
+///
+/// **Per tensor, not per model, and that is deliberate even though the first
+/// GPU phase only ever says `Device` for everything.** The interesting case —
+/// dense weights resident on the card while routed experts stream from disk —
+/// is per tensor by construction. A binary `Cpu | Device` baked into the load
+/// path would have to be torn out to get there, so the enum arrives now, when
+/// it costs one field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Residency {
+    /// Bound zero-copy: `ggml` is aimed at bytes we already hold.
+    Host,
+    /// Uploaded into device memory. `ggml_backend_tensor_set` **copies**, which
+    /// is the cost this whole tier is paying for.
+    #[default]
+    Device,
+}
+
+/// What one `place_on_device` call actually moved.
+///
+/// Returned rather than logged because the upload is a *product* number: 2.32
+/// GiB once at load is not a rounding error, and a 25x prefill that costs four
+/// seconds of upload is a different product from one that does not. The user
+/// experiences the sum, so the sum has to be printable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UploadReport {
+    pub tensors: usize,
+    pub bytes: usize,
+    pub seconds: f64,
+}
+
+impl UploadReport {
+    pub fn gib(&self) -> f64 {
+        self.bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Effective transfer rate, or `None` when nothing was uploaded.
+    pub fn gib_per_second(&self) -> Option<f64> {
+        (self.seconds > 0.0 && self.bytes > 0).then(|| self.gib() / self.seconds)
+    }
+}
+
 pub struct WeightSet<'ctx> {
     tensors: HashMap<String, Tensor<'ctx>>,
+    /// Device-resident tensors whose bytes have not been uploaded yet.
+    ///
+    /// They cannot be uploaded as they are bound: device memory is allocated
+    /// for a whole context at once, and that call has to come after every
+    /// tensor exists. So the bytes wait here and `place_on_device` drains them.
+    pending: Vec<(String, Arc<dyn WeightBytes>)>,
     /// The actual bytes, shared rather than owned outright.
     ///
     /// `Arc` because the streaming path binds the same expert slice over and
@@ -119,7 +167,90 @@ impl<'ctx> WeightSet<'ctx> {
             _repacked: Vec::new(),
             _shared_repacked: Vec::new(),
             repacked_bytes: 0,
+            pending: Vec::new(),
         }
+    }
+
+    /// Bind `data` at `residency`.
+    ///
+    /// [`Residency::Host`] is exactly [`Self::bind_shared`] — the zero-copy path
+    /// this engine is built on. [`Residency::Device`] creates the tensor with a
+    /// null data pointer and defers the bytes to [`Self::place_on_device`],
+    /// because device memory is allocated per context rather than per tensor.
+    pub fn bind_shared_at(
+        &mut self,
+        ctx: &'ctx Context,
+        name: &str,
+        ty: GgmlType,
+        dims: &[u64],
+        data: Arc<dyn WeightBytes>,
+        residency: Residency,
+    ) -> Result<(), GgmlError> {
+        match residency {
+            Residency::Host => self.bind_shared(ctx, name, ty, dims, data),
+            Residency::Device => {
+                let (ne0, ne1) = Self::shape_2d(dims)?;
+                let tensor = ctx.new_typed_2d(ty, ne0, ne1)?;
+                let expected = tensor.bytes();
+                let actual = data.as_bytes().len();
+                if actual != expected {
+                    return Err(GgmlError::WrongSize { expected, actual });
+                }
+                // No `set_data_ptr` here, and that is the whole difference: the
+                // tensor stays null so `ggml_backend_alloc_ctx_tensors_from_buft`
+                // gives it device memory. A tensor that already has a host
+                // pointer is skipped by that call, which is precisely what makes
+                // a mixed host/device context work without a scheduler.
+                self.tensors.insert(name.to_string(), tensor);
+                self.pending.push((name.to_string(), data));
+                Ok(())
+            }
+        }
+    }
+
+    /// How many tensors are waiting to be uploaded.
+    pub fn pending_uploads(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Allocate device memory for every device-resident tensor and upload them.
+    ///
+    /// **The ordering is enforced here rather than documented**: allocation
+    /// covers a whole context and must happen after every tensor exists, and
+    /// uploading must happen after allocation. Exposing the two steps separately
+    /// would make "upload before alloc" a call a caller could write, and it
+    /// writes into a null pointer.
+    ///
+    /// The returned [`DeviceBuffer`] owns the allocation — drop it and every
+    /// device tensor in the context is pointing at freed memory, exactly the
+    /// obligation this module's header describes for host buffers.
+    pub fn place_on_device(
+        &mut self,
+        backend: &crate::backend::Backend,
+        ctx: &Context,
+    ) -> Result<(crate::backend::DeviceBuffer, UploadReport), GgmlError> {
+        let buffer = backend.alloc(ctx)?;
+        let started = std::time::Instant::now();
+        let mut bytes = 0usize;
+        let pending = std::mem::take(&mut self.pending);
+        let tensors = pending.len();
+        for (name, data) in pending {
+            let tensor = self
+                .tensors
+                .get(&name)
+                .copied()
+                .ok_or(GgmlError::ArenaExhausted)?;
+            crate::backend::upload(&tensor, data.as_bytes())?;
+            bytes += data.as_bytes().len();
+        }
+        Ok((
+            buffer,
+            UploadReport {
+                tensors,
+                bytes,
+                seconds: started.elapsed().as_secs_f64(),
+            },
+        ))
     }
 
     /// Bind `data` as a tensor of `ty` with the given shape, taking ownership

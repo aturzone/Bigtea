@@ -160,3 +160,89 @@ fn opening_a_device_that_does_not_exist_is_an_error() {
         "opening device {far_past_the_end} should fail, not succeed"
     );
 }
+
+/// A mixed host/device context: allocation is safe, **computing it is not**.
+///
+/// Phase C — dense weights resident on the card, routed experts streaming from
+/// disk — is per-tensor residency by construction, so the question is whether
+/// ggml runs a two-place graph when nothing has told it to. Measured, in
+/// stages:
+///
+/// | step | outcome |
+/// |---|---|
+/// | bind one host, one device | fine |
+/// | build the graph | fine |
+/// | `place_on_device` | **fine, and correct** — uploads only the device tensor |
+/// | `ggml_backend_graph_compute` | **STATUS_ACCESS_VIOLATION** |
+///
+/// So `ggml_backend_alloc_ctx_tensors_from_buft` really does skip a tensor that
+/// already has a host pointer — the mixed context builds exactly as intended —
+/// and then the Vulkan backend dereferences that host pointer as device memory
+/// and the process dies. There is no error and no refusal.
+///
+/// **`ggml_backend_sched` is therefore mandatory for Phase C, not optional**,
+/// and this is the cheapest possible way to have learned it.
+///
+/// The compute step is not executed here on purpose. An access violation takes
+/// the whole test binary down and loses every other result — the failure mode
+/// CLAUDE.md records for the V4-Flash aborts — so it is written down rather
+/// than re-run. What IS asserted is the half that must keep working: the split
+/// itself, and that a host-bound tensor is never uploaded.
+#[test]
+fn a_mixed_context_uploads_only_the_device_half() {
+    let _guard = one_at_a_time();
+    let Some(index) = discrete_gpu() else {
+        eprintln!("skipping: no discrete GPU");
+        return;
+    };
+    let Ok(backend_handle) = Backend::open(index) else {
+        eprintln!("skipping: device {index} would not initialise");
+        return;
+    };
+
+    let (k, m, n) = (4usize, 3usize, 2usize);
+    let ctx = Context::new_no_alloc(16 * 1024 * 1024).expect("context");
+    let mut ws = bigtea_ggml::WeightSet::new();
+    let f32_ty = bigtea_gguf::GgmlType(0);
+
+    let a_bytes: Vec<u8> = (0..k * m).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let b_bytes: Vec<u8> = (0..k * n).flat_map(|i| (i as f32).to_le_bytes()).collect();
+
+    ws.bind_shared_at(
+        &ctx,
+        "a",
+        f32_ty,
+        &[k as u64, m as u64],
+        std::sync::Arc::new(a_bytes),
+        bigtea_ggml::Residency::Host,
+    )
+    .expect("bind host");
+    ws.bind_shared_at(
+        &ctx,
+        "b",
+        f32_ty,
+        &[k as u64, n as u64],
+        std::sync::Arc::new(b_bytes),
+        bigtea_ggml::Residency::Device,
+    )
+    .expect("bind device");
+    assert_eq!(
+        ws.pending_uploads(),
+        1,
+        "only the device tensor should wait"
+    );
+
+    let (_buffer, report) = ws
+        .place_on_device(&backend_handle, &ctx)
+        .expect("device placement");
+
+    assert_eq!(
+        report.tensors, 1,
+        "a host-bound tensor was uploaded; the zero-copy path is the whole          memory design and must never be silently copied to the card"
+    );
+    assert_eq!(
+        report.bytes,
+        k * n * 4,
+        "uploaded the wrong number of bytes"
+    );
+}
