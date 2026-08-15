@@ -177,6 +177,60 @@ fn flash_attn_off_is_refused_because_there_is_no_other_path() {
 }
 
 #[test]
+fn help_and_version_are_recognised_anywhere_not_only_first() {
+    // These were `args().nth(1)` comparisons, so `bigtea-run -m model.gguf
+    // --help` loaded the model and ran a completion instead of printing the
+    // option list. llama.cpp accepts all four in any position, and asking for
+    // help is precisely what a user does when they do not know where a flag
+    // goes -- the one case where position-sensitivity is most likely to bite.
+    let bin = env!("CARGO_BIN_EXE_bigtea-run");
+
+    let v = Command::new(bin)
+        .args(["-m", "nonexistent.gguf", "--version"])
+        .output()
+        .expect("cannot run bigtea-run");
+    assert!(v.status.success(), "--version after -m did not take effect");
+    let stdout = String::from_utf8_lossy(&v.stdout);
+    assert!(stdout.contains("bigtea-run"), "stdout was: {stdout}");
+
+    let h = Command::new(bin)
+        .args(["-m", "nonexistent.gguf", "--help"])
+        .output()
+        .expect("cannot run bigtea-run");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&h.stdout),
+        String::from_utf8_lossy(&h.stderr)
+    );
+    assert!(
+        text.contains("usage"),
+        "--help after -m printed no usage: {text}"
+    );
+    // It must not have tried to load the model instead.
+    assert!(
+        !text.contains("cannot open") && !text.contains("no model given"),
+        "--help after -m fell through to model loading: {text}"
+    );
+}
+
+#[test]
+fn a_prompt_after_the_escape_hatch_is_not_scanned_for_help() {
+    // `--` means everything after it is the prompt. A prompt containing the
+    // word `--help` must be completed, not intercepted -- otherwise the escape
+    // hatch is not one.
+    let out = Command::new(env!("CARGO_BIN_EXE_bigtea-run"))
+        .args(["--", "--help"])
+        .output()
+        .expect("cannot run bigtea-run");
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("no model given"),
+        "`-- --help` was intercepted as a help request: {err}"
+    );
+}
+
+#[test]
 fn a_declined_flag_says_why_and_does_not_merely_exit() {
     // Declining is only better than ignoring if the message is actionable. An
     // exit code alone leaves the caller unable to tell a refusal from a crash.

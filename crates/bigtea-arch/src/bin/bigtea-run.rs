@@ -1370,28 +1370,34 @@ fn main() -> ExitCode {
         .nth(1)
         .map(|a| a.starts_with('-') && a != "-")
         .unwrap_or(false);
-    // Before the positional model path is taken. `--version` as the first
-    // argument would otherwise *be* the path, and the runner would report that
-    // it cannot open a file called `--version`.
-    if let Some(first) = std::env::args().nth(1) {
-        if first == "--usage" {
-            // llama.cpp's alias for --help. Falls through to the usage block
-            // by leaving `path` unset.
-            eprintln!("usage: bigtea-run <model.gguf> \"prompt\" [options]");
-            eprintln!("  run with no arguments for the full option list");
-            return ExitCode::from(2);
-        }
-        if first == "--version" {
-            println!("bigtea-run {}", env!("CARGO_PKG_VERSION"));
-            return ExitCode::SUCCESS;
-        }
-        if first == "--help" || first == "-h" {
-            // Falls into the usage block below by leaving `path` unset, so
-            // there is one list rather than two that drift apart.
-            return usage();
-        }
-        if first == "--completion-bash" {
-            return completion_bash();
+    // Before the positional model path is taken. `--version` in that slot would
+    // otherwise *be* the path, and the runner would report that it cannot open a
+    // file called `--version`.
+    //
+    // **Scanned across every argument, not just the first.** These used to be
+    // `args().nth(1)` comparisons, so `bigtea-run -m model.gguf --help` loaded
+    // the model and ran a completion instead of printing the option list —
+    // llama.cpp accepts all four anywhere, and asking for help is the one thing
+    // a user does when they do not know where a flag goes. Anything after `--`
+    // is the prompt and is deliberately not scanned.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    for a in argv.iter().take_while(|a| *a != "--") {
+        match a.as_str() {
+            "--usage" => {
+                // llama.cpp's terse alias for --help.
+                eprintln!("usage: bigtea-run <model.gguf> \"prompt\" [options]");
+                eprintln!("  run with no arguments for the full option list");
+                return ExitCode::from(2);
+            }
+            "--version" => {
+                println!("bigtea-run {}", env!("CARGO_PKG_VERSION"));
+                return ExitCode::SUCCESS;
+            }
+            // One list rather than two that drift apart: this falls into the
+            // same usage block the no-argument path uses.
+            "--help" | "-h" => return usage(),
+            "--completion-bash" => return completion_bash(),
+            _ => {}
         }
     }
     let path_positional = if leads_with_flag { None } else { args.next() };
