@@ -1144,23 +1144,25 @@ const REFUSED: &[(&str, bool, &str)] = &[
     (
         "--split-mode",
         true,
-        "one device at a time: splitting a model across devices needs          ggml_backend_sched, and a mixed host/device graph segfaults without it",
+        "one device at a time; splitting a model across devices needs ggml_backend_sched to place each split, which exists but is not wired into the forward pass",
     ),
     (
         "--tensor-split",
         true,
-        "proportions across several devices, and only one device is used at a          time; needs the same scheduler as --split-mode",
+        "proportions across several devices, and only one device is used at a time; needs the same scheduler wiring as --split-mode",
     ),
     (
         "--kv-offload",
         false,
-        "the KV cache is host memory even on the device path; moving it needs          the cache push and the router to stop consuming host vectors",
+        "the KV cache is host memory even on the device path; moving it needs the cache push and the router to stop consuming host vectors",
     ),
-    ("--op-offload", false, "no GPU backend exists"),
+    // **This still said "no GPU backend exists" after the commit that claimed to
+    // have fixed it** -- three of the four were rewritten and this one was
+    // missed, which is exactly the drift the table exists to catch.
     (
-        "--override-tensor",
-        true,
-        "buffer-type overrides select a backend, and there is only one",
+        "--op-offload",
+        false,
+        "per-operation placement needs ggml_backend_sched driving the forward pass; today a BLOCK is wholly on the device or wholly on the host, and --override-tensor moves whole blocks",
     ),
     (
         "--backend-sampling",
@@ -1524,6 +1526,7 @@ fn main() -> ExitCode {
     // until `ggml_backend_sched` exists. See the `REFUSED` note on `-ngl`.
     let mut gpu_device: Option<usize> = None;
     let mut gpu_layers: Option<usize> = None;
+    let mut tensor_overrides: Vec<String> = Vec::new();
     let mut jinja = false;
     let mut loras: Vec<(String, f32)> = Vec::new();
     let mut cvecs: Vec<(String, f32)> = Vec::new();
@@ -2054,6 +2057,18 @@ fn main() -> ExitCode {
             // did not also pass `--device` would be technically correct and
             // useless. The first discrete GPU is picked when none was named;
             // `--device` still wins if both are given, in either order.
+            // **`-ot` implies a device too**, for the same reason `-ngl` does:
+            // `*_exps=CPU` is meaningless unless something else is on a card.
+            "-ot" | "--override-tensor" => {
+                let Some(v) = rest.get(i + 1) else {
+                    eprintln!(
+                        "bigtea-run: --override-tensor needs <pattern>=<CPU|GPU>,                          for example \"*_exps=CPU\""
+                    );
+                    return ExitCode::from(2);
+                };
+                tensor_overrides.push(v.clone());
+                i += 2;
+            }
             "-ngl" | "--gpu-layers" | "--n-gpu-layers" => {
                 let Some(v) = rest.get(i + 1).and_then(|v| v.parse::<usize>().ok()) else {
                     eprintln!(
@@ -2985,6 +3000,7 @@ fn main() -> ExitCode {
         },
         gpu_device,
         gpu_layers,
+        tensor_overrides,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -3031,6 +3047,7 @@ fn run_streaming(
     gpu_device: Option<usize>,
     // llama.cpp's `-ngl`. `None` means every block, once a device is open.
     gpu_layers: Option<usize>,
+    tensor_overrides: Vec<String>,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -3178,7 +3195,13 @@ fn run_streaming(
     // `-ngl 0` is the one case that opens nothing: the user asked for zero
     // layers on the card, and opening a device to then use none of it would
     // pay the initialisation and report a GPU run that is not one.
-    let want_device = match (gpu_device, gpu_layers) {
+    let want_device = match (gpu_device, gpu_layers.or(if tensor_overrides.is_empty() {
+        None
+    } else {
+        // `-ot` alone means "the model is on the card except these", so it
+        // implies a full offload that the rules then carve into.
+        Some(usize::MAX)
+    })) {
         (Some(i), _) => Some(i),
         (None, Some(0)) => None,
         // `-ngl N` with no `--device`: pick the first discrete GPU, because
@@ -3206,6 +3229,10 @@ fn run_streaming(
             },
             Err(e) => return Err(format!("--device {index}: {e}").into()),
         }
+        if !tensor_overrides.is_empty() {
+            runner.set_tensor_overrides(&tensor_overrides)?;
+            bigtea_arch::info!("overrides  {} tensor rule(s)", tensor_overrides.len());
+        }
     }
 
     let ctx = Context::new_no_alloc(64 << 20)?;
@@ -3220,7 +3247,7 @@ fn run_streaming(
         // given: `usize::MAX` exceeds every block count.
         let (bytes, buffer, report) =
             runner.load_resident_split(&ctx, &mut weights, runner_gpu_layers)?;
-        _device_buffer = Some(buffer);
+        _device_buffer = buffer;
         // The upload is the tier's real cost and the one number a reader will
         // want next to the speedup, so it is printed rather than folded into
         // the load time.
@@ -3788,6 +3815,7 @@ fn run(
     gpu_device: Option<usize>,
     // llama.cpp's `-ngl`. `None` means every block, once a device is open.
     gpu_layers: Option<usize>,
+    tensor_overrides: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -4088,6 +4116,7 @@ fn run(
         reasoning,
         gpu_device,
         gpu_layers,
+        tensor_overrides,
         t0,
     )
 }
