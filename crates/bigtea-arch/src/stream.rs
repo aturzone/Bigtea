@@ -986,6 +986,7 @@ impl<'m> StreamingRunner<'m> {
                             .copy_from_slice(&normed[t * n_embd..(t + 1) * n_embd]);
                     }
                     let xt = ctx.new_f32_2d(n_embd_i, m)?;
+                    xt.set_input();
                     xt.set_f32(&gathered)?;
 
                     let g = ctx.mul_mat(ws.get("gate").expect("bound"), &xt)?;
@@ -1077,6 +1078,7 @@ impl<'m> StreamingRunner<'m> {
             let ctx = unsafe { Context::in_buffer(&mut buf, false)? };
             let mut ws = WeightSet::new();
             let xt = ctx.new_f32_2d(n_embd, 1)?;
+            xt.set_input();
             xt.set_f32(&normed[..n_embd as usize])?;
 
             let mut total: Option<Tensor> = None;
@@ -1351,6 +1353,7 @@ impl<'m> StreamingRunner<'m> {
             )?;
 
             let xt = ctx.new_f32_2d(n_embd, 1)?;
+            xt.set_input();
             xt.set_f32(x)?;
 
             let g = ctx.mul_mat(ws.get("gate").expect("bound"), &xt)?;
@@ -1948,6 +1951,7 @@ impl<'m> StreamingRunner<'m> {
             );
             let ctx = cmp.context(arena_for(&[(n_embd, n_new)], 8))?;
             let tok = ctx.new_i32_1d(n_new)?;
+            tok.set_input();
             let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
             let emb = weights
                 .get("token_embd.weight")
@@ -2026,8 +2030,10 @@ impl<'m> StreamingRunner<'m> {
                     32,
                 ))?;
                 let xt = ctx.new_f32_2d(n_embd, n_new)?;
+                xt.set_input();
                 let xt_values = x.clone();
                 let pos = ctx.new_i32_1d(n_new)?;
+                pos.set_input();
                 // Written after `realize`, with `xt`, and NOT here. On a device
                 // this tensor has no memory until the context is realized, and
                 // writing early is a segfault rather than an error -- which is
@@ -2233,6 +2239,7 @@ impl<'m> StreamingRunner<'m> {
                 // mixed-residency test recorded.
                 let ctx = unsafe { cmp.context_in_buffer(&mut buf)? };
                 let q = ctx.new_f32_3d(head_dim, n_head, n_new)?;
+                q.set_input();
 
                 // Whatever the cache stores, handed over unchanged — no
                 // conversion on this path at all. ggml's fused attention
@@ -2242,19 +2249,16 @@ impl<'m> StreamingRunner<'m> {
                 // closed set rather than an arbitrary id.
                 let tkv = std::time::Instant::now();
                 let kv_ty = bigtea_gguf::GgmlType(cache.kind().ggml_type());
-                let k_all = ctx.reshape_3d(
-                    &ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?,
-                    head_dim,
-                    n_kv,
-                    n_total,
-                )?;
+                // Named rather than inlined so the INPUT flag lands on the base
+                // tensor: a reshape is a view, and flagging the view leaves the
+                // thing the scheduler must actually place unmarked.
+                let k_base = ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?;
+                k_base.set_input();
+                let k_all = ctx.reshape_3d(&k_base, head_dim, n_kv, n_total)?;
                 let k_bytes = cache.keys(il as usize);
-                let v_all = ctx.reshape_3d(
-                    &ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?,
-                    head_dim,
-                    n_kv,
-                    n_total,
-                )?;
+                let v_base = ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?;
+                v_base.set_input();
+                let v_all = ctx.reshape_3d(&v_base, head_dim, n_kv, n_total)?;
                 let v_bytes = cache.values(il as usize);
                 let kv_secs = tkv.elapsed().as_secs_f64();
 
@@ -2263,6 +2267,9 @@ impl<'m> StreamingRunner<'m> {
                 // graph is complete.
                 let (attn, mask_t) =
                     arch.attention_flash(&ctx, &q, &k_all, &v_all, n_new, n_total, layer_mask)?;
+                // The builder creates the mask and returns it unwritten, so the
+                // flag is set here rather than inside every architecture.
+                mask_t.set_input();
                 let out = ctx.mul_mat(&out_w, &attn)?;
                 // StarCoder2 carries a bias here; most architectures do not.
                 let out =
@@ -2350,6 +2357,7 @@ impl<'m> StreamingRunner<'m> {
                 );
                 let ctx = cmp.context(arena_for(&shapes, 24))?;
                 let xt = ctx.new_f32_2d(n_embd, n_new)?;
+                xt.set_input();
                 // **Which normalisation the FFN reads is the whole difference
                 // between a serial and a parallel block.**
                 //
@@ -2359,6 +2367,7 @@ impl<'m> StreamingRunner<'m> {
                 // The residual add below is identical either way, because `xt`
                 // already holds `x + attn`. Only the FFN's input moves.
                 let pre = ctx.new_f32_2d(n_embd, n_new)?;
+                pre.set_input();
                 let normed = if c.parallel_residual {
                     self.arch
                         .norm_named(&ctx, weights, &pre, &format!("blk.{il}.attn_norm"))?
@@ -2435,6 +2444,7 @@ impl<'m> StreamingRunner<'m> {
             16,
         ))?;
         let xt = ctx.new_f32_2d(n_embd, 1)?;
+        xt.set_input();
         let head_input: Vec<f32> = x[last..].to_vec();
         let normed = self.arch.norm_named(&ctx, weights, &xt, "output_norm")?;
         // **The embedding is this tensor, one step before the projection.**
