@@ -210,7 +210,28 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { path: dist, merge-multiple: true }
       - run: ls -la dist
-      - name: Upload
+      # **A tag push creates a tag, not a release.** `gh release upload` alone
+      # exits 1 with `release not found`, which is what happened the first time
+      # this workflow ever ran against a real tag: all three archives built and
+      # were then thrown away at the last step. Create it if it is missing, and
+      # keep the upload separate so a re-run over an existing release still
+      # replaces the artefacts rather than failing.
+      - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if ! gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            # --verify-tag refuses to invent a tag that does not exist, and
+            # --notes-from-tag uses the annotated tag's own message rather than
+            # generating a commit list nobody wrote.
+            gh release create "$TAG" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "$TAG" \
+              --notes-from-tag \
+              --verify-tag
+          fi
+          gh release upload "$TAG" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+          echo "### Published \`$TAG\`" >> $GITHUB_STEP_SUMMARY
+          gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" --json assets \
+            -q '.assets[] | "- \(.name)  \(.size) bytes"' >> $GITHUB_STEP_SUMMARY
