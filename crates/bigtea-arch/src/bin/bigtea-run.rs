@@ -1144,12 +1144,12 @@ const REFUSED: &[(&str, bool, &str)] = &[
     (
         "--split-mode",
         true,
-        "one device at a time; splitting a model across devices needs ggml_backend_sched to place each split, which exists but is not wired into the forward pass",
+        "the scheduler IS wired into the forward pass now (see --op-offload); what is missing is a SECOND USABLE DEVICE. This machine's other GPU is an integrated one that is slower than the CPU path, so splitting across devices cannot be verified here and will not be claimed unverified",
     ),
     (
         "--tensor-split",
         true,
-        "proportions across several devices, and only one device is used at a time; needs the same scheduler wiring as --split-mode",
+        "proportions across several devices, and there is only one usable device here -- same blocker as --split-mode, and it is hardware rather than code",
     ),
     (
         "--kv-offload",
@@ -1159,7 +1159,7 @@ const REFUSED: &[(&str, bool, &str)] = &[
     (
         "--backend-sampling",
         false,
-        "sampling runs on the host; there is no other backend to run it on",
+        "sampling runs on the host. A device exists now, so the old reason was wrong: what is missing is that sampling is Rust over a logits vector rather than a ggml graph, and only a graph can be scheduled onto a backend",
     ),
     // --- draft models. Speculative decoding was measured at ~1.4x here rather
     // than the literature's 2.2x, and below an acceptance rate of ~0.75 it is a
@@ -1191,7 +1191,7 @@ const REFUSED: &[(&str, bool, &str)] = &[
     (
         "--no-host",
         false,
-        "this is a CLI, not a server; see `bigtea-serve`",
+        "llama.cpp's flag bypasses the host buffer so extra buffer types can be used. Here the DEFAULT already binds host weights zero-copy with no buffer at all, so the flag is a no-op -- except under --op-offload, where host buffers are what makes a split copyable and removing them is a segfault",
     ),
     ("--no-mmproj", false, "no multimodal projector support"),
     // --- Jinja WAS refused here, and the entry outlived the refusal. `--jinja`
@@ -1208,9 +1208,9 @@ const REFUSED: &[(&str, bool, &str)] = &[
     (
         "--poll",
         true,
-        "ggml owns its threadpool here; `-t`/`-tb` are the levers that exist",
+        "ggml does expose ggml_threadpool_new, so this is reachable; we call ggml_graph_compute_with_ctx, which builds a transient plan with no threadpool. Not done because ggml_threadpool_params carries a fixed-size cpumask array and a mistranscribed FFI struct is silent corruption in the path every graph uses -- a bad trade for a polling knob. `-t`/`-tb` are the levers that exist",
     ),
-    ("--poll-batch", true, "ggml owns its threadpool here"),
+    ("--poll-batch", true, "same as --poll: reachable through ggml_threadpool_new, not worth a hand-transcribed params struct in the shared compute path"),
 ];
 
 /// Whether `flag` is refused, and the message if so.
