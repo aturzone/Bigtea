@@ -1161,8 +1161,6 @@ impl<'m> StreamingRunner<'m> {
             wanted.push((up_name.to_string(), e));
             wanted.push((down_name.to_string(), e));
         }
-        let fetched = self.read_slices_parallel(&wanted)?;
-
         let experts: Vec<(u32, f32)> = by_expert.iter().map(|(&e, m)| (e, m[0].1)).collect();
         let names = (gate_name, up_name, down_name);
         let types = (gate_ty, up_ty, down_ty);
@@ -1187,6 +1185,7 @@ impl<'m> StreamingRunner<'m> {
         // i.e. plausibly DRAM-bound, in which case more threads buy nothing.
         // That is a measurement, not a guess to ship on.
         let workers = self.expert_workers(experts.len());
+        let fetched = self.read_slices_parallel(&wanted)?;
         let (out, secs) = if workers <= 1 {
             let mut buf = std::mem::take(&mut self.scratch);
             let r = Self::expert_chunk(
@@ -1195,6 +1194,19 @@ impl<'m> StreamingRunner<'m> {
             self.scratch = buf;
             r?
         } else {
+            // **Read-then-compute, not pipelined, and that was measured.**
+            //
+            // Reading chunk k+1 while the workers computing 0..k keep the cores
+            // busy is the obvious next move -- disk is 3.2s and expert compute
+            // 1.7s of an 8.3s run, apparently additive. It was built, gave
+            // byte-identical output, and measured **3.28 against 3.19 tok/s,
+            // ahead in 3 of 4 alternating pairs**: ~1.03x, inside the noise.
+            //
+            // The aggregate misled. The cache absorbs 64-70% of expert reads, so
+            // the part that actually touches the disk is far smaller than "3.2s
+            // disk" suggests, and chunking the fetch gives up read concurrency
+            // to buy overlap that is mostly not there. Reverted rather than kept
+            // -- an unmeasurable win is not worth a concurrency structure.
             let chunk = experts.len().div_ceil(workers);
             let mut pool = std::mem::take(&mut self.expert_scratch);
             pool.resize_with(workers, Vec::new);
