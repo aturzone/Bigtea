@@ -2176,6 +2176,52 @@ element-sum comparisons against llama.cpp — the overlap changes *when* bytes a
 read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
 `BIGTEA_PREFETCH_READERS` tunes the split.
 
+## V4-Flash measured, and the parallel-experts port is dead (2026-08-16)
+
+**The flagship model now has a baseline taken with repeats rather than
+remembered.** Three alternating rounds, one session, greedy:
+
+| | run 1 | run 2 | run 3 | median |
+|---|---:|---:|---:|---:|
+| generation, 7 tokens | 0.387 | 0.396 | 0.400 | **0.396 tok/s** |
+| prefill, 51 tokens | 1.53 | 1.54 | 1.52 | **1.53 tok/s** |
+| prefill, 5 tokens | 0.62 | 0.63 | 0.63 | **0.63 tok/s** |
+
+Spread 3.3% on generation, 1.3% on prefill — tighter than this machine usually
+manages, and worth recording so the next session knows what counts as a real
+move. 8.6 GiB free; 0.85 GiB of the always-read set did not fit and was re-read
+every token.
+
+**Where a V4-Flash token goes**, which had never been written down because the
+block's single `compute` was buried in the residual of the phase table:
+
+| phase | per token | share |
+|---|---:|---:|
+| **expert slice read (disk)** | **1.70 s** | **67%** |
+| block `compute` — attention, both FFNs | 0.44 s | 17% |
+| `tail` — routing, which forces an early compute | 0.40 s | 16% |
+| dense binds | 0.01 s | <1% |
+
+**So porting `parallel-experts` here cannot pay, and the ceiling is measured.** A
+throwaway build that kept the read and dropped the three routed `mul_mat_id`
+calls ran **0.388 against 0.370 tok/s** and moved `compute` by **0.01 s of
+0.44** — the whole routed expert arithmetic is **under 5% of a token**, so
+perfect parallelisation at zero overhead is worth at most 1.05x.
+
+**The other premise was also wrong.** `read_expert_slices` packs the selected
+slices contiguously *as it reads them*, so this path already runs the batched
+`mul_mat_id` form — the ~1.02 GB/token gather that killed the Qwen3 version is
+here the read that had to happen anyway. No headroom and no mechanism.
+
+**The drive is not the fixable part either.** `bigtea-iobench` on a shard of this
+model tops out at **2.74 GiB/s at four handles** and does not climb at 8, 16 or
+32, so the 8-handle pool is not the limit. The gap to the achieved 1.88 GiB/s is
+the **per-block barrier**: nothing can be queued while a block computes, because
+what to read next is decided by the routing that block has not produced yet.
+Same wall as `v4flash-has-no-slack-2026-08-10.md`, reached from latency instead
+of bytes. Full node:
+`research/parallel-experts-do-not-transfer-2026-08-16.md`.
+
 ## Six declined-flag reasons were wrong, again (2026-08-16)
 
 The declined table drifted twice today and was audited a third time. **Four

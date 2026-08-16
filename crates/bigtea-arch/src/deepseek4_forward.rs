@@ -2178,6 +2178,18 @@ fn ffn<'c>(
             config.n_expert,
         );
     }
+    // **Do not parallelise across experts here.** `stream.rs` runs N whole
+    // experts side by side with one ggml thread each and gains 1.29x on expert
+    // compute; on this path the same change cannot pay, and the ceiling was
+    // measured rather than argued. A throwaway build that kept the disk read
+    // and dropped the three `mul_mat_id` calls below ran generation at 0.388
+    // against 0.370 tok/s, and moved the block's `compute` phase by 0.01s of
+    // 0.44 -- so **the entire routed expert arithmetic is under 5% of a
+    // V4-Flash token**, against 67% for the slice read. There is also nothing
+    // to gather: `read_expert_slices` packs the selected slices contiguously as
+    // it reads them, so this path already has the batched form that cost
+    // ~1.02 GB/token on the Qwen3 path. See
+    // `research/parallel-experts-do-not-transfer-2026-08-16.md`.
     let n_uniq = unique.len() as i64;
     let ids_t = ctx.new_i32_2d(n_used, nt)?;
     ids_t.set_i32(&compact)?;
@@ -2540,11 +2552,17 @@ pub fn block(
     let ffn_secs = t_phase.elapsed().as_secs_f64();
 
     let out = ctx.dsv4_hc_post(&ffn_out, &streams, &ffn_gates.post, &ffn_gates.comb)?;
+    // The block builds one graph and evaluates it here, so every phase timer
+    // above measures graph *construction* (plus, in `ffn`, the disk read). This
+    // is the only line where arithmetic actually happens, and leaving it inside
+    // the residual hid the fact that a V4-Flash token is 55% disk and 29% this.
+    let t_phase = std::time::Instant::now();
     ctx.compute(&out, threads())?;
+    let compute_secs = t_phase.elapsed().as_secs_f64();
 
     if std::env::var("BIGTEA_BLOCK_TIMING").is_ok() {
         eprintln!(
-            "  block {il:>2}  arena {arena_secs:.2}  dense {dense_secs:.2} ({:.0} MiB)               qkv {qkv_secs:.2}  attn {attn_secs:.2}  tail {tail_secs:.2}  ffn {ffn_secs:.2}               total {:.2}",
+            "  block {il:>2}  arena {arena_secs:.2}  dense {dense_secs:.2} ({:.0} MiB)               qkv {qkv_secs:.2}  attn {attn_secs:.2}  tail {tail_secs:.2}  ffn {ffn_secs:.2}  compute {compute_secs:.2}               total {:.2}",
             dense_bytes as f64 / (1 << 20) as f64,
             t_block.elapsed().as_secs_f64(),
         );
