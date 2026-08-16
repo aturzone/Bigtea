@@ -2022,6 +2022,7 @@ mod tests {
             rope_type_is_known: true,
             fused_qkv: false,
             fused_gate_up: false,
+            parallel_residual: false,
             post_norms: false,
             scale_embeddings: false,
             attn_scale_dim: 16,
