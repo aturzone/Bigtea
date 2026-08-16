@@ -2176,6 +2176,34 @@ element-sum comparisons against llama.cpp — the overlap changes *when* bytes a
 read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
 `BIGTEA_PREFETCH_READERS` tunes the split.
 
+## The GPU does not help a streaming MoE model — 4.3x slower (2026-08-16)
+
+`-ngl` is a smooth win on a dense model. On the model this project exists for it
+is a large loss. Qwen3-30B-A3B, medians of three, spread under 2%:
+
+| | prefill tok/s | generation tok/s |
+|---|---:|---:|
+| CPU only | 1.30 | **2.61** |
+| `-ngl 12` (of 48) | 1.30 | 1.44 |
+| `-ngl 48` | 1.09 | **0.61** |
+
+**Not a bug.** 76% of a token is disk, and **the experts run on the host
+whatever `-ngl` says** — they stream per block into host memory and their FFN
+builds its own CPU context. `-ngl` places only the resident set: 0.93 GiB, about
+5% of what a token actually reads. So offloading moves the small part, leaves
+the large part, and adds a host round trip for the activation at every one of 48
+blocks. Putting the experts on the card is not available either — ~16 GiB
+against 5.11 GiB of VRAM, the same wall that made the model stream.
+
+**The rule: a speedup measured on a model that fits does not transfer to one
+that does not.** Every GPU number published here — 25.6x on a kernel,
+1.33–1.52x on a Qwen3-4B prefill, 1.79x on the `-ngl` frontier — was measured on
+a model that fits, and none of them predicted this one.
+
+`bigtea-run` warns, with the measurement in the message, when a device is opened
+on a model that streams experts. Full node:
+`research/gpu-does-not-help-streaming-moe-2026-08-16.md`.
+
 ## `--op-offload` works, and it cannot pay yet (2026-08-16)
 
 The scheduled forward pass runs. `--op-offload` is implemented, produces the
