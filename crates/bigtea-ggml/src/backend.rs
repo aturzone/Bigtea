@@ -75,7 +75,7 @@ impl Drop for Backend {
     }
 }
 
-mod ffi {
+pub(crate) mod ffi {
     use std::os::raw::{c_char, c_int, c_void};
 
     pub type DevT = *mut c_void;
@@ -121,6 +121,13 @@ mod ffi {
         pub fn ggml_gallocr_reserve(galloc: GallocT, graph: *mut c_void) -> bool;
         pub fn ggml_gallocr_alloc_graph(galloc: GallocT, graph: *mut c_void) -> bool;
         pub fn ggml_gallocr_get_buffer_size(galloc: GallocT, buffer_id: c_int) -> usize;
+
+        // The host backend, from ggml-cpu.h. Not reached through the device
+        // registry: a scheduler needs a host fallback that is present whatever
+        // the registry enumerated.
+        pub fn ggml_backend_cpu_init() -> BackendT;
+        pub fn ggml_backend_cpu_set_n_threads(backend: BackendT, n_threads: c_int);
+        pub fn ggml_backend_cpu_buffer_type() -> BufferTypeT;
     }
 }
 
@@ -159,6 +166,70 @@ impl Backend {
         self.index
     }
 
+    /// The ggml handle, for the one caller that must pass it on: the scheduler,
+    /// which takes an array of backends rather than opening its own.
+    pub(crate) fn as_raw(&self) -> ffi::BackendT {
+        self.raw.as_ptr()
+    }
+
+    /// The buffer type this backend allocates from.
+    ///
+    /// Both allocators need it and both were resolving it themselves through
+    /// `dev_get` + `dev_buffer_type`; the scheduler needs it a third time, in an
+    /// array parallel to its backends. Three copies of a two-call sequence is
+    /// where it stops being a detail.
+    pub(crate) fn buffer_type(&self) -> Result<ffi::BufferTypeT, GgmlError> {
+        // **The CPU handle has no registry index.** `dev_get(usize::MAX)` is the
+        // aborting assert again, reached from a path that looks like a getter.
+        if self.index == Self::CPU_INDEX {
+            // SAFETY: a process-lifetime singleton, valid before any init.
+            let buft = unsafe { ffi::ggml_backend_cpu_buffer_type() };
+            return NonNull::new(buft)
+                .map(|_| buft)
+                .ok_or(GgmlError::DeviceInitFailed(self.index));
+        }
+        // SAFETY: the device is registry-owned and outlives the process; the
+        // buffer type it returns is owned by the backend, not by us.
+        let dev = unsafe { ffi::ggml_backend_dev_get(self.index) };
+        let buft = unsafe { ffi::ggml_backend_dev_buffer_type(dev) };
+        if buft.is_null() {
+            return Err(GgmlError::DeviceInitFailed(self.index));
+        }
+        Ok(buft)
+    }
+
+    /// Open the **CPU** backend.
+    ///
+    /// Not `open(cpu_index)`: a scheduler needs a host backend to fall back to
+    /// whatever the registry happens to enumerate, and `ggml_backend_cpu_init`
+    /// is the one that is always there. Without it there is nothing to schedule
+    /// *against* — a single-backend scheduler is an expensive `gallocr`.
+    pub fn cpu() -> Result<Self, GgmlError> {
+        // SAFETY: the CPU backend needs no device and never fails in practice;
+        // a null is still handled rather than assumed away.
+        let raw = unsafe { ffi::ggml_backend_cpu_init() };
+        let raw = NonNull::new(raw).ok_or(GgmlError::DeviceInitFailed(usize::MAX))?;
+        Ok(Self {
+            raw,
+            index: Self::CPU_INDEX,
+        })
+    }
+
+    /// Marks a handle that came from [`Self::cpu`] rather than from the registry.
+    ///
+    /// `buffer_type` would otherwise call `ggml_backend_dev_get(usize::MAX)`,
+    /// which **aborts** — the same assert `open` bounds-checks against.
+    pub(crate) const CPU_INDEX: usize = usize::MAX;
+
+    /// How many threads the CPU backend runs graphs on. No effect on a device.
+    pub fn set_threads(&self, threads: usize) {
+        if self.index != Self::CPU_INDEX {
+            return;
+        }
+        // SAFETY: `raw` is a live CPU backend; the call is a plain setter.
+        unsafe { ffi::ggml_backend_cpu_set_n_threads(self.raw.as_ptr(), threads.max(1) as i32) };
+    }
+
     /// Allocate device memory for **every tensor in `ctx` that has none**.
     ///
     /// The context must have been created with `no_alloc`, which is already how
@@ -168,12 +239,7 @@ impl Backend {
     /// One allocation covers the whole context, including graph intermediates,
     /// which is why it is called after the graph is built and not before.
     pub fn alloc(&self, ctx: &Context) -> Result<DeviceBuffer, GgmlError> {
-        // SAFETY: `dev` is live; `buft` is owned by the backend, not by us.
-        let dev = unsafe { ffi::ggml_backend_dev_get(self.index) };
-        let buft = unsafe { ffi::ggml_backend_dev_buffer_type(dev) };
-        if buft.is_null() {
-            return Err(GgmlError::DeviceInitFailed(self.index));
-        }
+        let buft = self.buffer_type()?;
         // SAFETY: `ctx` is a live context whose tensors have null data.
         let raw = unsafe { ffi::ggml_backend_alloc_ctx_tensors_from_buft(ctx.as_raw(), buft) };
         let raw = NonNull::new(raw).ok_or(GgmlError::DeviceOutOfMemory)?;
@@ -536,13 +602,7 @@ impl GraphAllocator {
         }
         #[cfg(have_ggml)]
         {
-            // SAFETY: the device is registry-owned and outlives the process;
-            // the buffer type it returns is owned by the backend, not by us.
-            let dev = unsafe { ffi::ggml_backend_dev_get(backend.device_index()) };
-            let buft = unsafe { ffi::ggml_backend_dev_buffer_type(dev) };
-            if buft.is_null() {
-                return Err(GgmlError::DeviceInitFailed(backend.device_index()));
-            }
+            let buft = backend.buffer_type()?;
             // SAFETY: `buft` is a live buffer type from the registry.
             let raw = unsafe { ffi::ggml_gallocr_new(buft) };
             NonNull::new(raw)

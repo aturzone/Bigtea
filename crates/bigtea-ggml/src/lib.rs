@@ -27,6 +27,8 @@ pub mod backend;
 pub mod device;
 mod graph;
 pub mod repack;
+#[cfg(have_ggml)]
+pub mod sched;
 mod weights;
 
 #[cfg(have_ggml)]
@@ -41,6 +43,8 @@ pub use device::{best_offload_device, devices, vulkan_available, DeviceInfo, Dev
 #[cfg(have_ggml)]
 pub use graph::{arena_for, f16_to_f32, f32_to_f16, Context, RopeParams, Tensor};
 pub use repack::{is_repackable, Repacked};
+#[cfg(have_ggml)]
+pub use sched::{HostBuffer, Scheduler};
 #[cfg(have_ggml)]
 pub use weights::{Residency, UploadReport, WeightSet};
 
@@ -70,6 +74,15 @@ pub enum GgmlError {
     /// *card* is full, and the answer is a smaller model or fewer resident
     /// layers rather than a bigger arena.
     DeviceOutOfMemory,
+    /// Host memory offered to ggml as a buffer is not `TENSOR_ALIGNMENT`-aligned.
+    ///
+    /// **This one exists because ggml aborts instead of refusing.**
+    /// `ggml_backend_cpu_buffer_from_ptr` asserts the pointer is 32-aligned and
+    /// a `Vec<u8>` is aligned to 1, so the natural call takes the whole process
+    /// down with `GGML_ASSERT ... "buffer pointer must be aligned"` — reported
+    /// as "process didn't exit successfully", not as a failure anyone can
+    /// catch. Checked on our side so it becomes a value.
+    Misaligned { address: usize, required: usize },
 }
 
 impl fmt::Display for GgmlError {
@@ -110,6 +123,12 @@ impl fmt::Display for GgmlError {
             GgmlError::DeviceOutOfMemory => f.write_str(
                 "the device could not allocate the requested tensors; it is out of memory, \
                  which needs a smaller model rather than a bigger arena",
+            ),
+            GgmlError::Misaligned { address, required } => write!(
+                f,
+                "host memory at {address:#x} is {} bytes off a {required}-byte boundary; \
+                 ggml requires buffer pointers and tensor offsets to be {required}-aligned",
+                address % required
             ),
         }
     }
