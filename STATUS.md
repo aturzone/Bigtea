@@ -2176,6 +2176,40 @@ element-sum comparisons against llama.cpp — the overlap changes *when* bytes a
 read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
 `BIGTEA_PREFETCH_READERS` tunes the split.
 
+## The scheduled forward pass is built and does not work (2026-08-16)
+
+Running every graph through `ggml_backend_sched` is what `--op-offload`,
+`--split-mode`, `--tensor-split` and a block-splitting `-ot` all wait on. The
+path is built end to end on `ticket/r25-scheduled-forward-pass` and it is **not
+merged**, because it aborts.
+
+**The scheduler demonstrably does its job.** With every weight on the host,
+`GGML_SCHED_DEBUG=2` shows it putting the embedding lookup on the CPU, moving
+the QKV matmuls onto Vulkan, and copying the host weights across the boundary —
+the first mixed graph this engine has ever run.
+
+**Then the third graph, attention, splits and dies in allocation:**
+`ggml-alloc.c:623 GGML_ASSERT(buffer_id >= 0)` — a node the split left
+unassigned. Attention is the only graph built in a caller-owned scratch buffer
+*and* the only one full of views over the KV cache, so a view whose `view_src`
+is unassigned is the hypothesis. Untested.
+
+Reserving before allocating did not fix it **and broke two passing scheduler
+tests**, which is its own answer.
+
+**The cost this exposed survives regardless of the bug.** A scheduled graph
+cannot use repacked weights — repacking is the layout the CPU kernels want, and
+a scheduler that may hand the tensor to Vulkan makes it wrong rather than merely
+unhelpful. That is **1.39x of CPU prefill** as the entry price. With 2.33 GiB of
+weights and a ~2.6 GiB/s bus, a pass that copies them costs ~0.9 s: a clear loss
+against a 22-token prefill (0.5 s on CPU), noise against a 4096-token one.
+**`--op-offload` is a long-prefill flag or it is nothing**, and that belongs on
+the record before anyone measures it on a short prompt and blames the scheduler.
+
+The flag stays in `REFUSED` with a reason that names the assert. A flag that
+kills the process is worse than one that refuses. Full node:
+`research/scheduled-forward-pass-2026-08-16.md`.
+
 ## The offload frontier is a smooth dial (2026-08-16)
 
 `-ngl` shipped with no performance number, which is a gap: a placement flag

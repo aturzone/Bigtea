@@ -1156,13 +1156,16 @@ const REFUSED: &[(&str, bool, &str)] = &[
         false,
         "the KV cache is host memory even on the device path; moving it needs the cache push and the router to stop consuming host vectors",
     ),
-    // **This still said "no GPU backend exists" after the commit that claimed to
-    // have fixed it** -- three of the four were rewritten and this one was
-    // missed, which is exactly the drift the table exists to catch.
+    // **BUILT, AND IT DOES NOT WORK YET** -- `ticket/r25-scheduled-forward-pass`
+    // carries the whole scheduled path, and `GGML_SCHED_DEBUG=2` shows the
+    // scheduler correctly moving matmuls onto Vulkan with host weights copied
+    // in. The third graph then dies in allocation. The reason below is what was
+    // measured rather than what is missing, which is a different and more
+    // useful thing to tell a reader.
     (
         "--op-offload",
         false,
-        "per-operation placement needs ggml_backend_sched driving the forward pass; today a BLOCK is wholly on the device or wholly on the host, and --override-tensor moves whole blocks",
+        "the scheduled path is built and aborts on the attention graph with ggml-alloc.c GGML_ASSERT(buffer_id >= 0) -- a node ggml_backend_sched left unassigned. Declined rather than shipped, because a flag that kills the process is worse than one that refuses",
     ),
     (
         "--backend-sampling",
