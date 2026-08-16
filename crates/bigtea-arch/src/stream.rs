@@ -327,6 +327,9 @@ pub struct StreamingRunner<'m> {
     /// One arena, reused for every expert graph, instead of a fresh multi-
     /// megabyte allocation per layer per token.
     scratch: Vec<u8>,
+    /// One arena per expert worker, kept so the buffers are not reallocated
+    /// on every position. Empty unless `BIGTEA_EXPERT_WORKERS` is set.
+    expert_scratch: Vec<Vec<u8>>,
     /// Reader threads, created once. Declared after `model` so it drops first.
     pool: ReadPool,
     /// Threads for a single-token step. Held rather than queried per call
@@ -555,6 +558,7 @@ impl<'m> StreamingRunner<'m> {
             keys: Vec::new(),
             rng: 0x9E3779B97F4A7C15,
             scratch: Vec::new(),
+            expert_scratch: Vec::new(),
             threads: configured_threads(),
             threads_batch: configured_threads_batch(),
             // An explicit `-t` is an instruction, not a hint: do not overrule
@@ -1024,6 +1028,117 @@ impl<'m> StreamingRunner<'m> {
     /// applied with `scale` and the results added together as part of the same
     /// graph. That leaves one arena and one `compute` per layer instead of one
     /// per expert matmul.
+    /// One chunk of experts, built and computed in its own context.
+    ///
+    /// # Why a free function
+    ///
+    /// So it can run on a worker thread. It touches no `self`: everything it
+    /// needs arrives by value or behind an `Arc`, and the `Context` it makes
+    /// never leaves the thread that made it — which is what keeps this safe
+    /// without a `Send` wrapper around a raw `ggml_context`.
+    #[allow(clippy::too_many_arguments)]
+    fn expert_chunk(
+        buf: &mut Vec<u8>,
+        c: &Qwen3Config,
+        normed: &[f32],
+        experts: &[(u32, f32)],
+        fetched: &HashMap<(String, u32), Arc<[u8]>>,
+        names: (&str, &str, &str),
+        types: (
+            bigtea_gguf::GgmlType,
+            bigtea_gguf::GgmlType,
+            bigtea_gguf::GgmlType,
+        ),
+        threads: usize,
+    ) -> Result<(Vec<f32>, f64)> {
+        let n_embd = c.n_embd as i64;
+        let n_ff = c.n_ff_expert as i64;
+        let (gate_name, up_name, down_name) = names;
+        let (gate_ty, up_ty, down_ty) = types;
+        let n_exp = experts.len() as i64;
+        if n_exp == 0 {
+            return Ok((vec![0f32; n_embd as usize], 0.0));
+        }
+        let weight_bytes: usize = experts
+            .iter()
+            .flat_map(|(e, _)| [gate_name, up_name, down_name].map(|n| (n.to_string(), *e)))
+            .filter_map(|k| fetched.get(&k).map(|v| v.len()))
+            .sum();
+        let need = arena_for(
+            &[(n_embd, 1), (n_ff, n_exp * 3), (n_embd, n_exp * 3)],
+            16 * experts.len() + 32,
+        ) + weight_bytes;
+        if buf.len() < need {
+            buf.resize(need, 0);
+        }
+        // **ggml's context allocator is not documented as thread-safe.**
+        // Creating them under a lock costs microseconds and removes the
+        // question; the compute that follows is the part being parallelised.
+        static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = INIT.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `buf` outlives `ctx` and no other context is live on it --
+        // each worker owns its own buffer.
+        let ctx = unsafe { Context::in_buffer(buf, false)? };
+        drop(guard);
+
+        let mut ws = WeightSet::new();
+        let xt = ctx.new_f32_2d(n_embd, 1)?;
+        xt.set_input();
+        xt.set_f32(&normed[..n_embd as usize])?;
+
+        let mut total: Option<Tensor> = None;
+        for &(expert, weight) in experts {
+            let take = |n: &str| -> Result<Arc<[u8]>> {
+                fetched
+                    .get(&(n.to_string(), expert))
+                    .cloned()
+                    .ok_or_else(|| ArchError::MissingTensor(format!("{n}[{expert}]")))
+            };
+            let (gk, uk, dk) = (
+                format!("g{expert}"),
+                format!("u{expert}"),
+                format!("d{expert}"),
+            );
+            ws.bind(
+                &ctx,
+                &gk,
+                gate_ty,
+                &[n_embd as u64, n_ff as u64],
+                take(gate_name)?,
+            )?;
+            ws.bind(
+                &ctx,
+                &uk,
+                up_ty,
+                &[n_embd as u64, n_ff as u64],
+                take(up_name)?,
+            )?;
+            ws.bind(
+                &ctx,
+                &dk,
+                down_ty,
+                &[n_ff as u64, n_embd as u64],
+                take(down_name)?,
+            )?;
+
+            let g = ctx.mul_mat(ws.get(&gk).expect("bound"), &xt)?;
+            let u = ctx.mul_mat(ws.get(&uk).expect("bound"), &xt)?;
+            let act = ctx.mul(&c.activate(&ctx, &g)?, &u)?;
+            let out = ctx.mul_mat(ws.get(&dk).expect("bound"), &act)?;
+            let scaled = ctx.scale(&out, weight)?;
+            total = Some(match total {
+                None => scaled,
+                Some(t) => ctx.add(&t, &scaled)?,
+            });
+        }
+        let Some(total) = total else {
+            return Ok((vec![0f32; n_embd as usize], 0.0));
+        };
+        let t = std::time::Instant::now();
+        ctx.compute(&total, threads)?;
+        Ok((total.to_vec_f32(), t.elapsed().as_secs_f64()))
+    }
+
     fn expert_ffn_single(
         &mut self,
         normed: &[f32],
@@ -1033,8 +1148,8 @@ impl<'m> StreamingRunner<'m> {
         down_name: &str,
     ) -> Result<Vec<f32>> {
         let c = self.arch.config.clone();
-        let n_embd = c.n_embd as i64;
-        let n_ff = c.n_ff_expert as i64;
+        // Shapes and arena sizing moved into `expert_chunk`, which is the only
+        // thing that needs them now.
         let gate_ty = self.tensor_type(gate_name)?;
         let up_ty = self.tensor_type(up_name)?;
         let down_ty = self.tensor_type(down_name)?;
@@ -1048,100 +1163,96 @@ impl<'m> StreamingRunner<'m> {
         }
         let fetched = self.read_slices_parallel(&wanted)?;
 
-        let n_exp = by_expert.len() as i64;
-        // Binding a weight allocates its full size in the arena before the data
-        // pointer is replaced, so every expert's three quantized tensors have to
-        // be paid for here. Eight experts is ~21 MiB, which overran the 16 MiB
-        // graph reserve when only the intermediates were counted — and ggml
-        // aborts rather than reporting it.
-        let weight_bytes: usize = fetched.values().map(|v| v.len()).sum();
-        let need = arena_for(
-            &[
-                (n_embd, 1),
-                (n_ff, n_exp * 3),   // gate, up and their product, per expert
-                (n_embd, n_exp * 3), // down output, scaled, and the sums
-            ],
-            16 * by_expert.len() + 32,
-        ) + weight_bytes;
-
-        // Borrow the scratch arena out of `self` so the context can hold it
-        // mutably while statistics are still being updated.
-        let mut buf = std::mem::take(&mut self.scratch);
-        if buf.len() < need {
-            buf.resize(need, 0);
-        }
+        let experts: Vec<(u32, f32)> = by_expert.iter().map(|(&e, m)| (e, m[0].1)).collect();
+        let names = (gate_name, up_name, down_name);
+        let types = (gate_ty, up_ty, down_ty);
         let threads = self.threads;
-        let result = (|| -> Result<(Vec<f32>, f64)> {
-            // SAFETY: `buf` is a local that outlives `ctx`, and no other
-            // context is live on it — the previous one was dropped and its
-            // results copied out before this call.
-            let ctx = unsafe { Context::in_buffer(&mut buf, false)? };
-            let mut ws = WeightSet::new();
-            let xt = ctx.new_f32_2d(n_embd, 1)?;
-            xt.set_input();
-            xt.set_f32(&normed[..n_embd as usize])?;
 
-            let mut total: Option<Tensor> = None;
-            for (&expert, members) in by_expert {
-                let weight = members[0].1;
-                let take = |n: &str| -> Result<Arc<[u8]>> {
-                    fetched
-                        .get(&(n.to_string(), expert))
-                        .cloned()
-                        .ok_or_else(|| ArchError::MissingTensor(format!("{n}[{expert}]")))
-                };
-                // Names must be unique per expert: one WeightSet holds them all.
-                let (gk, uk, dk) = (
-                    format!("g{expert}"),
-                    format!("u{expert}"),
-                    format!("d{expert}"),
-                );
-                ws.bind(
-                    &ctx,
-                    &gk,
-                    gate_ty,
-                    &[n_embd as u64, n_ff as u64],
-                    take(gate_name)?,
-                )?;
-                ws.bind(
-                    &ctx,
-                    &uk,
-                    up_ty,
-                    &[n_embd as u64, n_ff as u64],
-                    take(up_name)?,
-                )?;
-                ws.bind(
-                    &ctx,
-                    &dk,
-                    down_ty,
-                    &[n_ff as u64, n_embd as u64],
-                    take(down_name)?,
-                )?;
-
-                let g = ctx.mul_mat(ws.get(&gk).expect("bound"), &xt)?;
-                let u = ctx.mul_mat(ws.get(&uk).expect("bound"), &xt)?;
-                let act = ctx.mul(&c.activate(&ctx, &g)?, &u)?;
-                let out = ctx.mul_mat(ws.get(&dk).expect("bound"), &act)?;
-                let scaled = ctx.scale(&out, weight)?;
-                total = Some(match total {
-                    None => scaled,
-                    Some(t) => ctx.add(&t, &scaled)?,
-                });
+        // **The lead named in CLAUDE.md, approached from the other side.**
+        //
+        // ggml parallelises WITHIN a node. Each expert matmul is a 2048x768
+        // matrix-vector product, so splitting one twenty ways leaves ~38 rows
+        // per thread per barrier and the threads cost more than the work --
+        // which is why the tuner settles on ONE and why `-t 20` is 2.4x slower
+        // here.
+        //
+        // So parallelise ACROSS experts instead: N independent subgraphs, one
+        // ggml thread each, summed afterwards in Rust. This is NOT the
+        // `mul_mat_id` batching that was built and reverted; that one failed
+        // because gathering the selected experts into one contiguous tensor
+        // cost ~1.02 GB/token, and running them side by side copies nothing.
+        //
+        // Off by default until it is measured. `CLAUDE.md` records the expert
+        // matmul already running at 24.7 GiB/s -- above single-threaded memcpy,
+        // i.e. plausibly DRAM-bound, in which case more threads buy nothing.
+        // That is a measurement, not a guess to ship on.
+        let workers = self.expert_workers(experts.len());
+        let (out, secs) = if workers <= 1 {
+            let mut buf = std::mem::take(&mut self.scratch);
+            let r = Self::expert_chunk(
+                &mut buf, &c, normed, &experts, &fetched, names, types, threads,
+            );
+            self.scratch = buf;
+            r?
+        } else {
+            let chunk = experts.len().div_ceil(workers);
+            let mut pool = std::mem::take(&mut self.expert_scratch);
+            pool.resize_with(workers, Vec::new);
+            let started = std::time::Instant::now();
+            let parts: Vec<Result<(Vec<f32>, f64)>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = experts
+                    .chunks(chunk)
+                    .zip(pool.iter_mut())
+                    .map(|(group, buf)| {
+                        let (c, fetched) = (&c, &fetched);
+                        scope.spawn(move || {
+                            Self::expert_chunk(buf, c, normed, group, fetched, names, types, 1)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or(Err(ArchError::Unimplemented("an expert worker panicked")))
+                    })
+                    .collect()
+            });
+            self.expert_scratch = pool;
+            let mut sum = vec![0f32; c.n_embd as usize];
+            for part in parts {
+                let (values, _) = part?;
+                for (dst, v) in sum.iter_mut().zip(&values) {
+                    *dst += v;
+                }
             }
-
-            let Some(total) = total else {
-                return Ok((vec![0f32; n_embd as usize], 0.0));
-            };
-            let t = std::time::Instant::now();
-            ctx.compute(&total, threads)?;
-            let secs = t.elapsed().as_secs_f64();
-            Ok((total.to_vec_f32(), secs))
-        })();
-
-        self.scratch = buf;
-        let (out, secs) = result?;
+            (sum, started.elapsed().as_secs_f64())
+        };
         self.stats.expert_seconds += secs;
         Ok(out)
+    }
+
+    /// How many workers to split this position's experts across.
+    ///
+    /// **Four, measured.** Qwen3-30B-A3B, generation tok/s, interleaved runs so
+    /// a warming page cache cannot masquerade as a speedup:
+    ///
+    /// | workers | 1 | 2 | 4 | 6 | 8 |
+    /// |---|---|---|---|---|---|
+    /// | tok/s | 3.52 | 3.74 | **3.86** | 3.87 | 3.82 |
+    ///
+    /// Flat across 4-6 and falling by 8, so 4 is the safe end of the plateau.
+    /// It is not `cores / n`: the win is running *whole experts* side by side,
+    /// and this model selects eight per token, so past that there is nothing
+    /// left to split. `BIGTEA_EXPERT_WORKERS` overrides it on hardware this was
+    /// not measured on, and 1 restores the single-graph path exactly.
+    fn expert_workers(&self, n_experts: usize) -> usize {
+        const MEASURED_BEST: usize = 4;
+        let want = std::env::var("BIGTEA_EXPERT_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(MEASURED_BEST);
+        want.clamp(1, n_experts.max(1))
     }
 
     /// Put a freshly read slice in the cache if it deserves the space.
