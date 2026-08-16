@@ -4,7 +4,7 @@
 
 Links: [../backlog/lts-parity-criteria.md](../backlog/lts-parity-criteria.md) ·
 [../backlog/layernorm-and-biases.md](../backlog/layernorm-and-biases.md) ·
-[verify-before-citing](../../../MEMORY.md)
+[parity-band-discriminator-2026-08-15.md](parity-band-discriminator-2026-08-15.md)
 
 ## The claim being tested
 

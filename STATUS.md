@@ -5,8 +5,19 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-15 · **Version**: v0.0.2 · **Branch**:
-`ticket/r15-parity-discriminator` · **Open PRs**: #65.
+**Last updated**: 2026-08-16 · **Version**: v0.0.2 · **Branch**: `main` ·
+**Open PRs**: #84 (rebrand), #85 (docs), #86 (release).
+
+**The project is now called `chaos`.** Every crate, binary, environment variable
+and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
+`BIGTEA_THREADS` is `CHAOS_THREADS`, and nothing carries the old name. The git
+remote is deliberately unchanged; Atur renames the repository himself, at which
+point the `repository`/`homepage` URLs and the CI badge start resolving.
+
+**Current**: **566 tests**, clippy `--workspace --all-targets -D warnings` 0, fmt
+clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
+written reason, 0 unrecognised** — counted from both binaries rather than by
+reading, which is the only way that number has ever been right.
 
 ## The parity scoreboard, re-scored under the discriminator (2026-08-15)
 
@@ -36,10 +47,9 @@ own output byte for byte. See the discriminator section below.
 thirteen models*. `starcoder2` once passed 3/3 while running the wrong
 pre-tokenizer, and V4-Flash is not swept here at all.
 
-**Current**: **526 tests**, clippy `--workspace --all-targets -D warnings` 0, fmt
-clean. `#60`, `#63` and `#64` are merged; `#65` is open and green. The counts in
-dated sections further down are what was true on their date and are left alone —
-this line is the one to read.
+*(Counts in this section are what was true on 2026-08-15. The header at the top
+of this file is the one to read; every dated section below is left alone on
+purpose, so a number can be traced to the day it was taken.)*
 
 **`VERIFIED_ARCHITECTURES` is thirteen** — `baichuan`, `internlm2` and `olmo`
 added on `ticket/r14-architectures`, each diffed at **eight** prompts. Widening
@@ -64,8 +74,10 @@ merge — the KV cache, six architectures, four tokenizer families, 106 CLI flag
 weight repacking, the thread work and the first quality measurement this project
 has had. #44, #56 and #57 closed with it; their branches are deleted.
 
-In flight: `ticket/r10-grammar-and-overlap` — GBNF/JSON-schema constrained
-decoding as a new crate, then **R2** (overlap disk reads with compute).
+*(Both landed. GBNF/JSON-schema constrained decoding is `chaos-grammar`; R2's
+overlap was measured at 1.03x on the Qwen3 path and reverted, and shown to be
+unreachable on the V4-Flash path for a different reason — see the 2026-08-16
+sections.)*
 
 ---
 
@@ -138,6 +150,13 @@ we support, Chaos is as fast as llama.cpp. It supports far less.**
 ## The honest scoreboard
 
 Never quote a comparison without the model name and the phase.
+
+> **SUPERSEDED for both models — see the 2026-08-16 sections.** V4-Flash is
+> **parity on prefill and generation** (1640 vs 1679 ms/prompt token, 0.394 vs
+> 0.39 tok/s), and Qwen3-30B generation is **parity**, not the 1.60x deficit
+> below. The table is left in place because the numbers below are what was true
+> on their date and the corrections are the record.
+
 **All V4-Flash rows below were measured back to back on 2026-08-10** with 9.3 GiB
 free, which is the first time the whole 7.38 GiB always-read set fitted.
 
@@ -1993,7 +2012,25 @@ Tests **492 → 507**.
 
 ## Known limitations
 
-- **V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**
+> **Four of the five entries below are FIXED and are kept only as the record.**
+> What is actually limiting today, as of 2026-08-16:
+>
+> - **The GPU tier is not verified.** `--device`, `-ngl`, `-ot` and
+>   `--op-offload` all work, on Vulkan only. The device path fails 1 of 8 parity
+>   prompts where the CPU path fails none — arithmetic rather than wiring, but
+>   unproven either way, and it must not be called finished.
+> - **13 architectures of llama.cpp's 141**, and `qwen3moe` is deliberately not
+>   on the verified list.
+> - **20 tok/s on V4-Flash is not reachable** and this is a measurement, not a
+>   backlog item: it needs 79 MB/token and the model reads 3288.
+> - **One pass is capped at 897 tokens** on the V4-Flash path; chunking satisfies
+>   longer prompts, and the 256-token *context* cap is gone.
+> - **macOS falls back to buffered I/O** — `F_NOCACHE` is not wired up — and no
+>   model has been run on macOS or Linux, only built and tested there.
+
+- ~~**V4-Flash is capped at 256 tokens of context. Confirmed 2026-08-08.**~~
+  **FIXED 2026-08-11 (R12, #46)** — the raw latents live in a 1024-slot ring now.
+  Original entry:
   `attention()` builds one F16 cache of `kv_lora_rank * N_KV` = 512 × 256 and
   indexes it by absolute position. A 388-token prompt used to read weights for
   eight seconds and then panic with `range end index 198656 out of range for
@@ -2002,14 +2039,22 @@ Tests **492 → 507**.
   this project has published is 5–198 tokens, which is why nothing caught it.
   The long-context prefill figures in the docs are Qwen3, a different path.
   **Lifting this is part of R3.**
-- **No KV cache on the V4-Flash path**, so every generated token re-runs prefill
+- ~~**No KV cache on the V4-Flash path**~~ **FIXED (R3)** — one cache per
+  session; the prompt fills it and each token appends a row. Original entry:
+  every generated token re-runs prefill
   over the whole sequence. The 0.015–0.064 tok/s generation figures are an
   artefact of that, not a measure of the engine. **A single-token pass costs
   3.0s** (re-measured 2026-08-08 with the whole always-read set resident), so a
   cached step is worth **~0.33 tok/s against llama.cpp's 0.21–0.31** — R3 alone
   turns a 3–4x deficit into a slight lead.
-- **No GPU support** anywhere in the compute path.
-- **No installer.** Building needs the GNU Rust toolchain, MSYS2 and a
+- ~~**No GPU support** anywhere in the compute path.~~ **FIXED 2026-08-15/16** —
+  `--device`, `-ngl`, `-ot`, `--op-offload` and `ggml_backend_sched`, on Vulkan.
+  Not verified, and **4.3x slower on a streaming MoE model**, which is the one
+  this project exists for.
+- ~~**No installer.**~~ **FIXED 2026-08-16** — `scripts/install.ps1` installs and
+  upgrades in place on Windows, is shipped inside the archive, and is
+  smoke-tested in the release workflow on the unpacked archive. Original entry:
+  building needs the GNU Rust toolchain, MSYS2 and a
   hand-built ggml. There are no prebuilt binaries and no model downloader.
   **Windows binaries are now redistributable** (2026-08-08) — the GNU C++ and
   OpenMP runtimes link statically, so the `.exe` needs only system DLLs. Before
@@ -2066,14 +2111,24 @@ internet.
 
 ## Hardware this is measured on
 
-15.7 GiB RAM (typically 3–10 GiB free), NVMe at **2.37 GiB/s** measured,
-RTX 3050 6 GB laptop. **No GPU code exists** — `chaos-probe` detects the card,
-nothing in the compute path touches it.
+15.7 GiB RAM (typically 3–10 GiB free), i7-13650HX (20 logical cores), NVMe at
+**2.74 GiB/s** measured (`chaos-iobench`, 4 MiB scattered slices, one handle per
+reader — it reaches that at *four* handles and does not climb at 8, 16 or 32),
+RTX 3050 6 GB laptop.
+
+**The GPU is used**, and the sentence that stood here — *"no GPU code exists"* —
+has been false since 2026-08-15. `--device`, `-ngl`, `-ot`, `--op-offload` and
+`ggml_backend_sched` are all bound, on Vulkan. What is true is that **the device
+path is not verified**: it fails 1 of 8 parity prompts where the CPU path fails
+none, and that is arithmetic rather than wiring — the kernels disagree by
+0.37–0.71 while the model's own top-2 margin falls to 0.399. See
+`research/ngl-partial-offload-2026-08-16.md`.
 
 ## Working rules
 
-- Implementation goes on `ticket/<name>` branches + PR; **Atur merges.** Docs may
-  go to `main`.
+- Implementation goes on `ticket/<name>` branches + PR. **Claude owns git end to
+  end**: merge when CI is green, close what it supersedes, delete the branch, and
+  leave `main` verified. Docs may go to `main`.
 - Push with the token from `C:\Projects\.env` inline in the URL, output redacted.
   Never in git config, never echoed. Model files stay gitignored.
 - Graph docs live in `docs/graph/`; read `INDEX.md`, then only the 2–3 nodes a
@@ -2175,6 +2230,38 @@ All 21 container-backed V4-Flash tests pass with it active, including the
 element-sum comparisons against llama.cpp — the overlap changes *when* bytes are
 read, never which. `CHAOS_PREFETCH_OVERLAP=0` disables it;
 `CHAOS_PREFETCH_READERS` tunes the split.
+
+## V4-Flash is at parity with llama.cpp, and the old deficit is retracted (2026-08-16)
+
+**Supersedes the "V4-Flash prefill 1.62x behind, generation 3-4x behind" rows
+below and in the README**, which had stood for nine days. Both engines
+alternating in one session, warm-to-warm, three pairs after a discarded warm-up,
+10.3 GiB free:
+
+| DeepSeek-V4-Flash | Chaos | llama.cpp | verdict |
+|---|---:|---:|---|
+| prefill, ms per prompt token | **1640** | 1679 | **parity** |
+| generation, tok/s | **0.394** | 0.39 | **parity** |
+
+Per prompt token is the only fair prefill comparison: the prompt is 5 tokens for
+us and 7 for llama.cpp.
+
+**The warm-up is why this says parity and not a lead.** llama.cpp's discarded
+first run read **0.23 tok/s** — against 0.392 that is a 1.7x lead and would have
+been a fourth wrong published figure. Its first run generates two tokens and pays
+first-token cost across both; by the third it is at 0.39, and nothing in its
+output says "this one is cold".
+
+**llama.cpp was not left on a bad setting.** It defaults to 10 threads here and
+`CLAUDE.md` records it peaking at 4 on Qwen3-30B, so a `-t 4` arm was started —
+and abandoned: one 3-token run produced nothing after **417 s of wall clock for
+50 s of CPU**, CPU time flat over the last 126 s of it, against ~50 s wall at the
+default. On a model that streams, threads are an I/O concurrency knob rather than
+a compute one. Reported as an observation, not a ratio, because it never
+finished.
+
+Full node, with both command lines and the coverage counts:
+`research/where-we-stand-vs-llamacpp-2026-08-16.md`.
 
 ## V4-Flash measured, and the parallel-experts port is dead (2026-08-16)
 

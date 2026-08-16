@@ -1,5 +1,14 @@
 # Handoff — everything found, everything left, and the 20 tok/s problem
 
+> **SUPERSEDED, 2026-08-16. Read `/STATUS.md` first — this file is the
+> 2026-08-07 snapshot and its scoreboard is wrong now.** V4-Flash is at
+> **parity** with llama.cpp on prefill (1640 vs 1679 ms/prompt token) and
+> generation (0.394 vs 0.39 tok/s); the "prefill 2440 vs 1503, generation 0.064
+> vs 0.21-0.31" table below is what was true before the KV cache, the thread
+> split, the skewed reads and the handle pool. The project is also now called
+> `chaos`. What is still worth reading here is the *reasoning*: the byte budget,
+> and the order the work was taken in.
+
 Written 2026-08-07 at the end of a long session. Start here next time, then read
 only the two or three nodes a task links to.
 
