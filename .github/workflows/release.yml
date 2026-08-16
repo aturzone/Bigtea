@@ -113,14 +113,18 @@ jobs:
         run: |
           cd target/release
           fail=0
-          for b in chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench; do
+          for b in chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench chaos-iobench chaos-gpubench; do
             exe="./$b${{ matrix.ext }}"
             test -f "$exe" || { echo "::error::$b was not built"; fail=1; continue; }
             # No arguments: every one of these prints usage and exits non-zero,
             # which is fine. A load-time failure exits without printing at all.
-            # chaos-probe with no flags would measure disk bandwidth, so give
-            # it the cheap path; everything else prints usage and exits.
-            if [ "$b" = "chaos-probe" ]; then args=(--help); else args=(); fi
+            # The benchmarks with no flags would start measuring -- disk,
+            # then the GPU -- so give them the cheap path; everything else
+            # prints usage and exits.
+            case "$b" in
+              chaos-probe|chaos-iobench|chaos-gpubench) args=(--help) ;;
+              *) args=() ;;
+            esac
             out=$("$exe" "${args[@]}" 2>&1 || true)
             if [ -z "$out" ]; then
               echo "::error::$b produced no output — it probably failed before main (missing runtime?)"
@@ -149,7 +153,7 @@ jobs:
           VER="${GITHUB_REF_NAME:-dev}"
           DIR="chaos-${VER}-${{ matrix.name }}"
           mkdir -p "$DIR"
-          for b in chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench; do
+          for b in chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench chaos-iobench chaos-gpubench; do
             cp "target/release/$b${{ matrix.ext }}" "$DIR/"
           done
           cp README.md LICENSE NOTICE CHANGELOG.md STATUS.md "$DIR/"
