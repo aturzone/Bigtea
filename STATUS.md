@@ -2233,6 +2233,13 @@ span 3%, the reference's span 50%.
 Caveats stated rather than buried: short prompt, and by the fifth pair the page
 cache is warm. Both engines get that equally because the runs alternate.
 
+**Re-measured after parallel experts landed**, same protocol: medians 3.53 vs
+3.25 (1.09x), prefill 1.22 vs 1.25 (0.98x). **Still parity, not a lead** — the
+paired count is 3–2, the ranges overlap almost entirely, and both series decline
+across the session (3.53 → 3.03 and 3.62 → 2.53), which after hours of
+back-to-back 17 GiB runs reads as thermal drift. So the sequence is **0.90x →
+parity**, with the 1.10x from parallel experts accounting for the move.
+
 Nothing was aimed at this number. It moved because of everything that landed
 since — the `-t`/`-tb` split, `compute()` once per phase, a file handle per
 reader, frequency-gated cache admission, R2's overlap and R3's KV cache.

@@ -64,3 +64,29 @@ project's short history and the first one that moved a number *in our favour* �
 which is not better. A stale claim that flatters us is exactly as wrong as one
 that does not, and it is worse for planning, because the whole "generation is
 2x behind" framing has been steering which work gets picked.
+
+## Addendum: re-measured after parallel experts landed
+
+Same protocol, five alternating pairs, with `parallel-experts-2026-08-16.md`
+merged.
+
+| pair | Bigtea | llama.cpp | ahead |
+|---:|---:|---:|---|
+| 1 | 3.53 | 3.62 | llama.cpp |
+| 2 | 3.81 | 3.87 | llama.cpp |
+| 3 | 3.60 | 3.25 | Bigtea |
+| 4 | 3.31 | 2.96 | Bigtea |
+| 5 | 3.03 | 2.53 | Bigtea |
+
+Medians 3.53 against 3.25 — 1.09x — and prefill 1.22 against 1.25, 0.98x.
+
+**This is parity and nothing more.** The paired count is 3–2, the ranges overlap
+almost entirely (3.03–3.81 against 2.53–3.87), and **both series decline across
+the session** (Bigtea 3.53 → 3.03, llama.cpp 3.62 → 2.53), which after hours of
+back-to-back 17 GiB runs looks like thermal drift rather than anything about
+either engine. Alternating controls for that *between* the two, which is why the
+paired count is the number to read and the medians are not.
+
+So the honest sequence for generation on this model is **0.90x → parity**, with
+the 1.10x from parallel experts accounting for the move. A lead would need a
+cold machine, more pairs, and a reason to believe the decline is not systematic.
