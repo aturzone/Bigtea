@@ -73,6 +73,11 @@ are the measurement that killed an appealing idea.
   state, the first GPU run pays shader compilation inside the timed region
   (discard it), and an orphaned benchmark process holding 9 GiB looks exactly
   like a 10x regression — `Get-Process` before trusting a surprising number.
+- **The load rate is not the re-read rate.** A load is one stream; a residency
+  spill comes back across the 8-handle pool ~1.6x faster, and pricing the
+  shortfall by the load rate oversold "close these apps" by half. A counter
+  inside the R2-overlapped prefetch is worse — it measures occupancy (0.80
+  GiB/s) not cost (2.44). Price it by re-reading the spilled tensors themselves.
 - **The drive tops out at 2.74 GiB/s at four handles**, so the 8-handle pool is
   not the limit; the remaining gap is the per-block barrier, which cannot be
   filled because the next block's addresses depend on routing not yet computed.

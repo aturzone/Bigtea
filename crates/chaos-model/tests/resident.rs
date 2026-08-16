@@ -128,6 +128,39 @@ fn load_reports_a_plausible_throughput() {
 }
 
 #[test]
+fn the_spill_rate_beats_the_load_rate_it_replaced() {
+    // The shortfall warning used to divide by the *load* rate, which is
+    // essentially one stream, and overstated the per-token cost by ~1.6x. The
+    // spill is re-read across the handle pool instead, so this must come out
+    // FASTER than the load on the same container -- that inequality is the
+    // whole reason the function exists, and it is the part that would silently
+    // regress if the pool were ever collapsed onto one handle.
+    let Some(m) = model() else {
+        eprintln!("skipping: no container");
+        return;
+    };
+    // A small budget guarantees a large spill to sample from.
+    let (set, report) = ResidentSet::load(&m, GIB).expect("load");
+    let Some(rate) = chaos_model::measure_spill_rate(&m, set.skipped()) else {
+        eprintln!("skipping: spill too small to sample");
+        return;
+    };
+    let gibps = rate / GIB as f64;
+    assert!(
+        gibps > 0.05 && gibps < 60.0,
+        "implausible spill rate: {gibps:.2} GiB/s"
+    );
+    if report.loaded_bytes > (64 << 20) && report.bytes_per_sec() > 0.0 {
+        assert!(
+            rate > report.bytes_per_sec(),
+            "the pooled re-read ({:.2} GiB/s) should beat the load ({:.2} GiB/s)",
+            gibps,
+            report.bytes_per_sec() / GIB as f64
+        );
+    }
+}
+
+#[test]
 fn progress_callback_is_monotonic_and_bounded() {
     let Some(m) = model() else {
         eprintln!("skipping: no container");

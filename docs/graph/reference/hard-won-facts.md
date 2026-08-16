@@ -192,6 +192,24 @@ are the measurement that killed one.
   per-node barrier, a ggml graph does. Tune on real generated tokens instead. A
   proxy corrected until it agrees with the objective *is* the objective,
   measured badly.
+- **A counter inside an overlapped path measures the overlap, not the work.**
+  The obvious way to price a residency shortfall was to accumulate bytes and
+  elapsed time in `prefetch_dense_via`, the funnel every spilled read passes
+  through. It reads **0.80 GiB/s** against a swept truth of 2.44, because R2
+  overlap runs that prefetch on 2 of 8 handles for the whole duration of a
+  block — its wall clock is how long the thread was *occupied*.
+  `CHAOS_PREFETCH_OVERLAP=0` reads 1.99 on the same binary. Built, measured,
+  reverted; the same shape as the `dense` phase timer reading 0.01 s per token
+  while the spill demonstrably costs 0.41 s/GiB.
+- **The load rate is not the re-read rate, and the difference is queue depth.**
+  `chaos-run` priced a shortfall at `missing / LoadReport::bytes_per_sec()` and
+  overstated it by ~1.5x for two years' worth of sessions: the load is
+  essentially one stream at 1.6-2.0 GB/s, while the spill comes back across the
+  eight-handle pool at 2.4-2.7 GiB/s. What ships re-reads a sample of **the
+  spilled tensors themselves** through the same pool — the operation, not a model
+  of it. Its sizing had to be measured too: capping each read at 16 MiB swung the
+  answer 1.54-2.65 GiB/s, because whether a tensor exceeded the cap changed the
+  read size.
 - **A kernel benchmark measures the kernel, not the data movement needed to feed
   it.** `chaos-kernelbench` put the batched `mul_mat_id` expert form at 11.17
   GiB/s with 2.86x thread scaling — real, but it binds the model's

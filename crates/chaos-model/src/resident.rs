@@ -374,6 +374,125 @@ impl ResidentSet {
     }
 }
 
+/// Bytes sampled from the spill before a rate is trusted. Below this, thread
+/// spawn and the first seek dominate and the answer is noise.
+const SPILL_SAMPLE_BYTES: u64 = 256 << 20;
+
+/// Skip any single tensor larger than this rather than let one allocation
+/// dominate the transient footprint — this runs when RAM is *already* short.
+///
+/// Tensors are otherwise read **whole**. An earlier version capped every read at
+/// 16 MiB and the rate it returned swung 1.54-2.65 GiB/s across a 12-run sweep,
+/// because whether a spilled tensor happened to exceed the cap changed the read
+/// size and therefore the throughput. The prefetch reads whole tensors, so this
+/// does too: the sample is bounded by its total, not by truncating each read.
+const SPILL_MAX_TENSOR: u64 = 128 << 20;
+
+/// Which spilled tensors to time, and how many bytes that is.
+///
+/// Split out so the rules can be tested without a 144 GB container on the
+/// machine: only over-budget tensors count (an undownloaded one has no bytes to
+/// re-read), and the sample must reach [`SPILL_SAMPLE_BYTES`] or there is no
+/// measurement to report.
+fn spill_sample(skipped: &[Skipped]) -> Option<(Vec<(&str, u64)>, u64)> {
+    let mut sample: Vec<(&str, u64)> = Vec::new();
+    let mut bytes = 0u64;
+    for s in skipped
+        .iter()
+        .filter(|s| s.reason == SkipReason::OverBudget && s.size > 0 && s.size <= SPILL_MAX_TENSOR)
+    {
+        sample.push((s.name.as_str(), s.size));
+        bytes += s.size;
+        if bytes >= SPILL_SAMPLE_BYTES {
+            break;
+        }
+    }
+    (bytes >= SPILL_SAMPLE_BYTES).then_some((sample, bytes))
+}
+
+/// Time a real re-read of the spilled weights, through the reader pool.
+///
+/// # Why the load's own rate is the wrong denominator
+///
+/// Something has to say what a spilled GiB costs per token, and the shortfall
+/// warning used [`LoadReport::bytes_per_sec`] — the rate the load just achieved.
+/// That **overstated the cost by ~1.6x**. The load is essentially one stream;
+/// the spill comes back as a per-block prefetch across the whole handle pool,
+/// and queue depth is worth 1.3-1.4x here on its own
+/// (`research/the-plateau-was-ours-2026-08-10.md`).
+/// `research/v4flash-ram-frontier-2026-08-16.md` pinned the true marginal cost
+/// at **0.395 s/GiB** — 2.53 GiB/s — over a four-point balloon sweep at
+/// R² = 0.997, against the ~0.66 s/GiB the load rate implied.
+///
+/// **The fix is not to hardcode 0.395.** That is one drive on one machine, and
+/// this project has already thrown away a thread tuner that calibrated on a
+/// proxy: *a proxy that must be corrected until it agrees with the objective is
+/// the objective, measured badly.* So this reads **the spilled tensors
+/// themselves**, through the same pool, at the same alignment and skew. It is
+/// not a model of the operation; it is the operation.
+///
+/// # What it cannot see, stated rather than smoothed over
+///
+/// A real pass does two things this cannot: it shares the drive with the expert
+/// slice reads, and it hides part of the prefetch behind compute (R2 overlap).
+/// Those pull in opposite directions and neither is reproducible from a standing
+/// start, so this is **an estimate with a measured denominator, not the marginal
+/// cost itself**. Checked against a 12-run balloon sweep it lands within ~1.2x
+/// of the swept slope, where the load rate it replaces was consistently 1.6x
+/// over — see `research/spill-cost-is-measured-2026-08-17.md`, which also
+/// records that the buffer allocation costs nothing measurable, so it is timed
+/// with the reads rather than reported apart from them.
+///
+/// `None` when there is too little spill to sample or a read fails. A missing
+/// number beats a confident wrong one — the rule `chaos-probe`'s own header
+/// opens with.
+pub fn measure_spill_rate(model: &Model, skipped: &[Skipped]) -> Option<f64> {
+    let (sample, bytes) = spill_sample(skipped)?;
+
+    // Round-robin across distinct slots, exactly as the prefetch splits its
+    // work: sharing a handle would serialise the reads in the OS and measure
+    // queue depth 1, which is the very mistake being corrected here.
+    let slots = crate::READER_HANDLES.min(sample.len());
+    let mut work: Vec<Vec<(&str, SkewedBuf)>> = (0..slots).map(|_| Vec::new()).collect();
+    for (i, (name, take)) in sample.iter().enumerate() {
+        let loc = model.location(name)?;
+        work[i % slots].push((
+            *name,
+            SkewedBuf::new(*take as usize, SkewedBuf::skew_for(loc.file_offset)),
+        ));
+    }
+
+    let t_read = std::time::Instant::now();
+    let ok = std::thread::scope(|scope| {
+        let handles: Vec<_> = work
+            .into_iter()
+            .enumerate()
+            .map(|(slot, mut items)| {
+                scope.spawn(move || {
+                    for (name, buf) in items.iter_mut() {
+                        if model
+                            .read_range_into_via(name, 0, &mut buf[..], slot)
+                            .is_err()
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                })
+            })
+            .collect();
+        handles.into_iter().all(|h| h.join().unwrap_or(false))
+    });
+    if !ok {
+        return None;
+    }
+    let read_secs = t_read.elapsed().as_secs_f64();
+    if read_secs <= 0.0 {
+        return None;
+    }
+    Some(bytes as f64 / read_secs)
+}
+
 /// Which always-read tensors will be loaded, decided before any I/O.
 ///
 /// Separating the decision from the work is what makes parallel loading
@@ -452,5 +571,76 @@ impl fmt::Debug for ResidentSet {
             .field("bytes", &self.bytes)
             .field("skipped", &self.skipped.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod spill_sample_tests {
+    use super::{spill_sample, SkipReason, Skipped, SPILL_MAX_TENSOR, SPILL_SAMPLE_BYTES};
+
+    /// Comfortably under [`SPILL_MAX_TENSOR`], so four of them reach the floor
+    /// without any being filtered for size — the trap the first draft of these
+    /// tests fell into.
+    const CHUNK: u64 = SPILL_SAMPLE_BYTES / 4;
+
+    fn skipped(name: &str, size: u64, reason: SkipReason) -> Skipped {
+        Skipped {
+            name: name.into(),
+            size,
+            reason,
+        }
+    }
+
+    /// These exist because the container-backed tests **skip** when the model
+    /// is absent, and a skipped test reads exactly like a passing one.
+    #[test]
+    fn too_little_spill_yields_no_measurement() {
+        let s = vec![skipped("a", CHUNK, SkipReason::OverBudget)];
+        assert!(
+            spill_sample(&s).is_none(),
+            "a rate off a quarter sample is arithmetic on seek time"
+        );
+        assert!(spill_sample(&[]).is_none());
+    }
+
+    /// An undownloaded tensor is not re-read every token — it is not read at
+    /// all — so timing one would measure the wrong shortfall entirely.
+    #[test]
+    fn undownloaded_tensors_are_not_sampled() {
+        let mut s: Vec<Skipped> = (0..4)
+            .map(|i| skipped(&format!("gone{i}"), CHUNK, SkipReason::NotDownloaded))
+            .collect();
+        assert!(spill_sample(&s).is_none(), "none of those are readable");
+
+        s.extend((0..4).map(|i| skipped(&format!("here{i}"), CHUNK, SkipReason::OverBudget)));
+        let (sample, bytes) = spill_sample(&s).expect("the over-budget four are enough");
+        assert!(sample.iter().all(|(n, _)| n.starts_with("here")));
+        assert_eq!(bytes, SPILL_SAMPLE_BYTES);
+    }
+
+    /// One outsized tensor would dominate both the timing and the transient
+    /// footprint, and this runs when RAM is already short.
+    #[test]
+    fn an_outsized_tensor_is_skipped_not_truncated() {
+        let big = skipped("huge", SPILL_MAX_TENSOR + 1, SkipReason::OverBudget);
+        assert!(spill_sample(std::slice::from_ref(&big)).is_none());
+
+        let mut s = vec![big];
+        s.extend((0..4).map(|i| skipped(&format!("t{i}"), CHUNK, SkipReason::OverBudget)));
+        let (sample, bytes) = spill_sample(&s).expect("four chunks reach the floor");
+        assert!(!sample.iter().any(|(n, _)| *n == "huge"));
+        assert_eq!(bytes, SPILL_SAMPLE_BYTES);
+    }
+
+    /// Sampling stops at the floor rather than reading the whole spill, which
+    /// on this model would be gigabytes.
+    #[test]
+    fn sampling_stops_once_the_floor_is_reached() {
+        let s: Vec<Skipped> = (0..100)
+            .map(|i| skipped(&format!("t{i}"), CHUNK, SkipReason::OverBudget))
+            .collect();
+        let (sample, bytes) = spill_sample(&s).expect("plenty");
+        assert_eq!(sample.len(), 4, "stopped at the floor, not at the end");
+        assert_eq!(bytes, SPILL_SAMPLE_BYTES);
     }
 }

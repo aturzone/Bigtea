@@ -5,8 +5,8 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-16 · **Version**: **v0.0.3, released** · **Branch**:
-`main` · **Open PRs**: none. #83-#91 merged, every branch deleted.
+**Last updated**: 2026-08-17 · **Version**: **v0.0.3, released** · **Branch**:
+`main` · **Open PRs**: none. #83-#92 merged, every branch deleted.
 
 **The release is out**: <https://github.com/aturzone/Chaos/releases/tag/v0.0.3>
 — Linux, macOS and Windows archives, verified by downloading the published
@@ -20,7 +20,7 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **570 tests** (50 binaries, 0 failed, 31 ignored — the V4-Flash set
+**Current**: **575 tests** (50 binaries, 0 failed, 31 ignored — the V4-Flash set
 needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
 clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
@@ -66,6 +66,55 @@ the expert weights, at or past dual-channel DDR5 — so it is a GPU-memory
 specification. **Flagged as arithmetic, not measurement**: resident-in-VRAM is
 untested here and the only measured GPU figure is 4.3x *slower* on streaming MoE.
 Do not quote a GPU V4-Flash number until someone runs one.
+
+## The shortfall warning was 1.5x pessimistic, and now it is measured (2026-08-17)
+
+`chaos-run` tells a user how much of the always-read set will be re-read on every
+token, what that costs, and which processes to close. **The cost was computed
+from the rate the initial *load* achieved, and overstated it by about 1.5x** —
+the load is essentially one stream at 1.6-2.0 GB/s, while the spill comes back
+across the eight-handle reader pool. The line matters because the next one is
+*"closing these would free up to N GiB"*, so an inflated cost oversells closing an
+editor. Full write-up:
+[`research/spill-cost-is-measured-2026-08-17.md`](docs/graph/research/spill-cost-is-measured-2026-08-17.md).
+
+**The true marginal cost is 0.41 ± 0.01 s/GiB, from three independent balloon
+sweeps** — `0.395*spill + 2.353` (2026-08-16, by hand), `0.418*spill + 2.394`,
+and `0.410*spill + 2.204` at R² = 0.997, the last two this session at 4 balloon
+sizes x 3 interleaved passes. Only the slope is claimed; the intercepts move with
+free RAM. The sweep is now `scripts/spill-sweep.sh` + `scripts/ram-balloon.ps1`,
+because the first one was done by hand and could not be re-run.
+
+**It is not fixed by hardcoding 0.395** — that is one drive on one machine.
+`chaos_model::measure_spill_rate` re-reads a 256 MiB sample **of the spilled
+tensors themselves**, through the same pool at the same alignment, and times it:
+~0.1 s, only when there is a shortfall, `None` rather than a guess when the spill
+is too small to sample.
+
+| spill | old, from load rate | **new, measured** | swept truth |
+|---:|---:|---:|---:|
+| 1.54 GiB | 0.97 s (1.54x) | **0.7 s (1.11x)** | 0.63 s |
+| 3.05 | 2.00 (1.60x) | **1.4 (1.12x)** | 1.25 |
+| 4.57 | 2.78 (1.49x) | **1.7 (0.91x)** | 1.87 |
+| 6.07 | 3.43 (1.38x) | **2.3 (0.92x)** | 2.49 |
+
+**A consistent 1.5x overestimate becomes a mean of 1.02x**, with the scatter now
+falling on both sides. The case in the original report — 1.53 GiB printed as
+`~1.1s` — now prints `~0.7s` against a swept 0.63.
+
+**Two negatives are worth more than the fix.** (1) **The obvious instrument is
+wrong**: accumulating bytes and elapsed time inside `prefetch_dense_via` reads
+**0.80 GiB/s**, a *3x* overestimate, because R2 overlap runs that prefetch on 2 of
+8 handles for the duration of a block — its wall clock is occupancy, not cost.
+`CHAOS_PREFETCH_OVERLAP=0` on the same binary reads 1.99. Built, measured,
+reverted. (2) **The buffer allocation costs nothing measurable** (1.87 vs 1.86,
+2.52 vs 2.52), so a two-ended range was dropped before it shipped. A first
+version capping each read at 16 MiB swung 1.54-2.65 GiB/s because the cap changed
+the read size; reading whole tensors, as the prefetch does, gives 2.10-2.80 with
+a mean 2% off the swept rate.
+
+Still open: **`chaos-serve` never prints a shortfall warning at all**, though it
+loads a resident set the same way.
 
 ## CLAUDE.md pruned, and the test count was stale (2026-08-16)
 
