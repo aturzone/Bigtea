@@ -1333,6 +1333,7 @@ fn usage() -> ExitCode {
     eprintln!("  -f FILE             read the prompt from a file");
     eprintln!("  -b N                prefill block size");
     eprintln!("  --cache GIB         expert cache budget");
+    eprintln!("  --auto              pick device, -ngl and cache from this machine");
     eprintln!("  --temp T            0 = greedy (default)");
     eprintln!("  --top-k K           0 = off");
     eprintln!("  --top-p P           1.0 = off");
@@ -1520,6 +1521,7 @@ fn main() -> ExitCode {
     let mut gpu_layers: Option<usize> = None;
     let mut tensor_overrides: Vec<String> = Vec::new();
     let mut op_offload = false;
+    let mut auto = false;
     let mut jinja = false;
     let mut loras: Vec<(String, f32)> = Vec::new();
     let mut cvecs: Vec<(String, f32)> = Vec::new();
@@ -2054,6 +2056,15 @@ fn main() -> ExitCode {
             // `*_exps=CPU` is meaningless unless something else is on a card.
             // **Implies a device, like `-ngl` and `-ot`.** There is nothing to
             // offload an operation TO otherwise.
+            // **The knobs already worked; nothing joined them up.** `--auto`
+            // probes the machine, reads the model's weight split, and picks
+            // the device, `-ngl` and the cache from measurements rather than
+            // from the user knowing which side of a 4.3x cliff they are on.
+            // An explicit flag still wins over it.
+            "--auto" => {
+                auto = true;
+                i += 1;
+            }
             "--op-offload" => {
                 op_offload = true;
                 i += 1;
@@ -3001,12 +3012,165 @@ fn main() -> ExitCode {
         gpu_layers,
         tensor_overrides,
         op_offload,
+        auto,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("bigtea-run: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// What the machine can do with this model, decided from measurements.
+///
+/// # Why this exists
+///
+/// Every knob already worked -- `--device`, `-ngl`, `--cache`, `-t`/`-tb` --
+/// and nothing joined them up. A user had to know that `-ngl 99` is a 1.79x win
+/// on a card the model fits on and a **4.3x loss** on one it does not, which is
+/// not knowledge a CLI should demand.
+///
+/// # The rules, and where each number came from
+///
+/// * **The model fits in VRAM -> offload all of it.** Measured on Qwen3-4B:
+///   1.79x prefill, 1.40x generation, monotonic with no knee
+///   (`ngl-frontier-2026-08-16.md`).
+/// * **A streaming MoE model that does NOT fit -> do not open the card at
+///   all.** Measured on Qwen3-30B-A3B: generation 2.61 -> 0.61 tok/s, a 4.3x
+///   loss, because the experts run on the host whatever `-ngl` says and the
+///   card only adds a round trip per block
+///   (`gpu-does-not-help-streaming-moe-2026-08-16.md`).
+/// * **A dense model that does not fit -> offload as many whole blocks as the
+///   free VRAM holds.** The frontier is smooth, so a partial offload is worth
+///   its fraction.
+/// * **Expert cache ~6 GiB.** 2/4/6/8 GiB measured 2.22/2.66/3.45/3.43 tok/s --
+///   it plateaus at 6 and paying more buys nothing
+///   (`expert-read-overlap-does-not-pay-2026-08-16.md`).
+///
+/// The margin is VRAM the weights must NOT take: activations, the KV cache and
+/// the compute arenas all live there too once a block is on the card.
+struct AutoPlan {
+    device: Option<usize>,
+    gpu_layers: Option<usize>,
+    cache_bytes: Option<u64>,
+    why: Vec<String>,
+}
+
+/// VRAM left for activations, KV and arenas once the weights are placed.
+const AUTO_VRAM_MARGIN: u64 = 1 << 30;
+/// Where the expert-cache curve flattens.
+const AUTO_CACHE_CEILING: u64 = 6 << 30;
+
+fn auto_plan(model: &Model, config: &Qwen3Config) -> AutoPlan {
+    let mut why = Vec::new();
+    let (mut dense, mut experts) = (0u64, 0u64);
+    for name in model.tensor_names().map(str::to_string).collect::<Vec<_>>() {
+        if let Some(loc) = model.location(&name) {
+            if loc.routed_expert {
+                experts += loc.size;
+            } else {
+                dense += loc.size;
+            }
+        }
+    }
+    let total = dense + experts;
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    // The expert cache is only worth sizing when experts stream at all.
+    let cache_bytes = if experts > 0 {
+        let machine = bigtea_probe::Machine::probe(std::path::Path::new("."), false);
+        let avail = machine.ram_available_bytes.unwrap_or(0);
+        // Half of what is free, capped where the curve flattens: the rest has
+        // to hold the resident weights, the KV cache and the arenas.
+        let want = (avail / 2).clamp(1 << 30, AUTO_CACHE_CEILING);
+        why.push(format!(
+            "cache      {:.1} GiB of experts (half of {:.1} GiB free, capped at the {:.0} GiB plateau)",
+            gib(want),
+            gib(avail),
+            gib(AUTO_CACHE_CEILING)
+        ));
+        Some(want)
+    } else {
+        None
+    };
+
+    let gpu = bigtea_ggml::devices()
+        .ok()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, d)| d.kind == bigtea_ggml::DeviceKind::Gpu)
+        .max_by_key(|(_, d)| d.free_bytes);
+    let Some((index, dev)) = gpu else {
+        why.push("device     none: no discrete GPU, so everything runs on the CPU".into());
+        return AutoPlan {
+            device: None,
+            gpu_layers: None,
+            cache_bytes,
+            why,
+        };
+    };
+    let usable = (dev.free_bytes as u64).saturating_sub(AUTO_VRAM_MARGIN);
+
+    if total <= usable {
+        why.push(format!(
+            "device     {index} ({}): the whole model is {:.1} GiB against {:.1} GiB usable VRAM -- offloading all of it",
+            dev.name,
+            gib(total),
+            gib(usable)
+        ));
+        return AutoPlan {
+            device: Some(index),
+            gpu_layers: Some(usize::MAX),
+            cache_bytes,
+            why,
+        };
+    }
+
+    if config.is_moe() {
+        // The measured refusal. Partial offload places only the resident set --
+        // 5% of what a token reads -- and pays a host round trip per block.
+        why.push(format!(
+            "device     none: {:.1} GiB of model against {:.1} GiB usable VRAM, and this model streams experts. Measured 4.3x SLOWER offloaded (2.61 -> 0.61 tok/s), so the card is left alone",
+            gib(total),
+            gib(usable)
+        ));
+        return AutoPlan {
+            device: Some(index),
+            gpu_layers: Some(0),
+            cache_bytes,
+            why,
+        };
+    }
+
+    let n_layer = config.n_layer.max(1) as u64;
+    let per_block = (dense / n_layer).max(1);
+    let blocks = (usable / per_block).min(n_layer) as usize;
+    if blocks == 0 {
+        why.push(format!(
+            "device     none: {:.2} GiB per block against {:.1} GiB usable VRAM -- not one block fits",
+            gib(per_block),
+            gib(usable)
+        ));
+        return AutoPlan {
+            device: Some(index),
+            gpu_layers: Some(0),
+            cache_bytes,
+            why,
+        };
+    }
+    why.push(format!(
+        "device     {index} ({}): {blocks} of {n_layer} blocks fit in {:.1} GiB usable VRAM at {:.2} GiB each",
+        dev.name,
+        gib(usable),
+        gib(per_block)
+    ));
+    AutoPlan {
+        device: Some(index),
+        gpu_layers: Some(blocks),
+        cache_bytes,
+        why,
     }
 }
 
@@ -3049,6 +3213,7 @@ fn run_streaming(
     gpu_layers: Option<usize>,
     tensor_overrides: Vec<String>,
     op_offload: bool,
+    auto: bool,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -3091,6 +3256,23 @@ fn run_streaming(
             .into());
         }
     }
+
+    // **Before the cache is sized and before the device is opened**, because
+    // `--auto` sets both. Anything the user named explicitly still wins: this
+    // fills gaps, it does not overrule.
+    let (gpu_device, gpu_layers, cache_budget) = if auto {
+        let plan = auto_plan(model, &config);
+        for line in &plan.why {
+            bigtea_arch::info!("{line}");
+        }
+        (
+            gpu_device.or(plan.device.filter(|_| plan.gpu_layers != Some(0))),
+            gpu_layers.or(plan.gpu_layers),
+            cache_budget.or(plan.cache_bytes),
+        )
+    } else {
+        (gpu_device, gpu_layers, cache_budget)
+    };
 
     // Size the expert cache from the RAM that is actually free, not a constant.
     //
@@ -3223,6 +3405,13 @@ fn run_streaming(
         match runner.use_device(index) {
             Ok(()) => {
                 match gpu_layers {
+                    // `usize::MAX` is the sentinel for "every block plus the
+                    // embedding and output head". Printing it raw showed
+                    // `first 18446744073709551615 blocks resident on it`.
+                    Some(n) if n >= config.n_layer as usize => {
+                        runner.set_gpu_layers(n);
+                        bigtea_arch::info!("device     {index}, all blocks resident on it");
+                    }
                     Some(n) => {
                         runner.set_gpu_layers(n);
                         bigtea_arch::info!("device     {index}, first {n} blocks resident on it");
@@ -3846,6 +4035,7 @@ fn run(
     gpu_layers: Option<usize>,
     tensor_overrides: Vec<String>,
     op_offload: bool,
+    auto: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -4148,6 +4338,7 @@ fn run(
         gpu_layers,
         tensor_overrides,
         op_offload,
+        auto,
         t0,
     )
 }
