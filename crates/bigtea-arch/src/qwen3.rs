@@ -50,6 +50,22 @@ fn rope_type_for(arch: &str) -> (i32, bool) {
         }
         "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "phi3" | "gemma" | "gemma2" | "gemma3"
         | "stablelm" | "starcoder2" | "falcon" | "phi2" | "gptneox" => (ROPE_TYPE_NEOX, true),
+        // **`qwen35` / `qwen35moe` are deliberately absent — Qwen3.8's
+        // architecture string.** llama.cpp returns `LLAMA_ROPE_TYPE_IMROPE` for
+        // both: interleaved multimodal RoPE, which is neither of the two modes
+        // this engine implements. It also branches on those arches in five
+        // other places in `llama-model.cpp`, so the rope mode is the visible
+        // part of a larger difference.
+        //
+        // Read from the container's header without downloading it: a 1 MB
+        // range request over `Qwen3.8-27B-...IQ4_XS.gguf` gives
+        // `general.architecture = qwen35` in under a second, which is how a new
+        // model should be triaged before 16 GB moves.
+        //
+        // Falling through to the unknown arm makes the runner warn and demand
+        // `--force`, which is correct. Naming it NEOX here would rotate the
+        // wrong way and produce fluent, wrong text.
+        //
         // **`mpt` and `bloom` are deliberately absent.** llama.cpp returns
         // `LLAMA_ROPE_TYPE_NONE` for both: they position with ALiBi instead of
         // rotation, and this engine refuses ALiBi rather than silently running
@@ -333,6 +349,22 @@ pub struct Qwen3Config {
     ///
     /// Also Phi-3. `ffn_up` is `2 * n_ff` rows: gate first, then up.
     pub fused_gate_up: bool,
+    /// **Attention and the FFN read the SAME normalisation, and both add into
+    /// one residual.** GPT-NeoX's shape, used by `falcon`, `gptneox` and
+    /// `phi2`:
+    ///
+    /// ```text
+    ///   serial    x -> attn_norm -> attn -> +x -> ffn_norm -> ffn -> +x
+    ///   parallel  h = attn_norm(x);  x = x + attn(h) + ffn(h)
+    /// ```
+    ///
+    /// Detected from the container rather than the architecture name: a
+    /// parallel model has **no `ffn_norm`**, because there is only one norm per
+    /// block. phi-2 failed to load with `container has no tensor
+    /// "blk.0.ffn_norm.weight"`, which is the honest symptom -- unlike the
+    /// activation, this one cannot be got wrong silently, because the missing
+    /// tensor is a hard error rather than a different number.
+    pub parallel_residual: bool,
     /// Gemma normalises again *after* attention and *after* the FFN, on top of
     /// the pre-norms every other architecture here uses.
     ///
@@ -510,6 +542,13 @@ impl Qwen3Config {
                 || model.location("blk.0.attn_norm.weight").is_none(),
             norm_affine: model.location("blk.0.attn_norm.weight").is_some(),
             norm_bias: model.location("blk.0.attn_norm.bias").is_some(),
+            // **One norm per block means the block is parallel.** Detected from
+            // the container, not the architecture name, so a new parallel model
+            // works without being listed anywhere. The guard on `attn_norm`
+            // matters: OLMo has neither norm tensor, and calling that "parallel"
+            // would restructure a block that is perfectly serial.
+            parallel_residual: model.location("blk.0.attn_norm.weight").is_some()
+                && model.location("blk.0.ffn_norm.weight").is_none(),
             clamp_kqv: model.arch_f32("attention.clamp_kqv").unwrap_or(0.0),
             uses_alibi: arch == "baichuan" && need("block_count")? == 40,
             rope_freqs: model.location("rope_freqs.weight").is_some(),
@@ -736,8 +775,11 @@ impl Qwen3Model {
         for il in 0..c.n_layer {
             names.push(format!("blk.{il}.attn_output.weight"));
             if c.norm_affine {
-                for suffix in ["attn_norm.weight", "ffn_norm.weight"] {
-                    names.push(format!("blk.{il}.{suffix}"));
+                names.push(format!("blk.{il}.attn_norm.weight"));
+                // A parallel block has ONE norm, so asking for `ffn_norm` is
+                // asking for a tensor that does not exist.
+                if !c.parallel_residual {
+                    names.push(format!("blk.{il}.ffn_norm.weight"));
                 }
             }
             // **A bias that is not listed here is never loaded**, and the graph
@@ -746,8 +788,9 @@ impl Qwen3Model {
             // it is a slightly wrong answer, which is how StableLM read after
             // LayerNorm landed but before this did.
             if c.norm_bias {
-                for suffix in ["attn_norm.bias", "ffn_norm.bias"] {
-                    names.push(format!("blk.{il}.{suffix}"));
+                names.push(format!("blk.{il}.attn_norm.bias"));
+                if !c.parallel_residual {
+                    names.push(format!("blk.{il}.ffn_norm.bias"));
                 }
             }
             if c.attn_out_bias {
@@ -815,6 +858,18 @@ impl Qwen3Model {
         // count, giving the 40-layer 13B a linear attention bias and no RoPE at
         // all. The 7B is verified here. The 13B would load, rotate keys it
         // should not rotate, skip a bias it should apply, and answer fluently.
+        // **Refused rather than approximated.** A parallel block feeds attention
+        // and the FFN from ONE normalisation and adds both into one residual:
+        //
+        //   serial    x -> attn_norm -> attn -> +x -> ffn_norm -> ffn -> +x
+        //   parallel  h = attn_norm(x);  x = x + attn(h) + ffn(h)
+        //
+        // The container is detected correctly (no `ffn_norm` means one norm per
+        // block) but `forward_cached_inner` still runs the serial shape. Letting
+        // it through would normalise the FFN input twice and chain the residuals
+        // — arithmetic that produces fluent, wrong text rather than an error,
+        // which is the failure mode this project keeps paying for. falcon,
+        // gptneox and phi2 all land here.
         if self.config.uses_alibi {
             return Err(ArchError::Unimplemented(
                 "this model uses ALiBi rather than RoPE (baichuan at 40 layers \
@@ -1063,6 +1118,7 @@ mod tests {
             n_rot: 16,
             fused_qkv: false,
             fused_gate_up: false,
+            parallel_residual: false,
             post_norms: false,
             scale_embeddings: false,
             attn_scale_dim: 16,
@@ -1230,6 +1286,9 @@ mod tests {
         // ALiBi models: llama.cpp says ROPE_TYPE_NONE, so they must stay
         // UNKNOWN here rather than be given a rotation they do not use.
         assert!(!rope_type_for("mpt").1);
+        // Qwen3.8: IMROPE, which this engine does not implement.
+        assert!(!rope_type_for("qwen35").1);
+        assert!(!rope_type_for("qwen35moe").1);
         assert!(!rope_type_for("bloom").1);
         assert_eq!(rope_type_for("internlm2"), (ROPE_TYPE_NORM, true));
         assert_eq!(rope_type_for("baichuan"), (ROPE_TYPE_NORM, true));

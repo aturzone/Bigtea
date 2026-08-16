@@ -1132,10 +1132,30 @@ const REFUSED: &[(&str, bool, &str)] = &[
     // nothing, rounded" is exactly the lie this table exists to prevent.
     ("--gpu-layers", true, "layer-level offload needs a scheduler; this build is all-or-nothing per model -- use --device"),
     ("--n-gpu-layers", true, "layer-level offload needs a scheduler; this build is all-or-nothing per model -- use --device"),
-    ("--main-gpu", true, "no GPU backend exists"),
-    ("--split-mode", true, "no GPU backend exists"),
-    ("--tensor-split", true, "no GPU backend exists"),
-    ("--kv-offload", false, "the KV cache is always host memory"),
+    // `--main-gpu` is IMPLEMENTED as an alias for `--device`, so it is no
+    // longer here. llama.cpp's name for "which device", and there is no reason
+    // to make someone learn ours.
+    //
+    // These three said "no GPU backend exists" until 2026-08-16, and that
+    // stopped being true when the Vulkan path landed. A declined-flag reason is
+    // user-facing text: leaving it stale tells someone the tier is absent when
+    // it is merely partial, which is a different and worse lie than the one
+    // this table exists to prevent.
+    (
+        "--split-mode",
+        true,
+        "one device at a time: splitting a model across devices needs          ggml_backend_sched, and a mixed host/device graph segfaults without it",
+    ),
+    (
+        "--tensor-split",
+        true,
+        "proportions across several devices, and only one device is used at a          time; needs the same scheduler as --split-mode",
+    ),
+    (
+        "--kv-offload",
+        false,
+        "the KV cache is host memory even on the device path; moving it needs          the cache push and the router to stop consuming host vectors",
+    ),
     ("--op-offload", false, "no GPU backend exists"),
     (
         "--override-tensor",
@@ -2016,7 +2036,9 @@ fn main() -> ExitCode {
                 }
                 return ExitCode::SUCCESS;
             }
-            "--device" => {
+            // llama.cpp's name for the same thing. Aliased rather than
+            // declined, because "which device" is one concept.
+            "--device" | "--main-gpu" => {
                 let Some(v) = rest.get(i + 1).and_then(|v| v.parse::<usize>().ok()) else {
                     eprintln!(
                         "bigtea-run: --device needs a device index; --list-devices shows them"
