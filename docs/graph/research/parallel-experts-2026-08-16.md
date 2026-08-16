@@ -32,7 +32,7 @@ barrier, and the threads cost more than the work. That is why the tuner settles
 on one and why `-t 20` is 2.4x *slower* here.
 
 The batching route was built and reverted: `mul_mat_id` measured 11.17 GiB/s in
-`bigtea-kernelbench`, but on the streaming path the selected experts are
+`chaos-kernelbench`, but on the streaming path the selected experts are
 unrelated `Arc<[u8]>` slices and **making them contiguous costs ~1.02 GB/token**
 — exactly what the kernel saves. Byte-identical output, 1.34 → 1.27 tok/s,
 reverted.
@@ -50,7 +50,7 @@ running whole experts concurrently and this model selects eight per token, so
 past that there is nothing left to split, and the per-worker arena and context
 setup start to show. Four is the safe end of the plateau.
 
-`BIGTEA_EXPERT_WORKERS` overrides it for hardware this was not measured on, and
+`CHAOS_EXPERT_WORKERS` overrides it for hardware this was not measured on, and
 `1` restores the single-graph path exactly.
 
 ## Scope, stated so nobody over-reads it

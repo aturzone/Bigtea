@@ -14,7 +14,7 @@ a pass currently reads, and it reorders the roadmap.
 
 Every estimate in this project used **3.21 GiB of routed experts per token**,
 which is 6 experts × 43 layers. That figure is correct for a *single-token* step
-and wrong for everything Bigtea actually runs, because expert reads are
+and wrong for everything Chaos actually runs, because expert reads are
 **deduplicated per block across the whole batch** — `read_expert_slices` is given
 `unique`, not one entry per selection.
 

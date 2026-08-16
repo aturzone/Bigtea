@@ -1,16 +1,16 @@
 ---
-topic: Bigtea vs llama.cpp on DeepSeek-V4-Flash — measured back to back, and we lose on all three
+topic: Chaos vs llama.cpp on DeepSeek-V4-Flash — measured back to back, and we lose on all three
 status: resolved
 links: [v4flash-generation-first-numbers.md, zero-copy-expert-reads.md, head-to-head-llamacpp-2026-08-05.md, verify-before-citing.md]
 ---
 
 ## ⚠ CORRECTION, same day: the first version of this node was wrong
 
-Its first version claimed Bigtea was **3.0x faster on load** and **1.20x faster
+Its first version claimed Chaos was **3.0x faster on load** and **1.20x faster
 on prefill**. Both are **FALSE** and were published in the README, the CHANGELOG
 and the v0.0.1 release notes before being caught.
 
-The error: Bigtea's numbers were measured today, and llama.cpp's were copied from
+The error: Chaos's numbers were measured today, and llama.cpp's were copied from
 `head-to-head-llamacpp-2026-08-05.md`, taken two days earlier under different
 free-RAM conditions. **The two engines were never run back to back.** This project
 has a written rule against exactly this — *a competitive claim is not citable
@@ -29,15 +29,15 @@ Model  DeepSeek-V4-Flash-UD-Q4_K_XL, 144 GB across 5 shards
 ```
 
 **10.5 GiB free is the first time the whole 7.38 GiB always-read set fitted.**
-Every earlier Bigtea measurement was taken with 1-3 GiB of it streaming, so this
+Every earlier Chaos measurement was taken with 1-3 GiB of it streaming, so this
 is also the first fair reading of the design as intended.
 
 ## The commands, and their output
 
-**Bigtea**
+**Chaos**
 
 ```
-bigtea-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf \
+chaos-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf \
            "The capital of France is" -n 4
 
 resident   loaded 1199 tensors, 7.38 GiB of 8.15 GiB budget in 7.6s (1.04 GB/s)
@@ -61,7 +61,7 @@ eval time        =  6432.39 ms / 2 runs   (3216.19 ms per token, 0.31 tok/s)
 total time       = 16980.19 ms / 9 tokens
 ```
 
-Second run of each, minutes later: Bigtea prefill 0.43 tok/s, generation 0.081;
+Second run of each, minutes later: Chaos prefill 0.43 tok/s, generation 0.081;
 llama.cpp prompt eval 0.69 tok/s, eval 0.21.
 
 ## The comparison
@@ -69,13 +69,13 @@ llama.cpp prompt eval 0.69 tok/s, eval 0.21.
 The prompt tokenizes to 5 tokens for us and 7 for llama.cpp, so **per prompt
 token** is the only fair prefill comparison.
 
-| | Bigtea | llama.cpp | |
+| | Chaos | llama.cpp | |
 |---|---:|---:|:--|
 | load | 10.0s | 10.5s | parity |
 | prefill, per prompt token | 2440 ms | **1503 ms** | **llama.cpp 1.62x faster** |
 | generation | 0.064-0.081 tok/s | **0.21-0.31 tok/s** | **llama.cpp 3-4x faster** |
 
-**Bigtea loses on prefill and on generation. It does not lead on anything here.**
+**Chaos loses on prefill and on generation. It does not lead on anything here.**
 
 Note also that llama.cpp's reported "load time" and "prompt eval time" are nearly
 identical (10532 vs 10524 ms) and `load + eval ≈ total`, so its load is
@@ -89,8 +89,8 @@ same drive. Neither can cache 137 GiB. So the disk work is equal, and the
 difference is what happens *around* it.
 
 llama.cpp `mmap`s the container and the kernel reads ahead **while the CPU is
-computing the previous layer**. Bigtea reads a layer's experts, waits, computes,
-then reads the next layer's — strictly serial. Measured on Bigtea, per token:
+computing the previous layer**. Chaos reads a layer's experts, waits, computes,
+then reads the next layer's — strictly serial. Measured on Chaos, per token:
 **2.3s of I/O and 1.0s of compute, run one after the other**. Overlapped, that
 same work is `max(2.3, 1.0) = 2.3s` rather than `3.3s`.
 

@@ -1,6 +1,6 @@
 name: CI
 
-# Bigtea links against a prebuilt ggml. Rather than vendor it, each job builds
+# Chaos links against a prebuilt ggml. Rather than vendor it, each job builds
 # ggml from llama.cpp and points GGML_LIB_DIR at the result — the same steps a
 # contributor follows by hand, so a green CI means the documented steps work.
 #
@@ -48,22 +48,22 @@ jobs:
 
       - name: The ggml-free crates build, test and lint
         run: |
-          CRATES="-p bigtea-gguf -p bigtea-probe -p bigtea-plan -p bigtea-io -p bigtea-model -p bigtea-tokenizer -p bigtea-grammar -p bigtea-ggml"
+          CRATES="-p chaos-gguf -p chaos-probe -p chaos-plan -p chaos-io -p chaos-model -p chaos-tokenizer -p chaos-grammar -p chaos-ggml"
           cargo build $CRATES
           cargo test $CRATES
           cargo clippy $CRATES --all-targets -- -D warnings
 
-      - name: bigtea-arch fails with instructions, not with import errors
+      - name: chaos-arch fails with instructions, not with import errors
         run: |
-          if cargo build -p bigtea-arch 2>build.log; then
-            echo "::error::bigtea-arch built without ggml; the guard in its build.rs is not working"
+          if cargo build -p chaos-arch 2>build.log; then
+            echo "::error::chaos-arch built without ggml; the guard in its build.rs is not working"
             exit 1
           fi
           grep -q "GGML_LIB_DIR is not set" build.log \
             || { echo "::error::missing the actionable message"; cat build.log; exit 1; }
           grep -q "github.com/ggml-org/llama.cpp" build.log \
             || { echo "::error::error message does not tell the user what to do"; exit 1; }
-          echo "bigtea-arch failed correctly, with instructions."
+          echo "chaos-arch failed correctly, with instructions."
 
   test:
     name: ${{ matrix.name }}
@@ -93,7 +93,7 @@ jobs:
           rustup component add clippy --toolchain stable-x86_64-pc-windows-gnu
 
       # ggml must be built by the *same* toolchain that links it. The Visual
-      # Studio generator emits COFF `.lib` archives, which the GNU linker Bigtea
+      # Studio generator emits COFF `.lib` archives, which the GNU linker Chaos
       # uses on Windows cannot consume, so MSYS2's mingw64 gcc builds it instead.
       # This mirrors the documented local setup exactly.
       - name: MSYS2 toolchain (Windows)

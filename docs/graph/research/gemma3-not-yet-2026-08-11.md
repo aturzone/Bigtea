@@ -9,7 +9,7 @@ tensor. Shape reads correctly: 26 layers, 1152 embd, 4 heads (1 kv), head_dim
 256, QK-norm detected. It answers, and the answer looks fine.
 
 ```
-$ bigtea-run -m gemma-3-1b-it-Q4_K_M.gguf -p "The capital of France is" -n 10 --force
+$ chaos-run -m gemma-3-1b-it-Q4_K_M.gguf -p "The capital of France is" -n 10 --force
  Paris.
 
 The city of Rome is the capital

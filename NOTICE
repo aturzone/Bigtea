@@ -1,4 +1,4 @@
-Bigtea
+Chaos
 Copyright 2026 Atur Dana
 
 This product includes software developed by Atur Dana and contributors,
@@ -12,19 +12,19 @@ ggml — https://github.com/ggml-org/ggml
 Copyright (c) 2023-2024 The ggml authors
 Licensed under the MIT License.
 
-  Bigtea links against a prebuilt ggml as a static library and does not vendor,
-  redistribute or modify its source. `crates/bigtea-ggml` contains only Rust FFI
+  Chaos links against a prebuilt ggml as a static library and does not vendor,
+  redistribute or modify its source. `crates/chaos-ggml` contains only Rust FFI
   declarations written against ggml's public C API.
 
-  Quantized matmul kernels are years of specialist SIMD work. Bigtea does not
+  Quantized matmul kernels are years of specialist SIMD work. Chaos does not
   reimplement them; it owns memory, residency, streaming and the token loop, and
-  borrows the arithmetic. See crates/bigtea-ggml/build.rs.
+  borrows the arithmetic. See crates/chaos-ggml/build.rs.
 
   MIT License text: https://github.com/ggml-org/ggml/blob/master/LICENSE
 
 --------------------------------------------------------------------------------
 
-No model weights are distributed with Bigtea. Models are downloaded by the user
-from their own sources and carry their own licences, which Bigtea neither grants
+No model weights are distributed with Chaos. Models are downloaded by the user
+from their own sources and carry their own licences, which Chaos neither grants
 nor alters. DeepSeek-V4-Flash, Qwen3 and any other model referenced in this
 repository's documentation are the property of their respective publishers.

@@ -1,4 +1,4 @@
-"""Compare Bigtea's Jinja rendering against `llama.cpp --jinja`, per container.
+"""Compare Chaos's Jinja rendering against `llama.cpp --jinja`, per container.
 
 The family matcher is verified against llama.cpp's *hardcoded* renderer. This
 compares the other pair: our template evaluation against llama.cpp's, which is

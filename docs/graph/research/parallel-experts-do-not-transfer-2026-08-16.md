@@ -15,7 +15,7 @@ the entire routed expert arithmetic is under 5% of a V4-Flash token.**
 
 ## What a V4-Flash token is actually made of
 
-`BIGTEA_BLOCK_TIMING=1`, summed over all 43 blocks of one pass. The block builds
+`CHAOS_BLOCK_TIMING=1`, summed over all 43 blocks of one pass. The block builds
 one graph and evaluates it in a single `compute` at the end, so every other
 phase timer measures graph *construction* — plus, inside `ffn`, the expert slice
 read. `compute` is the only line where arithmetic happens, and it had been
@@ -84,14 +84,14 @@ re-read every token by the background prefetch.
 Command lines, verbatim:
 
 ```
-bigtea-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf "The capital of France is" -n 8
-bigtea-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf -f prompt51.txt -n 1
+chaos-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf "The capital of France is" -n 8
+chaos-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf -f prompt51.txt -n 1
 ```
 
 ## Where the remaining headroom is, and why it is not reachable in code
 
 67% of a token is the expert slice read: 3.19 GiB moved per token at **1.88
-GiB/s**. `bigtea-iobench` on a shard of this same model, 256 scattered 4 MiB
+GiB/s**. `chaos-iobench` on a shard of this same model, 256 scattered 4 MiB
 slices per pass:
 
 ```

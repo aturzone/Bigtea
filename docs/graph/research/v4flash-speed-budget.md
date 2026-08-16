@@ -53,7 +53,7 @@ remaining editors and chat apps takes it to ~10.0 GiB, which is the first point 
 ~2.5 GiB cache becomes possible at all.
 
 So the honest reading: **residency is reachable today; a cache large enough to matter is not,
-without either freeing more or adding RAM.** `bigtea-probe --quick` reports exactly what to
+without either freeing more or adding RAM.** `chaos-probe --quick` reports exactly what to
 close and what it is worth. It is the single largest speed lever available and costs nothing
 to pull.
 
@@ -89,9 +89,9 @@ slower.
 
 Everything above is engineering both engines could do. The design difference is this:
 llama.cpp mmaps all 144 GB and lets the kernel's LRU decide, so its dense weights compete
-with 137 GiB of cold expert traffic and get evicted — `bigtea-model-info` projects the dense
+with 137 GiB of cold expert traffic and get evicted — `chaos-model-info` projects the dense
 re-read per token climbing from 0.06 GiB at 4k context to **7.38 GiB at 128k**, which is the
-entire dense set being re-read every token. Bigtea pins that set and it never moves.
+entire dense set being re-read every token. Chaos pins that set and it never moves.
 
 At 4k context that is worth little. At 128k it is worth 7.38 GiB/token — more than twice the
 expert traffic. **That is the regime where the gap should be structural rather than
@@ -121,7 +121,7 @@ copies + bind      5.9s   34% of the step
                   17.1s
 ```
 
-And the disk's own ceiling, measured by `bigtea-probe` (not assumed):
+And the disk's own ceiling, measured by `chaos-probe` (not assumed):
 
 ```
 sequential, 8 MiB blocks, sized above RAM:   2.55 GB/s
@@ -137,7 +137,7 @@ Two separate problems, both worth real seconds:
 2. **The disk is running at 43% of its own sequential rate.** 12.7 MiB is a large read, so
    this is not per-request latency — parallelising it made things *worse*. It is scattered
    offsets across five shards with no readahead, under cache-bypassing direct I/O. **Worth up
-   to ~6.5s** if it can be closed, and the first thing to check is whether `bigtea-io` splits
+   to ~6.5s** if it can be closed, and the first thing to check is whether `chaos-io` splits
    these into smaller physical reads.
 
 Together the expert step could go 17.1s → ~5s.
@@ -208,7 +208,7 @@ most this machine will ever give. Chasing 5 tok/s here is chasing a number the h
 produce.
 
 **2. Once the model fits RAM the bottleneck stops being I/O and becomes dequantisation**, which
-is exactly where Bigtea currently *loses* to llama.cpp on Qwen3 (1.07 vs 2.16 tok/s,
+is exactly where Chaos currently *loses* to llama.cpp on Qwen3 (1.07 vs 2.16 tok/s,
 generation). Expert compute there is neither barrier-bound nor bandwidth-bound — 2.4 GB/s
 against DDR5 — it is unpacking Q4_K one block at a time while llama.cpp interleaves rows so
 several unpack per SIMD op. **On a big machine that gap is the whole race.** The repacking work
@@ -228,7 +228,7 @@ evicted. Its projected dense re-read climbs to 7.38 GiB/token at 128k. Then:
 
 ```
 llama.cpp @128k:  (7.38 dense re-read + 3.21 experts) / 2.55 GB/s  =  4.2 s/token  =  0.24 tok/s
-Bigtea    @128k:   3.21 experts only                  / 2.55 GB/s  =  1.26 s/token =  0.79 tok/s
+Chaos    @128k:   3.21 experts only                  / 2.55 GB/s  =  1.26 s/token =  0.79 tok/s
                                                                                        ~3.3x
 ```
 

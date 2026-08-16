@@ -1,4 +1,4 @@
-# 05 — Proposed actions for the Bigtea graph (not applied)
+# 05 — Proposed actions for the Chaos graph (not applied)
 
 Per Atur's instruction this folder stays outside `docs/graph/`. The items below are **proposals**,
 each mapped to where it belongs and who owns the decision (all are Atur). Nothing in the graph
@@ -52,7 +52,7 @@ was modified while writing this folder.
 ## A6. Future-backend research queue: WASTE + ds4 (v1.1+, warm)
 
 - **What:** add WASTE and ds4 to the future-backend queue with triggers: revisit when (a) v1
-  ships, or (b) either gains a Linux/Metal/Windows support matrix Bigtea can target.
+  ships, or (b) either gains a Linux/Metal/Windows support matrix Chaos can target.
 - **Where:** `backlog/mvp-v1.md` "future backends" note or a research queue node.
 - **Effort:** trivial.
 

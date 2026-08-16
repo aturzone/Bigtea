@@ -16,10 +16,10 @@ a shrug.
 
 ## The honest starting position
 
-Bigtea today opens **three** architectures and **one** tokenizer family. That is
+Chaos today opens **three** architectures and **one** tokenizer family. That is
 the real distance to "any model", and it is far larger than the performance gap.
 
-| | Bigtea | llama.cpp |
+| | Chaos | llama.cpp |
 |---|---|---|
 | architectures | **10** (`deepseek4`, `gemma2`, `gemma3`, `llama`, `phi3`, `qwen2`, `qwen3`, `qwen3moe`, `stablelm`, `starcoder2`) — each diffed against llama.cpp on **eight** prompts, because three certified `starcoder2` while its pre-tokenizer was wrong | ~100. Every entry is diffed against llama.cpp token for token; `gemma2` sat here for weeks without that and was **wrong** — see `../research/gemma-was-running-silu-2026-08-11.md` |
 | tokenizer families | **5** (spm, bpe, wpm, ugm, rwkv) — RWKV is *implemented, not verified*: no container on this machine, so it is tested against a hand-built vocabulary through the real loading path, never against llama.cpp | 6 (spm, bpe, wpm, ugm, rwkv, plamo2) |
@@ -56,7 +56,7 @@ if the failure says which architecture, which tensor, and whether it is a gap or
 a corrupt file. Today an unsupported model reports a missing tensor name.
 
 **A1+A2+A3 together are the single highest-value item in this document**: they
-take Bigtea from 3 architectures to the majority of GGUF files people actually
+take Chaos from 3 architectures to the majority of GGUF files people actually
 download.
 
 ## B. Performance against llama.cpp — the criteria
@@ -74,7 +74,7 @@ measured back to back in one session with both command lines recorded.
 | **quality (perplexity)** | untested | untested | **33.6434 vs 34.0293 — 1.13%** |
 
 **Quality is measured now, and it was the largest untested claim in this
-document.** `bigtea-run --ppl-chunk N` reports perplexity using llama.cpp's
+document.** `chaos-run --ppl-chunk N` reports perplexity using llama.cpp's
 windowing (whole chunks only, second half scored, `n_ctx - 1 - n_ctx/2` tokens
 each). Llama-3.2-1B: **29.0909 against 29.2456 ± 6.49**; Qwen3-4B: **33.6434
 against 34.0293 ± 9.64**. Two architectures, two tokenizer families, both within
@@ -89,7 +89,7 @@ repackable shape is `Q8_0`, and ggml's repacked `Q8_0` kernels are NEON and
 RISC-V only — 42 offered, 42 declined, 0 repacked on x86. llama.cpp cannot even
 load the file with repacking on (a 137 GiB single-range `CPU_REPACK` buffer),
 which is why its figures here pass `--no-repack`. The attempt did fix a null
-dereference that would have killed `bigtea-run` on any `*.Q8_0.gguf`:
+dereference that would have killed `chaos-run` on any `*.Q8_0.gguf`:
 `../research/v4flash-repacking-2026-08-10.md`.
 
 **Dense Qwen3-4B has never been compared to llama.cpp at all**, and it is the
@@ -107,7 +107,7 @@ reads + ~0.6 s of everything else, so with R2 overlap it is **~0.65 tok/s agains
 |---|---|---|
 | C1 | sampling: temperature, top-k, top-p, min-p, repeat penalty, seed | **DONE 2026-08-10** — 10 unit tests, `--llamacpp-defaults` for like-for-like comparison. **Extended same day** with `--frequency-penalty` and `--presence-penalty` (OpenAI's fields and llama.cpp's flags), including `temperature: 0` + a penalty, which is the penalised argmax and would otherwise have run `powf(1e6)` |
 | C2 | chat templates from `tokenizer.chat_template` | **DONE 2026-08-10** — 9 families, detected from the real templates; control tokens encode to single ids |
-| C3 | streaming responses (SSE) in `bigtea-serve` | **DONE 2026-08-10** — plus temperature/top_p/top_k/min_p/seed/stop from the request, EOS and stop sequences give `finish_reason: stop` |
+| C3 | streaming responses (SSE) in `chaos-serve` | **DONE 2026-08-10** — plus temperature/top_p/top_k/min_p/seed/stop from the request, EOS and stop sequences give `finish_reason: stop` |
 | C4 | `-c` context size, `-b` batch, `-t` threads as flags | **DONE 2026-08-10, then found broken and re-done the same day.** `-t` reached only `deepseek4`; every other architecture ignored it. Now plumbed, plus llama.cpp's `-tb`/`--threads-batch`, because generation and prefill want opposite counts. The generation default is **tuned on real tokens** — 1.66x/1.69x over "all cores". See `../research/threads-were-never-plumbed-2026-08-10.md` |
 | C5 | stop sequences, `max_tokens`, `n_predict` | **DONE** — `--stop` (repeatable) on the CLI, string-or-array on the server; both match accumulated text, not tokens |
 | C6 | grammar / JSON-schema constrained output | **won't for LTS** — large, and not what an agent needs first |

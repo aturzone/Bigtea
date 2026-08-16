@@ -3,7 +3,7 @@
 #
 #   GGUF=/path/model-00001-of-00005.gguf ./capture.sh [outdir]
 #
-# `-n 1` is load-bearing: exactly one prefill and no generation. bigtea-run
+# `-n 1` is load-bearing: exactly one prefill and no generation. chaos-run
 # regenerates statelessly, so each generated token re-runs prefill over the whole
 # sequence and the histogram counts the same prompt again -- which inflates
 # chi-square by the number of passes while leaving top-k coverage untouched.
@@ -16,7 +16,7 @@ set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${1:-"$HERE/captures"}
 GGUF=${GGUF:?set GGUF to the first shard of the model}
-BIN=${BIN:-"$HERE/../../target/release/bigtea-run"}
+BIN=${BIN:-"$HERE/../../target/release/chaos-run"}
 
 mkdir -p "$OUT/csv" "$OUT/logs"
 
@@ -28,7 +28,7 @@ for f in "$HERE"/prompts/*.txt; do
   fi
   echo "RUN  $name"
   start=$(date +%s)
-  BIGTEA_ROUTING=1 BIGTEA_ROUTING_DUMP="$OUT/csv/$name.csv" \
+  CHAOS_ROUTING=1 CHAOS_ROUTING_DUMP="$OUT/csv/$name.csv" \
     "$BIN" "$GGUF" "$(cat "$f")" -n 1 > "$OUT/logs/$name.log" 2>&1
   echo "DONE $name in $(( $(date +%s) - start ))s  $(grep -m1 '^prompt' "$OUT/logs/$name.log")"
 done

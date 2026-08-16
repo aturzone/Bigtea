@@ -31,7 +31,7 @@ would arrive late at someone else's finish line.
 
 Two halves, and both are things no other runner does.
 
-**Owned residency.** Bigtea decides what stays in memory. llama.cpp `mmap`s the
+**Owned residency.** Chaos decides what stays in memory. llama.cpp `mmap`s the
 container and hands the policy to the kernel's LRU. That is not a small
 difference on this workload:
 
@@ -45,7 +45,7 @@ difference on this workload:
 An mmap-based engine cannot fix either without ceasing to be mmap-based. **This
 is architectural, and it is the whole reason this project exists.**
 
-**Honest prediction.** `bigtea-model-info` already predicts fit and tok/s from
+**Honest prediction.** `chaos-model-info` already predicts fit and tok/s from
 the probe. Nothing else tells you *before* a 144 GB download that the answer
 will take ten minutes a token on your machine. That is worth more to a user than
 another 10% of throughput, and it is the half nobody is competing for.
@@ -62,7 +62,7 @@ Speed work is worth nothing if the thing cannot be installed. All of this is
    DLLs. Before that a downloaded `.exe` died with `0xC0000135` before `main`,
    printing nothing — a release workflow would have shipped binaries that simply
    did not start. What remains is the CI release job itself.
-2. **`bigtea pull`** with resume, checksums, and a disk-space check *before*
+2. **`chaos pull`** with resume, checksums, and a disk-space check *before*
    starting 144 GB.
 3. **Quant selection from the probe**, with the tok/s prediction stated first.
 4. **Self-configuration** — cache size, prefill block, threads, I/O mode, all
@@ -111,7 +111,7 @@ long prompts separately rather than one number.
   weights already live, and streaming the cold ones to the CPU. One expert index
   across all 43 layers is 0.535 GiB, so ~5.1 GiB of VRAM holds 9-10 of them.
   **Three blockers**: no CUDA toolkit here, the linked ggml is CPU-only, and
-  Bigtea binds weights by handing ggml a *host* pointer — a device tier needs a
+  Chaos binds weights by handing ggml a *host* pointer — a device tier needs a
   new binding path. **unproven, weeks of work.**
 - **Speculative decoding.** ~2.2x, a proven technique, independent of everything
   above. Needs a draft model sharing V4-Flash's tokenizer. **unproven here.**

@@ -53,7 +53,7 @@ Every `tokenizer.chat_template` in `C:/Projects/models/` — **12 templates**:
 
 That is the whole language these templates use. **No macros, no imports, no
 inheritance, no custom filters beyond three.** It is a weekend, not a quarter —
-comparable to `bigtea-grammar`, which is a self-contained crate with no
+comparable to `chaos-grammar`, which is a self-contained crate with no
 dependencies at all.
 
 Counting caveat: a naive `| filter` regex also matches the pipe inside
@@ -62,7 +62,7 @@ artefacts. The three above are the real ones.
 
 ## Shape
 
-A new crate, `bigtea-jinja`, with no dependencies — same as `bigtea-grammar`.
+A new crate, `chaos-jinja`, with no dependencies — same as `chaos-grammar`.
 Lexer, parser, evaluator. The evaluator's environment is exactly what a chat
 template gets: `messages` (a list of maps), `bos_token`, `eos_token`,
 `add_generation_prompt`, and whatever `{% set %}` introduces.
@@ -78,7 +78,7 @@ not byte-stable for that model rather than freezing a fake date.
 
 ## Acceptance
 
-The oracle already exists: `crates/bigtea-tokenizer/tests/chat-templates.txt` is
+The oracle already exists: `crates/chaos-tokenizer/tests/chat-templates.txt` is
 llama.cpp's own rendering of all 54 templates, captured token by token.
 
 1. For every container on disk, the **Jinja-evaluated** output must equal the

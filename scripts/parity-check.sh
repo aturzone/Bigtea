@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Diff Bigtea's output against llama.cpp's, token for token, at --temp 0.
+# Diff Chaos's output against llama.cpp's, token for token, at --temp 0.
 #
 # This exists because `VERIFIED_ARCHITECTURES` once contained an entry nobody
 # had ever run the reference against: gemma2 answered "**Paris**." where
@@ -23,7 +23,7 @@
 # (5). So this script now does two more things before shrugging:
 #
 #   1. **Compares the tokenized prompt, ID for ID.** If llama.cpp turns the
-#      prompt into different tokens than Bigtea does, the two engines are not
+#      prompt into different tokens than Chaos does, the two engines are not
 #      answering the same question and the mismatch is a FAILURE, not a tie.
 #      **This compared COUNTS until 2026-08-15, and a count cannot see the bug
 #      it was written for**: `starcoder2` passed 3/3 while running the wrong
@@ -57,7 +57,7 @@ set -u
 MODEL=${1:?usage: parity-check.sh <model.gguf> [n_tokens]}
 N=${2:-32}
 LLAMACPP_BIN=${LLAMACPP_BIN:-/c/Projects/llamacpp-unsloth/build/bin}
-BIGTEA=${BIGTEA:-./target/release/bigtea-run.exe}
+CHAOS=${CHAOS:-./target/release/chaos-run.exe}
 REF="$LLAMACPP_BIN/llama-completion.exe"
 
 # `NGL=n` runs BOTH engines with `-ngl n`, which is the only way to test a
@@ -111,7 +111,7 @@ PROMPTS=(
 
 # Strip terminal colouring, CRs, and llama.cpp's own end-of-stream marker.
 #
-# `[end of text]` is printed by llama-completion when it hits EOS; Bigtea stops
+# `[end of text]` is printed by llama-completion when it hits EOS; Chaos stops
 # silently. The GENERATED TOKENS ARE IDENTICAL -- this is the two CLIs framing
 # the same result differently, and leaving it in reported tinyllama's
 # `Q: What is 17 plus 25? A:` as a FAIL where both had answered ` 42`.
@@ -140,8 +140,8 @@ ref() {
 # Both engines print the IDs under `--verbose-prompt`; llama.cpp one per line as
 # `<id> -> '<text>'`, prefixed with its log timestamp. Matching on the arrow and
 # taking the number before it survives token texts containing quotes.
-bigtea_tokens() {
-  "$BIGTEA" -m "$MODEL" -p "$1" -n 1 --temp 0 --force --verbose-prompt 2>&1 \
+chaos_tokens() {
+  "$CHAOS" -m "$MODEL" -p "$1" -n 1 --temp 0 --force --verbose-prompt 2>&1 \
     | strip | sed -n 's/^prompt  *[0-9]* tokens: \[\(.*\)\]$/\1/p' | head -1 | tr -d ' '
 }
 llama_tokens() {
@@ -155,12 +155,12 @@ fail=0
 unstable=0
 near=0
 for p in "${PROMPTS[@]}"; do
-  a=$("$BIGTEA" -m "$MODEL" -p "$p" -n "$N" --temp 0 --force "${OFFLOAD[@]}" 2>/dev/null | strip)
+  a=$("$CHAOS" -m "$MODEL" -p "$p" -n "$N" --temp 0 --force "${OFFLOAD[@]}" 2>/dev/null | strip)
   b=$(ref "$p")
   a=${a#*"$p"}
   b=${b#*"$p"}
-  # Bigtea puts the echo on its own line; llama.cpp echoes inline. So exactly
-  # one newline on Bigtea's side is framing rather than output -- and stripping
+  # Chaos puts the echo on its own line; llama.cpp echoes inline. So exactly
+  # one newline on Chaos's side is framing rather than output -- and stripping
   # it from BOTH is wrong, because a model whose first token is a newline (the
   # `def fibonacci(n):` prompt, on every model tested) then loses a real token
   # from llama.cpp's side and every engine looks like a failure.
@@ -197,7 +197,7 @@ for p in "${PROMPTS[@]}"; do
   #
   #   -b 1         : Paris. Paris is known for its rich history,
   #   -fa off      : Paris.<|assistant|> Yes, that's correct
-  #   -b 1 -fa off : Paris.<|assistant|> That's correct! Paris   <- Bigtea's answer
+  #   -b 1 -fa off : Paris.<|assistant|> That's correct! Paris   <- Chaos's answer
   #
   # Neither flag alone reproduces it. A near-tie that needs two no-ops composed
   # is invisible to a single-flag probe, and there is no reason to think that
@@ -210,13 +210,13 @@ for p in "${PROMPTS[@]}"; do
   if [ "$c" != "$b" ] || [ "$d" != "$b" ] || [ "$e" != "$b" ] || [ "$f" != "$b" ]; then
     # Before shrugging: did the two engines even read the same prompt? A
     # near-tie is what a DIFFERENT INPUT looks like, so this is checked first.
-    bt=$(bigtea_tokens "$p")
+    bt=$(chaos_tokens "$p")
     lt=$(llama_tokens "$p")
     if [ -n "$bt" ] && [ -n "$lt" ] && [ "$bt" != "$lt" ]; then
       fail=1
       printf 'FAIL      %-36s %s\n' "$name" "$p"
       printf '  the prompt tokenized differently -- the IDs, not just the count:\n'
-      printf '    bigtea   : %s\n' "$(printf '%s' "$bt" | head -c 160)"
+      printf '    chaos   : %s\n' "$(printf '%s' "$bt" | head -c 160)"
       printf '    llama.cpp: %s\n' "$(printf '%s' "$lt" | head -c 160)"
       printf '  The reference also disagrees with itself here, which is what a\n'
       printf '  different input looks like -- so this is NOT a near-tie.\n'
@@ -251,14 +251,14 @@ for p in "${PROMPTS[@]}"; do
       near=$((near + 1))
       printf 'near-tie  %-36s %s\n' "$name" "$p"
       printf '  the reference disagrees with itself under:%s\n' "$which"
-      printf '  and Bigtea reproduces its `%s` output EXACTLY. Our answer is\n' "$inband"
+      printf '  and Chaos reproduces its `%s` output EXACTLY. Our answer is\n' "$inband"
       printf '  one llama.cpp itself gives; this is a tie, not a divergence.\n'
       continue
     fi
     unstable=$((unstable + 1))
     printf 'unstable  %-36s %s\n' "$name" "$p"
     printf '  the reference disagrees with itself under:%s\n' "$which"
-    printf '  but Bigtea matches NONE of its outputs -- a third answer, outside\n'
+    printf '  but Chaos matches NONE of its outputs -- a third answer, outside\n'
     printf '  the band. Its instability does not explain ours. Both engines\n'
     printf '  tokenized the prompt identically. Suspicious.\n'
     continue
@@ -266,7 +266,7 @@ for p in "${PROMPTS[@]}"; do
 
   fail=1
   printf 'FAIL      %-36s %s\n' "$name" "$p"
-  printf '  bigtea   : %s\n' "$(printf '%s' "$a" | head -c 200)"
+  printf '  chaos   : %s\n' "$(printf '%s' "$a" | head -c 200)"
   printf '  llama.cpp: %s\n' "$(printf '%s' "$b" | head -c 200)"
 done
 
@@ -276,7 +276,7 @@ if [ "$near" -gt 0 ] || [ "$unstable" -gt 0 ]; then
 fi
 # The cluster rule now applies to the SHARPER class. Nine of eleven `unstable`
 # verdicts in one session were real bugs -- but that was measured when a single
-# word covered both situations. A prompt where Bigtea reproduces one of the
+# word covered both situations. A prompt where Chaos reproduces one of the
 # reference's own outputs byte for byte is explained; a prompt where it produces
 # a third answer nobody's reference gives is not, and only the second kind is
 # the thing those nine turned out to be.

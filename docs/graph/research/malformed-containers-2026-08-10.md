@@ -31,7 +31,7 @@ which one arbitrary.
 
 ## The corpus
 
-`crates/bigtea-gguf/tests/malformed.rs`, headers built byte by byte with no
+`crates/chaos-gguf/tests/malformed.rs`, headers built byte by byte with no
 download. The builder can declare a length that disagrees with the bytes that
 follow it, which is the case no real container provides and every hostile one
 does.

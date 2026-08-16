@@ -1,5 +1,5 @@
 ---
-decision: Bigtea's position after WASTE/ds4 — what "be the best" actually means
+decision: Chaos's position after WASTE/ds4 — what "be the best" actually means
 status: proposed        # Atur must decide; extends (does not contradict) fork-vs-wrapper.md
 links: [../research/waste-engine-verified.md, ../research/moe-landscape-2026-08.md, ../research/advisory-evaluation-deepseek-0731.md, fork-vs-wrapper.md]
 ---
@@ -8,7 +8,7 @@ links: [../research/waste-engine-verified.md, ../research/moe-landscape-2026-08.
 
 - **The "big bang" already fired, twice.** Running a frontier MoE on consumer hardware is *done*:
   WASTE runs Kimi K3 (2.8T) on a 64 GB Mac at ~0.5 tok/s; ds4/DwarfStar (antirez) runs
-  DeepSeek-V4-Flash on Metal/CUDA/ROCm at ~20k stars. Bigtea cannot claim that headline — it was
+  DeepSeek-V4-Flash on Metal/CUDA/ROCm at ~20k stars. Chaos cannot claim that headline — it was
   claimed in June–July 2026 (../research/moe-landscape-2026-08.md).
 - **Every engine is model-family locked.** WASTE = Kimi only (converter hard-built for Moonshot's
   KDA+MLA architecture, *no DeepSeek support, none planned*). ds4 = DeepSeek-V4/GLM-5.2 only.
@@ -50,7 +50,7 @@ links: [../research/waste-engine-verified.md, ../research/moe-landscape-2026-08.
 
 ## Recommendation
 
-**Option B.** Bigtea is not "a ktransformers wrapper" — it is **the answer to which-engine-for-my-
+**Option B.** Chaos is not "a ktransformers wrapper" — it is **the answer to which-engine-for-my-
 machine-and-model, with a predicted tok/s before you download 600 GB**. Three verified facts force
 this: engines are model-family locked *and* accelerator-locked, so the choice is real and hard;
 every existing preflight is single-engine and post-download; and the underlying physics is now
@@ -61,7 +61,7 @@ drive upstream through stable surfaces, still never vendor/pin. It re-aims the *
 "observability for one engine" to "a trustworthy recommendation across engines," and observability
 becomes the verification loop that makes recommendations credible rather than a standalone bet.
 
-**Strongest counterargument**: a router is only as good as the engines it routes to, so Bigtea
+**Strongest counterargument**: a router is only as good as the engines it routes to, so Chaos
 inherits every upstream's install pain and can be flattened if one engine becomes universal. It
 loses because fragmentation is *increasing*, not decreasing — WASTE (Kimi) and ds4 (DeepSeek/GLM)
 both launched as *new* family-locked engines within 90 days, and neither can run the other's model

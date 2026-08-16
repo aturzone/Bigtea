@@ -77,7 +77,7 @@ It recommended (04 §C, 05 §A6) keeping **WASTE warm as a future wrapped backen
 kills this for our scope: WASTE has **zero CUDA/ROCm** (issue #11 open; maintainers themselves
 unconvinced), its only GPU path (Metal) is **22% slower than CPU**, and its converter is
 **hard-locked to Moonshot's Kimi architecture — no DeepSeek support exists or is planned**.
-Bigtea's v1 is DeepSeek-class on Linux+NVIDIA. Wrapping WASTE would serve *neither* axis.
+Chaos's v1 is DeepSeek-class on Linux+NVIDIA. Wrapping WASTE would serve *neither* axis.
 **ds4/DwarfStar is the far better future-backend candidate** (DeepSeek-V4-Flash + GLM-5.2,
 Metal+CUDA+ROCm, MIT, ~20k stars) and the advisory under-weighted it.
 

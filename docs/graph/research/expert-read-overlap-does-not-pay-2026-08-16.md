@@ -46,7 +46,7 @@ regression, and it is meaningless: by then the machine had been running 17 GiB
 models back to back for hours, and *both* arms of an unrelated head-to-head were
 declining across their five pairs (3.53 → 3.03 and 3.62 → 2.53).
 
-So a `BIGTEA_EXPERT_PIPELINE=0` toggle was added purely to get both paths into
+So a `CHAOS_EXPERT_PIPELINE=0` toggle was added purely to get both paths into
 one alternating session, and only then did the honest number appear. **This
 machine drifts by more than the effect being measured.** Any change worth less
 than ~10% here needs both arms in one session, alternating, or it cannot be

@@ -84,7 +84,7 @@ character outside the GPT-2 byte alphabet, and `\n` is outside it. So every
 newline vanished and generation arrived as one run-on line:
 
 ```
-bigtea   :  Paris.Q: What is the capital of France?Options:- france- france
+chaos   :  Paris.Q: What is the capital of France?Options:- france- france
 llama.cpp:  Paris.\nQ: What is the capital of France?\nOptions:\n- france\n- paris
 ```
 
@@ -118,13 +118,13 @@ pass.** One near-tie in eight is ordinary. Five is a bug you have not found yet.
 
 ## A fourth thing, in the harness rather than the engine
 
-`llama-completion` prints ` [end of text]` when the model stops on EOS. Bigtea
+`llama-completion` prints ` [end of text]` when the model stops on EOS. Chaos
 prints no equivalent, so any model that terminated early read as a FAIL whose
 two sides were otherwise identical:
 
 ```
 FAIL      tinyllama   Q: What is 17 plus 25? A:
-  bigtea   :  42
+  chaos   :  42
   llama.cpp:  42 [end of text]
 ```
 

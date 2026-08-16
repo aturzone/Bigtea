@@ -5,7 +5,7 @@ links: [lts-parity-criteria.md, threads-were-never-plumbed-2026-08-10.md, qwen3-
 ---
 
 Gemma-2 alternates a **sliding-window** layer with a **full-attention** one.
-Bigtea implemented neither the window nor a way to live without it, so
+Chaos implemented neither the window nor a way to live without it, so
 `correct_context_limit()` refused any sequence past 4096 tokens. That refusal
 was honest — below the window every layer *is* effectively full attention, so
 short sequences were exactly right — but it made the only Gemma container on
@@ -42,7 +42,7 @@ regression check and nothing more.
 completion on both sides:
 
 ```
-$ bigtea-run gemma-2-2b-it-Q4_K_M.gguf -f target/p5k.txt -n 16 -t 4
+$ chaos-run gemma-2-2b-it-Q4_K_M.gguf -f target/p5k.txt -n 16 -t 4
 prefill 5201 tokens in 45.2s (114.99 tok/s)
 "The history of computing is a history of abstraction. Each generation of engineers built a"
 
@@ -106,21 +106,21 @@ tensor a branch can allocate has to be listed for that branch.
 
 ## Performance, and a number that looked like a win and was not
 
-At `-t 4` on both sides, Bigtea prefilled 5201 tokens at **114.99 tok/s** against
+At `-t 4` on both sides, Chaos prefilled 5201 tokens at **114.99 tok/s** against
 llama.cpp's **76.76** — 1.50x ahead. That figure is worthless: prefill is
 compute-bound and wants every core, so `-t 4` handicaps it, and llama.cpp was
 being run at a setting nobody would use.
 
 ```
 $ llama-completion ... -t 20    prompt eval 127.35 tok/s / 5200 tokens
-$ bigtea-run       ... -t 20    prefill     109.30 tok/s / 5201 tokens
-$ bigtea-run       ... -t 4     prefill     114.99 tok/s / 5201 tokens
+$ chaos-run       ... -t 20    prefill     109.30 tok/s / 5201 tokens
+$ chaos-run       ... -t 4     prefill     114.99 tok/s / 5201 tokens
 ```
 
 | Gemma-2-2b prefill, 5200 tokens | best of each | verdict |
 |---|---:|---|
 | llama.cpp | **127.35** (t=20) | — |
-| Bigtea | 114.99 (t=4) | **1.11x behind** |
+| Chaos | 114.99 (t=4) | **1.11x behind** |
 
 **Not a win.** Recorded because the 1.50x version was one command line away from
 being quoted, and this project has retracted two claims already. The rule that
@@ -134,7 +134,7 @@ setting its own author would choose.
   hardcoded to Gemma-2's alternation rather than read from metadata.
 - **Memory.** The window means old KV entries can never be read by half the
   layers, so their cache could be a ring of `sliding_window` entries instead of
-  the full sequence. Bigtea still stores all of it — 529.8 MiB at 5216
+  the full sequence. Chaos still stores all of it — 529.8 MiB at 5216
   positions. That is a real saving left on the table, and it is the same
   wraparound work as issue #46.
 - **Sequences past ~8k**, untested; the arenas now scale but nothing above 5201

@@ -1,16 +1,16 @@
 ---
-topic: Bigtea vs llama.cpp head-to-head on the target machine — measured, retracted claims, and where we actually stand
+topic: Chaos vs llama.cpp head-to-head on the target machine — measured, retracted claims, and where we actually stand
 status: resolved
 links: [moe-landscape-2026-08.md, benchmarking-methodology.md, verify-before-citing]
 ---
 
 Measured 2026-08-05 on the target machine (i7-13650HX, 15.71 GiB RAM, Windows 11).
-llama.cpp build 2026-08-03 (`llamacpp-unsloth`). Bigtea `ticket/rust-core`.
+llama.cpp build 2026-08-03 (`llamacpp-unsloth`). Chaos `ticket/rust-core`.
 Same prompt files for both, greedy (`--temp 0`), 12 threads.
 
 ## CORRECTION BLOCK (2026-08-05)
 
-Three claims in `CLAUDE.md`, `memory/bigtea-runner-state.md`, and every prior session summary
+Three claims in `CLAUDE.md`, `memory/chaos-runner-state.md`, and every prior session summary
 were **wrong**. All three are retracted.
 
 **Claim 1 — "llama.cpp refuses this class of model here."** FALSE.
@@ -32,10 +32,10 @@ its output are in a doc.** See [[verify-before-citing]].
 
 ## Qwen3-30B-A3B Q4_K_M (17.28 GiB) — the full ladder
 
-Bigtea with fused attention and a 2048-token prefill block; llama.cpp with a fully warm page
+Chaos with fused attention and a 2048-token prefill block; llama.cpp with a fully warm page
 cache. Both produce identical, correct output at every length.
 
-| prompt tokens | prefill: Bigtea / llama.cpp | eval: Bigtea / llama.cpp |
+| prompt tokens | prefill: Chaos / llama.cpp | eval: Chaos / llama.cpp |
 |---|---|---|
 | 565  | **27.64** / 23.55 | 1.40 / 3.19 |
 | 2206 | **36.60** / 33.59 | 1.11 / 2.46 |
@@ -55,17 +55,17 @@ Earlier in the session this table read 19.92/23.68/19.79/14.46 on prefill, and b
 session's optimisation work the 565-token figure was **1.20 tok/s**. Prefill is 23x faster than
 where it started.
 
-Memory: Bigtea holds 0.93 GiB resident + a 6.26 GiB expert cache ≈ 7.2 GiB. llama.cpp's peak
+Memory: Chaos holds 0.93 GiB resident + a 6.26 GiB expert cache ≈ 7.2 GiB. llama.cpp's peak
 working set was 8.87 GiB, and it additionally benefits from the OS page cache holding most of
-the remaining model — effectively ~11 GiB working for it. **Bigtea also bypasses the page cache
+the remaining model — effectively ~11 GiB working for it. **Chaos also bypasses the page cache
 deliberately** (direct I/O), so on a model that nearly fits, it is competing with one hand tied:
-the kernel can use all free RAM elastically, Bigtea reserves a fixed budget.
+the kernel can use all free RAM elastically, Chaos reserves a fixed budget.
 
 ### The long-context hypothesis is dead
 
-The prediction was that llama.cpp's page cache would thrash at long context while Bigtea's
+The prediction was that llama.cpp's page cache would thrash at long context while Chaos's
 bounded residency degraded gracefully. It does not happen. From 565 to 8775 tokens llama.cpp's
-eval falls 49% (3.19 → 1.62) and Bigtea's falls 56% (1.48 → 0.65). Bigtea degrades *slightly
+eval falls 49% (3.19 → 1.62) and Chaos's falls 56% (1.48 → 0.65). Chaos degrades *slightly
 faster*, and the ratio between them stays roughly constant at 2.2–2.5x.
 
 An earlier reading of this as "the gap is narrowing" was an artefact: llama.cpp's first run was
@@ -75,11 +75,11 @@ cold, later ones warm.
 
 To test the design premise (a model far larger than available RAM) without waiting on the
 V4-Flash port, 7 GiB was held resident by a ballast process, leaving 4.28 GiB free against a
-17.28 GiB model. Results looked unremarkable — llama.cpp 25.33 prefill / 2.26 eval, Bigtea 19.58
+17.28 GiB model. Results looked unremarkable — llama.cpp 25.33 prefill / 2.26 eval, Chaos 19.58
 / 1.47, both close to their unpressured numbers.
 
 **That is because the experiment did not work.** The ballast touched its pages once and then
-slept, so Windows paged it straight back out to satisfy llama.cpp's demand. Bigtea, running
+slept, so Windows paged it straight back out to satisfy llama.cpp's demand. Chaos, running
 second, then probed 6.66 GiB as "available" — more than the ballast was supposedly holding,
 which is the tell. No pressure was ever applied and these numbers measure nothing. A valid
 version needs `VirtualLock`ed pages, and continuously re-touching them would burn the memory
@@ -92,10 +92,10 @@ bandwidth being measured.
 | default | **fails**: `failed to allocate buffer of size 147169738752` → `failed to allocate CPU_REPACK buffer` → `unable to create context` |
 | `--no-repack -c 512` | **runs**: load 12.3s, prefill 0.41 tok/s, eval **0.45 tok/s**, correct output |
 
-Bigtea cannot run this model — the architecture is not implemented. **This is the only regime
-where Bigtea's design should win, and it is exactly the one we cannot yet measure.** At 144 GB
+Chaos cannot run this model — the architecture is not implemented. **This is the only regime
+where Chaos's design should win, and it is exactly the one we cannot yet measure.** At 144 GB
 against 15.7 GiB the page cache holds under 8% of the model, so llama.cpp's 4 KiB demand-paged
-faults are competing against Bigtea's ~0.9 MiB sequential direct reads with an explicit
+faults are competing against Chaos's ~0.9 MiB sequential direct reads with an explicit
 frequency-based policy. That comparison is the whole thesis and it remains untested.
 
 Also worth noting: 0.45 tok/s means a 500-token answer takes 18 minutes. llama.cpp *loads* the
@@ -193,10 +193,10 @@ Two traps, both of which produce silent nonsense rather than an error:
   prompt processing — it does not make generation usable.
 - Generation remains ~2x behind on a model that nearly fits, and the kernel's page cache is
   elastic and free where ours is fixed and hand-managed. Expect to keep losing that one here.
-- Bigtea's measured advantage is memory: 7.2 GiB against llama.cpp's 8.87 GiB working set plus
+- Chaos's measured advantage is memory: 7.2 GiB against llama.cpp's 8.87 GiB working set plus
   page cache. That only matters to a user if it buys responsiveness, which is unmeasured.
 - The one place the design should win — model ≫ RAM, where cache policy dominates and we have
-  direct evidence that frequency beats recency 70% to 17% — cannot be tested until Bigtea runs
+  direct evidence that frequency beats recency 70% to 17% — cannot be tested until Chaos runs
   a model that large.
 
 ## Where generation time goes, and one lever ruled out
@@ -205,7 +205,7 @@ At 32 generated tokens: **12.6s expert compute, 5.8s disk, 3.9s other, 1.5s atte
 compute is 60% of it.
 
 Those matmuls are single-column against Q4_K weights. Sweeping the thread count they run on
-(`BIGTEA_EXPERT_THREADS`) changes almost nothing:
+(`CHAOS_EXPERT_THREADS`) changes almost nothing:
 
 | threads | eval tok/s | expert compute |
 |---|---|---|
@@ -230,7 +230,7 @@ every token that routes to it.
 **ggml does not expose repacking publicly.** There are no `_R4`/`_R8` entries in the `ggml_type`
 enum (`ggml.h`: Q4_K is 12, the enum ends at 43 with no repacked variants), and nothing matching
 `repack` appears anywhere in `ggml/include`. Upstream applies it through *extra buffer types*
-inside `ggml-cpu`, selected during `ggml-backend` buffer allocation — a path Bigtea bypasses
+inside `ggml-cpu`, selected during `ggml-backend` buffer allocation — a path Chaos bypasses
 entirely, because binding a weight means pointing a tensor's `data` at memory we already hold.
 
 So this is not a matter of calling one more function. Two possible routes, neither cheap:
@@ -253,7 +253,7 @@ is a multi-session piece of work, not an afternoon's.
 - Does bypassing the page cache still make sense when a model nearly fits? A runner that picked
   its I/O mode from the model-size-to-RAM ratio would use the kernel's cache when it helps and
   direct I/O when it would only double-buffer.
-- Our 4 GiB headroom is conservative: Bigtea uses 7.2 GiB where llama.cpp effectively uses ~11.
+- Our 4 GiB headroom is conservative: Chaos uses 7.2 GiB where llama.cpp effectively uses ~11.
   How much of the remaining gap is just that? Untested.
 - Where does generation time go now? At 565 tokens: 3.2s disk, 5.4s expert compute, 1.0s
   attention, ~3.3s unattributed. The expert compute is single-column matmuls against Q4_K
@@ -261,7 +261,7 @@ is a multi-session piece of work, not an afternoon's.
 
 ## V4-Flash prefill: a failed optimisation, and what the numbers actually say (2026-08-06)
 
-Bigtea runs V4-Flash end to end now — `bigtea-run <shard1>.gguf "The capital of France is"`
+Chaos runs V4-Flash end to end now — `chaos-run <shard1>.gguf "The capital of France is"`
 answers `" Paris"` — and the first profile of its 31.4s prefill (5 tokens, 43 blocks):
 
 ```

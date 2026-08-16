@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/aturzone/Bigtea/security/advisories/new
+    url: https://github.com/aturzone/Chaos/security/advisories/new
     about: Please report security issues privately, never as a public issue.
   - name: Ran it on Linux or macOS?
-    url: https://github.com/aturzone/Bigtea/issues/new
+    url: https://github.com/aturzone/Chaos/issues/new
     about: Those platforms are untested at runtime. Any result, including failure, is useful.

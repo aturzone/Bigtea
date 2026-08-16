@@ -1,4 +1,4 @@
-<h1 align="center">Bigtea</h1>
+<h1 align="center">Chaos</h1>
 
 <p align="center">
   <strong>A CPU inference runner for models that do not fit in RAM.</strong><br>
@@ -9,7 +9,7 @@
   <a href="#status"><img alt="status" src="https://img.shields.io/badge/status-v0.0.2%20preview-orange"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue"></a>
   <a href="#building"><img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-informational"></a>
-  <a href="https://github.com/aturzone/Bigtea/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aturzone/Bigtea/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/aturzone/Chaos/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aturzone/Chaos/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="tests" src="https://img.shields.io/badge/tests-168%20passing-brightgreen">
 </p>
 
@@ -19,14 +19,14 @@
 > the honest scoreboard against llama.cpp, what works, the known limitations, and
 > what is being worked on next. Read it before quoting any number from here.
 
-Bigtea runs a **144 GB** Mixture-of-Experts model on a **15.7 GiB** laptop, on CPU,
+Chaos runs a **144 GB** Mixture-of-Experts model on a **15.7 GiB** laptop, on CPU,
 and produces correct text. It does that by never loading the model: the weights
 every token needs stay in RAM, and the routed experts — which are most of the
 container and of which a token uses six of 256 — are read from disk as routing
 selects them.
 
 ```console
-$ bigtea-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf "The capital of France is" -n 5
+$ chaos-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf "The capital of France is" -n 5
 model      deepseek4 (direct (cache bypassed))
 shape      43 blocks, 4096 embd, 64 heads, 256 experts (6 used, 1 shared)
 resident   251 tensors, 6.21 GiB of 6.21 GiB budget in 4.1s (1.65 GB/s)
@@ -44,10 +44,10 @@ generate   4 tokens in 51.9s (0.077 tok/s, 13.0s per token)
 
 ## Read this before you try it
 
-**Bigtea is slower than llama.cpp.** Measured back to back on the same machine,
+**Chaos is slower than llama.cpp.** Measured back to back on the same machine,
 DeepSeek-V4-Flash:
 
-| | Bigtea | llama.cpp | |
+| | Chaos | llama.cpp | |
 |---|---:|---:|:--|
 | load | 10.0s | 10.5s | parity |
 | prefill, per prompt token | 2440 ms | **1503 ms** | llama.cpp **1.62x** faster |
@@ -56,14 +56,14 @@ DeepSeek-V4-Flash:
 Both command lines and both outputs:
 [`v4flash-vs-llamacpp-2026-08-07.md`](docs/graph/research/v4flash-vs-llamacpp-2026-08-07.md).
 
-> **Retraction.** v0.0.1 claimed Bigtea was 3.0x faster on load and 1.20x on
-> prefill for this model. That was **wrong**: Bigtea's numbers were fresh and
+> **Retraction.** v0.0.1 claimed Chaos was 3.0x faster on load and 1.20x on
+> prefill for this model. That was **wrong**: Chaos's numbers were fresh and
 > llama.cpp's were copied from a two-day-old document taken under different
 > conditions. Run back to back, we lose on both. The claim is withdrawn.
 
-Where Bigtea **is** ahead is Qwen3-30B-A3B prefill, measured back to back:
+Where Chaos **is** ahead is Qwen3-30B-A3B prefill, measured back to back:
 
-| prompt tokens | Bigtea | llama.cpp | |
+| prompt tokens | Chaos | llama.cpp | |
 |---:|---:|---:|:--|
 | 565 | **27.64** | 23.55 | ahead |
 | 2206 | **36.60** | 33.59 | ahead |
@@ -71,12 +71,12 @@ Where Bigtea **is** ahead is Qwen3-30B-A3B prefill, measured back to back:
 | 8775 | 34.88 | 35.01 | parity |
 
 **llama.cpp also runs models larger than RAM**, given `--no-repack`. "Runs a model
-bigger than your memory" is not a thing only Bigtea does; that claim is retracted
+bigger than your memory" is not a thing only Chaos does; that claim is retracted
 too, in
 [`head-to-head-llamacpp-2026-08-05.md`](docs/graph/research/head-to-head-llamacpp-2026-08-05.md).
 
 If you want the fastest local inference today, use
-[llama.cpp](https://github.com/ggml-org/llama.cpp). Bigtea is worth your time if
+[llama.cpp](https://github.com/ggml-org/llama.cpp). Chaos is worth your time if
 you care about *how* larger-than-RAM inference behaves and want an engine that
 measures and reports it rather than guessing.
 
@@ -106,8 +106,8 @@ not built yet.
 | ✅ Honest reporting of residency, throughput and shortfalls | |
 | ⚠️ **Generation is slow** | see above — no KV cache yet on the V4-Flash path |
 | ⚠️ **V4-Flash is limited to 256 prompt tokens** | it builds its attention cache for the whole sequence at once; longer prompts are refused with a message. Lifting this is part of the KV-cache work |
-| ⚠️ **Model downloader** | `bigtea-pull <name>` resolves, resumes and reports the fit before downloading. Two models in the catalogue so far |
-| ⚠️ **OpenAI-compatible server** | `bigtea-serve` answers `POST /v1/chat/completions`. Localhost only, one request at a time, no streaming yet |
+| ⚠️ **Model downloader** | `chaos-pull <name>` resolves, resumes and reports the fit before downloading. Two models in the catalogue so far |
+| ⚠️ **OpenAI-compatible server** | `chaos-serve` answers `POST /v1/chat/completions`. Localhost only, one request at a time, no streaming yet |
 | ⚠️ **Linux and macOS build and pass tests in CI** | but no model has been *run* there yet, and macOS falls back to buffered I/O (`F_NOCACHE` is not wired up) |
 | ⚠️ **Prebuilt binaries** | the release workflow is written and asserts the binaries start; not yet fired against a tag |
 
@@ -116,7 +116,7 @@ Architectures implemented: **Qwen3 / Qwen3-MoE** and **DeepSeek-V4-Flash**
 
 ## Building
 
-Bigtea links against a prebuilt **ggml**. It does not vendor it: quantized matmul
+Chaos links against a prebuilt **ggml**. It does not vendor it: quantized matmul
 kernels are years of specialist SIMD work, and reimplementing them is not where
 this project contributes.
 
@@ -130,11 +130,11 @@ cmake --build build --config Release -j
 # the static libraries land in build/ggml/src/
 ```
 
-### 2. Build Bigtea
+### 2. Build Chaos
 
 ```bash
-git clone https://github.com/aturzone/Bigtea
-cd Bigtea
+git clone https://github.com/aturzone/Chaos
+cd Chaos
 
 export GGML_LIB_DIR=/path/to/llama.cpp/build/ggml/src   # must contain ggml-base.a, ggml-cpu.a, ggml.a
 cargo build --release
@@ -144,18 +144,18 @@ cargo test --release
 `GGML_LIB_DIR` is checked at build time. **Seven of the eight crates build
 without it** — the container parser, hardware probe, planner, I/O layer, model
 resolver and tokenizer are all useful on a machine that has never compiled a line
-of C. Only `bigtea-arch`, the inference engine itself, requires it, and if it is
+of C. Only `chaos-arch`, the inference engine itself, requires it, and if it is
 missing you get one actionable message rather than a wall of unresolved imports:
 
 ```
-bigtea-arch cannot build: GGML_LIB_DIR is not set.
+chaos-arch cannot build: GGML_LIB_DIR is not set.
 
   1. Build ggml once:
        git clone https://github.com/ggml-org/llama.cpp
        cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
        cmake --build llama.cpp/build --config Release -j
 
-  2. Point Bigtea at the result …
+  2. Point Chaos at the result …
 ```
 
 <details>
@@ -186,28 +186,28 @@ that would be blocked for no reason.
 ## Using it
 
 ```bash
-# What Bigtea can fetch, and what each needs resident
-bigtea-pull --list
+# What Chaos can fetch, and what each needs resident
+chaos-pull --list
 
 # Says what it costs and whether it will run here, before downloading
-bigtea-pull v4flash --dry-run
+chaos-pull v4flash --dry-run
 
 # What can this machine run, and what should you close?
-bigtea-probe
+chaos-probe
 
 # Will this model fit, and how fast will it be — before downloading 144 GB
-bigtea-model-info model.gguf --budget 8
+chaos-model-info model.gguf --budget 8
 
 # Run it
-bigtea-run model.gguf "your prompt" -n 32
+chaos-run model.gguf "your prompt" -n 32
 
 # Or serve it to a coding agent
-bigtea-serve model.gguf --port 8080
+chaos-serve model.gguf --port 8080
 ```
 
 ```console
 $ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json'     -d '{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":6}'
-{"id":"bigtea","object":"chat.completion","model":"deepseek-v4-flash",
+{"id":"chaos","object":"chat.completion","model":"deepseek-v4-flash",
  "choices":[{"index":0,"message":{"role":"assistant","content":" Paris."},
  "finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":6,"total_tokens":11}}
 ```
@@ -223,11 +223,11 @@ For a split model, pass **any one shard**; the rest are discovered automatically
 
 | environment variable | effect |
 |---|---|
-| `BIGTEA_THREADS` | threads per graph evaluation (default 12) |
-| `BIGTEA_BLOCK_TIMING` | per-block, per-phase timing |
-| `BIGTEA_IO_TIMING` | per-tensor read throughput and how much was copied |
-| `BIGTEA_SPARSITY` | activation-magnitude histogram |
-| `BIGTEA_ROUTING` | how often each expert is selected, and what the hot set would cost |
+| `CHAOS_THREADS` | threads per graph evaluation (default 12) |
+| `CHAOS_BLOCK_TIMING` | per-block, per-phase timing |
+| `CHAOS_IO_TIMING` | per-tensor read throughput and how much was copied |
+| `CHAOS_SPARSITY` | activation-magnitude histogram |
+| `CHAOS_ROUTING` | how often each expert is selected, and what the hot set would cost |
 
 ## How it works
 
@@ -236,19 +236,19 @@ attention, routers, embeddings, shared experts — is touched by every token and
 a small fraction of the file. The **routed experts** are most of the bytes and a
 token uses a handful of them.
 
-Bigtea holds the first in RAM and streams the second. For DeepSeek-V4-Flash that
+Chaos holds the first in RAM and streams the second. For DeepSeek-V4-Flash that
 is 7.38 GiB resident against 137 GiB streamed.
 
 Three things make it work rather than thrash:
 
-1. **Weights are bound zero-copy.** `ggml` tensors point at buffers Bigtea already
+1. **Weights are bound zero-copy.** `ggml` tensors point at buffers Chaos already
    owns. A copy would need twice the model and would not fit.
 2. **Reads bypass the page cache.** With a model far larger than RAM, a cached
    read costs memory twice — the OS copy and ours — and a "cache hit" under memory
    pressure is a page fault wearing a disguise.
 3. **Expert slices are read into their final position.** GGUF pads tensor data to
    32 bytes, not to a disk sector, so aligned buffers can never receive a direct
-   transfer. Bigtea deliberately *mis*aligns its destination to match the file's
+   transfer. Chaos deliberately *mis*aligns its destination to match the file's
    sector residue. That took the expert path from 0.80 to 1.58 GiB/s with 0.09% of
    bytes copied instead of 300%.
 
@@ -256,14 +256,14 @@ Three things make it work rather than thrash:
 
 | crate | responsibility |
 |---|---|
-| `bigtea-gguf` | GGUF container parsing |
-| `bigtea-probe` | hardware probing, RAM reclaim advice |
-| `bigtea-plan` | fit prediction and residency policy |
-| `bigtea-io` | cache-bypassing aligned and skewed reads |
-| `bigtea-model` | sharded tensor resolution, partial reads, residency |
-| `bigtea-ggml` | FFI to ggml: graphs, zero-copy weight binding |
-| `bigtea-tokenizer` | byte-level BPE |
-| `bigtea-arch` | architectures and the streaming forward pass |
+| `chaos-gguf` | GGUF container parsing |
+| `chaos-probe` | hardware probing, RAM reclaim advice |
+| `chaos-plan` | fit prediction and residency policy |
+| `chaos-io` | cache-bypassing aligned and skewed reads |
+| `chaos-model` | sharded tensor resolution, partial reads, residency |
+| `chaos-ggml` | FFI to ggml: graphs, zero-copy weight binding |
+| `chaos-tokenizer` | byte-level BPE |
+| `chaos-arch` | architectures and the streaming forward pass |
 
 ## Engineering notes
 
@@ -290,5 +290,5 @@ days.
 
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-Bigtea distributes no model weights. Models are yours to obtain, under their own
+Chaos distributes no model weights. Models are yours to obtain, under their own
 licences.

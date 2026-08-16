@@ -73,7 +73,7 @@ diagnostic — not a compile error, not a wrong number, just a dead process.
 
 ## The test that stayed
 
-`crates/bigtea-ggml/tests/device_arithmetic.rs` asserts the half that must keep
+`crates/chaos-ggml/tests/device_arithmetic.rs` asserts the half that must keep
 working — that the split happens and a host-bound tensor is **never** uploaded,
 since the zero-copy path is the whole memory design. It does **not** execute the
 compute step: an access violation takes the entire test binary down and loses

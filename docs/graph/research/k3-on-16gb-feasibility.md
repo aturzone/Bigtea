@@ -323,7 +323,7 @@ free disk space available (a separate, solvable precondition).
 ## What would have to be built (engineering, not hand-waving)
 
 All of this is additive on top of WASTE's existing Apache-2.0 C11 codebase (consistent with
-Bigtea's "never from scratch" posture) — WASTE already has ~80% of the needed infrastructure
+Chaos's "never from scratch" posture) — WASTE already has ~80% of the needed infrastructure
 (streamed `pread` I/O, a read-ahead thread pattern, an oracle-diff correctness harness, a budget
 resolver), it just applies all of it only to experts, never to the trunk, and refuses rather than
 degrades below the current floor.
@@ -380,7 +380,7 @@ degrades below the current floor.
   bandwidth" claim applied specifically to a 12.4 MB record size on a modern PCIe5 consumer drive
   — the cited source (storedbits.com) used 1 MB blocks on unspecified hardware; directionally
   supportive, not a precise match.
-- Whether Bigtea should actually pursue this (fork WASTE + build the partial-trunk-streaming
+- Whether Chaos should actually pursue this (fork WASTE + build the partial-trunk-streaming
   extension) is a strategy question for `../decisions/strategy-post-waste.md`, not answered here
   — that decision currently states K3 "needs a RAM upgrade (29.06GB floor vs 15.7GB)," which this
   research suggests is true *for WASTE as currently shipped* but not a hard physical limit; worth

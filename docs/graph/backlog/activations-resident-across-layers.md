@@ -23,7 +23,7 @@ Links: [../research/phase-a-device-prefill-2026-08-15.md](../research/phase-a-de
 
 ## What it is worth, measured not guessed
 
-From `bigtea-gpubench`'s per-operation counters on a 512-token Qwen3-4B prefill:
+From `chaos-gpubench`'s per-operation counters on a 512-token Qwen3-4B prefill:
 
 | | seconds | calls |
 |---|---:|---:|
@@ -129,7 +129,7 @@ is real rather than assumed.
 - **CPU output byte-identical** on the parity prompts across all thirteen
   entries in `VERIFIED_ARCHITECTURES`. This is the gate; the port that produced
   Phase A cleared it once and this must clear it again.
-- `bigtea-gpubench --repeat 3` reports the new ratio, with the warm-up
+- `chaos-gpubench --repeat 3` reports the new ratio, with the warm-up
   discarded, and the per-operation counters show the transfers actually gone
   rather than merely a better wall clock.
 - Device and CPU logit checksums still agree.

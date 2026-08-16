@@ -1,5 +1,5 @@
 ---
-topic: The first dense head-to-head against llama.cpp — Qwen3-4B, both command lines recorded. Bigtea is 2.9x behind on prefill and 8.8x behind on generation, and the cause of each is now known
+topic: The first dense head-to-head against llama.cpp — Qwen3-4B, both command lines recorded. Chaos is 2.9x behind on prefill and 8.8x behind on generation, and the cause of each is now known
 status: measured
 links: [lts-parity-criteria.md, the-plateau-was-ours-2026-08-10.md, head-to-head-llamacpp-2026-08-05.md]
 ---
@@ -25,26 +25,26 @@ $ llama-bench.exe -m models/qwen3-4b/Qwen3-4B-Q4_K_M.gguf -p 512 -n 128 -r 2 -t 
 build: daef2b3 (1)
 ```
 
-## Bigtea
+## Chaos
 
 ```
-$ bigtea-run.exe models/qwen3-4b/Qwen3-4B-Q4_K_M.gguf -f target/prompt512.txt -n 1
+$ chaos-run.exe models/qwen3-4b/Qwen3-4B-Q4_K_M.gguf -f target/prompt512.txt -n 1
 prompt ... -> 651 tokens
 generated  1 tokens in 16.9s
 
-$ bigtea-run.exe models/qwen3-4b/Qwen3-4B-Q4_K_M.gguf "Write a short paragraph about the sea." -n 128
+$ chaos-run.exe models/qwen3-4b/Qwen3-4B-Q4_K_M.gguf "Write a short paragraph about the sea." -n 128
 generated  128 tokens in 191.7s (0.67 tok/s)
 ```
 
 ## The scoreboard
 
-| Qwen3-4B dense, CPU | Bigtea | llama.cpp | verdict |
+| Qwen3-4B dense, CPU | Chaos | llama.cpp | verdict |
 |---|---:|---:|---|
 | prefill | **38.5 tok/s** (651 tok in 16.9 s) | **111.2** (pp512) | **2.9x behind** |
 | generation | **0.67 tok/s** (128 tok) | **5.90** (tg128) | **8.8x behind** |
 
 Not a like-for-like prefill length — 651 against 512 — and longer prompts are
-*harder*, so 2.9x is if anything generous to Bigtea. Neither figure is quotable
+*harder*, so 2.9x is if anything generous to Chaos. Neither figure is quotable
 as anything but a deficit.
 
 ## Why generation is 8.8x behind, and it is not the kernel
@@ -89,7 +89,7 @@ after that: `ggml_graph_compute_with_ctx` allocates the graph struct *and its
 per-thread work buffer* out of the same arena, so sizing for tensor data alone
 left it 0.1% short — which is still an abort.
 
-`bigtea-run` now also **refuses** a prompt that will not fit, with the arena it
+`chaos-run` now also **refuses** a prompt that will not fit, with the arena it
 needs, the memory that is free, and the longest prompt that would work.
 
 ### 2. The output projection ran on every position
@@ -115,7 +115,7 @@ missing for non-Qwen architectures:
   nonsense rather than the clean "missing tensor" the QK-norm one gave.
 
 Correctness first: cached and uncached produce **byte-identical text** on
-Qwen3-4B (`BIGTEA_UNCACHED=1` keeps the old path reachable so this stays
+Qwen3-4B (`CHAOS_UNCACHED=1` keeps the old path reachable so this stays
 checkable, rather than being asserted once and then trusted).
 
 | generation, 128 tokens | before | after | llama.cpp | verdict |
@@ -139,15 +139,15 @@ prompt eval time = 5970.89 ms / 527 tokens (88.26 tokens per second)
 $ llama-completion ... --no-repack
 prompt eval time = 8276.33 ms / 527 tokens (63.68 tokens per second)
 
-$ bigtea-run Qwen3-4B-Q4_K_M.gguf -f target/p512.txt -n 1 -t 8
+$ chaos-run Qwen3-4B-Q4_K_M.gguf -f target/p512.txt -n 1 -t 8
 prefill 519 tokens in 8.6s (60.29 tok/s)
 ```
 
-| Qwen3-4B prefill, 20 threads | tok/s | vs Bigtea |
+| Qwen3-4B prefill, 20 threads | tok/s | vs Chaos |
 |---|---:|---:|
 | llama.cpp, repacking **on** (its default) | **88.26** | 1.46x ahead |
 | llama.cpp, repacking **off** | 63.68 | **1.06x ahead** |
-| Bigtea | 60.29 | — |
+| Chaos | 60.29 | — |
 
 **Repacking is worth 1.39x to llama.cpp. Without it the two engines are 6%
 apart.** Since both link the *same* ggml, that is the expected result once the
@@ -162,7 +162,7 @@ Each of these was the obvious suspect and each is measured, not assumed:
 |---|---|---|
 | thread count | 8/10/12/16/20 give 60.3/57.9/54.6/56.8/57.4 tok/s | **not it** |
 | graph-build and threadpool overhead | 108 `compute()` calls over 9.3 s ≈ 0.2% | **not it** |
-| the matmul kernel itself | FFN runs at 472 GFLOP/s; `bigtea-kernelbench` peaks at 420 for Q4_K | **already at the ceiling** |
+| the matmul kernel itself | FFN runs at 472 GFLOP/s; `chaos-kernelbench` peaks at 420 for Q4_K | **already at the ceiling** |
 | our arena sizing | fixed; was aborting, not slowing | **not it** |
 
 Where the time goes, from the runner's own breakdown at 519 tokens:
@@ -175,13 +175,13 @@ The feed-forward is 60% of prefill, which is where repacking would land.
 
 ### Why we do not repack, and what it would take
 
-Bigtea binds weights **zero-copy**: `ggml` is handed a pointer into the mapped
+Chaos binds weights **zero-copy**: `ggml` is handed a pointer into the mapped
 container. That is what makes a 144 GB model run on a 15.7 GiB machine, and it
 is not negotiable on the streaming path.
 
 llama.cpp repacks through `ggml-backend`'s *extra buffer types*, which rearrange
 a quantised tensor into a vectorisation-friendly layout when it is allocated.
-Bigtea uses the raw graph API and never sees that path.
+Chaos uses the raw graph API and never sees that path.
 
 **For a dense model that fits in RAM the trade is different**: the weights are
 already copied into memory, so repacking them once at load costs a rearrange
@@ -191,9 +191,9 @@ model is resident, and the streaming path keeps zero-copy binding untouched.
 ## What this does not measure
 
 - **Quality.** Both engines were run greedy where possible; no perplexity or
-  eval was collected. `--llamacpp-defaults` exists on the Bigtea side so a
+  eval was collected. `--llamacpp-defaults` exists on the Chaos side so a
   sampled comparison measures engines rather than sampler settings.
 - **Prefill at matched length.** 651 against 512. Worth redoing once the dense
   path can be given an exact token count.
-- **Memory footprint**, which is where Bigtea's design argument actually lives
+- **Memory footprint**, which is where Chaos's design argument actually lives
   and which llama-bench does not report.

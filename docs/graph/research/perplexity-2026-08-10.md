@@ -19,13 +19,13 @@ it was written.
 
 Same corpus, same 128-token chunks, same models, `-t 4` on both sides.
 
-| perplexity | Bigtea | llama.cpp | difference |
+| perplexity | Chaos | llama.cpp | difference |
 |---|---:|---:|---:|
 | Llama-3.2-1B-Instruct Q4_K_M | **29.0909** | 29.2456 ± 6.49 | **0.53%** |
 | Qwen3-4B Q4_K_M | **33.6434** | 34.0293 ± 9.64 | **1.13%** |
 
 ```
-$ bigtea-run <model> -f ppl_natural.txt --ppl-chunk 128 -t 4
+$ chaos-run <model> -f ppl_natural.txt --ppl-chunk 128 -t 4
 perplexity 29.0909 over 189 tokens in 3 chunks of 128
            mean NLL 3.3704 nats/token
 
@@ -43,7 +43,7 @@ them were wrong.
 
 Both figures are slightly *below* llama.cpp's, consistently. The corpus is only
 189 scored tokens and llama.cpp's own error bar is ±6.49, so **this is not a
-claim that Bigtea is more accurate** — it is well inside the noise. A larger
+claim that Chaos is more accurate** — it is well inside the noise. A larger
 corpus would be needed to say anything about the sign.
 
 ## The windowing is the measurement

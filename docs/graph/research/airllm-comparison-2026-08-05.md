@@ -1,5 +1,5 @@
 ---
-topic: AirLLM — "70B on a 4GB GPU" — what it actually claims, and how Bigtea compares
+topic: AirLLM — "70B on a 4GB GPU" — what it actually claims, and how Chaos compares
 status: resolved
 links: [head-to-head-llamacpp-2026-08-05.md, verify-before-citing]
 ---
@@ -17,7 +17,7 @@ Repo: https://github.com/lyogavin/airllm
 - **It publishes no tokens-per-second figure anywhere.** The only performance number in the
   README is a relative "3x inference speed up" with compression enabled — no absolute throughput.
 
-That absence is the same pattern as the Bigtea claim retracted earlier the same day: a
+That absence is the same pattern as the Chaos claim retracted earlier the same day: a
 memory/capability headline with no speed number behind it. See [[verify-before-citing]].
 
 ## What it measures at, per third parties
@@ -32,10 +32,10 @@ makes 70B possible on a 4GB GPU."*
 - https://abrarqasim.com/blog/airllm-the-hype-vs-the-reality/
 - https://news.ycombinator.com/item?id=49154228
 
-## Bigtea at a minimum footprint, measured
+## Chaos at a minimum footprint, measured
 
 ```
-bigtea-run.exe Qwen3-30B-A3B-Q4_K_M.gguf "The capital of France is" -n 16 --cache 0.5
+chaos-run.exe Qwen3-30B-A3B-Q4_K_M.gguf "The capital of France is" -n 16 --cache 0.5
 
 cache      0.50 GiB for experts
 generated  16 tokens in 16.9s (0.94 tok/s)
@@ -51,21 +51,21 @@ PEAK RSS: 1.58 GiB
 AirLLM streams **every layer** per token, so it reads the *entire model* from disk for each
 token generated. That 100% re-read is the whole reason it is slow.
 
-Bigtea keeps the always-read weights resident and streams **only the routed experts**. At the
+Chaos keeps the always-read weights resident and streams **only the routed experts**. At the
 1.58 GiB footprint above it read 0.91 GiB per token — **5% of the 17.28 GiB model** — and that
 is with the cache deliberately starved to 0.5 GiB. Frequency-gated admission has no equivalent
 in AirLLM.
 
-This is a difference in access pattern, not in tuning, and it is the same reason Bigtea's design
+This is a difference in access pattern, not in tuning, and it is the same reason Chaos's design
 should hold up on V4-Flash where llama.cpp's LRU lets cold expert traffic evict dense weights.
 
 ## Honest caveats — do not drop these when repeating the comparison
 
-- **AirLLM runs dense models** (Llama 70B). Bigtea's streaming path is MoE-only so far, so the
+- **AirLLM runs dense models** (Llama 70B). Chaos's streaming path is MoE-only so far, so the
   two do not currently cover the same models.
-- **AirLLM is GPU-first**, Bigtea is CPU. Different hardware targets; this is not like-for-like.
+- **AirLLM is GPU-first**, Chaos is CPU. Different hardware targets; this is not like-for-like.
 - The 0.94 tok/s above is *inside* AirLLM's reported range, not clear of it. The win to claim is
   **footprint at comparable speed**, not raw speed.
 - No AirLLM run was performed on this machine. Its numbers here are third-party reports, not
-  measurements taken alongside Bigtea's — which is weaker evidence than the llama.cpp ladder,
+  measurements taken alongside Chaos's — which is weaker evidence than the llama.cpp ladder,
   where both commands were run back to back. Flagged deliberately.

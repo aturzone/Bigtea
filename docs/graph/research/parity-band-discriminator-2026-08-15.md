@@ -12,12 +12,12 @@ links: [llamacpp-flag-audit.md, routing-skew-is-per-prompt-2026-08-08.md]
 
 and reported the answer as though it settled a different question:
 
-> is Bigtea's output **one of the things** llama.cpp disagrees between?
+> is Chaos's output **one of the things** llama.cpp disagrees between?
 
 Those come apart exactly where it matters. A prompt where the reference wobbles
-between A and B, and Bigtea says B, is a tie — our answer is the reference's own,
+between A and B, and Chaos says B, is a tie — our answer is the reference's own,
 arrived at by a different route. A prompt where the reference wobbles between A
-and B and Bigtea says C is not explained by that wobble at all. **The old harness
+and B and Chaos says C is not explained by that wobble at all. **The old harness
 printed the same word for both**, and the nine-of-eleven `unstable` verdicts that
 turned out to be real bugs were all the second kind.
 
@@ -45,7 +45,7 @@ unstable  Dear Sir or Madam, I am writing to          matches none of them
 4 of 8 in-band, 2 outside, exit 0
 ```
 
-**Four of the six were never unexplained.** On those, Bigtea's continuation is
+**Four of the six were never unexplained.** On those, Chaos's continuation is
 byte-identical to something llama.cpp itself emits under a configuration that
 only reorders a sum. That is the strongest evidence available short of matching
 the default, and the old harness could not express it.
@@ -58,7 +58,7 @@ It is not zero, and the two are below the cluster threshold rather than absent.
 Which configuration we land on is **not constant**: `-b 1` twice, `-fa off` once,
 `-b 1 -fa off` once. That distinction is worth more than the count.
 
-A systematic defect would be systematic. If Bigtea were, say, quietly running
+A systematic defect would be systematic. If Chaos were, say, quietly running
 batch-1 semantics on a batched prefill, it would reproduce `-b 1` on *every*
 prompt where the default differs — a single wrong behaviour reproducing a single
 reference configuration. Landing on three different configurations across four
@@ -73,7 +73,7 @@ lead. This one is not constant.
 ## The composed configuration earned its place immediately
 
 `-b 1 -fa off` was added on the r14 session's Phi-3 measurement — neither flag
-alone reproduced Bigtea's answer there, only the two together. On its first run
+alone reproduced Chaos's answer there, only the two together. On its first run
 against a different model it explained the `SELECT` prompt, which no single flag
 accounted for. **A near-tie that needs two no-ops composed is invisible to a
 probe that tries flags singly**, and that class is not rare; it is the one nobody
@@ -92,12 +92,12 @@ default        ' 42\n\nOkay, so I need to figure out what '
 -b 1 -fa off   ' 42\n\nOkay, so I need to figure out what '
 -fa off        " 42\nA: 42\n\nOkay, let's"
 --no-repack    ' 17 + 25 = 42\n\nOkay,'
-BIGTEA         "\n 42\n\nOkay, let's see. The user is asking"
+CHAOS         "\n 42\n\nOkay, let's see. The user is asking"
 ```
 
-**Bigtea emits `42`.** The earlier reading — that it skipped the answer and went
+**Chaos emits `42`.** The earlier reading — that it skipped the answer and went
 straight to reasoning — was **wrong, and was an artefact of the measurement**:
-the two sides had been captured with different tail-truncation, so Bigtea's first
+the two sides had been captured with different tail-truncation, so Chaos's first
 line was cut off and the reference's was not. This node flagged that claim as not
 citable before anyone acted on it, which is the only reason it cost nothing.
 
@@ -111,7 +111,7 @@ What the corrected data shows:
   — including `A: 42` repeated on its own line under `-fa off`, and
   `17 + 25 = 42` under `--no-repack`. This prompt sits in a high-entropy region
   *after* the answer, where the continuation is barely determined at all.
-* Bigtea is a fourth output, so `outside the band` is correct as classified. But
+* Chaos is a fourth output, so `outside the band` is correct as classified. But
   it agrees with `-fa off` on the token where the reference splits (`Okay,
   let's` against `Okay, so`) and differs from it only by the repeated `A: 42`
   line.

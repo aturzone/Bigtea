@@ -56,7 +56,7 @@ an individual is officially representing the community in public spaces.
 
 Instances of abusive, harassing, or otherwise unacceptable behaviour may be
 reported to the maintainers by opening a confidential report through GitHub's
-["Report abuse"](https://github.com/aturzone/Bigtea) flow, or by contacting the
+["Report abuse"](https://github.com/aturzone/Chaos) flow, or by contacting the
 maintainer directly through their GitHub profile:
 [@aturzone](https://github.com/aturzone).
 

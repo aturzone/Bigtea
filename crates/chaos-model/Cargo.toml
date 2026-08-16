@@ -1,0 +1,39 @@
+[package]
+name = "chaos-model"
+description = "A model on disk: sharded GGUF containers, resolved into readable tensors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chaos-gguf = { path = "../chaos-gguf" }
+chaos-io = { path = "../chaos-io" }
+chaos-plan = { path = "../chaos-plan" }
+chaos-probe = { path = "../chaos-probe" }
+
+# Binary targets contain no #[test] functions, so the empty harness cargo would
+# build for each is pure overhead -- and on Windows with Smart App Control
+# enforced, running those unsigned harnesses is blocked outright, failing the
+# suite for no reason. The library tests are unaffected.
+
+[[bin]]
+name = "chaos-pull"
+path = "src/bin/chaos-pull.rs"
+test = false
+
+[[bin]]
+name = "chaos-model-info"
+path = "src/bin/chaos-model-info.rs"
+test = false
+
+[[bin]]
+name = "chaos-loadbench"
+path = "src/bin/chaos-loadbench.rs"
+test = false
+
+[[bin]]
+name = "chaos-meta"
+path = "src/bin/chaos-meta.rs"
+test = false

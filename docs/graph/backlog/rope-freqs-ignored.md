@@ -42,7 +42,7 @@ The eight-prompt parity sweep. Llama-3.2-1B:
 
 ```
 FAIL  Llama-3.2-1B-Instruct  SELECT name, COUNT(*) FROM users WHERE
-  bigtea   :  age > 18 AND gender = 'male' GROUP BY name;
+  chaos   :  age > 18 AND gender = 'male' GROUP BY name;
   llama.cpp:  age > 18 GROUP BY name HAVING COUNT(*) > 1;
 ```
 

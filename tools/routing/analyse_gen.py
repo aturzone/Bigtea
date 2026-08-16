@@ -1,6 +1,6 @@
 """R0.1 — does a cache warmed on the prompt predict what generation needs?
 
-    GGUF=... bigtea-run <model> "<prompt>" -n 16   # with BIGTEA_ROUTING_DUMP set
+    GGUF=... chaos-run <model> "<prompt>" -n 16   # with CHAOS_ROUTING_DUMP set
     python analyse_gen.py <dump.csv> [more.csv ...]
 
 R0 established that the hot expert set is per-prompt: pinned from one prompt it
@@ -10,7 +10,7 @@ running. The question is what that warmed set is worth *afterwards*, on the
 tokens the model goes on to generate. Between the two bounds R0 measured, the
 answer is the difference between ~1.60 and ~7.76 tok/s.
 
-**How one generated token's routing is isolated.** `bigtea-run` regenerates
+**How one generated token's routing is isolated.** `chaos-run` regenerates
 statelessly: pass k re-runs prefill over prompt + k generated tokens. The model
 is causal, so token i's routing is identical in every pass containing it — which
 makes `pass[k] - pass[k-1]` exactly the routing of the single token generated in

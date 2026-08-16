@@ -5,12 +5,12 @@ links: [head-to-head-llamacpp-2026-08-05.md, moe-landscape-2026-08.md]
 ---
 
 Read from `DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf` on 2026-08-05 with
-`bigtea-meta` and `bigtea-model-info`. Everything below is from the container, not from a
+`chaos-meta` and `chaos-model-info`. Everything below is from the container, not from a
 model card or an advisory.
 
 ## Why this is the critical path
 
-Bigtea currently loses to llama.cpp on Qwen3-30B-A3B at every context length, and the reason is
+Chaos currently loses to llama.cpp on Qwen3-30B-A3B at every context length, and the reason is
 structural: that model *nearly fits*, so the kernel's page cache — elastic, free, and using all
 available RAM — beats a fixed hand-managed budget. There is no version of that fight we win.
 
@@ -24,9 +24,9 @@ routing        6 of 256 experts per token -> 3.21 GiB of experts read per token
 ```
 
 **The 7.38 GiB of always-read weights fit in this machine's ~11 GiB of free RAM.** That is the
-whole thesis in one line. Bigtea pins them and they are never read again. llama.cpp mmaps all
+whole thesis in one line. Chaos pins them and they are never read again. llama.cpp mmaps all
 144 GB and lets LRU decide, so its dense weights compete with 137 GiB of cold expert traffic for
-the same page cache and get evicted — `bigtea-model-info` projects the dense *re-read* per token
+the same page cache and get evicted — `chaos-model-info` projects the dense *re-read* per token
 climbing from 0.06 GiB at 4k context to 7.38 GiB at 128k, which is the entire dense set being
 re-read every token.
 
@@ -38,7 +38,7 @@ the mmap, which is why the default flags fail and `--no-repack` works.
 
 llama.cpp runs it at **0.45 tok/s** (`--no-repack -c 512`, measured).
 
-Bigtea's floor is set by physics: 3.21 GiB of experts per token at the 2.79 GB/s this NVMe gives
+Chaos's floor is set by physics: 3.21 GiB of experts per token at the 2.79 GB/s this NVMe gives
 across threads is ~1.15s/token, so **~0.87 tok/s with a cold cache and perfect streaming** —
 roughly 2x llama.cpp. Any expert cache hits push it higher; 256 experts with 6 used is a skew
 our frequency-gated admission should exploit better than LRU, which is the one policy result we
@@ -77,7 +77,7 @@ Distinct pieces of work, roughly in dependency order:
 3. **Per-layer compression ratios** — 44 values for 43 blocks (the off-by-one needs checking
    against llama.cpp's reader before assuming which is which).
 4. **The sparse attention indexer** (64 heads, key length 128, top_k 512) selecting which keys
-   each query attends to. This is the piece with no analogue anywhere in Bigtea today.
+   each query attends to. This is the piece with no analogue anywhere in Chaos today.
 5. **Hyper-connections with 20 Sinkhorn iterations**, replacing plain residual addition.
 6. **MoE differences from Qwen3**: a shared expert always active, `expert_gating_func 4`
    (sigmoid rather than softmax — verify against llama.cpp), an explicit `expert_weights_scale`
@@ -128,7 +128,7 @@ is not an off-by-one in the manifest — it is indexed per layer as
 consulted.
 
 **A numerical reference now exists.**
-`crates/bigtea-arch/tests/fixtures/v4flash-layer0-oracle.txt` holds the shape
+`crates/chaos-arch/tests/fixtures/v4flash-layer0-oracle.txt` holds the shape
 and element-sum of every tensor in the prologue and layer 0, captured with
 `llama-eval-callback` on the real container. That is the oracle the forward
 pass gets built against. It already caught one thing invisible in the shapes:
@@ -158,7 +158,7 @@ kv_norm-0 (view) {64,  1, 5}     24.049295  ->  kv_pe-0      76.641815
 attn_raw (view)  {64, 64, 5}   3432.786621  ->  ROPE_BACK    28.466785
 ```
 
-Bigtea now matches all three-plus-25 checkpoints through the end of the KV
+Chaos now matches all three-plus-25 checkpoints through the end of the KV
 projection. The one-token fixture is kept: matching two independent inputs is
 stronger than matching one.
 
@@ -275,7 +275,7 @@ code.
 - `compress_ratios` has 44 entries for 43 blocks. Off-by-one, or an extra leading/trailing value?
   (Partly answered above: only the first 43 are consulted.)
 - Is the shared expert always-read (and therefore resident) or routed? If resident, it adds to
-  the 7.38 GiB — `bigtea-model-info` already counts it somewhere and that needs confirming.
+  the 7.38 GiB — `chaos-model-info` already counts it somewhere and that needs confirming.
   The five-token trace shows `ffn_shexp-0` running unconditionally, which is consistent with
   resident, but the byte accounting has not been re-checked.
 - **Still unverified: the other two attention kinds.** Layer 0 is `Raw`. The 20

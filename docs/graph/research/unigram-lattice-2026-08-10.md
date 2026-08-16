@@ -58,7 +58,7 @@ Both produce in-range ids and fluent-looking output. That case is a unit test.
 | `  spaced   out  ` | `628 26 91` | whitespace runs collapse; **trailing whitespace adds no token** |
 
 **`llama-tokenize` prints no trailing `</s>`** although the container declares
-`add_eos_token = true`. Bigtea honours the container — T5's encoder input ends
+`add_eos_token = true`. Chaos honours the container — T5's encoder input ends
 with `</s>`, which is how it was trained — so the expectations are the oracle's
 ids plus id 1, and the difference is written into the test rather than absorbed
 by loosening it.

@@ -1,12 +1,12 @@
 ---
-decision: implementation stack for Bigtea
+decision: implementation stack for Chaos
 status: accepted        # Atur, 2026-08-03
 links: [k3-run-path.md, ../research/fixed-hardware-design-space.md, fork-vs-wrapper.md]
 ---
 
 ## Context
 
-Bigtea's goal is **to be the runner** that makes frontier MoE models execute on
+Chaos's goal is **to be the runner** that makes frontier MoE models execute on
 low-spec machines — not a front-end that shells out to someone else's runner.
 That reframing (Atur, 2026-08-03) supersedes the narrower "wrapper/advisor"
 framing in `strategy-post-waste.md`.
@@ -37,7 +37,7 @@ The division is the whole bet: **borrow the math, own the memory.**
 ## Options rejected
 
 - **Python** (initially chosen, ~400 lines written and thrown away): correct
-  only under the false premise that Bigtea merely orchestrates. It cannot own a
+  only under the false premise that Chaos merely orchestrates. It cannot own a
   token loop, cannot control buffer alignment, and forces users of a
   *low-resource* tool to install a runtime first. The validated architecture
   math it produced ports directly — that was the real asset, not the code.
@@ -63,11 +63,11 @@ built the memory/streaming layer for the **≤16 GiB** tier, where:
   to zero — measured, not theorised), so spare RAM goes to residency instead, and
 - **bits/param is the only lever that improves fit *and* speed at once.**
 
-That policy layer is what Bigtea owns.
+That policy layer is what Chaos owns.
 
 ## Scope: personal single-user runner (Atur, 2026-08-03)
 
-Bigtea runs a model **on your own machine, for you** — it is not a serving
+Chaos runs a model **on your own machine, for you** — it is not a serving
 stack. Nobody is behind it issuing concurrent requests. That is a scope
 decision, and it removes real complexity rather than deferring it:
 

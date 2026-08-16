@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/bigtea-gguf",
-    "crates/bigtea-probe",
-    "crates/bigtea-plan",
-    "crates/bigtea-io",
-    "crates/bigtea-model",
-    "crates/bigtea-ggml",
-    "crates/bigtea-tokenizer",
-    "crates/bigtea-grammar",
-    "crates/bigtea-jinja",
-    "crates/bigtea-arch",
+    "crates/chaos-gguf",
+    "crates/chaos-probe",
+    "crates/chaos-plan",
+    "crates/chaos-io",
+    "crates/chaos-model",
+    "crates/chaos-ggml",
+    "crates/chaos-tokenizer",
+    "crates/chaos-grammar",
+    "crates/chaos-jinja",
+    "crates/chaos-arch",
 ]
 
 [workspace.package]
@@ -18,8 +18,8 @@ version = "0.0.2"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
-repository = "https://github.com/aturzone/Bigtea"
-homepage = "https://github.com/aturzone/Bigtea"
+repository = "https://github.com/aturzone/Chaos"
+homepage = "https://github.com/aturzone/Chaos"
 authors = ["Atur Dana <https://github.com/aturzone>"]
 keywords = ["llm", "inference", "moe", "gguf", "streaming"]
 categories = ["science", "command-line-utilities"]

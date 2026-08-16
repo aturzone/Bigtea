@@ -14,8 +14,8 @@ Fixtures already extracted from the existing five-token capture — no new llama
 needed to start:
 
 ```
-crates/bigtea-arch/tests/fixtures/v4flash-layer2-oracle-5tok.txt   CSA + indexer, 273 rows
-crates/bigtea-arch/tests/fixtures/v4flash-layer3-oracle-5tok.txt   HCA,           133 rows
+crates/chaos-arch/tests/fixtures/v4flash-layer2-oracle-5tok.txt   CSA + indexer, 273 rows
+crates/chaos-arch/tests/fixtures/v4flash-layer3-oracle-5tok.txt   HCA,           133 rows
 ```
 
 ## The layer pattern, which nothing in the metadata announces

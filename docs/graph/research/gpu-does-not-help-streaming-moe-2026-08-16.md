@@ -59,6 +59,6 @@ project has published — 25.6x on a kernel, 1.33-1.52x on a Qwen3-4B prefill,
 1.79x on the `-ngl` frontier — was measured on a model that fits. None of them
 predicted this one.
 
-`bigtea-run` now warns when a device is opened on a model that streams experts,
+`chaos-run` now warns when a device is opened on a model that streams experts,
 with the measurement in the message. Finding this out four minutes into a 17 GiB
 run is worse than being told.

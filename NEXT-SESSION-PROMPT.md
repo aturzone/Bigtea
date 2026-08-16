@@ -1,10 +1,10 @@
 # Prompt for the next session
 
-Copy everything below the line into a fresh session in `C:\Projects\Bigtea`.
+Copy everything below the line into a fresh session in `C:\Projects\Chaos`.
 
 ---
 
-You are continuing work on **Bigtea**, a Rust inference runner for GGUF models
+You are continuing work on **Chaos**, a Rust inference runner for GGUF models
 larger than RAM. Read `CLAUDE.md` and `STATUS.md` first — `STATUS.md` is the
 canonical scoreboard. Then read only the 2–3 graph nodes a task links to.
 
@@ -36,7 +36,7 @@ tests had never run. Use `build-vulkan` for anything touching the device.
 
 All taken 2026-08-16 on an RTX 3050 6 GB / i7-13650HX / 15.7 GiB machine.
 
-| | Bigtea | llama.cpp | notes |
+| | Chaos | llama.cpp | notes |
 |---|---|---|---|
 | Qwen3-30B generation | 3.03–3.86 | 3.35 | **parity**, paired 3–2, ranges overlap |
 | Qwen3-30B prefill | 1.22 | 1.17 | parity |
@@ -61,7 +61,7 @@ here.
 
 ### 1. Rebrand the project to **chaos**
 
-Complete and mechanical: crate names, binary names (`bigtea-run` → `chaos-run`
+Complete and mechanical: crate names, binary names (`chaos-run` → `chaos-run`
 etc.), every string in `--help` and the info lines, all 104 `.md` files, the
 release workflow, `Cargo.toml` metadata. Leave the git remote alone — Atur
 renames the repo himself afterwards.

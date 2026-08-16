@@ -26,12 +26,12 @@ import sys
 from pathlib import Path
 
 LLAMA = Path("C:/Projects/llamacpp-unsloth/build/bin/llama-completion.exe")
-BIGTEA = Path("./target/release/bigtea-run.exe")
+CHAOS = Path("./target/release/chaos-run.exe")
 MODELS = Path("C:/Projects/models")
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 LLAMA_ID = re.compile(r"^[\d.]+ I\s+(\d+) -> ", re.M)
-BIGTEA_IDS = re.compile(r"^prompt\s+\d+ tokens: \[([\d, ]*)\]", re.M)
+CHAOS_IDS = re.compile(r"^prompt\s+\d+ tokens: \[([\d, ]*)\]", re.M)
 
 # Each name says what would break if the case failed, so a red line explains
 # itself without anyone re-deriving why the string was chosen.
@@ -73,12 +73,12 @@ def llama_ids(model: Path, text: str) -> list[int] | None:
     return ids or None
 
 
-def bigtea_ids(model: Path, text: str) -> list[int] | None:
+def chaos_ids(model: Path, text: str) -> list[int] | None:
     out = run([
-        str(BIGTEA), "-m", str(model), "-p", text, "-n", "1", "--temp", "0",
+        str(CHAOS), "-m", str(model), "-p", text, "-n", "1", "--temp", "0",
         "--force", "--verbose-prompt",
     ])
-    m = BIGTEA_IDS.search(out)
+    m = CHAOS_IDS.search(out)
     if not m:
         return None
     body = m.group(1).strip()
@@ -105,7 +105,7 @@ def main() -> int:
         bad = []
         checked = 0
         for name, text in CASES:
-            ours, theirs = bigtea_ids(m, text), llama_ids(m, text)
+            ours, theirs = chaos_ids(m, text), llama_ids(m, text)
             if ours is None or theirs is None:
                 continue
             checked += 1
@@ -123,7 +123,7 @@ def main() -> int:
         print(f"DIFFER {m.name}  ({len(bad)} of {checked})")
         for name, ours, theirs in bad:
             print(f"  {name}")
-            print(f"    bigtea   : {ours}")
+            print(f"    chaos   : {ours}")
             print(f"    llama.cpp: {theirs}")
     return worst
 
