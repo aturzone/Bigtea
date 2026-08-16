@@ -126,7 +126,7 @@ and is unchanged: prefill 1.25x behind, generation at parity. See below.
 | CLI flags (long) | 119 | 182 | 63 |
 | tokenizer families | 4 | 6 | rwkv, plamo2 |
 | samplers | 16 | 20 | adaptive-p, infill, 2 lazy-grammar |
-| GPU backends | **0** | CUDA, Metal, Vulkan, SYCL, HIP | total |
+| GPU backends | **1** (Vulkan, *not verified*) | CUDA, Metal, Vulkan, SYCL, HIP | 4 |
 
 The architecture number is not comparable as written: llama.cpp *declares* 141
 and Bigtea's 8 are ones whose output was diffed token for token against it.
@@ -1084,7 +1084,7 @@ parity doc had said "~100", which was a guess. Bigtea now accepts **106**.
 | RoPE / YaRN | 15 | **9 done**, 6 refused |
 | KV type + prompt cache | 7 | **done** |
 | runtime / memory | 31 | I/O mode, `--override-kv`, `--mlock`; **most refused with reasons** |
-| GPU | 15 | **won't** — no backend to apply them to |
+| GPU | 15 | **8 done** — `--device`/`--main-gpu`, `--list-devices`, `-ngl`/`--gpu-layers`/`--n-gpu-layers`; 7 refused, all on multi-device scheduling |
 | grammar / JSON schema | 4 | the r10 worktree session owns this |
 
 **Nothing is accepted that does nothing.** ~20 flags are refused outright with a
@@ -2175,6 +2175,59 @@ All 21 container-backed V4-Flash tests pass with it active, including the
 element-sum comparisons against llama.cpp — the overlap changes *when* bytes are
 read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
 `BIGTEA_PREFETCH_READERS` tunes the split.
+
+## `-ngl` runs, and it says the device path was never checked (2026-08-16)
+
+`ggml_backend_sched` is bound and tested. Partial offload works. And the thing
+worth carrying forward is neither: **the device path fails 1 of 8 parity prompts
+where the CPU path fails none, and nobody had run that comparison.**
+
+`scripts/parity-check.sh` takes `NGL=n` now and passes `-ngl n` to **both**
+engines, which is the only honest way to diff a partial offload — the
+reference's own answer moves with the split. Llama-3.2-1B, RTX 3050, Vulkan:
+
+| offload | ok | FAIL |
+|---|---:|---:|
+| `-ngl 0` — both on CPU | 6 (+1 unstable, +1 near-tie) | **0** |
+| `-ngl 8` — 8 of 16 blocks on the card | 7 | **1** |
+| `-ngl 99` — all of it | 7 | **1** |
+
+So **`-ngl` costs nothing over `--device`** — same score, and a *different*
+failing prompt each time, which is a near-tie landing differently rather than a
+broken split. The 1-in-8 belongs to `--device`, and it has been there since
+Phase A, which was accepted on "it runs and it is 1.73x" with **no completion
+diff at all**. The GPU tier is not verified and must not be called finished.
+
+**The first reading of this was wrong.** One prompt swept over `-ngl 0..17` had
+us changing at 5 values and llama.cpp at none, which looks exactly like our bug.
+Eight prompts reversed it: llama.cpp answers `A triangle has a base of 5 units`
+at `-ngl 0` and `a base of 10 cm` at `-ngl 99`, and Bigtea flips the *opposite*
+way. A CPU kernel and a Vulkan kernel do not produce bit-identical sums and
+greedy decoding turns the last bit into a different word — in both engines.
+
+**The scheduler is not what makes `-ngl` work**, and the two changes should not
+borrow each other's credit. A mixed *graph* is undefined behaviour; a mixed
+*model* is not, because this engine materialises the activation as a host
+`Vec<f32>` at every block boundary. The per-block round trip that costs
+everywhere else is what makes the split free here. The scheduler becomes
+load-bearing when `backlog/activations-resident-across-layers.md` lands.
+
+**One tensor broke the rule and segfaulted.** `rope_freqs.weight` carries no
+`blk.` prefix but every block reads it, so hosting it while block 0 ran on the
+card was a mixed graph: exit 139, no error, every `-ngl` from 1 to 16 dead while
+0 and 17+ passed. It is bound on both sides now. **A tensor every block reads
+must exist on both sides of a split** — it is the only one today, and a new
+architecture that adds another will fail identically.
+
+**Two near-misses, both invisible to the harness.** `CLAUDE.md`'s `GGML_LIB_DIR`
+points at a ggml build with **no Vulkan archive**, and the GPU tests *skip*
+rather than fail without a card — so `6 passed` was reported for a file whose
+two GPU tests had never run, and the scheduler commit's first draft claimed a
+mixed graph had computed when it had not. And `splits() >= 2` was asserted on a
+**single-node** graph, which cannot split however its operands are placed: an
+unfalsifiable assertion, only revealed when a real card started evaluating it.
+
+Full node: `research/ngl-partial-offload-2026-08-16.md`.
 
 ## R12 — the 256-token V4-Flash context cap is gone (2026-08-11)
 

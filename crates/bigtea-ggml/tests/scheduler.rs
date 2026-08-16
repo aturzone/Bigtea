@@ -69,8 +69,18 @@ fn aligned(values: &[f32]) -> AlignedBytes {
 /// **The one that was undefined behaviour before this file existed.**
 ///
 /// `a` lives in host memory the test owns; `b` lives on the card. One graph
-/// consumes both. Without a scheduler this is the access violation; with one it
-/// is two splits and the right numbers.
+/// consumes both, and a second node is forced back onto the host. Without a
+/// scheduler this shape is the access violation; with one it is two splits and
+/// the right numbers.
+///
+/// # Why the graph has two nodes and not one
+///
+/// Because splits partition **nodes**. The first version of this test built
+/// `mul_mat(host, device)` — a single node — and asserted `splits() >= 2`,
+/// which cannot happen however the operands are placed: a leaf on another
+/// backend is copied in as an input, not run as its own split. It passed
+/// anyway, because the ggml build it ran against had no Vulkan archive and the
+/// test was skipping. **Two failures, and only one of them was the assertion.**
 #[test]
 fn a_graph_spanning_host_and_device_computes_and_splits() {
     let _guard = one_at_a_time();
@@ -88,23 +98,33 @@ fn a_graph_spanning_host_and_device_computes_and_splits() {
     let (k, m, n) = (4usize, 3usize, 2usize);
     let a: Vec<f32> = (0..k * m).map(|i| (i as f32) * 0.5 - 1.0).collect();
     let b: Vec<f32> = (0..k * n).map(|i| 2.0 - (i as f32) * 0.25).collect();
+    let bias: Vec<f32> = (0..m * n).map(|i| (i as f32) * 0.125).collect();
 
     let ctx = Context::new_no_alloc(16 * 1024 * 1024).expect("context");
     let ta = ctx.new_f32_2d(k as i64, m as i64).expect("a");
     let tb = ctx.new_f32_2d(k as i64, n as i64).expect("b");
-    let out = ctx.mul_mat(&ta, &tb).expect("mul_mat");
+    let tbias = ctx.new_f32_2d(m as i64, n as i64).expect("bias");
+    let product = ctx.mul_mat(&ta, &tb).expect("mul_mat");
+    let out = ctx.add(&product, &tbias).expect("add");
 
-    // `a` gets a host buffer. This is the whole fix: the bytes do not move, but
-    // the tensor now names the buffer they live in, so a split can copy them.
+    // `a` and the bias get host buffers. This is the whole fix: the bytes do
+    // not move, but the tensors now name the buffer they live in, so a split
+    // can copy them.
     let mut a_bytes = aligned(&a);
-    let host = HostBuffer::wrap(&mut a_bytes).expect("host buffer");
-    host.attach(&ta, 0).expect("attach a");
+    let host_a = HostBuffer::wrap(&mut a_bytes).expect("host buffer a");
+    host_a.attach(&ta, 0).expect("attach a");
+    let mut bias_bytes = aligned(&bias);
+    let host_bias = HostBuffer::wrap(&mut bias_bytes).expect("host buffer bias");
+    host_bias.attach(&tbias, 0).expect("attach bias");
 
-    // The device is preferred, so the matmul should land there and `a` should be
-    // copied across — that is the split we are asserting on.
+    // The matmul on the card, the add back on the host: a partition ggml would
+    // not choose on its own, which is exactly what makes it a test of pinning
+    // AND of the copy between splits.
     let backends = [&gpu, &cpu];
     let sched = Scheduler::new(&backends, 2048, false).expect("scheduler");
-    sched.realize(&ctx, &[&out]).expect("realize");
+    sched
+        .realize_with(&ctx, &[&out], &[(&product, &gpu), (&out, &cpu)])
+        .expect("realize");
 
     // `b` is device-side and is filled after allocation, per the ordering rule.
     backend::upload_f32(&tb, &b).expect("upload b");
@@ -114,12 +134,16 @@ fn a_graph_spanning_host_and_device_computes_and_splits() {
     let splits = sched.splits();
     assert!(
         splits >= 2,
-        "the graph was not split ({splits}); a partition of one means both \
-         operands landed on the same backend and this test proves nothing"
+        "the graph was not split ({splits}); a partition of one means every node          landed on the same backend and this test proves nothing"
+    );
+    assert!(
+        sched.copies() > 0,
+        "two splits with no copies between them is not a partition"
     );
 
+    let product_want = reference_mul_mat(&a, &b, k, m, n);
+    let want: Vec<f32> = product_want.iter().zip(&bias).map(|(p, c)| p + c).collect();
     let got = backend::download_f32(&out).expect("download");
-    let want = reference_mul_mat(&a, &b, k, m, n);
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
         assert!(
             (g - w).abs() < 1e-4,
@@ -226,12 +250,19 @@ fn a_scheduler_needs_at_least_one_backend() {
 
 /// Pinning moves a node, and the assignment can be read back.
 ///
-/// **`pin` is what `-ngl` becomes** — a per-node override rather than a second
-/// code path — so the thing that has to be true is that an override sticks and
-/// that a caller can tell when it did not. An override ggml declines to honour
-/// is silently ignored, which is why the assignment is read rather than assumed.
+/// **This is what `-ngl` becomes** once the forward pass builds one graph per
+/// pass — a list of nodes and where they go, not a second code path. So the
+/// thing that has to be true is that an override sticks and that a caller can
+/// tell when it did not: an override ggml declines to honour is silently
+/// ignored, which is why the assignment is read rather than assumed.
+///
+/// The first version called a standalone `pin()` before `realize()`, and
+/// `realize()` began with `ggml_backend_sched_reset` — which clears the
+/// tensor-to-backend map. The pin was erased and the node landed on the CPU,
+/// reported only as `left: Some(1), right: Some(0)`. The pins are a parameter
+/// of `realize_with` now, so that order cannot be written.
 #[test]
-fn pinning_a_node_to_the_cpu_is_honoured() {
+fn pinning_a_node_is_honoured() {
     let _guard = one_at_a_time();
     let Some(index) = discrete_gpu() else {
         eprintln!("skipping: no discrete GPU");
@@ -263,9 +294,10 @@ fn pinning_a_node_to_the_cpu_is_honoured() {
     let backends = [&gpu, &cpu];
     let sched = Scheduler::new(&backends, 2048, false).expect("scheduler");
     // Both operands are host-resident, so without an override the matmul stays
-    // on the CPU. Pin it to the card and it must move.
-    sched.pin(&out, &gpu);
-    sched.realize(&ctx, &[&out]).expect("realize");
+    // on the CPU. Pinned to the card, it must move.
+    sched
+        .realize_with(&ctx, &[&out], &[(&out, &gpu)])
+        .expect("realize");
 
     let placed = sched.assignment_of(&out, &backends);
     assert_eq!(

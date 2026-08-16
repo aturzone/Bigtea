@@ -1121,17 +1121,17 @@ const REFUSED: &[(&str, bool, &str)] = &[
     // at 1.73x the CPU. The rest stay, and the reason is now specific rather
     // than "no GPU backend exists":
     //
-    // The residency choice is **per tensor and all-or-nothing per model**. A
-    // mixed host/device context binds and builds correctly and then dies in
-    // `ggml_backend_graph_compute` with `STATUS_ACCESS_VIOLATION`, because the
-    // backend dereferences the host pointer as device memory — no error, no
-    // refusal, no fallback. Splitting *layers* across devices needs
-    // `ggml_backend_sched`, which does not exist here yet.
+    // **`-ngl` / `--n-gpu-layers` also came out**, on 2026-08-16. The reason
+    // they were here was that a mixed host/device *graph* dies in
+    // `ggml_backend_graph_compute` with `STATUS_ACCESS_VIOLATION` — no error,
+    // no refusal, no fallback. That is still true of a mixed graph.
     //
-    // So `-ngl 20` cannot mean twenty layers, and accepting it as "all or
-    // nothing, rounded" is exactly the lie this table exists to prevent.
-    ("--gpu-layers", true, "layer-level offload needs a scheduler; this build is all-or-nothing per model -- use --device"),
-    ("--n-gpu-layers", true, "layer-level offload needs a scheduler; this build is all-or-nothing per model -- use --device"),
+    // It is not true of a mixed *model*. This engine materialises the
+    // activation as a host `Vec<f32>` at every block boundary, so block 0 can
+    // be wholly device-side and block 20 wholly host-side without any single
+    // graph spanning both. The per-layer round trip is a cost everywhere else;
+    // here it is what makes `-ngl` honest.
+    //
     // `--main-gpu` is IMPLEMENTED as an alias for `--device`, so it is no
     // longer here. llama.cpp's name for "which device", and there is no reason
     // to make someone learn ours.
@@ -1523,6 +1523,7 @@ fn main() -> ExitCode {
     // One value, not a per-layer count: residency is all-or-nothing per model
     // until `ggml_backend_sched` exists. See the `REFUSED` note on `-ngl`.
     let mut gpu_device: Option<usize> = None;
+    let mut gpu_layers: Option<usize> = None;
     let mut jinja = false;
     let mut loras: Vec<(String, f32)> = Vec::new();
     let mut cvecs: Vec<(String, f32)> = Vec::new();
@@ -2046,6 +2047,21 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 };
                 gpu_device = Some(v);
+                i += 2;
+            }
+            // **`-ngl N` implies a device.** llama.cpp's users type `-ngl 99`
+            // and nothing else, and a build that offloaded nothing because they
+            // did not also pass `--device` would be technically correct and
+            // useless. The first discrete GPU is picked when none was named;
+            // `--device` still wins if both are given, in either order.
+            "-ngl" | "--gpu-layers" | "--n-gpu-layers" => {
+                let Some(v) = rest.get(i + 1).and_then(|v| v.parse::<usize>().ok()) else {
+                    eprintln!(
+                        "bigtea-run: -ngl needs a layer count; 0 keeps every layer on the CPU"
+                    );
+                    return ExitCode::from(2);
+                };
+                gpu_layers = Some(v);
                 i += 2;
             }
             // --- flash attention ----------------------------------------------
@@ -2968,6 +2984,7 @@ fn main() -> ExitCode {
             cvec_range,
         },
         gpu_device,
+        gpu_layers,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -3012,6 +3029,8 @@ fn run_streaming(
     shift: Shift,
     reasoning: Reasoning,
     gpu_device: Option<usize>,
+    // llama.cpp's `-ngl`. `None` means every block, once a device is open.
+    gpu_layers: Option<usize>,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -3155,9 +3174,36 @@ fn run_streaming(
     // the weights go straight into device memory rather than being uploaded
     // afterwards — `load_resident_on_device` allocates through the backend's
     // buffer type, and there is no path that moves an already-host-resident set.
-    if let Some(index) = gpu_device {
+    //
+    // `-ngl 0` is the one case that opens nothing: the user asked for zero
+    // layers on the card, and opening a device to then use none of it would
+    // pay the initialisation and report a GPU run that is not one.
+    let want_device = match (gpu_device, gpu_layers) {
+        (Some(i), _) => Some(i),
+        (None, Some(0)) => None,
+        // `-ngl N` with no `--device`: pick the first discrete GPU, because
+        // that is what the flag means everywhere else and a build that
+        // offloaded nothing for want of a second flag would be useless.
+        (None, Some(_)) => match bigtea_ggml::best_offload_device() {
+            Ok(Some(d)) => bigtea_ggml::devices()
+                .ok()
+                .and_then(|all| all.iter().position(|x| x.name == d.name)),
+            _ => {
+                return Err("-ngl was given but no GPU was found; --list-devices                             shows what this build can see"
+                    .into())
+            }
+        },
+        (None, None) => None,
+    };
+    if let Some(index) = want_device {
         match runner.use_device(index) {
-            Ok(()) => bigtea_arch::info!("device     {index}, weights resident on it"),
+            Ok(()) => match gpu_layers {
+                Some(n) => {
+                    runner.set_gpu_layers(n);
+                    bigtea_arch::info!("device     {index}, first {n} blocks resident on it");
+                }
+                None => bigtea_arch::info!("device     {index}, weights resident on it"),
+            },
             Err(e) => return Err(format!("--device {index}: {e}").into()),
         }
     }
@@ -3168,8 +3214,12 @@ fn run_streaming(
     // Held for the run: dropping the device buffer frees the weights out from
     // under every graph that binds them.
     let _device_buffer;
+    let runner_gpu_layers = runner.gpu_layers();
     let resident = if runner.device_in_use().is_some() {
-        let (bytes, buffer, report) = runner.load_resident_on_device(&ctx, &mut weights)?;
+        // The split loader, which is the all-device one when `-ngl` was not
+        // given: `usize::MAX` exceeds every block count.
+        let (bytes, buffer, report) =
+            runner.load_resident_split(&ctx, &mut weights, runner_gpu_layers)?;
         _device_buffer = Some(buffer);
         // The upload is the tier's real cost and the one number a reader will
         // want next to the speedup, so it is printed rather than folded into
@@ -3736,6 +3786,8 @@ fn run(
     jinja: bool,
     adapters: Adapters,
     gpu_device: Option<usize>,
+    // llama.cpp's `-ngl`. `None` means every block, once a device is open.
+    gpu_layers: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -4035,6 +4087,7 @@ fn run(
         shift,
         reasoning,
         gpu_device,
+        gpu_layers,
         t0,
     )
 }

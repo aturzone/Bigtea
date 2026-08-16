@@ -32,6 +32,14 @@ use crate::qwen3::{Qwen3Config, Qwen3Model};
 use crate::{ArchError, Result};
 
 const ROPE_TYPE_NEOX: i32 = 2;
+/// The one resident tensor with no `blk.` prefix that **every block reads**.
+///
+/// Llama-3.1/3.2/3.3 ship their RoPE scaling as a tensor rather than as
+/// metadata. That makes it the only weight a partial offload has to place on
+/// both sides — see `load_resident_split`.
+const SHARED_ROPE: &str = "rope_freqs.weight";
+/// The device-side duplicate, under a name no container uses.
+const SHARED_ROPE_DEVICE: &str = "rope_freqs.weight@device";
 const GIB: f64 = (1u64 << 30) as f64;
 
 /// How much work streaming actually did — the numbers that justify it.
@@ -253,6 +261,10 @@ pub struct StreamingRunner<'m> {
     /// bound tensor points at, and reading freed device memory does not fault
     /// reliably -- it returns numbers.
     device: Option<bigtea_ggml::Backend>,
+    /// How many repeating blocks run on the device. `usize::MAX` means all of
+    /// them plus the non-repeating parts, which is what "use the GPU" meant
+    /// before this existed and is still the default once a device is opened.
+    gpu_layers: usize,
     pub stats: StreamStats,
     /// Keep the pre-projection hidden state from each forward pass.
     ///
@@ -439,6 +451,7 @@ impl<'m> StreamingRunner<'m> {
                 ThreadTuner::new(cores)
             },
             device: None,
+            gpu_layers: usize::MAX,
             stats: StreamStats::default(),
             want_embedding: false,
             last_embedding: None,
@@ -494,6 +507,56 @@ impl<'m> StreamingRunner<'m> {
 
     pub fn device_in_use(&self) -> Option<usize> {
         self.device.as_ref().map(|b| b.device_index())
+    }
+
+    /// Run only the first `n` repeating blocks on the device — llama.cpp's
+    /// `-ngl`.
+    ///
+    /// Must be set **before** the weights are loaded: residency is decided per
+    /// tensor at bind time, and moving a bound tensor afterwards would mean
+    /// re-reading it from the container.
+    pub fn set_gpu_layers(&mut self, n: usize) {
+        self.gpu_layers = n;
+    }
+
+    pub fn gpu_layers(&self) -> usize {
+        self.gpu_layers
+    }
+
+    /// Which target block `il` runs on.
+    ///
+    /// **This is the whole of partial offload in the forward pass**, and it is
+    /// this small only because the activation already materialises in host
+    /// memory between blocks. Block 0's graph is wholly device-side, block 20's
+    /// is wholly host-side, and no single graph spans the two — see
+    /// [`Self::load_resident_split`].
+    fn layer_device(
+        device: Option<&bigtea_ggml::Backend>,
+        gpu_layers: usize,
+        il: usize,
+    ) -> Option<&bigtea_ggml::Backend> {
+        if il < gpu_layers {
+            device
+        } else {
+            None
+        }
+    }
+
+    /// Which target the embedding lookup and the output projection run on.
+    ///
+    /// The non-repeating parts, offloaded only when `gpu_layers` exceeds the
+    /// block count — llama.cpp's rule, and the reason `-ngl 99` means "all of
+    /// it" there and has to mean it here.
+    fn edge_device(
+        device: Option<&bigtea_ggml::Backend>,
+        gpu_layers: usize,
+        n_layer: usize,
+    ) -> Option<&bigtea_ggml::Backend> {
+        if gpu_layers > n_layer {
+            device
+        } else {
+            None
+        }
     }
 
     /// Where a graph over `n_tokens` runs.
@@ -1144,11 +1207,61 @@ impl<'m> StreamingRunner<'m> {
         ctx: &'a Context,
         weights: &mut WeightSet<'a>,
     ) -> Result<(u64, bigtea_ggml::DeviceBuffer, bigtea_ggml::UploadReport)> {
+        self.load_resident_split(ctx, weights, usize::MAX)
+    }
+
+    /// Load resident weights with the **first `gpu_layers` blocks on the device**
+    /// and everything else in host memory.
+    ///
+    /// # Why a per-layer split needs no scheduler, and that is not a dodge
+    ///
+    /// A mixed *graph* is undefined behaviour without `ggml_backend_sched` —
+    /// that is what `sched.rs` exists for. A mixed *model* is not, and the
+    /// difference is where the activation lives between blocks. This engine
+    /// materialises `x` as a host `Vec<f32>` at every layer boundary: the KV
+    /// cache push takes bytes, the router reads a host vector, and streamed
+    /// expert bytes land in host memory. So block 0's graph is wholly on the
+    /// device, block 20's is wholly on the host, and **no single graph ever
+    /// spans both**.
+    ///
+    /// That per-layer round trip is a cost everywhere else — it is the whole of
+    /// `backlog/activations-resident-across-layers.md` — and here it is the
+    /// thing that makes `-ngl` cheap to build. Worth saying plainly rather than
+    /// claiming the scheduler did it.
+    ///
+    /// The mixed *context* was already legal, and `weights.rs` says why: a
+    /// tensor that already has a host pointer is skipped by
+    /// `ggml_backend_alloc_ctx_tensors_from_buft`, so one `WeightSet` can hold
+    /// both kinds.
+    ///
+    /// # Repacking follows the residency, per tensor
+    ///
+    /// Repacking rearranges a quantised tensor into the layout the **CPU**
+    /// kernels want. It is worth 1.39x on the CPU prefill and it is meaningless
+    /// — worse, wrong — on a device. Applying one rule to the whole model would
+    /// mean `-ngl 4` on a 36-layer model gave up that 1.39x on the 32 layers
+    /// still running on the CPU, which is how a partial offload ends up slower
+    /// than no offload at all.
+    pub fn load_resident_split<'a>(
+        &mut self,
+        ctx: &'a Context,
+        weights: &mut WeightSet<'a>,
+        gpu_layers: usize,
+    ) -> Result<(u64, bigtea_ggml::DeviceBuffer, bigtea_ggml::UploadReport)> {
         let backend = self.device.as_ref().ok_or(ArchError::Unimplemented(
             "no device opened; call use_device first",
         ))?;
+        let repack = std::env::var("BIGTEA_NO_REPACK").is_err();
+        let c_fused_gate_up = self.arch.config.fused_gate_up;
+        let n_layer = self.arch.config.n_layer as usize;
         let mut total = 0u64;
-        for name in self.resident_tensor_names() {
+        let mut names = self.resident_tensor_names();
+        if self.model.location("output.weight").is_some()
+            && !names.iter().any(|n| n == "output.weight")
+        {
+            names.push("output.weight".to_string());
+        }
+        for name in names {
             let loc = self
                 .model
                 .location(&name)
@@ -1156,17 +1269,83 @@ impl<'m> StreamingRunner<'m> {
                 .clone();
             let data = self.model.read_tensor(&name)?;
             total += data.len() as u64;
-            weights.bind_shared_at(
-                ctx,
-                &name,
-                loc.ty,
-                &loc.dims,
-                std::sync::Arc::new(data),
-                bigtea_ggml::Residency::Device,
-            )?;
+            if Self::on_device(&name, gpu_layers, n_layer) {
+                weights.bind_shared_at(
+                    ctx,
+                    &name,
+                    loc.ty,
+                    &loc.dims,
+                    std::sync::Arc::new(data),
+                    bigtea_ggml::Residency::Device,
+                )?;
+                continue;
+            }
+            // Host side: the same three exclusions `load_resident` documents —
+            // a repacked tensor's rows are interleaved, so anything indexed by
+            // `get_rows` or sliced by byte offset must stay in the plain layout.
+            let sliced = name.ends_with("attn_qkv.weight")
+                || (c_fused_gate_up && name.ends_with("ffn_up.weight"));
+            let indexed = name == "token_embd.weight";
+            if repack && !sliced && !indexed {
+                weights.bind_repacked(ctx, &name, loc.ty, &loc.dims, data)?;
+            } else {
+                weights.bind(ctx, &name, loc.ty, &loc.dims, data)?;
+            }
+        }
+        // **A tensor every block reads has to exist on BOTH sides of the split.**
+        //
+        // `rope_freqs.weight` is the one: Llama-3.1/3.2/3.3 ship their RoPE
+        // scaling as a tensor, it carries no `blk.` prefix, and every block's
+        // rope consumes it. Binding it host-side while block 0 runs on the
+        // device is precisely the mixed graph this design avoids everywhere
+        // else — and it **segfaulted at layer 0**, after the embedding, with no
+        // error and no refusal, exactly as `mixed-residency-segfaults` records.
+        //
+        // Duplicating is the honest fix rather than a clever one. It is
+        // `n_rot/2` floats — 32 of them on Llama-3.2-1B — so the copy costs
+        // nothing, and the alternative (forcing every block that reads it onto
+        // one side) would make `-ngl` a no-op for the whole Llama-3 family.
+        //
+        // llama.cpp does not need this because it runs one graph through
+        // `ggml_backend_sched`, which inserts the copy itself. We run one graph
+        // per block, which is why the split is cheap and why the shared tensor
+        // is ours to place.
+        if gpu_layers > 0 && gpu_layers <= n_layer {
+            if let Some(loc) = self.model.location(SHARED_ROPE).cloned() {
+                let data = self.model.read_tensor(SHARED_ROPE)?;
+                weights.bind_shared_at(
+                    ctx,
+                    SHARED_ROPE_DEVICE,
+                    loc.ty,
+                    &loc.dims,
+                    std::sync::Arc::new(data),
+                    bigtea_ggml::Residency::Device,
+                )?;
+            }
         }
         let (buffer, report) = weights.place_on_device(backend, ctx)?;
+        self.stats.resident_bytes = total;
         Ok((total, buffer, report))
+    }
+
+    /// Does this tensor belong on the device at `gpu_layers`?
+    ///
+    /// llama.cpp's rule, which is not "the first N tensors": `-ngl N` offloads
+    /// the first N **repeating** blocks, and the non-repeating parts — the
+    /// embedding, the final norm, the output projection — go only when `N`
+    /// exceeds the block count. Matching it matters because `-ngl 99` is what
+    /// every llama.cpp user types for "all of it", and a rule that offloaded
+    /// exactly `n_layer` would leave the output head on the CPU while reporting
+    /// a full offload.
+    fn on_device(name: &str, gpu_layers: usize, n_layer: usize) -> bool {
+        match name
+            .strip_prefix("blk.")
+            .and_then(|rest| rest.split_once('.'))
+            .and_then(|(index, _)| index.parse::<usize>().ok())
+        {
+            Some(il) => il < gpu_layers,
+            None => gpu_layers > n_layer,
+        }
     }
 
     pub fn load_resident<'a>(
@@ -1367,6 +1546,11 @@ impl<'m> StreamingRunner<'m> {
         device: Option<&bigtea_ggml::Backend>,
     ) -> Result<Vec<f32>> {
         let c = self.arch.config.clone();
+        // Read once: `device` arrives as a parameter rather than from `self`
+        // (so `Compute` never borrows `self`), and the split has to travel the
+        // same way or the two could disagree mid-pass.
+        let gpu_layers = self.gpu_layers;
+        let n_layer_total = c.n_layer as usize;
         let trace = std::env::var("BIGTEA_GPU_TRACE").is_ok();
         let n_new = tokens.len() as i64;
         let n_embd = c.n_embd as i64;
@@ -1440,7 +1624,10 @@ impl<'m> StreamingRunner<'m> {
             // Sized from the prompt, not a constant: `get_rows` materialises
             // n_embd * n_new floats, and ggml aborts the process when an arena
             // runs out rather than returning an error we could catch.
-            let cmp = Self::compute_with(device, threads);
+            let cmp = Self::compute_with(
+                Self::edge_device(device, gpu_layers, n_layer_total),
+                threads,
+            );
             let ctx = cmp.context(arena_for(&[(n_embd, n_new)], 8))?;
             let tok = ctx.new_i32_1d(n_new)?;
             let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
@@ -1465,7 +1652,11 @@ impl<'m> StreamingRunner<'m> {
             if trace {
                 eprintln!("TRACE: embedding ok");
             }
-            cmp.to_vec_f32(&rows)?
+            let out = cmp.to_vec_f32(&rows)?;
+            if trace {
+                eprintln!("TRACE: embedding read back ok");
+            }
+            out
         };
 
         for il in 0..c.n_layer {
@@ -1473,12 +1664,25 @@ impl<'m> StreamingRunner<'m> {
                 w.get(&n).copied().ok_or(ArchError::MissingTensor(n))
             };
 
+            if trace {
+                eprintln!(
+                    "TRACE: layer {il} on {}",
+                    if Self::layer_device(device, gpu_layers, il as usize).is_some() {
+                        "device"
+                    } else {
+                        "host"
+                    }
+                );
+            }
             // Phase 1: Q, K and V for the new positions only.
             let (q_v, k_v, v_v, residual, qkv_secs) = {
                 // Was a fixed 256 MiB, which aborted at a 4096-token block:
                 // ggml asked for 318,787,536 bytes and got told 268,435,456.
                 // Every arena in this function has to scale with the block.
-                let cmp = Self::compute_with(device, threads);
+                let cmp = Self::compute_with(
+                    Self::layer_device(device, gpu_layers, il as usize),
+                    threads,
+                );
                 let ctx = cmp.context(arena_for(
                     &[
                         (n_embd, n_new),                     // input activations
@@ -1587,7 +1791,17 @@ impl<'m> StreamingRunner<'m> {
                 // clean FAIL. Nothing in the metadata announces it — llama.cpp
                 // logs `create_tensor: loading tensor rope_freqs.weight` and
                 // that line is the only sign.
-                let freqs = weights.get("rope_freqs.weight");
+                // The device copy when this block runs on the device, the
+                // host one otherwise. `or_else` covers the all-device case,
+                // where the original IS the device copy and no duplicate was
+                // made.
+                let freqs = if Self::layer_device(device, gpu_layers, il as usize).is_some() {
+                    weights
+                        .get(SHARED_ROPE_DEVICE)
+                        .or_else(|| weights.get(SHARED_ROPE))
+                } else {
+                    weights.get(SHARED_ROPE)
+                };
                 let q = ctx.rope_ext(&q, &pos, freqs, n_rot, rope_type, 0, rp)?;
                 let k = ctx.rope_ext(&k, &pos, freqs, n_rot, rope_type, 0, rp)?;
 
@@ -1685,7 +1899,10 @@ impl<'m> StreamingRunner<'m> {
                 // SAFETY: `buf` is a local outliving `ctx`, and no other context
                 // is live on it — the Q/K/V context above was dropped and its
                 // results copied out before this point.
-                let cmp = Self::compute_with(device, threads);
+                let cmp = Self::compute_with(
+                    Self::layer_device(device, gpu_layers, il as usize),
+                    threads,
+                );
                 // The scratch buffer holds tensor METADATA on both paths. What
                 // differs is whether tensor DATA also comes from it: on a
                 // device it must not, or the graph would compute over host
@@ -1803,7 +2020,10 @@ impl<'m> StreamingRunner<'m> {
                 if c.post_norms {
                     shapes.extend([(n_embd, n_new), (n_embd, n_new)]);
                 }
-                let cmp = Self::compute_with(device, threads);
+                let cmp = Self::compute_with(
+                    Self::layer_device(device, gpu_layers, il as usize),
+                    threads,
+                );
                 let ctx = cmp.context(arena_for(&shapes, 24))?;
                 let xt = ctx.new_f32_2d(n_embd, n_new)?;
                 // **Which normalisation the FFN reads is the whole difference
@@ -1881,7 +2101,10 @@ impl<'m> StreamingRunner<'m> {
         // again for results nothing reads.
         let t_out = std::time::Instant::now();
         let last = x.len() - n_embd as usize;
-        let cmp = Self::compute_with(device, threads);
+        let cmp = Self::compute_with(
+            Self::edge_device(device, gpu_layers, n_layer_total),
+            threads,
+        );
         let ctx = cmp.context(arena_for(
             &[(n_embd, 1), (n_embd, 1), (c.vocab_size as i64, 1)],
             16,

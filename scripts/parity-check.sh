@@ -60,6 +60,29 @@ LLAMACPP_BIN=${LLAMACPP_BIN:-/c/Projects/llamacpp-unsloth/build/bin}
 BIGTEA=${BIGTEA:-./target/release/bigtea-run.exe}
 REF="$LLAMACPP_BIN/llama-completion.exe"
 
+# `NGL=n` runs BOTH engines with `-ngl n`, which is the only way to test a
+# partial offload honestly.
+#
+# **Comparing our `-ngl 8` against llama.cpp's `-ngl 0` would be a lie dressed
+# as a test**, because the reference's own answer moves with the split: on
+# Llama-3.2-1B, llama.cpp answers `A triangle has a base of 5 units` at
+# `-ngl 0` and `a base of 10 cm` at `-ngl 99`. A CPU kernel and a Vulkan kernel
+# do not produce bit-identical sums, greedy decoding turns a last-bit
+# difference into a different word, and that is true of the reference too. So
+# the split must be the same on both sides, or the diff measures the flag
+# rather than the engine.
+#
+# Both binaries must be able to SEE a GPU. A CPU-only llama.cpp build accepts
+# `-ngl` and silently ignores it, which looks exactly like a pass -- point
+# LLAMACPP_BIN at a build whose `-ngl 99` is measurably faster than its
+# `-ngl 0` before believing anything here.
+NGL=${NGL:-}
+if [ -n "$NGL" ]; then
+  OFFLOAD=(-ngl "$NGL")
+else
+  OFFLOAD=()
+fi
+
 # Eight prompts, deliberately unalike, and the count is the point.
 #
 # A PASS IS EVIDENCE ABOUT THESE PROMPTS, NOT ABOUT THE ARCHITECTURE. That is
@@ -103,7 +126,7 @@ strip() {
 }
 
 ref() {
-  "$REF" -m "$MODEL" -p "$1" -n "$N" --temp 0 --no-warmup -no-cnv "${@:2}" 2>/dev/null | strip
+  "$REF" -m "$MODEL" -p "$1" -n "$N" --temp 0 --no-warmup -no-cnv "${OFFLOAD[@]}" "${@:2}" 2>/dev/null | strip
 }
 
 # The token IDs each engine makes of a prompt, as `1,450,7483,...`.
@@ -132,7 +155,7 @@ fail=0
 unstable=0
 near=0
 for p in "${PROMPTS[@]}"; do
-  a=$("$BIGTEA" -m "$MODEL" -p "$p" -n "$N" --temp 0 --force 2>/dev/null | strip)
+  a=$("$BIGTEA" -m "$MODEL" -p "$p" -n "$N" --temp 0 --force "${OFFLOAD[@]}" 2>/dev/null | strip)
   b=$(ref "$p")
   a=${a#*"$p"}
   b=${b#*"$p"}

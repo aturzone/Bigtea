@@ -343,14 +343,51 @@ impl<'b> Scheduler<'b> {
     }
 
     /// Split the graph, assign every node a backend, and give it storage.
-    ///
-    /// Resets first. Without that, a second graph inherits the previous one's
-    /// assignments and ggml reports success while computing the wrong
-    /// partition.
     pub fn realize(&self, ctx: &Context, outputs: &[&Tensor<'_>]) -> Result<(), GgmlError> {
+        self.realize_with(ctx, outputs, &[])
+    }
+
+    /// The same, with `pins` forcing named nodes onto named backends.
+    ///
+    /// # Why the pins are a parameter and not a method
+    ///
+    /// Because a `pin()` method is impossible to call correctly. The sequence
+    /// ggml requires is **reset, then assign, then allocate** —
+    /// `ggml_backend_sched_reset` clears the tensor-to-backend map along with
+    /// everything else, so an override set before it is silently erased, and one
+    /// set after allocation arrives when the splits are already cut.
+    ///
+    /// That is not hypothetical. The first version of this file exposed `pin`
+    /// separately and its test pinned a node to the GPU, got the CPU, and
+    /// reported `left: Some(1), right: Some(0)` — no error anywhere, because an
+    /// override ggml does not see is indistinguishable from one it declined.
+    /// Taking the pins here makes the wrong order unwriteable, the same way
+    /// `place_on_device` enforces alloc-before-upload.
+    ///
+    /// **This is what `-ngl` and `--tensor-split` become** when the forward pass
+    /// eventually builds one graph per pass instead of one per block: a list of
+    /// nodes and where they go, not a second code path.
+    pub fn realize_with(
+        &self,
+        ctx: &Context,
+        outputs: &[&Tensor<'_>],
+        pins: &[(&Tensor<'_>, &Backend)],
+    ) -> Result<(), GgmlError> {
         let graph = ctx.build_forward(outputs)?;
         // SAFETY: live scheduler; reset is unconditional and always valid.
+        // Without it a second graph inherits the previous one's assignments and
+        // ggml reports success while computing the wrong partition.
         unsafe { ffi::ggml_backend_sched_reset(self.raw.as_ptr()) };
+        for (node, backend) in pins {
+            // SAFETY: live scheduler, live tensor, live backend.
+            unsafe {
+                ffi::ggml_backend_sched_set_tensor_backend(
+                    self.raw.as_ptr(),
+                    node.as_raw(),
+                    backend.as_raw(),
+                )
+            };
+        }
         // SAFETY: `graph` lives in `ctx`'s arena.
         if unsafe { ffi::ggml_backend_sched_alloc_graph(self.raw.as_ptr(), graph) } {
             Ok(())
@@ -385,6 +422,13 @@ impl<'b> Scheduler<'b> {
     /// **The measurement that says whether anything was scheduled.** One split
     /// means every node landed on the same backend and the scheduler did the
     /// work of a graph allocator at the cost of a scheduler.
+    ///
+    /// **A single-node graph can never report more than one**, however its
+    /// operands are placed. Splits partition *nodes*; a leaf that lives on
+    /// another backend is copied into the split as an input and does not open a
+    /// new one. The first version of this crate's test asserted `>= 2` on
+    /// `mul_mat(host, device)` and was wrong about what it was measuring —
+    /// which only surfaced when the test stopped skipping.
     pub fn splits(&self) -> usize {
         // SAFETY: valid on a live scheduler; zero before the first graph.
         unsafe { ffi::ggml_backend_sched_get_n_splits(self.raw.as_ptr()).max(0) as usize }
@@ -403,23 +447,6 @@ impl<'b> Scheduler<'b> {
         // SAFETY: `backend` is one of the handles this scheduler was built with;
         // ggml returns 0 for one it does not know rather than faulting.
         unsafe { ffi::ggml_backend_sched_get_buffer_size(self.raw.as_ptr(), backend.as_raw()) }
-    }
-
-    /// Force `node` onto `backend`, overriding the scheduler's own choice.
-    ///
-    /// This is what `-ngl` becomes: not a separate code path, but a per-node
-    /// assignment applied to the layers the caller decided to offload. Must be
-    /// called **before** [`Self::realize`] — after it, the splits are already
-    /// cut.
-    pub fn pin(&self, node: &Tensor<'_>, backend: &Backend) {
-        // SAFETY: live scheduler, live tensor, live backend.
-        unsafe {
-            ffi::ggml_backend_sched_set_tensor_backend(
-                self.raw.as_ptr(),
-                node.as_raw(),
-                backend.as_raw(),
-            )
-        };
     }
 
     /// Which backend a node was actually assigned, or `None` before the split.
