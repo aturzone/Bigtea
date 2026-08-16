@@ -152,14 +152,30 @@ against llama.cpp at 8 prompts**, which is what counts as verified here; and the
 Vulkan device path is bound but **not** verified — it fails 1 of those 8 prompts
 where the CPU path fails none.
 
-The last two bars are the honest ones. **`V4-Flash speed` will not move** —
-20 tok/s needs 79 MB/token, this model reads 3288, and everything still alive
-multiplies to 3.1x against a 42x gap. That is a measurement, not a lack of
-effort, and the remaining cost is the active weights coming from disk, which no
-code change touches. The number that *can* move is one nobody has published:
-**tok/s against resident bytes for a 144 GB model**, which Chaos can sweep
-because it owns residency where an `mmap` engine cannot be told to use exactly
-N GiB.
+The last two bars are the honest ones. **`V4-Flash speed` will not move, and we
+measured how far it cannot move.** A token is 1.56 s of expert reading plus
+**0.84 s that never touches the disk** — so with the entire 144 GB model resident
+in RAM, this CPU tops out at **1.19 tok/s**. 20 tok/s is a 50 ms token: the fixed
+cost alone is 17x over budget, and it separately needs 67.7 GB/s of bandwidth to
+the expert weights. That is a GPU-memory specification, not a code change.
+
+So here is the thing nobody had published — **tok/s against resident RAM for a
+144 GB model**, which Chaos can sweep because it owns residency where an `mmap`
+engine cannot be told to use exactly N GiB:
+
+```
+    RAM     experts resident    tok/s
+   16 GB           ~3%          0.42   <- measured on the laptop above
+   64 GB          ~38%          0.55
+  128 GB          ~85%          0.93
+  160 GB          100%          1.19   <- the ceiling, nothing left to stream
+```
+
+**Holding the whole model in RAM is worth 2.9x, not 48x.** That is a useful
+answer even though it is not the hoped-for one, and it is the kind of thing this
+project exists to tell you before you spend money.
+[`v4flash-ram-frontier-2026-08-16.md`](docs/graph/research/v4flash-ram-frontier-2026-08-16.md)
+has the sweep, the fit (R² = 0.997) and the controls.
 
 ## Build from source
 

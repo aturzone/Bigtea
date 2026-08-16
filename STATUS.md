@@ -26,6 +26,47 @@ clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
 reading, which is the only way that number has ever been right.
 
+## 20 tok/s on V4-Flash is closed, with a number (2026-08-16)
+
+Full node:
+[`research/v4flash-ram-frontier-2026-08-16.md`](docs/graph/research/v4flash-ram-frontier-2026-08-16.md).
+
+**With every expert resident — infinite RAM, zero disk — this engine tops out at
+1.19 tok/s on this CPU.** A generated token is **1.56 s of expert slice reading
+(3.15 GiB at 2.02 GiB/s) plus 0.84 s that never touches the disk**. 20 tok/s is a
+50 ms token, so the disk-independent cost alone is **17x over budget**, and no
+amount of memory touches it.
+
+**The frontier was swept by removing memory rather than adding it** — a balloon
+process commits and touches N GiB, and Chaos sizes its resident block from the
+free RAM it sees. Four points, three interleaved passes:
+
+| balloon | resident GiB | spill GiB | median tok/s | spread |
+|---:|---:|---:|---:|---:|
+| 0 | 7.38 | 0.00 | **0.411** | 1.9% |
+| 2 | 6.16 | 1.22 | 0.352 | 4.8% |
+| 4 | 4.09 | 3.28 | 0.278 | 3.2% |
+| 6 | 2.04 | 5.33 | 0.221 | 2.7% |
+
+`t = 0.395 s/GiB × spill + 2.353 s`, **R² = 0.997**. Spilled weights are re-read
+at 2.53 GiB/s — near the 2.74 GiB/s drive ceiling, because a per-block prefetch
+is a friendlier pattern than the scattered six-slice expert gather. And memory
+pressure slows the expert read itself (1.65 vs 2.02 GiB/s), so a shortfall costs
+more than its own re-read.
+
+**Extrapolated, this is a purchasing table**: 16 GB → 0.42 (measured), 64 GB →
+0.55, 128 GB → 0.93, 160 GB → **1.19**. Holding the entire 144 GB model in RAM is
+worth **2.9x, not 48x**.
+
+**F was attacked before being trusted.** A `-t` 2/4/8/16 sweep gives block work
+0.92 / **0.78** / 0.95 / 1.27 s, so 0.84 s is a floor on this CPU rather than a
+knob left in the wrong position; the expert read is flat at 1.54-1.55 s
+throughout, because it is the drive. 20 tok/s separately needs **67.7 GB/s** to
+the expert weights, at or past dual-channel DDR5 — so it is a GPU-memory
+specification. **Flagged as arithmetic, not measurement**: resident-in-VRAM is
+untested here and the only measured GPU figure is 4.3x *slower* on streaming MoE.
+Do not quote a GPU V4-Flash number until someone runs one.
+
 ## CLAUDE.md pruned, and the test count was stale (2026-08-16)
 
 `CLAUDE.md` had reached **3,308 words against its own stated ~2000-token

@@ -73,8 +73,9 @@ Then run `chaos-probe` and report, as a table:
 | physical cores / logical cores | |
 | OS and version | |
 
-Also run `chaos-iobench` if it is in the archive, and tell me the **measured**
-sequential and scattered read bandwidth of that drive. Do not skip this: on the
+Then run `chaos-iobench <some-large-file>` — the archive ships it — and tell me
+the **measured** scattered read bandwidth of that drive at 4 MiB slices, and
+whether it improves past four concurrent handles. Do not skip this: on the
 laptop this project was built on, the drive tops out at 2.74 GiB/s and stops
 improving past four concurrent handles, and that single number sets the ceiling
 for everything a streaming runner can do. **A quoted spec-sheet figure is not a

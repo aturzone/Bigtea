@@ -114,15 +114,22 @@ prefill 1.62x behind, generation 3-4x behind" is retracted**, and so is
 "generation ~2x behind" on Qwen3-30B. Do not replace either with a claimed lead:
 the ranges overlap.
 
-**The byte-reduction roadmap is closed** (`v4flash-has-no-slack-2026-08-10.md`).
-20 tok/s needs 79 MB/token; V4-Flash reads 3288. Everything still alive
-multiplies to 3.1x against a 42x gap. **20 tok/s is not a code problem on this
-machine** — it needs the active weights to stop coming from disk.
+**20 tok/s on V4-Flash is closed from both sides, with numbers**
+(`v4flash-ram-frontier-2026-08-16.md`). Bytes: 20 tok/s needs 79 MB/token and it
+reads 3288 (`v4flash-has-no-slack-2026-08-10.md`). Time: **a token is 1.56 s of
+expert read plus 0.84 s that never touches the disk, so with EVERY expert
+resident this CPU tops out at 1.19 tok/s** — the fixed cost alone is 17x over a
+50 ms budget, and `-t` 2/4/8/16 confirms it is a floor, not a knob left wrong.
+**The measured frontier**: 16 GB 0.42 (measured), 64 GB 0.55, 128 GB 0.93,
+160 GB 1.19 — **holding the whole 144 GB model in RAM is worth 2.9x, not 48x.**
+20 tok/s also needs 67.7 GB/s to the experts, so it is a GPU-memory
+specification. Do not quote a GPU V4-Flash figure: resident-in-VRAM is untested
+and the only measured number is 4.3x *slower* on streaming MoE.
 
-1. **The tok/s-versus-RAM frontier for a 144 GB model** — nobody has published
-   it, and only an engine that owns residency can sweep it (`mmap` cannot be told
-   to use exactly N GiB). Answers the product question honestly: *given your
-   machine, the largest model at the speed you want.*
+1. **The frontier on a machine with real memory.** The curve above is this
+   laptop's left-hand edge; the two numbers worth bringing back are `F` on a
+   bigger CPU and `F` with the model resident on a real GPU, because the whole
+   question reduces to them. Prompt ready: `backlog/bigger-machine-prompt.md`.
 2. **A bigger machine**, measured rather than predicted. The 5090 box is 32 GiB
    VRAM + 64 GiB RAM, where Qwen3-30B-A3B (17.3 GiB) fits **entirely in VRAM** —
    that is the demo, not V4-Flash. 96 GiB of fast memory against 144 GiB of model
