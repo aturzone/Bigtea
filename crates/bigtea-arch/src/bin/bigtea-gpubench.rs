@@ -41,7 +41,78 @@ struct Series {
     /// token is a real thing a user waits for exactly once per machine.
     first_prefill_seconds: f64,
     /// Compared between targets: a wrong device path returns plausible logits.
+    ///
+    /// **This was `sum(|logits[0..64]|)` to four decimals, and Phase A reported
+    /// "logit checksums agree" on it.** Sixty-four entries of a 128k vocabulary,
+    /// summed and rounded — it cannot see the top token move, which is the only
+    /// thing that changes what the model says. Kept as a cheap tripwire; the
+    /// agreement verdict below is what actually answers the question.
     checksum: f64,
+    /// The last position's full logit vector, for the CPU/device diff.
+    logits: Vec<f32>,
+}
+
+/// How far apart two logit vectors are, and whether that matters.
+///
+/// # Why a diff and not an equality
+///
+/// Because they will never be equal. A CPU kernel and a Vulkan kernel sum in
+/// different orders, so the last bits differ by construction — that is true of
+/// llama.cpp too, whose own greedy output moves when layers cross to the card.
+/// The question is not "are they identical" but **"is the disagreement bigger
+/// than the model's own margin"**, and only the second one can be failed.
+///
+/// So the verdict compares the CPU/device gap against the CPU's own top-2 gap:
+/// a difference far below the margin cannot flip the token, and one above it
+/// can. That distinction is exactly what `parity-check.sh` cannot make from
+/// text, and it is why the device path's 1-in-8 was unresolvable there.
+struct Agreement {
+    argmax_cpu: usize,
+    argmax_gpu: usize,
+    max_abs: f32,
+    mean_abs: f32,
+    /// The CPU's own margin between its best and second-best token.
+    top2_gap_cpu: f32,
+    top2_gap_gpu: f32,
+}
+
+fn top2(logits: &[f32]) -> (usize, f32, f32) {
+    let mut best = (0usize, f32::NEG_INFINITY);
+    let mut second = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best.1 {
+            second = best.1;
+            best = (i, v);
+        } else if v > second {
+            second = v;
+        }
+    }
+    (best.0, best.1, second)
+}
+
+fn agreement(cpu: &[f32], gpu: &[f32]) -> Option<Agreement> {
+    if cpu.is_empty() || cpu.len() != gpu.len() {
+        return None;
+    }
+    let (argmax_cpu, best_cpu, second_cpu) = top2(cpu);
+    let (argmax_gpu, best_gpu, second_gpu) = top2(gpu);
+    let mut max_abs = 0.0f32;
+    let mut total = 0.0f64;
+    for (a, b) in cpu.iter().zip(gpu) {
+        let d = (a - b).abs();
+        if d > max_abs {
+            max_abs = d;
+        }
+        total += d as f64;
+    }
+    Some(Agreement {
+        argmax_cpu,
+        argmax_gpu,
+        max_abs,
+        mean_abs: (total / cpu.len() as f64) as f32,
+        top2_gap_cpu: best_cpu - second_cpu,
+        top2_gap_gpu: best_gpu - second_gpu,
+    })
 }
 
 /// One load, then `repeats + 1` prefills on the loaded weights.
@@ -80,6 +151,7 @@ fn prefill_series(
     let mut rates = Vec::new();
     let mut first_prefill = 0.0f64;
     let mut checksum = 0.0f64;
+    let mut last_logits: Vec<f32> = Vec::new();
     for r in 0..=repeats {
         let mut cache = KvCache::new(
             config.n_layer as usize,
@@ -98,6 +170,7 @@ fn prefill_series(
             .take(64)
             .map(|v| v.abs())
             .fold(0.0f64, |a, b| a + b as f64);
+        last_logits = logits;
         if r == 0 {
             first_prefill = seconds;
             continue; // the warm-up: cold shader cache on the device path
@@ -109,6 +182,7 @@ fn prefill_series(
         rates,
         first_prefill_seconds: first_prefill,
         checksum,
+        logits: last_logits,
     })
 }
 
@@ -128,9 +202,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "usage: bigtea-gpubench <model.gguf> [--device N] [--limit-gib X]\n\
          \n\
          Uploads every tensor of the model to a compute device and reports what \
-         that cost. Does not run a forward pass, so it does not move the GPU bar.",
+         that cost, then prefills on both targets and compares their logits.
+\n         
+\n         `--prompt <text>` runs real text instead of synthetic ids -- the only way
+\n         to ask whether a SPECIFIC prompt's disagreement is a bug or a margin
+\n         narrower than the kernels' own spread.",
     )?;
     let mut want_device: Option<usize> = None;
+    let mut text_prompt: Option<String> = None;
     // Three timed repeats after a discarded warm-up. Not a convenience: see
     // `report` below for why one run of a GPU path is not a measurement.
     let mut repeats: usize = 3;
@@ -139,6 +218,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--device" => want_device = args.next().and_then(|v| v.parse().ok()),
+            "--prompt" | "-p" => text_prompt = args.next(),
             "--limit-gib" => limit_gib = args.next().and_then(|v| v.parse().ok()),
             "--repeat" => {
                 repeats = args
@@ -286,11 +366,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Overridable so a crash can be bisected by length: the device path's
     // shapes change with the token count, and "works at 1, dies at 512" says
     // something different from "dies at 1".
+    // **A synthetic prompt cannot answer the question this tool now asks.**
+    // Speed is indifferent to which token ids go in; agreement is not. The
+    // device path's one-in-eight parity failure lives on a SPECIFIC prompt, and
+    // "the logits are close on 64 arbitrary ids" says nothing about the one
+    // where the model's own margin is narrow. `--prompt` runs the real text.
     let n_prompt: usize = std::env::var("BIGTEA_PREFILL_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(PREFILL_TOKENS);
-    let prompt: Vec<u32> = (0..n_prompt).map(|i| (i % 3000 + 10) as u32).collect();
+    let prompt: Vec<u32> = match text_prompt.as_deref() {
+        Some(text) => {
+            let tokenizer = bigtea_tokenizer::Tokenizer::from_metadata(model.metadata())?;
+            let ids = tokenizer.encode(text);
+            if ids.is_empty() {
+                return Err("--prompt tokenized to nothing".into());
+            }
+            ids
+        }
+        None => (0..n_prompt).map(|i| (i % 3000 + 10) as u32).collect(),
+    };
     let config = Qwen3Config::from_model(&model)?;
     println!(
         "
@@ -329,6 +424,7 @@ prefill {} tokens, same prompt, same session",
         gpu.first_prefill_seconds,
         gpu.checksum,
     );
+    let (cpu_logits, gpu_logits) = (cpu.logits, gpu.logits);
     let (realize_s, up_s, down_s, comp_s, realize_n, comp_n) =
         bigtea_ggml::backend::timing::snapshot();
 
@@ -395,5 +491,49 @@ prefill {} tokens, same prompt, same session",
     println!("    upload   {up_s:>6.2}s");
     println!("    download {down_s:>6.2}s");
     println!("  logit checksum        cpu {cpu_sum:.4} vs device {gpu_sum:.4}");
+    match agreement(&cpu_logits, &gpu_logits) {
+        None => println!("  agreement             not computed (no logits captured)"),
+        Some(a) => {
+            println!(
+                "  argmax                cpu {} vs device {}{}",
+                a.argmax_cpu,
+                a.argmax_gpu,
+                if a.argmax_cpu == a.argmax_gpu {
+                    ""
+                } else {
+                    "   <-- DIFFERENT TOKEN"
+                }
+            );
+            println!(
+                "  logit difference      max {:.5}, mean {:.6}",
+                a.max_abs, a.mean_abs
+            );
+            println!(
+                "  the model's margin    cpu top-2 gap {:.5}, device {:.5}",
+                a.top2_gap_cpu, a.top2_gap_gpu
+            );
+            // The verdict, stated in the terms that can actually fail. A gap
+            // below the margin cannot move the token however large it looks in
+            // absolute terms; one above it can, and that is a real divergence
+            // rather than a rounding difference to shrug at.
+            let margin = a.top2_gap_cpu.min(a.top2_gap_gpu);
+            if a.argmax_cpu != a.argmax_gpu {
+                println!(
+                    "  VERDICT               different tokens chosen; margin {margin:.5}, max difference {:.5}",
+                    a.max_abs
+                );
+            } else if a.max_abs > margin {
+                println!(
+                    "  VERDICT               same token, but difference {:.5} EXCEEDS margin {margin:.5} -- agrees by luck",
+                    a.max_abs
+                );
+            } else {
+                println!(
+                    "  VERDICT               difference {:.5} is inside margin {margin:.5} -- the token cannot flip",
+                    a.max_abs
+                );
+            }
+        }
+    }
     Ok(())
 }

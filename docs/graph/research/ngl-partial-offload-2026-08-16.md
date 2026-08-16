@@ -4,10 +4,17 @@
 `llamacpp-unsloth/build-vulkan`.
 
 Partial offload runs. It is deterministic, it does not crash, and by the
-project's own parity gate it is **exactly as accurate as full offload**. What it
-turned up on the way is worth more than the flag: **the device path fails 1 of 8
-parity prompts where the CPU path fails none**, and nobody had ever run that
-comparison.
+project's own parity gate it is **exactly as accurate as full offload**.
+
+What it turned up on the way is worth more than the flag. The device path fails
+1 of 8 parity prompts where the CPU path fails none — a comparison nobody had
+ever run — and chasing that produced the more useful result: **a greedy text
+diff is not a valid acceptance test for a GPU path, in any engine.** The
+kernels disagree by 0.37–0.71 in the logits while the model's own margin falls
+to 0.399, so the flip is arithmetic. The device picks the same token on 8 of 8
+first tokens. The measurement that shows this is in `bigtea-gpubench` now,
+because the old one — `sum(|logits[0..64]|)` to four decimals — could not have
+failed.
 
 Links: [phase-a-device-prefill-2026-08-15.md](phase-a-device-prefill-2026-08-15.md) ·
 [mixed-residency-segfaults-2026-08-15.md](mixed-residency-segfaults-2026-08-15.md)
@@ -40,7 +47,10 @@ a broken split.
 **The device path costs one prompt in eight.** `-ngl 0` fails none. That gap
 belongs to `--device`, not to `-ngl`, and it has been there since Phase A —
 which was accepted on "it runs and it is 1.73x", with no completion diff at all.
-The GPU tier is **not verified** and should not be described as finished.
+
+At this point in the day that read as an unclosed correctness bug. The logit
+measurement below shows it is not; what it *is* is the absence of any check on
+the device path until now.
 
 ## Greedy output moves with the split in llama.cpp too
 
@@ -128,11 +138,54 @@ The assertion was unfalsifiable, and it took a real GPU to reveal that, because
 until then it was not being evaluated at all. The test builds two nodes now and
 pins them to opposite backends.
 
+## The 1-in-8 is arithmetic, not a bug — measured, same day
+
+`bigtea-gpubench` grew `--prompt <text>` and a real comparison. The old check was
+`sum(|logits[0..64]|)` to four decimals, and **Phase A reported "logit checksums
+agree" on it** — sixty-four entries of a 128k vocabulary, summed and rounded,
+which cannot see the top token move. It is kept as a tripwire; the verdict below
+is what answers the question.
+
+All eight parity prompts, Llama-3.2-1B, CPU against device, first token:
+
+| max abs Δlogit | CPU top-2 margin | prompt |
+|---:|---:|---|
+| 0.672 | 2.246 | The capital of France is |
+| 0.420 | 2.421 | Once upon a time |
+| **0.567** | **0.758** | def fibonacci(n): |
+| 0.712 | 2.642 | 1 2 3 4 5 6 7 8 9 10 11 |
+| 0.369 | 2.178 | The following is a list of items: apples, oranges, |
+| 0.465 | 2.859 | Q: What is 17 plus 25? A: |
+| 0.525 | 0.883 | SELECT name, COUNT(*) FROM users WHERE |
+| **0.375** | **0.399** | Dear Sir or Madam, I am writing to |
+
+**Every one picks the same token.** A wiring bug does not do that — it produces
+nonsense, not agreement. What the table shows instead is the size of the two
+quantities that decide the outcome: the kernels disagree by **0.37–0.71**
+(mean 0.06–0.09), and the model's own margin falls as low as **0.399**. On
+`Dear Sir or Madam` the difference is 94% of the margin. It agrees by a hair.
+
+So within a 32-token greedy continuation, some position will have a margin under
+0.4 and the token will flip. **That is arithmetic, and it is why a text diff is
+not a valid acceptance test for a GPU path in any engine** — which is exactly
+what llama.cpp's own 2-in-8 flip rate between `-ngl 0` and `-ngl 99` was already
+saying.
+
+The proper test is the one now in the tool: **argmax agreement, plus the
+difference measured against the margin.** `parity-check.sh` cannot make that
+distinction from text, and that is why the 1-in-8 was unresolvable there.
+
+**What is still not established**: that 0.09 mean is *as good as llama.cpp's*.
+Comparing the two engines' CPU-vs-GPU spreads needs llama.cpp's logits, which
+has not been done. The claim here is narrower and survives: the device path
+chooses the same token on 8 of 8, and the parity failures sit inside a band the
+reference disagrees with itself in.
+
 ## Open
 
-1. **The device path's 1-in-8.** Not `-ngl`'s. Needs a logit-level diff rather
-   than a text diff — a text diff cannot separate "wrong" from "0.3% and a near
-   tie", which is the whole difficulty.
+1. **Is our kernel spread larger than llama.cpp's?** Needs its logits, not its
+   text. Until then "the device path is as accurate as the reference" is
+   unproven in either direction.
 2. **A speed number for `-ngl`.** Nothing here is a performance claim. The
    partial-offload tok/s ladder against resident VRAM is the interesting
    measurement and it has not been run.
