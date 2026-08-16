@@ -2176,6 +2176,41 @@ element-sum comparisons against llama.cpp — the overlap changes *when* bytes a
 read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
 `BIGTEA_PREFETCH_READERS` tunes the split.
 
+## Overlapping expert reads does not pay — 1.03x, reverted (2026-08-16)
+
+The phase breakdown after parallel experts looks like an obvious next win: 3.2 s
+disk and 1.7 s expert compute of an 8.3 s run, apparently additive, so
+arithmetic says ~1.25x.
+
+| | generation tok/s |
+|---|---|
+| read everything, then compute | 3.19 |
+| read chunk k+1 while 0..k compute | 3.28 |
+
+Ahead in 3 of 4 alternating pairs, output byte-identical. **Inside the noise,
+and reverted.**
+
+**The arithmetic was wrong because the cache absorbs 64–70% of expert reads.**
+"3.2 s disk" is time in the read path, not time waiting on the drive; the
+genuinely disk-blocked fraction is perhaps a third of it. And chunking the fetch
+gives up read concurrency — `read_slices_parallel` issues a whole block across
+eight pooled handles, and four chunks of two cannot reach that queue depth. The
+overlap gained and the concurrency lost nearly cancel.
+
+**The measurement nearly did not happen.** The first comparison was
+pipelined-now against a *remembered* number from an earlier session, which read
+as a large regression and meant nothing — the machine had been running 17 GiB
+models for hours and both arms of an unrelated head-to-head were declining
+across their pairs. A throwaway toggle was added purely to get both paths into
+one alternating session. **This machine drifts by more than the effect; anything
+worth under ~10% needs both arms alternating in one session.**
+
+Also measured: the expert cache budget. 2/4/6/8 GiB gives 2.22 / 2.66 / 3.45 /
+3.43 tok/s — plateaus at 6 GiB, default already on the plateau, and
+`CLAUDE.md`'s "past ~6 GiB the cache is the slowest configuration" does not
+reproduce on this model. Full node:
+`research/expert-read-overlap-does-not-pay-2026-08-16.md`.
+
 ## Parallel experts: 1.29x on expert compute, 1.10x end to end (2026-08-16)
 
 The lead `CLAUDE.md` has named for months — *"llama.cpp peaks at 4 threads where
