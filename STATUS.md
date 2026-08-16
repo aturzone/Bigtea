@@ -2176,6 +2176,27 @@ element-sum comparisons against llama.cpp — the overlap changes *when* bytes a
 read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
 `BIGTEA_PREFETCH_READERS` tunes the split.
 
+## Six declined-flag reasons were wrong, again (2026-08-16)
+
+The declined table drifted twice today and was audited a third time. **Four
+reasons had become false and two were incomplete** — and one was never right.
+
+| flag | was | now |
+|---|---|---|
+| `--split-mode` | "needs `ggml_backend_sched`, which is not wired in" | the scheduler **is** wired in; what is missing is a **second usable device**, which is hardware |
+| `--tensor-split` | "needs the same scheduler wiring" | same hardware blocker |
+| `--backend-sampling` | "there is no other backend to run it on" | a device exists; sampling is **Rust over a logits vector, not a graph**, and only a graph can be scheduled |
+| `--no-host` | "this is a CLI, not a server" | **never right** — llama.cpp's flag bypasses the host buffer; here the default already binds zero-copy with no buffer, so it is a no-op except under `--op-offload` where removing host buffers is a segfault |
+| `--poll` / `--poll-batch` | "ggml owns its threadpool here" | ggml **does** expose `ggml_threadpool_new`; not done because `ggml_threadpool_params` carries a fixed-size cpumask and a mistranscribed FFI struct is silent corruption in the path every graph uses |
+
+`--no-host` is the one worth noting: it was not stale, it was a **misreading of
+the flag**, sitting in the table that exists to stop exactly that. Checked
+against `common/arg.cpp` this time rather than inferred from the name.
+
+**A declined reason is user-facing text and it rots.** Three audits in one day
+found six wrong entries between them; anything that changes what the engine can
+do should end with a pass over this table.
+
 ## Overlapping expert reads does not pay — 1.03x, reverted (2026-08-16)
 
 The phase breakdown after parallel experts looks like an obvious next win: 3.2 s
