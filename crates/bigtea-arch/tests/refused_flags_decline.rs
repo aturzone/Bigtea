@@ -234,14 +234,21 @@ fn a_prompt_after_the_escape_hatch_is_not_scanned_for_help() {
 fn a_declined_flag_says_why_and_does_not_merely_exit() {
     // Declining is only better than ignoring if the message is actionable. An
     // exit code alone leaves the caller unable to tell a refusal from a crash.
+    //
+    // **The example used to be `--gpu-layers`, and that flag got implemented.**
+    // The test then failed with "message names no flag: no model given", which
+    // is the right failure for the wrong reason and took a minute to read as
+    // "this flag graduated" rather than "the refusal broke". `--split-mode` is
+    // the replacement because it is genuinely blocked on something absent
+    // (multi-device scheduling), not merely unbuilt.
     let out = Command::new(env!("CARGO_BIN_EXE_bigtea-run"))
-        .args(["--gpu-layers", "32"])
+        .args(["--split-mode", "row"])
         .output()
         .expect("cannot run bigtea-run");
 
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr was: {err}");
-    assert!(err.contains("--gpu-layers"), "message names no flag: {err}");
+    assert!(err.contains("--split-mode"), "message names no flag: {err}");
     assert!(
         err.contains("Drop the flag to continue"),
         "message gives the caller nothing to do: {err}"
