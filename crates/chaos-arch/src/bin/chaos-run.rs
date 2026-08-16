@@ -1327,14 +1327,40 @@ fn infill_tokens(tokenizer: &Tokenizer) -> Vec<u32> {
 /// The full option list. One place, so `--help`, `-h` and a bare
 /// invocation cannot drift apart.
 fn usage() -> ExitCode {
-    eprintln!("usage: chaos-run <model.gguf> \"prompt\" [options]");
+    eprintln!("usage: chaos-run <model> \"prompt\" [options]");
     eprintln!();
+    // `<model>` is a path OR a name, so the first thing to show someone with no
+    // arguments is which names actually work on their machine. A usage block
+    // that says "<model.gguf>" and nothing else leaves them to go and find one.
+    list_models_here();
     eprintln!("  -n N                tokens to generate");
     eprintln!("  -f FILE             read the prompt from a file");
     eprintln!("  -b N                prefill block size");
     eprintln!("  --cache GIB         expert cache budget");
     eprintln!("  --auto              pick device, -ngl and cache from this machine");
     eprintln!("  --temp T            0 = greedy (default)");
+    usage_rest()
+}
+
+/// The models on this machine, or where to put one if there are none.
+fn list_models_here() {
+    let found = chaos_model::find::list();
+    if found.is_empty() {
+        eprintln!("  no models found. Put a .gguf file in:");
+        if let Some(dir) = chaos_model::find::model_dirs().first() {
+            eprintln!("    {}", dir.display());
+        }
+        eprintln!("  Chaos downloads nothing on its own.");
+    } else {
+        eprintln!("  models on this machine (any unique part of a name works):");
+        for f in &found {
+            eprintln!("    {}", f.label);
+        }
+    }
+    eprintln!();
+}
+
+fn usage_rest() -> ExitCode {
     eprintln!("  --top-k K           0 = off");
     eprintln!("  --top-p P           1.0 = off");
     eprintln!("  --min-p P           0.0 = off");
@@ -2902,6 +2928,18 @@ fn main() -> ExitCode {
     let Some(path) = fetched.or(model_flag).or(path_positional) else {
         eprintln!("chaos-run: no model given. Pass it positionally, with -m, or with -hf.");
         return ExitCode::from(2);
+    };
+    // A name, not just a path. `chaos-run qwen3` beats making someone type
+    // `C:\Users\you\.chaos\models\Qwen3-30B-A3B-Q4_K_M.gguf`, and for a
+    // five-shard container it also removes having to know which shard to name.
+    // An existing path is returned unchanged, so nothing that worked before
+    // changes.
+    let path = match chaos_model::find::resolve(&path) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(e) => {
+            eprintln!("chaos-run: {}", chaos_model::find::explain(&path, &e));
+            return ExitCode::from(2);
+        }
     };
 
     chaos_arch::log::configure(logcfg);

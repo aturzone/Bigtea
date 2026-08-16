@@ -2231,6 +2231,24 @@ element-sum comparisons against llama.cpp — the overlap changes *when* bytes a
 read, never which. `CHAOS_PREFETCH_OVERLAP=0` disables it;
 `CHAOS_PREFETCH_READERS` tunes the split.
 
+## Running it no longer starts with a path (2026-08-16)
+
+`chaos-run <name>` resolves any unique part of a model's name against
+`CHAOS_MODELS`, `~/.chaos/models`, the download cache and `./models`. Bare
+`chaos-run` lists what is on the machine. An existing path still wins, so no
+previous invocation changes; an ambiguous name lists the candidates rather than
+guessing a 144 GB read; an unknown one lists what is available.
+
+**This closed a gap nobody had noticed was two gaps.** `install.ps1` created
+`~/.chaos/models` for hand-dropped files and `chaos-pull` wrote to a platform
+cache directory, and nothing searched both — so where a model lived depended on
+how it had arrived. The lookup searches both, and `chaos-serve` uses the same
+code so the two binaries cannot drift apart on it.
+
+The banner also changed shape: **the name first, the logo centred beneath it**,
+and the logo cropped to the artwork rather than the SVG's canvas, which had been
+carrying a wide white margin into every render.
+
 ## Clone-to-run, checked before the release (2026-08-16)
 
 **23 s from `git clone` to twelve binaries; 566 tests, 0 failed.** Run from a
