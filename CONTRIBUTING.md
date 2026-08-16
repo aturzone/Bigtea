@@ -34,7 +34,10 @@ The project's record on reasoning ahead of measurement is **nought for four**:
 2. Read [`CLAUDE.md`](CLAUDE.md). It is the project's short list of facts that
    cost real time to rediscover — things like *ggml aborts the process when its
    arena is exhausted*, and *a wrong tokenizer produces fluent nonsense, never a
-   crash*.
+   crash*. Each line there is a summary; the full text of all 38 is
+   [`docs/graph/reference/hard-won-facts.md`](docs/graph/reference/hard-won-facts.md),
+   and **that one is worth reading in full before you propose an optimisation**,
+   because about half of its entries are the measurement that killed one.
 
 ## Building and testing
 

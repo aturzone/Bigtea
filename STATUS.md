@@ -6,7 +6,7 @@ closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
 **Last updated**: 2026-08-16 · **Version**: **v0.0.3, released** · **Branch**:
-`main` · **Open PRs**: none. #83-#89 merged, every branch deleted.
+`main` · **Open PRs**: none. #83-#91 merged, every branch deleted.
 
 **The release is out**: <https://github.com/aturzone/Chaos/releases/tag/v0.0.3>
 — Linux, macOS and Windows archives, verified by downloading the published
@@ -20,10 +20,48 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **566 tests**, clippy `--workspace --all-targets -D warnings` 0, fmt
+**Current**: **570 tests** (50 binaries, 0 failed, 31 ignored — the V4-Flash set
+needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
 clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
 reading, which is the only way that number has ever been right.
+
+## CLAUDE.md pruned, and the test count was stale (2026-08-16)
+
+`CLAUDE.md` had reached **3,308 words against its own stated ~2000-token
+budget** — a rule the file itself carries and nobody had enforced. Its 35
+long-form facts moved verbatim to
+[`docs/graph/reference/hard-won-facts.md`](docs/graph/reference/hard-won-facts.md)
+(38 entries, grouped), and `CLAUDE.md` now carries one summary line each and
+points there. **1,238 words, ~1,700 tokens.** Nothing was dropped; the summaries
+are lossy on purpose and the node says so.
+
+**One entry was partly wrong and the move surfaced it.** *"Past ~6 GiB the expert
+cache is the slowest configuration measured"* is a V4-Flash observation that had
+been generalised: on Qwen3-30B a 2/4/6/8 GiB sweep gives 2.22/2.66/3.45/3.43
+tok/s, which **plateaus rather than declining**
+(`research/expert-read-overlap-does-not-pay-2026-08-16.md` recorded the
+contradiction at the time and `CLAUDE.md` was never corrected). The headline —
+hit rate is not a success metric — and the mechanism both stand. Retraction
+noted in the node under the original entry rather than by editing it away.
+
+**The README progress bars were redrawn.** They were ~100 characters wide with
+wrapped continuation lines, so a GitHub code block reflowed them into a mess, and
+an empty `[    ]` at 2% read as a rendering fault rather than a value. Now every
+row is one line, ≤72 characters, brackets aligned, unfilled cells drawn as a
+track rather than whitespace, and the prose that was wrapping sits below the
+block. **The fill is floored, never rounded** — `Architectures` had been drawn
+with 2 of 20 cells for 9.2%, which rounds up; it is 1. Checked by arithmetic
+rather than by eye.
+
+**The test count in this file was stale: 566 → 570.** The four `find.rs` lookup
+tests landed after the from-zero run that produced 566, and the README badge
+carried the same number. Counted from a clean full run: **50 binaries, 570
+passed, 0 failed, 31 ignored.** Also a method note worth keeping — an earlier
+count in the same session read 374, because the command piped `cargo test`
+through `tail -40` and there were 50 result lines. **A filter that truncates
+looks exactly like a regression**, and the only thing that caught it was the
+number disagreeing with a previously measured one.
 
 ## The parity scoreboard, re-scored under the discriminator (2026-08-15)
 
@@ -2073,8 +2111,9 @@ Tests **492 → 507**.
 
 ## Things that are true and cost time to rediscover
 
-The full list is in `CLAUDE.md` under *Facts that cost time to rediscover*. The
-three that have burned the most time:
+The full list is [`docs/graph/reference/hard-won-facts.md`](docs/graph/reference/hard-won-facts.md),
+38 entries; `CLAUDE.md` carries a one-line summary of each. The three that have
+burned the most time:
 
 - **A wrong tokenizer or forward pass produces fluent nonsense, never a crash.**
   Test pieces separately, against an oracle.

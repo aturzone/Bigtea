@@ -13,7 +13,7 @@
   <a href="https://github.com/aturzone/Chaos/releases"><img alt="version" src="https://img.shields.io/badge/version-0.0.3-orange"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue"></a>
   <a href="https://github.com/aturzone/Chaos/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aturzone/Chaos/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-566%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-570%20passing-brightgreen">
 </p>
 
 ---
@@ -130,29 +130,36 @@ machine.
 
 ## Progress
 
-Every bar is a ratio of two counted things, both stated.
+Every bar is a ratio of two counted things, both named. Filled cells are floored,
+never rounded up.
 
 ```
-CLI flags       [##################  ]  91%   165 of llama.cpp's 182 implemented, 17 declined
-                                              with a written reason, 0 unrecognised
-Chat templates  [################### ]  96%   52 of its 54 built-in names
-Tokenizers      [#################   ]  83%   5 of 6 families: BPE, SPM, WordPiece, Unigram, RWKV
-Samplers        [################    ]  80%   16 of 20, audited 2026-08-11
-Architectures   [##                  ]   9%   13 of the 141 llama.cpp declares, each diffed
-                                              against it at 8 prompts
-GPU backends    [####                ]  20%   1 of 5, Vulkan, and the device path is NOT verified
-V4-Flash speed  [                    ]   2%   0.394 of the 20 tok/s target. Closed by measurement,
-                                              not by effort: 20 tok/s needs 79 MB/token and this
-                                              model reads 3288
-GUI             [                    ]   0%   not planned. CLI only
+CLI flags         91%  [##################..]  165 of llama.cpp's 182
+Chat templates    96%  [###################.]  52 of its 54 names
+Tokenizers        83%  [################....]  5 of 6 families
+Samplers          80%  [################....]  16 of 20
+Architectures      9%  [#...................]  13 of the 141 it declares
+GPU backends      20%  [####................]  1 of 5, Vulkan only
+V4-Flash speed     2%  [....................]  0.394 of 20 tok/s
+GUI                0%  [....................]  not planned, CLI only
 ```
 
-The last two are the honest ones. **`V4-Flash speed` will not move** — everything
-still alive multiplies to 3.1x against a 42x gap, and the remaining cost is the
-active weights coming from disk, which no code change touches. The number that
-*can* move is one nobody has published: **tok/s against resident bytes for a
-144 GB model**, which Chaos can sweep because it owns residency where an `mmap`
-engine cannot be told to use exactly N GiB.
+Where those numbers come from, in the same order: 17 flags are declined with a
+written reason and **0 are unrecognised**; the two missing templates are Hunyuan
+variants; the tokenizer families are BPE, SPM, WordPiece, Unigram and RWKV; the
+sampler audit was 2026-08-11; **every one of the 13 architectures was diffed
+against llama.cpp at 8 prompts**, which is what counts as verified here; and the
+Vulkan device path is bound but **not** verified — it fails 1 of those 8 prompts
+where the CPU path fails none.
+
+The last two bars are the honest ones. **`V4-Flash speed` will not move** —
+20 tok/s needs 79 MB/token, this model reads 3288, and everything still alive
+multiplies to 3.1x against a 42x gap. That is a measurement, not a lack of
+effort, and the remaining cost is the active weights coming from disk, which no
+code change touches. The number that *can* move is one nobody has published:
+**tok/s against resident bytes for a 144 GB model**, which Chaos can sweep
+because it owns residency where an `mmap` engine cannot be told to use exactly
+N GiB.
 
 ## Build from source
 
