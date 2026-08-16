@@ -48,7 +48,11 @@ jobs:
 
       - name: The ggml-free crates build, test and lint
         run: |
-          CRATES="-p chaos-gguf -p chaos-probe -p chaos-plan -p chaos-io -p chaos-model -p chaos-tokenizer -p chaos-grammar -p chaos-ggml"
+          # Every crate except chaos-arch. The README claims nine of the ten are
+          # usable on a machine that has never compiled a line of C, and this is
+          # the only thing that makes that a fact rather than a hope --
+          # chaos-jinja was missing from the list while the claim counted it.
+          CRATES="-p chaos-gguf -p chaos-probe -p chaos-plan -p chaos-io -p chaos-model -p chaos-tokenizer -p chaos-grammar -p chaos-jinja -p chaos-ggml"
           cargo build $CRATES
           cargo test $CRATES
           cargo clippy $CRATES --all-targets -- -D warnings

@@ -113,7 +113,7 @@ jobs:
         run: |
           cd target/release
           fail=0
-          for b in chaos-run chaos-probe chaos-model-info chaos-meta gguf-info chaos-loadbench; do
+          for b in chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench; do
             exe="./$b${{ matrix.ext }}"
             test -f "$exe" || { echo "::error::$b was not built"; fail=1; continue; }
             # No arguments: every one of these prints usage and exits non-zero,
@@ -149,16 +149,49 @@ jobs:
           VER="${GITHUB_REF_NAME:-dev}"
           DIR="chaos-${VER}-${{ matrix.name }}"
           mkdir -p "$DIR"
-          for b in chaos-run chaos-probe chaos-model-info chaos-meta gguf-info chaos-loadbench; do
+          for b in chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench; do
             cp "target/release/$b${{ matrix.ext }}" "$DIR/"
           done
           cp README.md LICENSE NOTICE CHANGELOG.md STATUS.md "$DIR/"
+          # The Windows archive carries its own installer. Unix gets three
+          # lines of `install -m 755` in the README instead, which is what
+          # anyone on those platforms would rather have than a script.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp scripts/install.ps1 "$DIR/"
+          fi
           if [ "${{ matrix.archive }}" = "zip" ]; then
             7z a "$DIR.zip" "$DIR" >/dev/null
           else
             tar czf "$DIR.tar.gz" "$DIR"
           fi
           ls -la chaos-*.${{ matrix.archive }}
+
+      # An installer that fails on the archive it ships with is worse than no
+      # installer, and it is the one thing here that cannot be checked locally
+      # in the shape a user meets it: unpacked archive, no toolchain, no repo.
+      - name: The installer installs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = (Get-ChildItem -Directory -Filter 'chaos-*-windows-x86_64')[0].FullName
+          $prefix = Join-Path $env:RUNNER_TEMP 'chaos-install-test'
+          $models = Join-Path $env:RUNNER_TEMP 'chaos-models-test'
+          # -NoPath: a CI runner's user PATH is not ours to edit, and the
+          # copy/upgrade/manifest half is what an archive can get wrong.
+          & powershell -ExecutionPolicy Bypass -File "$dir\install.ps1" -Prefix $prefix -ModelsDir $models -NoPath
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 exited $LASTEXITCODE" }
+          $exe = Join-Path $prefix 'bin\chaos-run.exe'
+          if (-not (Test-Path $exe)) { throw "chaos-run.exe is missing: $exe" }
+          if (-not (Test-Path $models)) { throw "models directory was not created" }
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "the installed chaos-run does not start" }
+          # Re-running must upgrade in place rather than fail or duplicate.
+          & powershell -ExecutionPolicy Bypass -File "$dir\install.ps1" -Prefix $prefix -ModelsDir $models -NoPath
+          if ($LASTEXITCODE -ne 0) { throw "re-running install.ps1 exited $LASTEXITCODE" }
+          & powershell -ExecutionPolicy Bypass -File "$dir\install.ps1" -Prefix $prefix -ModelsDir $models -NoPath -Uninstall
+          if (Test-Path (Join-Path $prefix 'bin')) { throw "uninstall left the bin directory behind" }
+          if (-not (Test-Path $models)) { throw "uninstall deleted the models directory" }
+          Write-Host 'install / upgrade / uninstall all clean'
 
       - uses: actions/upload-artifact@v4
         with:
