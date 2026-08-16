@@ -2176,6 +2176,42 @@ element-sum comparisons against llama.cpp — the overlap changes *when* bytes a
 read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
 `BIGTEA_PREFETCH_READERS` tunes the split.
 
+## Parallel experts: 1.29x on expert compute, 1.10x end to end (2026-08-16)
+
+The lead `CLAUDE.md` has named for months — *"llama.cpp peaks at 4 threads where
+we peak at 1"* — closed from the other side.
+
+ggml parallelises **within** a node. An expert matmul is a 2048×768
+matrix-vector product; split twenty ways that is ~38 rows per thread per
+barrier, so the tuner picks one and `-t 20` is 2.4x slower. The batching route
+was built and reverted: `mul_mat_id` hit 11.17 GiB/s in the kernel bench, but
+making the selected `Arc<[u8]>` experts contiguous costs ~1.02 GB/token — 1.34 →
+1.27 tok/s.
+
+**This gathers nothing.** Each expert keeps its own subgraph and its weights
+where they already are; N whole experts run side by side with one ggml thread
+each, and the partial sums are added in Rust. Parallelism across nodes, the axis
+ggml does not offer and Rust does.
+
+Interleaved so a warming page cache cannot look like a speedup:
+
+| workers | 1 | 2 | **4** | 6 | 8 |
+|---|---:|---:|---:|---:|---:|
+| generation tok/s | 3.52 | 3.74 | **3.86** | 3.87 | 3.82 |
+
+Four alternating pairs of 1 against 4, spread under 1%: generation **3.52 →
+3.86**, expert compute **2.2 s → 1.7 s**. Output byte-identical across 1/2/4/8
+workers on three prompts.
+
+**Four is not a core count.** The plateau is 4–6 and falls by 8 because this
+model selects eight experts per token; past that there is nothing left to split.
+`BIGTEA_EXPERT_WORKERS` overrides it, `1` restores the old path exactly.
+
+Scope: **generation only** — the batched prefill path is untouched and measured
+flat at 1.30–1.32 across every worker count. 1.10x rather than 1.29x end to end
+because expert compute is 33% of a token against disk's 39%. Full node:
+`research/parallel-experts-2026-08-16.md`.
+
 ## Generation on Qwen3-30B is 0.90x, not 2x behind (2026-08-16)
 
 `CLAUDE.md` has said in bold, for months: *"Generation is still ~2x behind (1.07
