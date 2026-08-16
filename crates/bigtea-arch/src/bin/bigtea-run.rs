@@ -1156,17 +1156,6 @@ const REFUSED: &[(&str, bool, &str)] = &[
         false,
         "the KV cache is host memory even on the device path; moving it needs the cache push and the router to stop consuming host vectors",
     ),
-    // **BUILT, AND IT DOES NOT WORK YET** -- `ticket/r25-scheduled-forward-pass`
-    // carries the whole scheduled path, and `GGML_SCHED_DEBUG=2` shows the
-    // scheduler correctly moving matmuls onto Vulkan with host weights copied
-    // in. The third graph then dies in allocation. The reason below is what was
-    // measured rather than what is missing, which is a different and more
-    // useful thing to tell a reader.
-    (
-        "--op-offload",
-        false,
-        "the scheduled path is built and aborts on the attention graph with ggml-alloc.c GGML_ASSERT(buffer_id >= 0) -- a node ggml_backend_sched left unassigned. Declined rather than shipped, because a flag that kills the process is worse than one that refuses",
-    ),
     (
         "--backend-sampling",
         false,
@@ -1530,6 +1519,7 @@ fn main() -> ExitCode {
     let mut gpu_device: Option<usize> = None;
     let mut gpu_layers: Option<usize> = None;
     let mut tensor_overrides: Vec<String> = Vec::new();
+    let mut op_offload = false;
     let mut jinja = false;
     let mut loras: Vec<(String, f32)> = Vec::new();
     let mut cvecs: Vec<(String, f32)> = Vec::new();
@@ -2062,6 +2052,12 @@ fn main() -> ExitCode {
             // `--device` still wins if both are given, in either order.
             // **`-ot` implies a device too**, for the same reason `-ngl` does:
             // `*_exps=CPU` is meaningless unless something else is on a card.
+            // **Implies a device, like `-ngl` and `-ot`.** There is nothing to
+            // offload an operation TO otherwise.
+            "--op-offload" => {
+                op_offload = true;
+                i += 1;
+            }
             "-ot" | "--override-tensor" => {
                 let Some(v) = rest.get(i + 1) else {
                     eprintln!(
@@ -3004,6 +3000,7 @@ fn main() -> ExitCode {
         gpu_device,
         gpu_layers,
         tensor_overrides,
+        op_offload,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -3051,6 +3048,7 @@ fn run_streaming(
     // llama.cpp's `-ngl`. `None` means every block, once a device is open.
     gpu_layers: Option<usize>,
     tensor_overrides: Vec<String>,
+    op_offload: bool,
     t0: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigtea_arch::StreamingRunner;
@@ -3198,7 +3196,7 @@ fn run_streaming(
     // `-ngl 0` is the one case that opens nothing: the user asked for zero
     // layers on the card, and opening a device to then use none of it would
     // pay the initialisation and report a GPU run that is not one.
-    let want_device = match (gpu_device, gpu_layers.or(if tensor_overrides.is_empty() {
+    let want_device = match (gpu_device, gpu_layers.or(if tensor_overrides.is_empty() && !op_offload {
         None
     } else {
         // `-ot` alone means "the model is on the card except these", so it
@@ -3236,10 +3234,24 @@ fn run_streaming(
             runner.set_tensor_overrides(&tensor_overrides)?;
             bigtea_arch::info!("overrides  {} tensor rule(s)", tensor_overrides.len());
         }
+        if op_offload {
+            runner.set_op_offload(true)?;
+            // **Measured slower, and said so at the moment it is switched
+            // on.** Burying this in a node nobody reads is the same as not
+            // knowing it.
+            bigtea_arch::info!(
+                "op-offload ggml_backend_sched places each operation. MEASURED SLOWER on Qwen3-4B: 64.4 vs 79.2 prefill tok/s at ~900 tokens, because this engine submits ~5 graphs per block so weight copies amortise over a block rather than a pass, and scheduling also gives up the 1.39x repack. See op-offload-cannot-pay-2026-08-16.md"
+            );
+        }
     }
 
     let ctx = Context::new_no_alloc(64 << 20)?;
     let mut weights = WeightSet::new();
+    if runner.op_offload() {
+        // Host weights need a CPU buffer to be copyable across a split. Must
+        // precede every bind, so it sits here rather than inside the loader.
+        weights.use_host_buffers();
+    }
     let load_start = std::time::Instant::now();
     // Held for the run: dropping the device buffer frees the weights out from
     // under every graph that binds them.
@@ -3819,6 +3831,7 @@ fn run(
     // llama.cpp's `-ngl`. `None` means every block, once a device is open.
     gpu_layers: Option<usize>,
     tensor_overrides: Vec<String>,
+    op_offload: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Set once, read by every graph evaluation. A flag that only reached some
@@ -4120,6 +4133,7 @@ fn run(
         gpu_device,
         gpu_layers,
         tensor_overrides,
+        op_offload,
         t0,
     )
 }

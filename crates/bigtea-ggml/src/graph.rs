@@ -44,6 +44,10 @@ extern "C" {
     fn ggml_init(params: InitParams) -> *mut ggml_context;
     fn ggml_free(ctx: *mut ggml_context);
 
+    // The scheduler reads these flags; see `Tensor::set_input`.
+    fn ggml_set_input(tensor: *mut ggml_tensor);
+    fn ggml_set_output(tensor: *mut ggml_tensor);
+
     fn ggml_new_tensor_1d(ctx: *mut ggml_context, ty: c_int, ne0: i64) -> *mut ggml_tensor;
     fn ggml_new_tensor_2d(
         ctx: *mut ggml_context,
@@ -1220,6 +1224,36 @@ pub struct Tensor<'a> {
 
 impl Tensor<'_> {
     /// The raw `ggml_tensor*`, for the backend path in `backend.rs`.
+    /// Mark this tensor as a **graph input**, i.e. something the caller fills.
+    ///
+    /// # Why this is not cosmetic
+    ///
+    /// `ggml_backend_sched` reads the flag. A leaf with no buffer, no data and
+    /// no op is otherwise something it cannot place, and an unplaced node
+    /// reaches `ggml_gallocr_allocate_node` as backend `-1`:
+    ///
+    /// ```text
+    /// ggml-alloc.c:623: GGML_ASSERT(buffer_id >= 0) failed
+    /// ```
+    ///
+    /// which **aborts the process**. With the flag it takes the documented
+    /// path -- `cur_backend_id = sched->n_backends - 1`, the last backend,
+    /// which is why the CPU must be passed last.
+    ///
+    /// llama.cpp marks every graph input this way. That is not a style choice,
+    /// and the day spent finding it is the argument for saying so here.
+    pub fn set_input(&self) {
+        // SAFETY: `self` is a live tensor in a live context; the call only sets
+        // a flag bit.
+        unsafe { ggml_set_input(self.raw.as_ptr()) };
+    }
+
+    /// Mark this tensor as a graph **output**, read back after the compute.
+    pub fn set_output(&self) {
+        // SAFETY: as above.
+        unsafe { ggml_set_output(self.raw.as_ptr()) };
+    }
+
     pub(crate) fn as_raw(&self) -> *mut c_void {
         self.raw.as_ptr()
     }

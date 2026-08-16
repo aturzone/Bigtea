@@ -313,3 +313,134 @@ fn pinning_a_node_is_honoured() {
         assert!((g - w).abs() < 1e-4, "element {i}: {g} vs {w}");
     }
 }
+
+/// **A minimal stand-in for the attention graph, which aborts in the runner.**
+///
+/// `--op-offload` dies on the third graph with
+/// `ggml-alloc.c:623 GGML_ASSERT(buffer_id >= 0)` — a node the split left
+/// unassigned. Attention is the only graph full of views, so this builds the
+/// same shape and nothing else: a matmul, a permute, and a `cont`, across two
+/// backends.
+///
+/// `#[ignore]`d because a ggml assert **aborts the process** and would take
+/// every other result in this binary with it. Run it on its own:
+///
+/// ```text
+/// cargo test --release -p bigtea-ggml --test scheduler -- --ignored views
+/// ```
+#[test]
+#[ignore = "aborts the whole binary if the bug reproduces; run alone"]
+fn views_across_a_split_are_assigned_a_backend() {
+    let _guard = one_at_a_time();
+    let Some(index) = discrete_gpu() else {
+        eprintln!("skipping: no discrete GPU");
+        return;
+    };
+    let Ok(gpu) = Backend::open(index) else {
+        eprintln!("skipping: device {index} would not initialise");
+        return;
+    };
+    let cpu = Backend::cpu().expect("cpu backend");
+    cpu.set_threads(1);
+
+    let (k, m, n) = (4usize, 4usize, 4usize);
+    let a: Vec<f32> = (0..k * m).map(|i| (i as f32) * 0.5 - 1.0).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| 2.0 - (i as f32) * 0.25).collect();
+
+    let ctx = Context::new_no_alloc(16 * 1024 * 1024).expect("context");
+    let ta = ctx.new_f32_2d(k as i64, m as i64).expect("a");
+    let tb = ctx.new_f32_2d(k as i64, n as i64).expect("b");
+    let product = ctx.mul_mat(&ta, &tb).expect("mul_mat");
+    // The shape attention actually has: a 3-D reshape, a permute, and a cont.
+    let three = ctx.reshape_3d(&product, 2, 2, n as i64).expect("reshape");
+    let moved = ctx.permute(&three, [0, 2, 1, 3]).expect("permute");
+    let out = ctx.cont(&moved).expect("cont");
+
+    let mut a_bytes = aligned(&a);
+    let host_a = HostBuffer::wrap(&mut a_bytes).expect("host buffer a");
+    host_a.attach(&ta, 0).expect("attach a");
+    let mut b_bytes = aligned(&b);
+    let host_b = HostBuffer::wrap(&mut b_bytes).expect("host buffer b");
+    host_b.attach(&tb, 0).expect("attach b");
+
+    let backends = [&gpu, &cpu];
+    let sched = Scheduler::new(&backends, 2048, true).expect("scheduler");
+    sched.realize(&ctx, &[&out]).expect("realize");
+    sched.run(&ctx, &[&out]).expect("run");
+
+    let got = backend::download_f32(&out).expect("download");
+    assert_eq!(
+        got.len(),
+        m * n,
+        "wrong element count out of the view chain"
+    );
+}
+
+/// The other half of the attention graph: the fused kernel and its F16 mask.
+///
+/// Views alone schedule fine (above), so if `--op-offload`'s abort reproduces
+/// anywhere small it is here. Same `#[ignore]` reasoning: an assert kills the
+/// binary.
+///
+/// ```text
+/// cargo test --release -p bigtea-ggml --test scheduler -- --ignored flash
+/// ```
+#[test]
+#[ignore = "aborts the whole binary if the bug reproduces; run alone"]
+fn a_flash_attention_graph_schedules() {
+    let _guard = one_at_a_time();
+    let Some(index) = discrete_gpu() else {
+        eprintln!("skipping: no discrete GPU");
+        return;
+    };
+    let Ok(gpu) = Backend::open(index) else {
+        eprintln!("skipping: device {index} would not initialise");
+        return;
+    };
+    let cpu = Backend::cpu().expect("cpu backend");
+    cpu.set_threads(1);
+
+    // The runner's shapes in miniature: head_dim 32, 2 heads, 4 positions.
+    let (head_dim, n_head, n_tok) = (32i64, 2i64, 4i64);
+    let ctx = Context::new_no_alloc(32 * 1024 * 1024).expect("context");
+    let q = ctx.new_f32_3d(head_dim, n_head, n_tok).expect("q");
+    let k = ctx.new_f16_3d(head_dim, n_head, n_tok).expect("k");
+    let v = ctx.new_f16_3d(head_dim, n_head, n_tok).expect("v");
+    // ggml wants [head_dim, n_tok, n_head] for the fused kernel.
+    let qp = ctx.permute(&q, [0, 2, 1, 3]).expect("q permute");
+    let qc = ctx.cont(&qp).expect("q cont");
+    let kp = ctx.permute(&k, [0, 2, 1, 3]).expect("k permute");
+    let kc = ctx.cont(&kp).expect("k cont");
+    let vp = ctx.permute(&v, [0, 2, 1, 3]).expect("v permute");
+    let vc = ctx.cont(&vp).expect("v cont");
+    // **F16 and contiguous**, which the fused kernel asserts; the only values
+    // are 0 and -inf so the bit patterns go in directly.
+    let mask = ctx.new_f16_3d(n_tok, n_tok, 1).expect("mask");
+    let attn = ctx
+        .flash_attn_ext(&qc, &kc, &vc, &mask, 0.125, 0.0)
+        .expect("flash_attn_ext");
+    let out = ctx.cont(&attn).expect("out cont");
+
+    // **The whole fix.** Without these the scheduler cannot place a bare leaf
+    // and `ggml_gallocr_allocate_node` gets backend -1, which aborts.
+    for t in [&q, &k, &v, &mask] {
+        t.set_input();
+    }
+
+    let backends = [&gpu, &cpu];
+    let sched = Scheduler::new(&backends, 2048, true).expect("scheduler");
+    sched.realize(&ctx, &[&out]).expect("realize");
+
+    // Inputs after allocation, per the ordering rule.
+    let zeros_q = vec![0.0f32; (head_dim * n_head * n_tok) as usize];
+    backend::upload_f32(&q, &zeros_q).expect("upload q");
+    let zeros_kv = vec![0u8; (head_dim * n_head * n_tok) as usize * 2];
+    backend::upload(&k, &zeros_kv).expect("upload k");
+    backend::upload(&v, &zeros_kv).expect("upload v");
+    let zeros_mask = vec![0u8; (n_tok * n_tok) as usize * 2];
+    backend::upload(&mask, &zeros_mask).expect("upload mask");
+
+    sched.run(&ctx, &[&out]).expect("run");
+    let got = backend::download_f32(&out).expect("download");
+    assert_eq!(got.len(), (head_dim * n_head * n_tok) as usize);
+}

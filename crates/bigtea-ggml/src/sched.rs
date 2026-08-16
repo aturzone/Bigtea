@@ -166,6 +166,89 @@ impl Drop for AlignedBytes {
     }
 }
 
+/// A CPU buffer that **owns** the bytes it wraps.
+///
+/// # Why this exists beside [`HostBuffer`]
+///
+/// [`HostBuffer`] borrows, which is right for memory the caller already holds
+/// and wrong for a `WeightSet`: the set has to keep the allocation and the ggml
+/// buffer together for its whole life, and a borrowing wrapper stored next to
+/// what it borrows is self-referential.
+///
+/// Owning both is safe because [`AlignedBytes`] is a heap allocation — moving
+/// this struct moves the pointer, never the bytes, which is the same argument
+/// `WeightSet::bind_shared` already makes about its `Arc`s.
+pub struct OwnedHostBuffer {
+    raw: NonNull<std::os::raw::c_void>,
+    /// Dropped **after** `raw` is freed. Field order is the drop order, and
+    /// freeing the ggml buffer touches the wrapper rather than these bytes, but
+    /// the ordering is stated rather than relied on by accident.
+    bytes: AlignedBytes,
+}
+
+impl OwnedHostBuffer {
+    /// Take ownership of `bytes` and give ggml a buffer over them.
+    pub fn adopt(mut bytes: AlignedBytes) -> Result<Self, GgmlError> {
+        let base = bytes.as_mut_ptr();
+        let len = bytes.len();
+        if (base as usize) % TENSOR_ALIGNMENT != 0 {
+            return Err(GgmlError::Misaligned {
+                address: base as usize,
+                required: TENSOR_ALIGNMENT,
+            });
+        }
+        // SAFETY: `bytes` is owned by the returned value and outlives `raw`;
+        // ggml stores the pointer and a from_ptr buffer's free does not touch
+        // the caller's allocation.
+        let raw = unsafe { ffi::ggml_backend_cpu_buffer_from_ptr(base.cast(), len) };
+        NonNull::new(raw)
+            .map(|raw| Self { raw, bytes })
+            .ok_or(GgmlError::DeviceOutOfMemory)
+    }
+
+    /// Point `tensor` at the start of this buffer.
+    ///
+    /// One buffer per tensor, unlike [`HostBuffer::attach`]'s offset form: a
+    /// weight set binds tensors one at a time from separate reads, so there is
+    /// no single span to offset into.
+    pub fn attach(&self, tensor: &Tensor<'_>) -> Result<(), GgmlError> {
+        if tensor.bytes() != self.bytes.len() {
+            return Err(GgmlError::WrongSize {
+                expected: tensor.bytes(),
+                actual: self.bytes.len(),
+            });
+        }
+        // SAFETY: `raw` is a live CPU buffer over `bytes`, and the tensor's size
+        // was just checked to match it exactly.
+        let status = unsafe {
+            ffi::ggml_backend_tensor_alloc(
+                self.raw.as_ptr(),
+                tensor.as_raw(),
+                self.bytes.as_ptr() as *mut std::os::raw::c_void,
+            )
+        };
+        if status != 0 {
+            return Err(GgmlError::ComputeFailed(status));
+        }
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl Drop for OwnedHostBuffer {
+    fn drop(&mut self) {
+        // SAFETY: freed exactly once, before `bytes` is dropped.
+        unsafe { bffi::ggml_backend_buffer_free(self.raw.as_ptr()) };
+    }
+}
+
 /// Host memory given a buffer identity, so the scheduler can copy out of it.
 ///
 /// **It does not own or copy the bytes.** It wraps a slice the caller already

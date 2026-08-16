@@ -386,8 +386,24 @@ pub mod timing {
 /// that get this wrong write into a null pointer, so the sequence is stated
 /// here once rather than rediscovered per site.
 pub enum Compute<'b> {
-    Cpu { threads: usize },
+    Cpu {
+        threads: usize,
+    },
     Device(&'b Backend),
+    /// A graph partitioned across backends by `ggml_backend_sched`.
+    ///
+    /// # What this buys and what it costs
+    ///
+    /// It is the only variant that can run a graph whose tensors are **not all
+    /// in one place**: the scheduler cuts the graph into splits and inserts the
+    /// copies. That is what `--op-offload` needs, and what lets
+    /// `--override-tensor` split a single block.
+    ///
+    /// It is not free. Host weights must carry a CPU buffer to be copyable
+    /// (`WeightSet::use_host_buffers`), which rules out repacking — worth
+    /// **1.39x on CPU prefill**. So this is opt-in and its value is a
+    /// measurement, not an assumption.
+    Sched(&'b crate::sched::Scheduler<'b>),
 }
 
 impl Compute<'_> {
@@ -401,7 +417,10 @@ impl Compute<'_> {
             Compute::Cpu { .. } => Context::new(arena),
             // Metadata only: a few hundred bytes per tensor, because the bytes
             // live on the card.
-            Compute::Device(_) => Context::new_no_alloc(arena),
+            //
+            // The scheduler wants the same: it assigns every graph tensor its
+            // storage, on whichever backend it picked.
+            Compute::Device(_) | Compute::Sched(_) => Context::new_no_alloc(arena),
         }
     }
 
@@ -414,7 +433,10 @@ impl Compute<'_> {
     /// its byte buffers.
     pub fn realize(&self, ctx: &Context) -> Result<Option<DeviceBuffer>, GgmlError> {
         match self {
-            Compute::Cpu { .. } => Ok(None),
+            // A scheduled graph is allocated by `realize_graph`, which is the
+            // only form that knows the outputs -- and the scheduler needs them
+            // to cut the splits.
+            Compute::Cpu { .. } | Compute::Sched(_) => Ok(None),
             Compute::Device(b) => {
                 let t = std::time::Instant::now();
                 let out = b.alloc(ctx).map(Some);
@@ -446,6 +468,15 @@ impl Compute<'_> {
     ) -> Result<Option<GraphAllocator>, GgmlError> {
         match self {
             Compute::Cpu { .. } => Ok(None),
+            Compute::Sched(s) => {
+                let t = std::time::Instant::now();
+                s.realize(ctx, outputs)?;
+                timing::add(&timing::REALIZE_NS, t);
+                timing::REALIZE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The scheduler owns its buffers for its whole life, so there
+                // is nothing per-graph for the caller to hold.
+                Ok(None)
+            }
             Compute::Device(b) => {
                 let t = std::time::Instant::now();
                 let galloc = GraphAllocator::new(b)?;
@@ -461,7 +492,7 @@ impl Compute<'_> {
     pub fn set_f32(&self, t: &Tensor<'_>, values: &[f32]) -> Result<(), GgmlError> {
         match self {
             Compute::Cpu { .. } => t.set_f32(values),
-            Compute::Device(_) => {
+            Compute::Device(_) | Compute::Sched(_) => {
                 let started = std::time::Instant::now();
                 let r = upload_f32(t, values);
                 timing::add(&timing::UPLOAD_NS, started);
@@ -474,7 +505,7 @@ impl Compute<'_> {
     pub fn set_i32(&self, t: &Tensor<'_>, values: &[i32]) -> Result<(), GgmlError> {
         match self {
             Compute::Cpu { .. } => t.set_i32(values),
-            Compute::Device(_) => {
+            Compute::Device(_) | Compute::Sched(_) => {
                 let mut bytes = Vec::with_capacity(values.len() * 4);
                 for v in values {
                     bytes.extend_from_slice(&v.to_le_bytes());
@@ -493,7 +524,7 @@ impl Compute<'_> {
     pub fn set_bytes(&self, t: &Tensor<'_>, data: &[u8]) -> Result<(), GgmlError> {
         match self {
             Compute::Cpu { .. } => t.set_bytes(data),
-            Compute::Device(_) => {
+            Compute::Device(_) | Compute::Sched(_) => {
                 let started = std::time::Instant::now();
                 let r = upload(t, data);
                 timing::add(&timing::UPLOAD_NS, started);
@@ -515,13 +546,13 @@ impl Compute<'_> {
     /// on it, exactly as for [`Context::in_buffer`].
     pub unsafe fn context_in_buffer<'a>(&self, buf: &'a mut [u8]) -> Result<Context, GgmlError> {
         let _ = std::marker::PhantomData::<&'a ()>;
-        Context::in_buffer(buf, matches!(self, Compute::Device(_)))
+        Context::in_buffer(buf, !matches!(self, Compute::Cpu { .. }))
     }
 
     pub fn to_vec_f32(&self, t: &Tensor<'_>) -> Result<Vec<f32>, GgmlError> {
         match self {
             Compute::Cpu { .. } => Ok(t.to_vec_f32()),
-            Compute::Device(_) => {
+            Compute::Device(_) | Compute::Sched(_) => {
                 let started = std::time::Instant::now();
                 let r = download_f32(t);
                 timing::add(&timing::DOWNLOAD_NS, started);
@@ -533,6 +564,7 @@ impl Compute<'_> {
     pub fn run(&self, ctx: &Context, outputs: &[&Tensor<'_>]) -> Result<(), GgmlError> {
         match self {
             Compute::Cpu { threads } => ctx.compute_many(outputs, *threads),
+            Compute::Sched(s) => s.run(ctx, outputs),
             Compute::Device(b) => {
                 let t = std::time::Instant::now();
                 let r = b.compute(ctx, outputs);
@@ -552,6 +584,12 @@ impl Compute<'_> {
         match self {
             Compute::Cpu { .. } => crate::Residency::Host,
             Compute::Device(_) => crate::Residency::Device,
+            // The scheduled path places weights by the caller's own rules and
+            // copies across whatever split that produces, so it has no single
+            // answer here. Host is the safe default: a host-bound tensor with a
+            // CPU buffer is copyable, and a device-bound one is not reachable
+            // from a host kernel at all.
+            Compute::Sched(_) => crate::Residency::Host,
         }
     }
 }

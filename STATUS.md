@@ -1084,7 +1084,7 @@ parity doc had said "~100", which was a guess. Bigtea now accepts **106**.
 | RoPE / YaRN | 15 | **9 done**, 6 refused |
 | KV type + prompt cache | 7 | **done** |
 | runtime / memory | 31 | I/O mode, `--override-kv`, `--mlock`; **most refused with reasons** |
-| GPU | 15 | **9 done** — `--device`/`--main-gpu`, `--list-devices`, `-ngl`/`--gpu-layers`/`--n-gpu-layers`, `-ot`/`--override-tensor`; 6 refused, all needing the scheduler wired into the forward pass |
+| GPU | 15 | **10 done** — `--device`/`--main-gpu`, `--list-devices`, `-ngl`/`--gpu-layers`/`--n-gpu-layers`, `-ot`/`--override-tensor`, `--op-offload`; 5 refused, and `--split-mode`/`--tensor-split` need a second usable device this machine does not have |
 | grammar / JSON schema | 4 | the r10 worktree session owns this |
 
 **Nothing is accepted that does nothing.** ~20 flags are refused outright with a
@@ -2176,39 +2176,39 @@ element-sum comparisons against llama.cpp — the overlap changes *when* bytes a
 read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
 `BIGTEA_PREFETCH_READERS` tunes the split.
 
-## The scheduled forward pass is built and does not work (2026-08-16)
+## `--op-offload` works, and it cannot pay yet (2026-08-16)
 
-Running every graph through `ggml_backend_sched` is what `--op-offload`,
-`--split-mode`, `--tensor-split` and a block-splitting `-ot` all wait on. The
-path is built end to end on `ticket/r25-scheduled-forward-pass` and it is **not
-merged**, because it aborts.
+The scheduled forward pass runs. `--op-offload` is implemented, produces the
+same completion as every other path, and is **slower than not using it**.
 
-**The scheduler demonstrably does its job.** With every weight on the host,
-`GGML_SCHED_DEBUG=2` shows it putting the embedding lookup on the CPU, moving
-the QKV matmuls onto Vulkan, and copying the host weights across the boundary —
-the first mixed graph this engine has ever run.
+**The blocking bug was one missing call: `ggml_set_input`.** The scheduler has
+an explicit branch — `if (tensor->flags & GGML_TENSOR_FLAG_INPUT) cur_backend_id
+= sched->n_backends - 1` — and without the flag a leaf with no buffer, no data
+and no op is unplaceable, reaching `ggml_gallocr_allocate_node` as `-1`, which
+aborts. It also explains why the CPU must be passed **last**. Found by bisection
+in a 60-line test after two wrong guesses (the scratch buffer; the views).
 
-**Then the third graph, attention, splits and dies in allocation:**
-`ggml-alloc.c:623 GGML_ASSERT(buffer_id >= 0)` — a node the split left
-unassigned. Attention is the only graph built in a caller-owned scratch buffer
-*and* the only one full of views over the KV cache, so a view whose `view_src`
-is unassigned is the hypothesis. Untested.
+| prompt | plain CPU | `--op-offload` | `-ngl 99` |
+|---|---:|---:|---:|
+| 11 tokens | 34.23 | 35.04 | 56.93 |
+| ~900 tokens | **79.24** | **64.39** | 205.37 |
 
-Reserving before allocating did not fix it **and broke two passing scheduler
-tests**, which is its own answer.
+**The prediction written down first was wrong.** "A long-prefill flag or
+nothing" assumed the weight copy happens once per pass. It does not: this engine
+submits ~5 graphs per block — ~180 per pass — and the scheduler copies weights
+**per submission**, so the copy amortises over a *block*, and prefill length
+never helps. llama.cpp submits **one** graph and its copies amortise across all
+36 blocks. That is the entire difference. Scheduling also gives up the 1.39x
+repack, so the flag starts 19% behind before moving an operation.
 
-**The cost this exposed survives regardless of the bug.** A scheduled graph
-cannot use repacked weights — repacking is the layout the CPU kernels want, and
-a scheduler that may hand the tensor to Vulkan makes it wrong rather than merely
-unhelpful. That is **1.39x of CPU prefill** as the entry price. With 2.33 GiB of
-weights and a ~2.6 GiB/s bus, a pass that copies them costs ~0.9 s: a clear loss
-against a 22-token prefill (0.5 s on CPU), noise against a 4096-token one.
-**`--op-offload` is a long-prefill flag or it is nothing**, and that belongs on
-the record before anyone measures it on a short prompt and blames the scheduler.
+**So this is a second, independent argument for
+`activations-resident-across-layers`** — the first was 110 graph submissions
+costing 0.64 s of allocation on a single prefill. `--op-offload` is the cheapest
+test of whether fusing graphs did what it claims.
 
-The flag stays in `REFUSED` with a reason that names the assert. A flag that
-kills the process is worse than one that refuses. Full node:
-`research/scheduled-forward-pass-2026-08-16.md`.
+Ships off by default, printing the measurement when enabled. `ggml_set_input` is
+applied on **every** path: marking an input is what it is regardless of who runs
+the graph. Full node: `research/op-offload-cannot-pay-2026-08-16.md`.
 
 ## The offload frontier is a smooth dial (2026-08-16)
 
