@@ -50,6 +50,22 @@ fn rope_type_for(arch: &str) -> (i32, bool) {
         }
         "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "phi3" | "gemma" | "gemma2" | "gemma3"
         | "stablelm" | "starcoder2" | "falcon" | "phi2" | "gptneox" => (ROPE_TYPE_NEOX, true),
+        // **`qwen35` / `qwen35moe` are deliberately absent — Qwen3.8's
+        // architecture string.** llama.cpp returns `LLAMA_ROPE_TYPE_IMROPE` for
+        // both: interleaved multimodal RoPE, which is neither of the two modes
+        // this engine implements. It also branches on those arches in five
+        // other places in `llama-model.cpp`, so the rope mode is the visible
+        // part of a larger difference.
+        //
+        // Read from the container's header without downloading it: a 1 MB
+        // range request over `Qwen3.8-27B-...IQ4_XS.gguf` gives
+        // `general.architecture = qwen35` in under a second, which is how a new
+        // model should be triaged before 16 GB moves.
+        //
+        // Falling through to the unknown arm makes the runner warn and demand
+        // `--force`, which is correct. Naming it NEOX here would rotate the
+        // wrong way and produce fluent, wrong text.
+        //
         // **`mpt` and `bloom` are deliberately absent.** llama.cpp returns
         // `LLAMA_ROPE_TYPE_NONE` for both: they position with ALiBi instead of
         // rotation, and this engine refuses ALiBi rather than silently running
@@ -1270,6 +1286,9 @@ mod tests {
         // ALiBi models: llama.cpp says ROPE_TYPE_NONE, so they must stay
         // UNKNOWN here rather than be given a rotation they do not use.
         assert!(!rope_type_for("mpt").1);
+        // Qwen3.8: IMROPE, which this engine does not implement.
+        assert!(!rope_type_for("qwen35").1);
+        assert!(!rope_type_for("qwen35moe").1);
         assert!(!rope_type_for("bloom").1);
         assert_eq!(rope_type_for("internlm2"), (ROPE_TYPE_NORM, true));
         assert_eq!(rope_type_for("baichuan"), (ROPE_TYPE_NORM, true));
