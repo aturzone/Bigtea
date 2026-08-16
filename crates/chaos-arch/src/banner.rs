@@ -54,20 +54,44 @@ pub fn print() {
     }) else {
         return;
     };
-    eprint!("{}", render(width, height_for(width)));
-    // Centred under the logo, dim, one line. The version belongs here because
-    // it is the first thing asked about any bug report, and `--version` is not
-    // what a user types before noticing something is wrong.
-    // The long form wraps in a narrow terminal, and a wrapped tagline looks
-    // like a bug rather than a strapline, so it is dropped rather than folded.
+    // **Name first, logo centred beneath it, everything centred in the
+    // terminal.** The first version printed the logo hard against column 0 with
+    // the name underneath, which reads as an image that happens to have a
+    // caption rather than as a banner.
+    let indent = cols.saturating_sub(width) / 2;
+
+    // Letter-spaced so a five-character word carries the width of the logo
+    // below it. Bold rather than a block font: a bitmap alphabet is a second
+    // embedded asset and a second thing to keep in step with the first.
+    eprintln!();
+    eprintln!("{}", centre(cols, "\x1b[1mC H A O S\x1b[0m", 9));
+
+    for line in render(width, height_for(width)).lines() {
+        eprintln!("{:indent$}{line}", "", indent = indent);
+    }
+
+    // The version belongs on the banner because it is the first thing asked
+    // about any bug report, and `--version` is not what a user types before
+    // noticing something is wrong. The long form wraps in a narrow terminal and
+    // a wrapped tagline reads as a bug, so it is dropped rather than folded.
     let long = format!("chaos {VERSION}  --  a runner for models larger than RAM");
-    let mark = if long.chars().count() <= cols.saturating_sub(2) {
+    let mark = if long.chars().count() + 2 <= cols {
         long
     } else {
         format!("chaos {VERSION}")
     };
-    let pad = width.saturating_sub(mark.chars().count()) / 2;
-    eprintln!("\x1b[2m{:pad$}{mark}\x1b[0m\n", "", pad = pad);
+    let n = mark.chars().count();
+    eprintln!("{}", centre(cols, &format!("\x1b[2m{mark}\x1b[0m"), n));
+    eprintln!();
+}
+
+/// Centre `text` in `cols`, where `visible` is its width ignoring escapes.
+///
+/// The escape codes have to be excluded by hand: `str::chars().count()` counts
+/// every byte of `\x1b[1m` and would shift a bold line four columns left of an
+/// unbold one.
+fn centre(cols: usize, text: &str, visible: usize) -> String {
+    format!("{:pad$}{text}", "", pad = cols.saturating_sub(visible) / 2)
 }
 
 /// The workspace version, so the banner cannot drift from `Cargo.toml`.

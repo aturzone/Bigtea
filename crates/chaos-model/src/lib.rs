@@ -34,6 +34,7 @@ pub mod adapter;
 pub mod catalogue;
 mod discover;
 pub mod download;
+pub mod find;
 mod resident;
 pub mod validate;
 

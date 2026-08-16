@@ -24,10 +24,39 @@ repository is renamed.
 **This is a breaking change for anything scripted against the old names**, which
 is what a `0.0.x` minor is for.
 
+### Added — running it no longer starts with a path
+
+**`chaos-run <name>`.** Every command used to begin with an absolute path to a
+`.gguf` file, which on Windows means something like
+`C:\Users\you\.chaos\models\Qwen3-30B-A3B-Q4_K_M.gguf` typed by hand, and for a
+five-shard container it means knowing which shard to name. Now any unique part
+of a name resolves:
+
+```
+chaos-run                                   # lists the models you have
+chaos-run qwen3 "The capital of France is"  # runs Qwen3-30B-A3B-Q4_K_M.gguf
+chaos-run deepseek "..."                    # opens shard 1 of 5, automatically
+```
+
+An existing path still wins, so nothing that worked before changes. An ambiguous
+name lists the candidates rather than guessing a 144 GB read, and an unknown one
+lists what *is* available rather than leaving the user to go looking.
+`chaos-serve` has the same lookup from the same code, so the two cannot disagree
+about where models live.
+
+Searched in order: `CHAOS_MODELS`, `~/.chaos/models` (which `install.ps1`
+creates), the download cache `chaos-pull` writes to, and `./models`. **Two of
+those already existed and pointed at different places** — where a model lived
+depended on how it had arrived — which is exactly the kind of thing a first-time
+user should never have to learn.
+
 ### Added
 
-- **A startup logo.** Rasterised offline into 3 KB of committed luminance bytes
-  and printed with Unicode half-blocks, two pixels to a cell. No SVG parser, no
+- **A startup logo**: the name, then the logo centred beneath it, then the
+  version. Rasterised offline into 3 KB of committed luminance bytes and printed
+  with Unicode half-blocks, two pixels to a cell. Cropped to the artwork rather
+  than the SVG's canvas, which had been carrying a wide white margin into every
+  render. No SVG parser, no
   image decoder, no build script, no dependency — the workspace still has zero.
   It sizes itself to the terminal and is skipped for `NO_COLOR`,
   `CHAOS_NO_BANNER`, `--log-disable`, a terminal too small, and any stdout or

@@ -93,6 +93,15 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // The same name lookup the runner has, so `chaos-serve qwen3` works and the
+    // two binaries cannot disagree about where models live.
+    let path = match chaos_model::find::resolve(&path) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(e) => {
+            eprintln!("chaos-serve: {}", chaos_model::find::explain(&path, &e));
+            return ExitCode::from(2);
+        }
+    };
     match serve(&path, port, cache_gib) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -103,7 +112,20 @@ fn main() -> ExitCode {
 }
 
 fn usage() {
-    println!("usage: chaos-serve <model.gguf> [--port 8080] [--cache GiB] [-t N] [-tb N]");
+    println!("usage: chaos-serve <model> [--port 8080] [--cache GiB] [-t N] [-tb N]");
+    println!();
+    let found = chaos_model::find::list();
+    if found.is_empty() {
+        println!("  no models found. Put a .gguf file in:");
+        if let Some(dir) = chaos_model::find::model_dirs().first() {
+            println!("    {}", dir.display());
+        }
+    } else {
+        println!("  models on this machine (any unique part of a name works):");
+        for f in &found {
+            println!("    {}", f.label);
+        }
+    }
     println!();
     println!("Serves an OpenAI-compatible endpoint on 127.0.0.1:");
     println!("  POST /v1/chat/completions   the one an agent calls");

@@ -124,6 +124,11 @@ if ($Uninstall) {
         Write-Step "removed $Prefix"
     }
     if (-not $NoPath) { Remove-FromUserPath $BinDir }
+    # Only if it is ours. A user who set CHAOS_MODELS by hand keeps it.
+    if ([Environment]::GetEnvironmentVariable('CHAOS_MODELS', 'User') -eq $ModelsDir) {
+        [Environment]::SetEnvironmentVariable('CHAOS_MODELS', $null, 'User')
+        Write-Step 'removed CHAOS_MODELS'
+    }
     Write-Host ''
     Write-Host "Your models in $ModelsDir were left alone."
     exit 0
@@ -222,6 +227,15 @@ if (-not (Test-Path $ModelsDir)) {
 
 if (-not $NoPath) { Add-ToUserPath $BinDir }
 
+# `chaos-run <name>` searches CHAOS_MODELS first, then ~/.chaos/models. Setting
+# it only when the user chose a non-default location keeps the common case free
+# of environment variables entirely.
+$default = Join-Path $env:USERPROFILE '.chaos\models'
+if ($ModelsDir -ne $default) {
+    [Environment]::SetEnvironmentVariable('CHAOS_MODELS', $ModelsDir, 'User')
+    Write-Step "set CHAOS_MODELS to $ModelsDir"
+}
+
 # -- what to do next ---------------------------------------------------------
 
 Write-Host ''
@@ -231,8 +245,9 @@ Write-Host '  Put your .gguf files here:'
 Write-Host "    $ModelsDir"
 Write-Host ''
 Write-Host '  Then, in a new terminal:'
+Write-Host '    chaos-run                          lists the models you have'
+Write-Host '    chaos-run <name> "hello" --auto    any unique part of a name works'
 Write-Host '    chaos-probe                        what this machine can run'
-Write-Host "    chaos-run `"$ModelsDir\<model>.gguf`" `"hello`" -n 32 --auto"
 Write-Host ''
 Write-Host '  Chaos downloads nothing on its own. Models are yours to obtain,'
 Write-Host '  under their own licences.'

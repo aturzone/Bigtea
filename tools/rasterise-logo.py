@@ -32,7 +32,7 @@ SVG = ROOT / "assets" / "logo.svg"
 # grey blob, which was checked by rendering candidates to PNG and looking at
 # them rather than by guessing.
 OUT_W = int(os.environ.get("LOGO_W", 56))
-OUT_H = int(os.environ.get("LOGO_H", 54))
+OUT_H = int(os.environ.get("LOGO_H", 56))
 SS = int(os.environ.get("LOGO_SS", 12))  # supersample factor per axis
 
 
@@ -115,8 +115,17 @@ def flatten(d, tx, ty):
     return polys
 
 
-def rasterise(paths, w, h, sw, sh, scale_x, scale_y):
-    """Painter's algorithm at supersample resolution. Returns a row-major grid."""
+def rasterise(paths, w, h, sw, sh, scale_x, scale_y, ss=None, origin=(0.0, 0.0)):
+    """Painter's algorithm at supersample resolution. Returns a row-major grid.
+
+    `ss` is the supersample factor and must satisfy `sw == w * ss`. It is a
+    parameter rather than the module constant because the PNG is rendered at a
+    different size from the terminal bitmap, and reading `SS` here silently
+    indexed past the end of the grid the first time that happened.
+    """
+    if ss is None:
+        ss = SS
+    assert sw == w * ss and sh == h * ss, "supersample factor does not match"
     grid = [[(255, 255, 255)] * sw for _ in range(sh)]
     for polys, rgb in paths:
         # Bucket the edges by the scanline range they cross so each row only
@@ -130,7 +139,15 @@ def rasterise(paths, w, h, sw, sh, scale_x, scale_y):
                 x1, y1 = poly[(k + 1) % n]
                 if y0 == y1:
                     continue
-                edges.append((x0 * scale_x, y0 * scale_y, x1 * scale_x, y1 * scale_y))
+                ox, oy = origin
+                edges.append(
+                    (
+                        (x0 - ox) * scale_x,
+                        (y0 - oy) * scale_y,
+                        (x1 - ox) * scale_x,
+                        (y1 - oy) * scale_y,
+                    )
+                )
         if not edges:
             continue
         buckets = [[] for _ in range(sh)]
@@ -167,9 +184,9 @@ def rasterise(paths, w, h, sw, sh, scale_x, scale_y):
         row = []
         for x in range(w):
             r = g = b = n = 0
-            for sy in range(y * SS, (y + 1) * SS):
+            for sy in range(y * ss, (y + 1) * ss):
                 line = grid[sy]
-                for sx in range(x * SS, (x + 1) * SS):
+                for sx in range(x * ss, (x + 1) * ss):
                     pr, pg, pb = line[sx]
                     r += pr
                     g += pg
@@ -180,13 +197,40 @@ def rasterise(paths, w, h, sw, sh, scale_x, scale_y):
     return out
 
 
+def ink_box(paths, pad_frac=0.02):
+    """The bounding box of the non-white paths, in SVG user units.
+
+    The first path in this file is a full-canvas `#FEFEFE` rectangle -- the
+    white background -- so a bbox over *every* path is just the canvas and the
+    logo renders with a wide margin baked in. Only paths dark enough to be ink
+    count, and a small pad keeps the outermost rays from touching the edge.
+    """
+    xs, ys = [], []
+    for polys, rgb in paths:
+        if (rgb[0] * 299 + rgb[1] * 587 + rgb[2] * 114) // 1000 > 128:
+            continue  # background or a highlight, not ink
+        for poly in polys:
+            for x, y in poly:
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        raise SystemExit("no ink found in the SVG -- every path is light")
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    # Square it off first, so cropping cannot change the aspect ratio, then pad.
+    side = max(x1 - x0, y1 - y0)
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    side *= 1 + 2 * pad_frac
+    return cx - side / 2, cy - side / 2, side
+
+
 def main():
     text = SVG.read_text(encoding="utf-8")
-    vw = float(re.search(r'width="([\d.]+)"', text).group(1))
-    vh = float(re.search(r'height="([\d.]+)"', text).group(1))
     paths = parse_paths(text)
+    bx, by, side = ink_box(paths)
     sw, sh = OUT_W * SS, OUT_H * SS
-    grid = rasterise(paths, OUT_W, OUT_H, sw, sh, sw / vw, sh / vh)
+    grid = rasterise(
+        paths, OUT_W, OUT_H, sw, sh, sw / side, sh / side, origin=(bx, by)
+    )
 
     # The logo is black on white, so one byte of luminance per pixel is lossless
     # here and a third of the size of RGB.
@@ -223,6 +267,44 @@ def main():
         encoding="utf-8",
     )
     print(f"\nwrote {out} ({OUT_W}x{OUT_H}, {OUT_W * OUT_H} bytes)", file=sys.stderr)
+
+    # The README needs a real image, and it should come from the same source of
+    # truth as the terminal bitmap rather than being exported by hand once and
+    # then drifting. `zlib` and `struct` are standard library, so this still
+    # adds no dependency to anything.
+    png = ROOT / "assets" / "logo.png"
+    write_png(
+        png,
+        rasterise(
+            paths, PNG_W, PNG_H, PNG_W * 3, PNG_H * 3,
+            PNG_W * 3 / side, PNG_H * 3 / side, ss=3, origin=(bx, by),
+        ),
+    )
+    print(f"wrote {png} ({PNG_W}x{PNG_H})", file=sys.stderr)
+
+
+PNG_W = 512
+PNG_H = 512
+
+
+def write_png(path, grid):
+    """Minimal truecolour PNG. No encoder dependency for one image."""
+    import struct
+    import zlib
+
+    raw = b"".join(b"\x00" + bytes(c for px in row for c in px) for row in grid)
+
+    def chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    header = struct.pack(">IIBBBBB", len(grid[0]), len(grid), 8, 2, 0, 0, 0)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
 
 
 if __name__ == "__main__":
