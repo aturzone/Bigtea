@@ -2176,6 +2176,37 @@ element-sum comparisons against llama.cpp — the overlap changes *when* bytes a
 read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
 `BIGTEA_PREFETCH_READERS` tunes the split.
 
+## The offload frontier is a smooth dial (2026-08-16)
+
+`-ngl` shipped with no performance number, which is a gap: a placement flag
+whose effect on speed is unmeasured cannot inform a decision. Qwen3-4B-Q4_K_M,
+RTX 3050, **three runs per point, medians**:
+
+| `-ngl` | prefill tok/s | generation tok/s |
+|---:|---:|---:|
+| 0 | 43.29 | 6.34 |
+| 9 | 48.38 | 6.41 |
+| 18 | 54.57 | 6.99 |
+| 27 | 63.78 | 7.06 |
+| 36 | 66.49 | 7.78 |
+| 99 | **77.34** | **8.85** |
+
+Both monotonic, no knee: **1.79x prefill and 1.40x generation end to end**, with
+every intermediate point on the line. That is the useful result — `-ngl` is a
+dial a user sets from the VRAM they have, not an all-or-nothing switch.
+
+**The single-run version of this table said something false.** One run per point
+gave `36: 72.41` against `99: 65.80`, which reads as "offloading the output head
+costs something". The three runs at 36 were 63.41 / 66.49 / **81.04** — a 28%
+spread, wider than the entire difference being explained. Third time this
+project has caught a causal story built on one GPU run, and the first two both
+reached a published number.
+
+**This is not the interesting frontier.** The model fits (2.33 of 5.11 GiB), so
+every point was a free choice rather than a constraint. The larger-than-VRAM
+curve is the one CLAUDE.md names as unpublished by anyone, and `-ngl` is what
+makes it sweepable. Full node: `research/ngl-frontier-2026-08-16.md`.
+
 ## `--override-tensor`, and the same bug three times (2026-08-16)
 
 `-ot <pattern>=<CPU|GPU>` places named tensors regardless of `-ngl`, which is
