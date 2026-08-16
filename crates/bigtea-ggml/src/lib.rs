@@ -44,7 +44,7 @@ pub use device::{best_offload_device, devices, vulkan_available, DeviceInfo, Dev
 pub use graph::{arena_for, f16_to_f32, f32_to_f16, Context, RopeParams, Tensor};
 pub use repack::{is_repackable, Repacked};
 #[cfg(have_ggml)]
-pub use sched::{HostBuffer, Scheduler};
+pub use sched::{AlignedBytes, HostBuffer, OwnedHostBuffer, Scheduler};
 #[cfg(have_ggml)]
 pub use weights::{Residency, UploadReport, WeightSet};
 

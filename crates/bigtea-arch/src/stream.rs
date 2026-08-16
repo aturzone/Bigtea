@@ -348,6 +348,14 @@ pub struct StreamingRunner<'m> {
     /// bound tensor points at, and reading freed device memory does not fault
     /// reliably -- it returns numbers.
     device: Option<bigtea_ggml::Backend>,
+    /// The host backend, opened only for `--op-offload`.
+    ///
+    /// A scheduler needs somewhere to put the ops it does *not* move, and the
+    /// registry's CPU entry is not guaranteed to be enumerated, so this comes
+    /// from `ggml_backend_cpu_init`.
+    cpu_backend: Option<bigtea_ggml::Backend>,
+    /// `--op-offload`: run every graph through `ggml_backend_sched`.
+    op_offload: bool,
     /// How many repeating blocks run on the device. `usize::MAX` means all of
     /// them plus the non-repeating parts, which is what "use the GPU" meant
     /// before this existed and is still the default once a device is opened.
@@ -557,6 +565,8 @@ impl<'m> StreamingRunner<'m> {
                 ThreadTuner::new(cores)
             },
             device: None,
+            cpu_backend: None,
+            op_offload: false,
             gpu_layers: usize::MAX,
             overrides: Vec::new(),
             block_placement: Vec::new(),
@@ -630,6 +640,36 @@ impl<'m> StreamingRunner<'m> {
 
     pub fn gpu_layers(&self) -> usize {
         self.gpu_layers
+    }
+
+    /// `--op-offload`: let `ggml_backend_sched` place each operation.
+    ///
+    /// **Changes what the weights are**, not just how they run: a scheduled
+    /// graph copies between splits, and a copy needs a buffer, so host weights
+    /// stop being repacked. That costs 1.39x on CPU prefill and is why this is a
+    /// flag rather than the default — see `WeightSet::use_host_buffers`.
+    pub fn set_op_offload(&mut self, on: bool) -> Result<()> {
+        if on && self.cpu_backend.is_none() {
+            self.cpu_backend = Some(bigtea_ggml::Backend::cpu()?);
+        }
+        self.op_offload = on;
+        Ok(())
+    }
+
+    pub fn op_offload(&self) -> bool {
+        self.op_offload
+    }
+
+    /// Where one graph runs: the scheduler if there is one, else the old rule.
+    fn target<'x>(
+        sched: Option<&'x bigtea_ggml::Scheduler<'x>>,
+        device: Option<&'x bigtea_ggml::Backend>,
+        threads: usize,
+    ) -> bigtea_ggml::Compute<'x> {
+        match sched {
+            Some(s) => bigtea_ggml::Compute::Sched(s),
+            None => Self::compute_with(device, threads),
+        }
     }
 
     /// `--override-tensor`: place named tensors regardless of `-ngl`.
@@ -1427,7 +1467,12 @@ impl<'m> StreamingRunner<'m> {
         let backend = self.device.as_ref().ok_or(ArchError::Unimplemented(
             "no device opened; call use_device first",
         ))?;
-        let repack = std::env::var("BIGTEA_NO_REPACK").is_err();
+        // **Scheduling and repacking are mutually exclusive.** A repacked tensor
+        // is in the layout the CPU kernels want; a scheduler that may hand the
+        // same tensor to a Vulkan kernel makes that layout wrong rather than
+        // merely unhelpful. Costs 1.39x on CPU prefill, which is the price of
+        // `--op-offload` and belongs in its measurement.
+        let repack = std::env::var("BIGTEA_NO_REPACK").is_err() && !self.op_offload;
         let c_fused_gate_up = self.arch.config.fused_gate_up;
         let n_layer = self.arch.config.n_layer as usize;
         let mut total = 0u64;
@@ -1726,8 +1771,10 @@ impl<'m> StreamingRunner<'m> {
         // count, which is a different question with a different answer.
         if tokens.len() != 1 || self.tuner.is_none() {
             let device = self.device.take();
-            let out = self.forward_cached_inner(weights, cache, tokens, pos_start, device.as_ref());
+            let cpu = self.cpu_backend.take();
+            let out = self.forward_scheduled(weights, cache, tokens, pos_start, &device, &cpu);
             self.device = device;
+            self.cpu_backend = cpu;
             return out;
         }
         if let Some(t) = self.tuner.as_ref() {
@@ -1736,8 +1783,10 @@ impl<'m> StreamingRunner<'m> {
         let start = std::time::Instant::now();
         let disk_before = self.stats.read_seconds;
         let device = self.device.take();
-        let out = self.forward_cached_inner(weights, cache, tokens, pos_start, device.as_ref());
+        let cpu = self.cpu_backend.take();
+        let out = self.forward_scheduled(weights, cache, tokens, pos_start, &device, &cpu);
         self.device = device;
+        self.cpu_backend = cpu;
         // Time the thread count can actually affect. On a streaming MoE model
         // most of a token is disk, and how much varies per token with cache
         // hits and warming — on Qwen3-30B that noise swamped the signal
@@ -1764,6 +1813,44 @@ impl<'m> StreamingRunner<'m> {
         (self.threads, self.tuner.is_none())
     }
 
+    /// Build the scheduler for this pass, if one was asked for, then run.
+    ///
+    /// **Per pass rather than per runner**, because a `Scheduler` borrows the
+    /// backends it was built from: holding one beside them inside
+    /// `StreamingRunner` would be self-referential. One `sched_new` per pass is
+    /// a hash-set allocation amortised over roughly `5 x n_layer` graphs.
+    fn forward_scheduled<'a>(
+        &mut self,
+        weights: &WeightSet<'a>,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        pos_start: usize,
+        device: &Option<bigtea_ggml::Backend>,
+        cpu: &Option<bigtea_ggml::Backend>,
+    ) -> Result<Vec<f32>> {
+        match (self.op_offload, device.as_ref(), cpu.as_ref()) {
+            (true, Some(gpu), Some(host)) => {
+                host.set_threads(self.threads_for(tokens.len()));
+                // Device first: index 0 is ggml's most-preferred backend, and
+                // passing them the other way round silently produces a CPU-only
+                // run that still reports success.
+                let backends = [gpu, host];
+                let sched = bigtea_ggml::Scheduler::new(&backends, 8192, true)?;
+                self.forward_cached_inner(
+                    weights,
+                    cache,
+                    tokens,
+                    pos_start,
+                    device.as_ref(),
+                    Some(&sched),
+                )
+            }
+            _ => {
+                self.forward_cached_inner(weights, cache, tokens, pos_start, device.as_ref(), None)
+            }
+        }
+    }
+
     fn forward_cached_inner<'a>(
         &mut self,
         weights: &WeightSet<'a>,
@@ -1771,6 +1858,7 @@ impl<'m> StreamingRunner<'m> {
         tokens: &[u32],
         pos_start: usize,
         device: Option<&bigtea_ggml::Backend>,
+        sched: Option<&bigtea_ggml::Scheduler<'_>>,
     ) -> Result<Vec<f32>> {
         let c = self.arch.config.clone();
         // Read once: `device` arrives as a parameter rather than from `self`
@@ -1853,7 +1941,8 @@ impl<'m> StreamingRunner<'m> {
             // Sized from the prompt, not a constant: `get_rows` materialises
             // n_embd * n_new floats, and ggml aborts the process when an arena
             // runs out rather than returning an error we could catch.
-            let cmp = Self::compute_with(
+            let cmp = Self::target(
+                sched,
                 Self::edge_device(device, edge, gpu_layers, n_layer_total),
                 threads,
             );
@@ -1909,7 +1998,8 @@ impl<'m> StreamingRunner<'m> {
                 // Was a fixed 256 MiB, which aborted at a 4096-token block:
                 // ggml asked for 318,787,536 bytes and got told 268,435,456.
                 // Every arena in this function has to scale with the block.
-                let cmp = Self::compute_with(
+                let cmp = Self::target(
+                    sched,
                     Self::layer_device_at(device, &placement, gpu_layers, il as usize),
                     threads,
                 );
@@ -2131,7 +2221,8 @@ impl<'m> StreamingRunner<'m> {
                 // SAFETY: `buf` is a local outliving `ctx`, and no other context
                 // is live on it — the Q/K/V context above was dropped and its
                 // results copied out before this point.
-                let cmp = Self::compute_with(
+                let cmp = Self::target(
+                    sched,
                     Self::layer_device_at(device, &placement, gpu_layers, il as usize),
                     threads,
                 );
@@ -2252,7 +2343,8 @@ impl<'m> StreamingRunner<'m> {
                 if c.post_norms {
                     shapes.extend([(n_embd, n_new), (n_embd, n_new)]);
                 }
-                let cmp = Self::compute_with(
+                let cmp = Self::target(
+                    sched,
                     Self::layer_device_at(device, &placement, gpu_layers, il as usize),
                     threads,
                 );
@@ -2333,7 +2425,8 @@ impl<'m> StreamingRunner<'m> {
         // again for results nothing reads.
         let t_out = std::time::Instant::now();
         let last = x.len() - n_embd as usize;
-        let cmp = Self::compute_with(
+        let cmp = Self::target(
+            sched,
             Self::edge_device(device, edge, gpu_layers, n_layer_total),
             threads,
         );

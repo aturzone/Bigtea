@@ -157,6 +157,13 @@ pub struct WeightSet<'ctx> {
     /// `WeightSet` once per block.
     _shared_repacked: Vec<Arc<crate::repack::Repacked>>,
     repacked_bytes: usize,
+    /// Host weights re-homed into ggml-owned CPU buffers, for the scheduler.
+    ///
+    /// Empty unless [`Self::use_host_buffers`] was called. Held for the same
+    /// reason as `_buffers`: a graph reads them for as long as the set lives.
+    _host_buffers: Vec<crate::sched::OwnedHostBuffer>,
+    /// Whether [`Self::bind_shared`] gives its tensors a CPU buffer.
+    host_buffers: bool,
 }
 
 impl<'ctx> WeightSet<'ctx> {
@@ -168,6 +175,8 @@ impl<'ctx> WeightSet<'ctx> {
             _shared_repacked: Vec::new(),
             repacked_bytes: 0,
             pending: Vec::new(),
+            _host_buffers: Vec::new(),
+            host_buffers: false,
         }
     }
 
@@ -397,6 +406,31 @@ impl<'ctx> WeightSet<'ctx> {
         })
     }
 
+    /// Give host-resident tensors a **CPU buffer**, so a scheduler can copy them.
+    ///
+    /// # What this costs, stated before it is switched on
+    ///
+    /// The zero-copy bind writes a pointer into `tensor->data` and leaves
+    /// `tensor->buffer` null. That is right for the CPU path and is exactly what
+    /// `ggml_backend_sched` cannot copy *from* — it reaches the copy through
+    /// `buffer->iface`, and a null buffer is a segfault.
+    ///
+    /// Giving them buffers means two things, and both are real:
+    ///
+    /// * **a copy at load**, because ggml asserts 32-byte alignment on any
+    ///   pointer handed to `cpu_buffer_from_ptr` and a `Vec<u8>` is aligned to
+    ///   1. Cheap: resident weights were already an owned copy in RAM.
+    /// * **no repacking**, which is worth **1.39x on CPU prefill**. Repacking
+    ///   rearranges a tensor into the layout the CPU kernels want, and a
+    ///   scheduler that may hand the same tensor to a GPU kernel makes that
+    ///   layout wrong rather than merely unhelpful.
+    ///
+    /// So this is opt-in, and whether it pays is a measurement rather than an
+    /// assumption. Must be called before any bind.
+    pub fn use_host_buffers(&mut self) {
+        self.host_buffers = true;
+    }
+
     /// Bind bytes that are already shared — the expert cache's case, where the
     /// same slice is bound again on every token that routes to it.
     pub fn bind_shared(
@@ -420,6 +454,17 @@ impl<'ctx> WeightSet<'ctx> {
         let actual = data.as_bytes().len();
         if actual != expected {
             return Err(GgmlError::WrongSize { expected, actual });
+        }
+        if self.host_buffers {
+            // Copied rather than wrapped in place: the source is a `Vec<u8>`
+            // from a disk read and ggml ABORTS on a pointer that is not
+            // 32-aligned, which a byte vector is not.
+            let owned = crate::sched::AlignedBytes::from_slice(data.as_bytes())?;
+            let buffer = crate::sched::OwnedHostBuffer::adopt(owned)?;
+            buffer.attach(&tensor)?;
+            self._host_buffers.push(buffer);
+            self.tensors.insert(name.to_string(), tensor);
+            return Ok(());
         }
         let ptr = data.as_bytes().as_ptr() as *mut c_void;
         self._buffers.push(data);
