@@ -8,7 +8,59 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
+### Changed — the project is now called `chaos`
+
+`bigtea-run` is `chaos-run`, and so are the other ten binaries. Crate names,
+`--help` text, info lines, environment variables (`BIGTEA_*` → `CHAOS_*`), the
+workflows and all 105 documents were renamed in one pass — 1,623 occurrences
+across 184 files, none left. The git remote is deliberately untouched; the
+`repository`/`homepage` URLs point at the new name and start resolving when the
+repository is renamed.
+
+**This is a breaking change for anything scripted against the old names**, which
+is what a `0.0.x` minor is for.
+
+### Added
+
+- **A startup logo.** Rasterised offline into 3 KB of committed luminance bytes
+  and printed with Unicode half-blocks, two pixels to a cell. No SVG parser, no
+  image decoder, no build script, no dependency — the workspace still has zero.
+  It sizes itself to the terminal and is skipped for `NO_COLOR`,
+  `CHAOS_NO_BANNER`, `--log-disable`, a terminal too small, and any stdout or
+  stderr that is not a terminal.
+- **`scripts/install.ps1`** — Windows install and in-place upgrade. Copies the
+  binaries to `%LOCALAPPDATA%\Chaos\bin`, adds it to the *user* PATH exactly
+  once, and creates `%USERPROFILE%\.chaos\models`. Re-running upgrades and
+  removes binaries the new version no longer ships; `-Uninstall` reverses it and
+  never touches the models directory. It refuses rather than half-upgrading when
+  a binary is running. Shipped inside the Windows archive and smoke-tested in
+  the release workflow, on the unpacked archive, in the shape a user meets it.
+- `chaos-serve` and `chaos-pull` are now in the release archives. They were
+  built and never packaged.
+
 ### Corrected
+
+**V4-Flash is at parity with llama.cpp, not far behind it.** The published
+figures — prefill 1.62x behind, generation 3-4x behind — date from 2026-08-07 and
+no longer reproduce. Three alternating pairs in one session, both engines at
+their defaults:
+
+| DeepSeek-V4-Flash | Chaos | llama.cpp |
+|---|---:|---:|
+| prefill, ms per prompt token | **1640** | 1679 |
+| generation, tok/s | **0.394** | 0.39 |
+
+The warm-up run, discarded, read llama.cpp at 0.23 tok/s — which would have made
+this a 1.7x lead. It is not one. See
+[`where-we-stand-vs-llamacpp-2026-08-16.md`](docs/graph/research/where-we-stand-vs-llamacpp-2026-08-16.md).
+
+**The parallel-experts optimisation does not transfer to V4-Flash, and the
+ceiling is measured: the entire routed expert arithmetic is under 5% of a
+token.** A token is 67% expert-slice read, 17% block compute, 16% routing. The
+block's single `compute` had been folded into the residual of the phase table,
+which is why that split had never been written down.
+
+### Corrected — earlier
 
 **The hot expert set is per-prompt, so it cannot be pinned.** v0.0.2's routing
 figures were all scored *in-sample on a single prompt*. Re-measured on eight

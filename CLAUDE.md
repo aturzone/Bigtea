@@ -58,13 +58,15 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 - **A kernel benchmark measures the kernel, not the data movement needed to feed it.** `chaos-kernelbench` put the batched `mul_mat_id` expert form at 11.17 GiB/s with 2.86x thread scaling — real, but it binds the model's *already-stacked* tensor zero-copy. On the streaming path the selected experts are unrelated `Arc<[u8]>`, and making them contiguous costs ~1.02 GB/token, which is what the kernel saves. Built, byte-identical output, **1.34 → 1.27 tok/s, reverted.** The version that pays needs the experts resident. Also: `Arc::from(Box<[u8]>)` **reallocates and copies** — hand `bind` the `Vec<u8>` instead (`WeightBytes` covers any `Deref<Target=[u8]>`); that mistake alone cost 12s of a 27s run.
 - **Do not calibrate on a proxy.** A 150 ms DRAM-saturation benchmark picked 6/8/12/12/4/6 on six identical runs while the true optimum was 2-4, and its spread was worse than the bad default it replaced — a pure read has no per-node barrier, a ggml graph does. Tune on real generated tokens instead. A proxy corrected until it agrees with the objective *is* the objective, measured badly.
 - **Concurrent readers need a file handle EACH.** A Windows handle without `FILE_FLAG_OVERLAPPED` is synchronous and the OS serialises reads on it, so N threads on one handle hold the drive at queue depth 1. The old "no gain past 4 readers, the drive does 2.37 GiB/s" was this artefact: same reads, 4 threads, **2.01 GiB/s shared vs 2.65 per-handle**, and per-handle beats the "sequential ceiling". `Shard` now pools 8 handles.
-- **The expert matmul is 3% of a token, not the floor.** 3.02 ms per block = 0.13 s/token, at 24.7 GiB/s — *above* single-threaded memcpy, i.e. already at DRAM speed. **76% of a token is disk.** Compute also scales as ~`n^0.49` in the batch, not linearly, so batched/speculative passes are cheaper than a linear model predicts.
+- **The expert matmul is a few percent of a token on V4-Flash, and the parallel-experts win does NOT port there.** 3.02 ms per block at 24.7 GiB/s — above single-threaded memcpy, i.e. already at DRAM speed. Measured directly 2026-08-16 by dropping the three routed `mul_mat_id` calls and keeping the read: generation **0.388 against 0.370**, block `compute` **0.01s of 0.44** — so the whole routed arithmetic is **under 5%** and perfect parallelisation is worth at most 1.05x. **A V4-Flash token is 67% expert-slice read, 17% block compute, 16% routing.** There is also nothing to gather: `read_expert_slices` packs the slices contiguously as it reads them, so this path already runs the batched form for free. Compute scales as ~`n^0.49` in the batch, so batched/speculative passes are cheaper than a linear model predicts (`parallel-experts-do-not-transfer-2026-08-16.md`).
 - **Every arena must scale with the prefill block.** Fixed-size arenas abort once the block grows; ggml asks and dies rather than returning an error. **`available` in that message is the pool's total size, not the remainder** — read it as the remainder and you go looking at whichever arena was nearly full instead of the one that was too small. Divide `needed` by the tensor size instead: `56,624,208 ≈ 3 × 18,874,368` said "this arena budgeted one and allocated three" immediately. And **`arena_for` doubles its total, which hides an undercount until the block grows enough to eat it** — list every tensor a branch can allocate, for that branch.
 - **V4-Flash has no redundancy left to harvest — four probes, four negatives.** Experts are 9.1% internally negligible; the expert *bank* is full-rank (a rank-512 shared basis holds 20.4% of its energy against **16.6% for random noise**, `chaos-spectrum`); the router's tail is not small (33.5/20.6/15.0/12.1/10.1/**8.8**%, so 3-of-6 discards 31% of the mass); and a pinned hot set scores 37.5% vs 25.0% random. **3.21 GiB/token is what the model costs, not an artefact.** Do not re-propose factorisation, contextual sparsity, or pinning.
 - **Speculative decoding is ~1.4x here, not 2.2x.** The literature assumes the verify pass costs what a single-token pass costs; here it costs more, because more tokens select more distinct experts (`U(n)≈6·n^0.667`). Below α≈0.75 it is a net *loss*, and the optimum draft is short.
 - **Nothing in a GGUF records the FFN activation** — a GELU model and a SiLU model hold byte-identical tensor sets. The whole Gemma family is GELU and everything else here is SiLU; the wrong one is not a missing tensor, not a shape error and not a crash, just a model that answers fluently and disagrees with llama.cpp from the first token. `gemma2` sat in `VERIFIED_ARCHITECTURES` in that state for weeks. **Membership in that list means someone ran the reference — loading is not evidence and answering in English is not evidence.**
 - **Match the reference's *order*, not its algebra, wherever a soft cap is involved.** llama.cpp pre-scales Q and passes `scale = 1.0`; ggml folds the cap into the scale (`scale /= cap`), so passing the scale instead is the same arithmetic and `0.0625f/50f` vs `0.0625f*(1f/50f)` differ by **one ULP**. Through `tanh` that flipped Gemma-2's first token and rewrote the whole completion. A cap turns a scale into a non-linearity's argument, and then the last bit is not decorative.
 - **`chaos-run -v` prints the derived hparams** (`attn_scale`, per-layer RoPE bases, windowed-layer list). Use it before theorising: a key read under the wrong name looks exactly like a key that was absent.
+- **Killing a benchmark's wrapper does not kill the engine, and an orphan is invisible in the numbers.** A stopped background script left `llama-completion` alive holding **8.98 GiB**; every run after it read 10x slow (V4-Flash generation 0.039 against 0.39) and looked exactly like a regression. `Get-Process` before trusting a surprising number, and prefer letting a comparison finish over stopping it.
+- **The drive tops out at 2.74 GiB/s and stops climbing at FOUR handles** (`chaos-iobench`, 4 MiB scattered slices; 8/16/32 do not improve on it). So the 8-handle pool is not the limit — the gap between that and V4-Flash's achieved 1.88 GiB/s is the per-block barrier, and nothing can be queued during it because the next block's addresses depend on routing it has not computed yet.
 - **Windows: `.cargo/config.toml` sets `link-self-contained=no`.** MSYS2 gcc 16.1.0 dropped symbols rustup's bundled `crt2.o` still references, so every link fails with "undefined reference" on code that compiles. Do not delete it.
 
 ## Working rules
@@ -79,22 +81,45 @@ Windows: needs the **GNU** Rust toolchain (`rustup default stable-x86_64-pc-wind
 
 ## Next
 
-**v0.0.2 released 2026-08-07.** Read `backlog/next-session-handoff.md` first — it carries R0-R6 in measurement order.
+**v0.0.2 released 2026-08-07. Renamed to `chaos` 2026-08-16**, and the release
+for that name is what this repository is being cut for. `STATUS.md` is the
+scoreboard; read `backlog/next-session-handoff.md` for the work queue.
 
-**V4-Flash vs llama.cpp, run back to back**: load parity, prefill **1.62x behind**, generation **3-4x behind**. We lead on nothing on this model. Do not claim otherwise: `v4flash-vs-llamacpp-2026-08-07.md`.
+**Against llama.cpp, measured 2026-08-16 with both engines alternating**
+(`where-we-stand-vs-llamacpp-2026-08-16.md`): **parity on everything that
+streams** — V4-Flash prefill 1640 against 1679 ms/prompt token and generation
+0.394 against 0.39, Qwen3-30B parity on both phases. Behind by 1.20-1.27x on the
+dense path when both sides are hand-tuned; ahead 1.23x out of the box, because we
+measure the machine and llama.cpp uses a fixed default. **The old "V4-Flash
+prefill 1.62x behind, generation 3-4x behind" is retracted.** Do not replace it
+with a claimed lead either: the ranges overlap.
 
-**R0 done 2026-08-08** (`routing-skew-is-per-prompt-2026-08-08.md`): the router is genuinely skewed — top-8 takes 5-7x a uniform router — but **the hot set is per-prompt and must be warmed, not pinned.** Pinned from one prompt it covers 61.3% of another on the same subject, 37.5% across subjects, against 25.0% for a *random* cache. This corrected four v0.0.2 figures, killed the "prune the model to its hot set" plan, and reshaped R1.
+**The byte-reduction roadmap is closed** (`v4flash-has-no-slack-2026-08-10.md`).
+20 tok/s needs 79 MB/token; V4-Flash reads 3288. Everything still alive
+multiplies to 3.1x against a 42x gap. **20 tok/s is not a code problem** — it
+needs the active weights to stop coming from disk.
 
-**R0.1, R1, R3 done. R5 started** — `chaos-pull`, `chaos-serve` (OpenAI-compatible, verified against the live model), release workflow.
+1. **The tok/s-versus-RAM frontier for a 144 GB model** — nobody has published
+   it, and only an engine that owns residency can sweep it (`mmap` cannot be told
+   to use exactly N GiB). Answers the product question honestly: *given your
+   machine, the largest model at the speed you want.*
+2. **The 5090 machine** (32 GiB VRAM, 64 GiB RAM). Qwen3-30B-A3B is 17.3 GiB and
+   fits **entirely in VRAM** — that is the demo, not V4-Flash. 96 GiB of fast
+   memory against 144 GiB of model is ~67% resident there against ~11% here, so
+   **measure it rather than predicting it**, and check `--auto` picks sensibly
+   without the user knowing any flags.
+3. **Verify the GPU tier.** `--device`, `-ngl`, `-ot`, `--op-offload` and
+   `ggml_backend_sched` are all bound, on Vulkan — the sentence "no GPU code
+   exists" was false for a day after it stopped being true. What is *not* done is
+   verification: the device path fails 1 of 8 parity prompts where the CPU path
+   fails none, and that is arithmetic rather than wiring.
+4. Finish R5/T1-T5 of `lts-0-0-0.md`: quant selection, self-configuration.
 
-**2026-08-10** (`v4flash-has-no-slack-2026-08-10.md`): the byte-reduction roadmap is closed. 20 tok/s needs 79 MB/token; V4-Flash reads 3288. Everything still alive multiplies to **3.1x** against a **42x** gap, and the two ideas that could have closed it were measured and failed. **20 tok/s is not a code problem** — it needs the active weights to stop coming from disk.
-
-1. **The tok/s-versus-RAM frontier for a 144 GB model** — never published by anyone, and only an engine that owns residency can sweep it (`mmap` cannot be told to use exactly N GiB). Answers the product question honestly: *given your machine, the largest model at the speed you want.*
-2. **Overlap reads with compute** — ~53 ms read vs ~23 ms compute per block, ceiling ~1.4x.
-3. **Ring wraparound** to lift the 256-token context ceiling (#46).
-4. Finish R5/T1-T5 of `lts-0-0-0.md`: quant selection, self-configuration, prebuilt binaries.
-
-**No GPU code exists** — `chaos-probe` detects the card, nothing uses it. A VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer.
+**Dead ends, measured, do not re-propose**: expert factorisation, contextual
+sparsity, a pinned hot set, expert-read/compute overlap (1.03x), `--op-offload`
+(19% slower), `mul_mat_id` batching on the streaming path, and porting
+parallel-experts to V4-Flash (its whole routed arithmetic is under 5% of a
+token).
 
 ## Compact Instructions
 
