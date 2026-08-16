@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="#where-it-stands-against-llamacpp"><img alt="status" src="https://img.shields.io/badge/status-v0.0.2%20preview-orange"></a>
+  <a href="#where-it-stands-against-llamacpp"><img alt="status" src="https://img.shields.io/badge/status-v0.0.3%20preview-orange"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue"></a>
   <a href="#build-it-yourself"><img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-informational"></a>
   <a href="https://github.com/aturzone/Chaos/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aturzone/Chaos/actions/workflows/ci.yml/badge.svg"></a>

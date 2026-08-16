@@ -8,6 +8,10 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.0.3] — 2026-08-16
+
 ### Changed — the project is now called `chaos`
 
 `bigtea-run` is `chaos-run`, and so are the other ten binaries. Crate names,
@@ -90,21 +94,19 @@ caching at random. See
 
 ### Planned
 
-In the order the measurements justify — see
-[`docs/graph/backlog/lts-0-0-0.md`](docs/graph/backlog/lts-0-0-0.md):
+Everything the previous list named is done — the KV cache, the downloader, the
+OpenAI-compatible server, quant selection from the probe and prebuilt binaries.
+What replaces it, in the order the measurements justify:
 
-- KV cache for the DeepSeek-V4-Flash path — the only thing between us and a real
-  generation number. A single-token pass already costs 4.0s; today every
-  generated token re-runs the whole sequence instead.
-- Overlap expert reads with compute. 2.3s of I/O and 1.0s of compute per token
-  run serially; llama.cpp gets this overlap free from `mmap`. Layers 0-2 route by
-  token id, so their expert set is knowable before any compute runs.
-- Model downloader (`chaos pull`) resolving names to Hugging Face repos, with
-  resume, checksums and a disk-space check before starting.
-- Quant selection from the hardware probe, with the tok/s prediction stated
-  *before* a 144 GB download begins.
-- OpenAI-compatible `/v1/chat/completions` server.
-- Prebuilt binaries for Linux, macOS and Windows.
+- **The tok/s-versus-RAM frontier for a 144 GB model.** Nobody has published it,
+  and only an engine that owns residency can sweep it — `mmap` cannot be told to
+  use exactly N GiB.
+- **Verify the GPU tier.** `--device`, `-ngl`, `-ot` and `--op-offload` all work
+  on Vulkan, and the device path fails 1 of 8 parity prompts where the CPU path
+  fails none. Shown to be arithmetic rather than wiring, but unproven either way.
+- **More architectures.** 13 of llama.cpp's 141 have been diffed against it.
+- **Not** 20 tok/s on V4-Flash. That is closed by measurement rather than
+  deferred: it needs 79 MB/token and the model reads 3288.
 
 ## [0.0.2] — 2026-08-07
 
