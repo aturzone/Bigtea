@@ -854,11 +854,6 @@ impl Qwen3Model {
         // — arithmetic that produces fluent, wrong text rather than an error,
         // which is the failure mode this project keeps paying for. falcon,
         // gptneox and phi2 all land here.
-        if self.config.parallel_residual {
-            return Err(ArchError::Unimplemented(
-                "this model uses a parallel attention/FFN block (one norm per layer,                  no ffn_norm) and only the serial shape is implemented; running it                  would be wrong rather than fail",
-            ));
-        }
         if self.config.uses_alibi {
             return Err(ArchError::Unimplemented(
                 "this model uses ALiBi rather than RoPE (baichuan at 40 layers \

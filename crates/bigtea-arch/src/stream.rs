@@ -1754,6 +1754,14 @@ impl<'m> StreamingRunner<'m> {
             } else {
                 attn_out
             };
+            // A parallel block feeds its FFN from `attn_norm(x)` -- the value
+            // attention consumed -- not from the post-attention sum, so the
+            // pre-attention activation has to survive the add below.
+            let pre_attention = if c.parallel_residual {
+                Some(residual.clone())
+            } else {
+                None
+            };
             let mut ffn_input = residual;
             for (dst, v) in ffn_input.iter_mut().zip(attn_out) {
                 *dst += v;
@@ -1798,9 +1806,22 @@ impl<'m> StreamingRunner<'m> {
                 let cmp = Self::compute_with(device, threads);
                 let ctx = cmp.context(arena_for(&shapes, 24))?;
                 let xt = ctx.new_f32_2d(n_embd, n_new)?;
-                let normed =
+                // **Which normalisation the FFN reads is the whole difference
+                // between a serial and a parallel block.**
+                //
+                //   serial    ffn(ffn_norm(x + attn))
+                //   parallel  ffn(attn_norm(x))          -- the SAME h attention saw
+                //
+                // The residual add below is identical either way, because `xt`
+                // already holds `x + attn`. Only the FFN's input moves.
+                let pre = ctx.new_f32_2d(n_embd, n_new)?;
+                let normed = if c.parallel_residual {
                     self.arch
-                        .norm_named(&ctx, weights, &xt, &format!("blk.{il}.ffn_norm"))?;
+                        .norm_named(&ctx, weights, &pre, &format!("blk.{il}.attn_norm"))?
+                } else {
+                    self.arch
+                        .norm_named(&ctx, weights, &xt, &format!("blk.{il}.ffn_norm"))?
+                };
                 if !c.is_moe() {
                     // Dense: no router at all. The FFN is one gate/up/down
                     // triple on resident weights, so it runs here rather than
@@ -1816,6 +1837,9 @@ impl<'m> StreamingRunner<'m> {
                     let t = std::time::Instant::now();
                     let _dev = cmp.realize_graph(&ctx, &[&out])?;
                     cmp.set_f32(&xt, &ffn_input)?;
+                    if let Some(pre_x) = pre_attention.as_ref() {
+                        cmp.set_f32(&pre, pre_x)?;
+                    }
                     cmp.run(&ctx, &[&out])?;
                     if trace {
                         eprintln!("TRACE: dense ffn ok (layer)");
