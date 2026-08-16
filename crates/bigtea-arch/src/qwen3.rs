@@ -45,11 +45,19 @@ fn rope_type_for(arch: &str) -> (i32, bool) {
         // `LLM_ARCH_LLAMA`. `olmo` was previously in the NEOX arm below **with
         // `known = true`** — a guess wearing the label of a checked fact, and
         // wrong. Nothing had ever been run against the reference for it.
-        "llama" | "llama4" | "baichuan" | "deci" | "mistral" | "olmo" | "internlm2" => {
+        "llama" | "llama4" | "baichuan" | "deci" | "mistral" | "olmo" | "internlm2" | "minicpm" => {
             (ROPE_TYPE_NORM, true)
         }
         "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "phi3" | "gemma" | "gemma2" | "gemma3"
-        | "stablelm" | "starcoder2" => (ROPE_TYPE_NEOX, true),
+        | "stablelm" | "starcoder2" | "falcon" | "phi2" | "gptneox" => (ROPE_TYPE_NEOX, true),
+        // **`mpt` and `bloom` are deliberately absent.** llama.cpp returns
+        // `LLAMA_ROPE_TYPE_NONE` for both: they position with ALiBi instead of
+        // rotation, and this engine refuses ALiBi rather than silently running
+        // a model without positional information — see `uses_alibi` in
+        // `verify`. Falling through to the `_` arm would mark them "unknown"
+        // and the runner would warn, which is right, but writing them here as
+        // NEOX would be a guess wearing the label of a checked fact. That is
+        // the exact mistake `olmo` cost.
         _ => (ROPE_TYPE_NEOX, false),
     }
 }
@@ -118,6 +126,13 @@ fn ffn_act_for(arch: &str) -> FfnAct {
 /// diff was run against *a* container, and the refusals guard the rest.
 pub const VERIFIED_ARCHITECTURES: &[&str] = &[
     "baichuan",
+    // **Verified 2026-08-16 on gemma-1.1-2b-it-Q4_K_M**: 8 of 8 prompts exact
+    // against llama.cpp, twice, zero unstable. Gemma v1 is NOT gemma2 -- it has
+    // no post-norms and no logit soft-capping -- so this entry is its own
+    // measurement and not an inference from the sibling that was already here.
+    // The activation is GELU, detected from the container rather than assumed;
+    // gemma2 sat on this list for weeks running SiLU by mistake.
+    "gemma",
     "deepseek4",
     "gemma2",
     "gemma3",
@@ -1205,6 +1220,17 @@ mod tests {
         // been run against the reference for it. These four are now diffed at
         // eight prompts each.
         assert_eq!(rope_type_for("olmo"), (ROPE_TYPE_NORM, true));
+        // Read out of llama.cpp's `llama_model_rope_type`: MINICPM sits in the
+        // NORM arm beside LLAMA, while FALCON, PHI2 and GPTNEOX are in the
+        // NEOX arm below it.
+        assert_eq!(rope_type_for("minicpm"), (ROPE_TYPE_NORM, true));
+        assert_eq!(rope_type_for("falcon"), (ROPE_TYPE_NEOX, true));
+        assert_eq!(rope_type_for("phi2"), (ROPE_TYPE_NEOX, true));
+        assert_eq!(rope_type_for("gptneox"), (ROPE_TYPE_NEOX, true));
+        // ALiBi models: llama.cpp says ROPE_TYPE_NONE, so they must stay
+        // UNKNOWN here rather than be given a rotation they do not use.
+        assert!(!rope_type_for("mpt").1);
+        assert!(!rope_type_for("bloom").1);
         assert_eq!(rope_type_for("internlm2"), (ROPE_TYPE_NORM, true));
         assert_eq!(rope_type_for("baichuan"), (ROPE_TYPE_NORM, true));
         assert_eq!(rope_type_for("starcoder2"), (ROPE_TYPE_NEOX, true));
@@ -1334,12 +1360,22 @@ mod tests {
         // implemented, Gemma-2 loaded through this path with no error at all
         // and answered "The capital of France is" with "himselff" — which is
         // exactly why loading is not evidence of anything.
-        for arch in ["deepseek4", "gemma2", "gemma3", "llama", "phi3", "qwen3"] {
+        for arch in [
+            "deepseek4",
+            "gemma",
+            "gemma2",
+            "gemma3",
+            "llama",
+            "phi3",
+            "qwen3",
+        ] {
             assert!(architecture_is_verified(arch), "{arch} should be verified");
         }
-        // `gemma` (v1) is deliberately absent: it is close to `gemma2` but not
-        // identical, and nobody has run it. So is `gemma3n`, which is a
-        // different model despite the name.
+        // `gemma` (v1) JOINED the list on 2026-08-16, after gemma-1.1-2b-it
+        // came back 8 of 8 against llama.cpp twice. It was absent before that
+        // for the right reason -- close to `gemma2` but not identical, and
+        // never run. `gemma3n` is still absent: a different model despite the
+        // name.
         //
         // **`qwen3moe` is absent because it was REMOVED**, not because nobody
         // tried. It sat here through a diff it had never been given, and the
@@ -1348,14 +1384,7 @@ mod tests {
         // the near-tie explanation survived and the divergence did not shrink.
         // This assertion is what would have caught someone quietly putting it
         // back on the strength of the FAIL turning into a softer word.
-        for arch in [
-            "gemma",
-            "gemma3n",
-            "qwen3moe",
-            "falcon",
-            "mamba",
-            "something-new",
-        ] {
+        for arch in ["gemma3n", "qwen3moe", "falcon", "mamba", "something-new"] {
             assert!(
                 !architecture_is_verified(arch),
                 "{arch} has not been checked and must not claim to be"
