@@ -123,9 +123,11 @@ machine** — it needs the active weights to stop coming from disk.
    it, and only an engine that owns residency can sweep it (`mmap` cannot be told
    to use exactly N GiB). Answers the product question honestly: *given your
    machine, the largest model at the speed you want.*
-2. **A bigger machine**, measured rather than predicted. 96 GiB of fast memory
-   against 144 GiB of model is ~67% resident against ~11% here. Check `--auto`
-   picks sensibly without the user knowing any flags.
+2. **A bigger machine**, measured rather than predicted. The 5090 box is 32 GiB
+   VRAM + 64 GiB RAM, where Qwen3-30B-A3B (17.3 GiB) fits **entirely in VRAM** —
+   that is the demo, not V4-Flash. 96 GiB of fast memory against 144 GiB of model
+   is ~67% resident there against ~11% here. Check `--auto` picks sensibly
+   without the user knowing any flags.
 3. **Verify the GPU tier.** `--device`, `-ngl`, `-ot`, `--op-offload` and
    `ggml_backend_sched` are all bound on Vulkan; what is *not* done is
    verification — the device path fails 1 of 8 parity prompts where the CPU path
