@@ -2227,6 +2227,19 @@ mixed graph had computed when it had not. And `splits() >= 2` was asserted on a
 **single-node** graph, which cannot split however its operands are placed: an
 unfalsifiable assertion, only revealed when a real card started evaluating it.
 
+**The 1-in-8 turned out to be arithmetic, measured the same day.** `bigtea-gpubench`
+grew `--prompt <text>` and a real comparison — the old one was
+`sum(|logits[0..64]|)` to four decimals, which is what Phase A's "logit
+checksums agree" rested on and cannot see the top token move. On all eight
+parity prompts the device picks the **same first token**; the kernels disagree
+by **0.37–0.71** (mean 0.06–0.09) and the model's own top-2 margin falls to
+**0.399**, so on `Dear Sir or Madam` the difference is 94% of the margin. Within
+a 32-token continuation some position has a margin under 0.4 and the token
+flips. **A wiring bug does not agree on 8 of 8** — and this is why a text diff
+is not a valid acceptance test for a GPU path in any engine, which llama.cpp's
+own 2-in-8 flip rate was already saying. Still unproven either way: whether our
+spread is larger than llama.cpp's, which needs its logits rather than its text.
+
 Full node: `research/ngl-partial-offload-2026-08-16.md`.
 
 ## R12 — the 256-token V4-Flash context cap is gone (2026-08-11)
