@@ -2748,3 +2748,30 @@ sizes closing it at 2.5–3x, still far short of llama.cpp.
 `research/mixed-residency-segfaults-2026-08-15.md`. And Phase C's ceiling is
 revised **down** from 1.3x — that estimate assumed the compute moved for free,
 and Phase A shows it does not.
+
+## The architecture count overstates the work, and here is the evidence
+
+**2026-08-16.** Three containers downloaded to verify three "new" architectures.
+Two of them declare `llama`:
+
+| container | `general.architecture` | verdict |
+|---|---|---|
+| Mistral-7B-Instruct-v0.3 | **`llama`** | 8/8 exact — but verifies `llama`, already on the list |
+| Yi-1.5-6B-Chat | **`llama`** | same family, same path |
+| gemma-1.1-2b-it | `gemma` | **8/8 twice — genuinely new, now verified** |
+
+**A GGUF names an architecture, not a model family.** Mistral, Yi, Vicuna,
+Zephyr, TinyLlama, WizardLM and most fine-tunes all ship as `llama`, so they run
+today and always did. "12 of 141" counts llama.cpp's *dispatch arms*, and a
+large share of the models people actually run funnel through a handful of them.
+
+That does not make the 141 wrong — those arms are real and some are genuinely
+different models. It makes **the bar a poor proxy for coverage**, and it means
+the honest question is "does the model you have run?", not "how many arms are
+implemented".
+
+**Mistral's first run failed with `梦梦梦梦…` and llama.cpp emitted nothing.**
+That was a corrupt download — two fetch processes resuming into one file, 4973 MB
+against an expected ~4370 MB — not a forward-pass bug. **Two engines failing the
+same container is a file problem**, and the size said so before any debugging
+did. A clean re-download passed 8/8.
