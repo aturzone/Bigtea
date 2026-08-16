@@ -32,6 +32,93 @@ use crate::qwen3::{Qwen3Config, Qwen3Model};
 use crate::{ArchError, Result};
 
 const ROPE_TYPE_NEOX: i32 = 2;
+/// One `--override-tensor` rule: which tensors, and where they go.
+///
+/// # Why the pattern is not a regex
+///
+/// llama.cpp's `-ot` takes `std::regex`. This workspace has **no external
+/// dependencies at all** — deliberately — so a regex engine would be a new one
+/// for a single flag, or a hand-written one to get subtly wrong.
+///
+/// So the pattern is a substring with `*` as a wildcard, and **anything that
+/// looks like a regex is refused rather than matched literally.** That
+/// distinction is the whole point: `blk\.(1[0-9])\..*_exps` treated as a
+/// literal matches nothing, the flag appears to work, and the model quietly
+/// loads exactly where it would have anyway. A flag accepted and ignored is the
+/// failure this project's declined-flag table exists to prevent, and it would
+/// be no better for being half-implemented.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorOverride {
+    /// Segments split on `*`. `["", "_exps"]` is `*_exps`.
+    segments: Vec<String>,
+    /// True to place matches on the compute device, false for host memory.
+    pub on_device: bool,
+}
+
+impl TensorOverride {
+    /// Parse one `pattern=TARGET` rule. `TARGET` is `CPU` or `GPU`/`DEVICE`.
+    pub fn parse(rule: &str) -> Result<Self> {
+        let (pattern, target) = rule.rsplit_once('=').ok_or_else(|| {
+            ArchError::BadOverride(format!(
+                "{rule:?}: expected <pattern>=<CPU|GPU>, for example \"*_exps=CPU\""
+            ))
+        })?;
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return Err(ArchError::BadOverride(format!("{rule:?}: empty pattern")));
+        }
+        // The refusal that keeps this honest. Every one of these means
+        // something in `std::regex` and nothing here.
+        if let Some(c) = pattern.chars().find(|c| r"\()[]|^$+?{}".contains(*c)) {
+            return Err(ArchError::BadOverride(format!(
+                "{pattern:?}: {c:?} is a regex character. This build matches substrings with `*` as the only wildcard, unlike llama.cpp's `-ot`. Treating it as a literal would match nothing and look like it worked -- rewrite it, e.g. `*_exps=CPU`"
+            )));
+        }
+        let on_device = match target.trim().to_ascii_uppercase().as_str() {
+            "CPU" | "HOST" => false,
+            "GPU" | "DEVICE" => true,
+            other => {
+                return Err(ArchError::BadOverride(format!(
+                    "{other:?}: expected CPU or GPU. Naming a specific device needs --split-mode, which is not implemented"
+                )))
+            }
+        };
+        Ok(Self {
+            segments: pattern.split('*').map(str::to_string).collect(),
+            on_device,
+        })
+    }
+
+    /// Does `name` match? `*` matches any run of characters, including none.
+    ///
+    /// Public as `matches_name` so the pattern can be tested without a GPU —
+    /// which is where a placement rule actually goes wrong.
+    pub fn matches_name(&self, name: &str) -> bool {
+        self.matches(name)
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        let mut rest = name;
+        for (i, seg) in self.segments.iter().enumerate() {
+            if seg.is_empty() {
+                continue;
+            }
+            match (i, rest.find(seg.as_str())) {
+                // A leading segment (no `*` before it) must sit at the start.
+                (0, Some(0)) => rest = &rest[seg.len()..],
+                (0, _) => return false,
+                (_, Some(at)) => rest = &rest[at + seg.len()..],
+                (_, None) => return false,
+            }
+        }
+        // A trailing segment (no `*` after it) must reach the end.
+        match self.segments.last() {
+            Some(last) if !last.is_empty() => rest.is_empty(),
+            _ => true,
+        }
+    }
+}
+
 /// The one resident tensor with no `blk.` prefix that **every block reads**.
 ///
 /// Llama-3.1/3.2/3.3 ship their RoPE scaling as a tensor rather than as
@@ -265,6 +352,25 @@ pub struct StreamingRunner<'m> {
     /// them plus the non-repeating parts, which is what "use the GPU" meant
     /// before this existed and is still the default once a device is opened.
     gpu_layers: usize,
+    /// `--override-tensor`: patterns that place named tensors regardless of
+    /// `-ngl`. Empty unless the flag was given.
+    overrides: Vec<TensorOverride>,
+    /// Where the non-repeating parts run — embedding lookup and output head.
+    ///
+    /// **A third instance of the same bug lives here if it is derived rather
+    /// than resolved.** `-ot "*=CPU"` sends every weight to the host, but the
+    /// `-ngl` rule alone says "the edges go to the card" because `-ot` implies
+    /// a full offload — so the embedding graph ran on the device over a host
+    /// tensor and segfaulted. Anything that decides *where a graph runs* must
+    /// read the same answer the weights were bound with.
+    edge_placement: Option<bool>,
+    /// Where each block's graph runs, resolved once at load.
+    ///
+    /// Empty on the CPU path. Filled by `load_resident_split`, because that is
+    /// where residency is actually decided and a second derivation could
+    /// disagree with the first -- which would put a block's graph on one target
+    /// and its weights on the other, i.e. a segfault.
+    block_placement: Vec<bool>,
     pub stats: StreamStats,
     /// Keep the pre-projection hidden state from each forward pass.
     ///
@@ -452,6 +558,9 @@ impl<'m> StreamingRunner<'m> {
             },
             device: None,
             gpu_layers: usize::MAX,
+            overrides: Vec::new(),
+            block_placement: Vec::new(),
+            edge_placement: None,
             stats: StreamStats::default(),
             want_embedding: false,
             last_embedding: None,
@@ -523,19 +632,76 @@ impl<'m> StreamingRunner<'m> {
         self.gpu_layers
     }
 
-    /// Which target block `il` runs on.
+    /// `--override-tensor`: place named tensors regardless of `-ngl`.
     ///
-    /// **This is the whole of partial offload in the forward pass**, and it is
-    /// this small only because the activation already materialises in host
-    /// memory between blocks. Block 0's graph is wholly device-side, block 20's
-    /// is wholly host-side, and no single graph spans the two — see
-    /// [`Self::load_resident_split`].
-    fn layer_device(
-        device: Option<&bigtea_ggml::Backend>,
+    /// Must be set before the weights are loaded, like `-ngl`.
+    pub fn set_tensor_overrides(&mut self, rules: &[String]) -> Result<()> {
+        let mut parsed = Vec::new();
+        for rule in rules {
+            for one in rule.split(',') {
+                let one = one.trim();
+                if !one.is_empty() {
+                    parsed.push(TensorOverride::parse(one)?);
+                }
+            }
+        }
+        self.overrides = parsed;
+        Ok(())
+    }
+
+    /// Refuse any rule that would split a single block across both targets.
+    ///
+    /// **This is the constraint `-ot` inherits from running one graph per
+    /// block.** llama.cpp can place attention on the card and the FFN on the
+    /// host inside one layer, because its single graph goes through
+    /// `ggml_backend_sched` and the scheduler inserts the copies. Here a
+    /// block's graph runs in exactly one place, so a rule that splits a block
+    /// would build a mixed graph — and that does not fail, it segfaults, which
+    /// `rope_freqs.weight` already demonstrated once today.
+    ///
+    /// Refusing is the honest option and it names the block, because a rule
+    /// like `*ffn_down*=CPU` looks entirely reasonable until you know this.
+    fn refuse_split_blocks(
+        &self,
+        names: &[String],
+        gpu_layers: usize,
+        n_layer: usize,
+    ) -> Result<()> {
+        let mut seen: Vec<Option<bool>> = vec![None; n_layer];
+        for name in names {
+            let Some(il) = Self::block_of(name) else {
+                continue;
+            };
+            if il >= n_layer {
+                continue;
+            }
+            let here = self.residency_of(name, gpu_layers, n_layer);
+            match seen[il] {
+                None => seen[il] = Some(here),
+                Some(before) if before != here => {
+                    return Err(ArchError::BadOverride(format!(
+                        "splits block {il} across host and device. This build runs ONE GRAPH PER BLOCK, so a block's tensors must all be in one place -- a mixed graph segfaults rather than failing. Move the whole block with `blk.{il}.*=CPU`, or use -ngl to choose how many blocks go to the card"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Where block `il` runs, from the placement resolved at load.
+    fn layer_device_at<'b>(
+        device: Option<&'b bigtea_ggml::Backend>,
+        placement: &[bool],
         gpu_layers: usize,
         il: usize,
-    ) -> Option<&bigtea_ggml::Backend> {
-        if il < gpu_layers {
+    ) -> Option<&'b bigtea_ggml::Backend> {
+        // Empty placement is the CPU path and the pre-`-ot` rule both.
+        let on_device = match placement.get(il) {
+            Some(&p) => p,
+            None => il < gpu_layers,
+        };
+        if on_device {
             device
         } else {
             None
@@ -549,10 +715,12 @@ impl<'m> StreamingRunner<'m> {
     /// it" there and has to mean it here.
     fn edge_device(
         device: Option<&bigtea_ggml::Backend>,
+        edge: Option<bool>,
         gpu_layers: usize,
         n_layer: usize,
     ) -> Option<&bigtea_ggml::Backend> {
-        if gpu_layers > n_layer {
+        let on_device = edge.unwrap_or(gpu_layers > n_layer);
+        if on_device {
             device
         } else {
             None
@@ -1206,7 +1374,11 @@ impl<'m> StreamingRunner<'m> {
         &mut self,
         ctx: &'a Context,
         weights: &mut WeightSet<'a>,
-    ) -> Result<(u64, bigtea_ggml::DeviceBuffer, bigtea_ggml::UploadReport)> {
+    ) -> Result<(
+        u64,
+        Option<bigtea_ggml::DeviceBuffer>,
+        bigtea_ggml::UploadReport,
+    )> {
         self.load_resident_split(ctx, weights, usize::MAX)
     }
 
@@ -1247,7 +1419,11 @@ impl<'m> StreamingRunner<'m> {
         ctx: &'a Context,
         weights: &mut WeightSet<'a>,
         gpu_layers: usize,
-    ) -> Result<(u64, bigtea_ggml::DeviceBuffer, bigtea_ggml::UploadReport)> {
+    ) -> Result<(
+        u64,
+        Option<bigtea_ggml::DeviceBuffer>,
+        bigtea_ggml::UploadReport,
+    )> {
         let backend = self.device.as_ref().ok_or(ArchError::Unimplemented(
             "no device opened; call use_device first",
         ))?;
@@ -1261,6 +1437,22 @@ impl<'m> StreamingRunner<'m> {
         {
             names.push("output.weight".to_string());
         }
+        // Before a single byte is read: a rule that splits a block is fatal
+        // later and cheap to refuse now.
+        self.refuse_split_blocks(&names, gpu_layers, n_layer)?;
+        // Resolved once, here, and read by the forward pass. Deriving it twice
+        // is how a block's graph ends up on one target and its weights on the
+        // other.
+        self.edge_placement = Some(self.residency_of("token_embd.weight", gpu_layers, n_layer));
+        self.block_placement = (0..n_layer)
+            .map(|il| {
+                names
+                    .iter()
+                    .find(|n| Self::block_of(n) == Some(il))
+                    .map(|n| self.residency_of(n, gpu_layers, n_layer))
+                    .unwrap_or(il < gpu_layers)
+            })
+            .collect();
         for name in names {
             let loc = self
                 .model
@@ -1269,7 +1461,12 @@ impl<'m> StreamingRunner<'m> {
                 .clone();
             let data = self.model.read_tensor(&name)?;
             total += data.len() as u64;
-            if Self::on_device(&name, gpu_layers, n_layer) {
+            // **The shared tensor is always bound host-side**, and the device
+            // copy is made below. Deciding it by the same rule as everything
+            // else is what segfaulted `-ot`: `-ot` implies a full offload, so
+            // this went to the card while the blocks the rules moved back to
+            // the host still read it.
+            if name != SHARED_ROPE && self.residency_of(&name, gpu_layers, n_layer) {
                 weights.bind_shared_at(
                     ctx,
                     &name,
@@ -1310,7 +1507,16 @@ impl<'m> StreamingRunner<'m> {
         // `ggml_backend_sched`, which inserts the copy itself. We run one graph
         // per block, which is why the split is cheap and why the shared tensor
         // is ours to place.
-        if gpu_layers > 0 && gpu_layers <= n_layer {
+        //
+        // **Keyed on the resolved placement, not on `-ngl`'s range.** The first
+        // version asked `gpu_layers > 0 && gpu_layers <= n_layer`, which is
+        // true for a partial `-ngl` and FALSE for `-ot`, since `-ot` implies a
+        // full offload that the rules then carve into. So `-ot blk.1*=CPU` got
+        // no device copy, seven blocks ran on the host reading a device
+        // pointer, and it segfaulted exactly as `-ngl` had that morning. The
+        // condition has to be "are any blocks on the card", because that is the
+        // actual question.
+        if self.block_placement.iter().any(|&p| p) {
             if let Some(loc) = self.model.location(SHARED_ROPE).cloned() {
                 let data = self.model.read_tensor(SHARED_ROPE)?;
                 weights.bind_shared_at(
@@ -1346,6 +1552,27 @@ impl<'m> StreamingRunner<'m> {
             Some(il) => il < gpu_layers,
             None => gpu_layers > n_layer,
         }
+    }
+
+    /// Which block a tensor belongs to, or `None` for the non-repeating parts.
+    fn block_of(name: &str) -> Option<usize> {
+        name.strip_prefix("blk.")
+            .and_then(|rest| rest.split_once('.'))
+            .and_then(|(index, _)| index.parse::<usize>().ok())
+    }
+
+    /// Residency for `name`, with `--override-tensor` applied over `-ngl`.
+    ///
+    /// **Last match wins**, which is llama.cpp's rule and the one that makes a
+    /// broad pattern followed by a narrow exception mean what it looks like.
+    fn residency_of(&self, name: &str, gpu_layers: usize, n_layer: usize) -> bool {
+        let mut placed = Self::on_device(name, gpu_layers, n_layer);
+        for ov in &self.overrides {
+            if ov.matches(name) {
+                placed = ov.on_device;
+            }
+        }
+        placed
     }
 
     pub fn load_resident<'a>(
@@ -1550,6 +1777,8 @@ impl<'m> StreamingRunner<'m> {
         // (so `Compute` never borrows `self`), and the split has to travel the
         // same way or the two could disagree mid-pass.
         let gpu_layers = self.gpu_layers;
+        let placement = self.block_placement.clone();
+        let edge = self.edge_placement;
         let n_layer_total = c.n_layer as usize;
         let trace = std::env::var("BIGTEA_GPU_TRACE").is_ok();
         let n_new = tokens.len() as i64;
@@ -1625,7 +1854,7 @@ impl<'m> StreamingRunner<'m> {
             // n_embd * n_new floats, and ggml aborts the process when an arena
             // runs out rather than returning an error we could catch.
             let cmp = Self::compute_with(
-                Self::edge_device(device, gpu_layers, n_layer_total),
+                Self::edge_device(device, edge, gpu_layers, n_layer_total),
                 threads,
             );
             let ctx = cmp.context(arena_for(&[(n_embd, n_new)], 8))?;
@@ -1667,7 +1896,8 @@ impl<'m> StreamingRunner<'m> {
             if trace {
                 eprintln!(
                     "TRACE: layer {il} on {}",
-                    if Self::layer_device(device, gpu_layers, il as usize).is_some() {
+                    if Self::layer_device_at(device, &placement, gpu_layers, il as usize).is_some()
+                    {
                         "device"
                     } else {
                         "host"
@@ -1680,7 +1910,7 @@ impl<'m> StreamingRunner<'m> {
                 // ggml asked for 318,787,536 bytes and got told 268,435,456.
                 // Every arena in this function has to scale with the block.
                 let cmp = Self::compute_with(
-                    Self::layer_device(device, gpu_layers, il as usize),
+                    Self::layer_device_at(device, &placement, gpu_layers, il as usize),
                     threads,
                 );
                 let ctx = cmp.context(arena_for(
@@ -1795,7 +2025,9 @@ impl<'m> StreamingRunner<'m> {
                 // host one otherwise. `or_else` covers the all-device case,
                 // where the original IS the device copy and no duplicate was
                 // made.
-                let freqs = if Self::layer_device(device, gpu_layers, il as usize).is_some() {
+                let freqs = if Self::layer_device_at(device, &placement, gpu_layers, il as usize)
+                    .is_some()
+                {
                     weights
                         .get(SHARED_ROPE_DEVICE)
                         .or_else(|| weights.get(SHARED_ROPE))
@@ -1900,7 +2132,7 @@ impl<'m> StreamingRunner<'m> {
                 // is live on it — the Q/K/V context above was dropped and its
                 // results copied out before this point.
                 let cmp = Self::compute_with(
-                    Self::layer_device(device, gpu_layers, il as usize),
+                    Self::layer_device_at(device, &placement, gpu_layers, il as usize),
                     threads,
                 );
                 // The scratch buffer holds tensor METADATA on both paths. What
@@ -2021,7 +2253,7 @@ impl<'m> StreamingRunner<'m> {
                     shapes.extend([(n_embd, n_new), (n_embd, n_new)]);
                 }
                 let cmp = Self::compute_with(
-                    Self::layer_device(device, gpu_layers, il as usize),
+                    Self::layer_device_at(device, &placement, gpu_layers, il as usize),
                     threads,
                 );
                 let ctx = cmp.context(arena_for(&shapes, 24))?;
@@ -2102,7 +2334,7 @@ impl<'m> StreamingRunner<'m> {
         let t_out = std::time::Instant::now();
         let last = x.len() - n_embd as usize;
         let cmp = Self::compute_with(
-            Self::edge_device(device, gpu_layers, n_layer_total),
+            Self::edge_device(device, edge, gpu_layers, n_layer_total),
             threads,
         );
         let ctx = cmp.context(arena_for(

@@ -1084,7 +1084,7 @@ parity doc had said "~100", which was a guess. Bigtea now accepts **106**.
 | RoPE / YaRN | 15 | **9 done**, 6 refused |
 | KV type + prompt cache | 7 | **done** |
 | runtime / memory | 31 | I/O mode, `--override-kv`, `--mlock`; **most refused with reasons** |
-| GPU | 15 | **8 done** — `--device`/`--main-gpu`, `--list-devices`, `-ngl`/`--gpu-layers`/`--n-gpu-layers`; 7 refused, all on multi-device scheduling |
+| GPU | 15 | **9 done** — `--device`/`--main-gpu`, `--list-devices`, `-ngl`/`--gpu-layers`/`--n-gpu-layers`, `-ot`/`--override-tensor`; 6 refused, all needing the scheduler wired into the forward pass |
 | grammar / JSON schema | 4 | the r10 worktree session owns this |
 
 **Nothing is accepted that does nothing.** ~20 flags are refused outright with a
@@ -2175,6 +2175,46 @@ All 21 container-backed V4-Flash tests pass with it active, including the
 element-sum comparisons against llama.cpp — the overlap changes *when* bytes are
 read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
 `BIGTEA_PREFETCH_READERS` tunes the split.
+
+## `--override-tensor`, and the same bug three times (2026-08-16)
+
+`-ot <pattern>=<CPU|GPU>` places named tensors regardless of `-ngl`, which is
+how llama.cpp users keep MoE experts off a card that cannot hold them. It reuses
+the per-tensor residency `-ngl` introduced, so the flag is mostly a pattern and
+two refusals.
+
+**The pattern is a substring with `*`, not a regex, and a regex is refused.**
+This workspace has no external dependencies, so a regex engine would be a new
+one for a single flag. The refusal is the part that matters: `blk\.(1[0-9])\..*_exps`
+treated as a literal matches nothing, the flag appears to work, and the model
+loads exactly where it would have anyway — a flag accepted and ignored, which is
+what the declined-flag table exists to prevent.
+
+**A rule that splits a single block is refused too, by name.** llama.cpp can put
+attention on the card and the FFN on the host inside one layer because its one
+graph goes through `ggml_backend_sched`. Here a block's graph runs in exactly one
+place, so `*ffn_down.weight=CPU` would build a mixed graph — and that segfaults
+rather than failing.
+
+**THE SAME BUG APPEARED THREE TIMES IN ONE DAY, and the third one is the
+lesson.** Every instance was a *graph* placed by one rule while its *weights*
+were placed by another:
+
+1. `rope_freqs.weight` bound host-side while block 0 ran on the card (`-ngl`).
+2. The device duplicate of it keyed on `gpu_layers > 0 && <= n_layer` — true for
+   a partial `-ngl`, **false for `-ot`**, which implies a full offload the rules
+   then carve into. Seven blocks read a device pointer from the host.
+3. `edge_device` never consulted the overrides, so `-ot "*=CPU"` ran the
+   embedding on the card over a host tensor.
+
+Each was exit 139 with no error. The fix is structural rather than three
+patches: **residency is resolved once at load into `block_placement` and
+`edge_placement`, and everything that decides where a graph runs reads those.**
+A second derivation of the same fact is what kept being wrong.
+
+`-ot "*=CPU"` now reproduces the pure-CPU completion exactly, which is the
+strongest check available for the flag: force everything home and the device
+path must vanish.
 
 ## `-ngl` runs, and it says the device path was never checked (2026-08-16)
 

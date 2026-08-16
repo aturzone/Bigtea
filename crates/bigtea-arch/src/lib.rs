@@ -32,7 +32,9 @@ pub use expert_cache::{CacheStats, ExpertCache};
 pub use kv::{KvCache, KvError, KvType};
 pub use qwen3::{architecture_is_verified, Qwen3Config, Qwen3Model, VERIFIED_ARCHITECTURES};
 pub use sample::{neg_log_prob, Sampler, SamplerConfig, SamplerStage};
-pub use stream::{configured_threads, configured_threads_batch, StreamStats, StreamingRunner};
+pub use stream::{
+    configured_threads, configured_threads_batch, StreamStats, StreamingRunner, TensorOverride,
+};
 
 use std::fmt;
 
@@ -58,6 +60,12 @@ pub enum ArchError {
     },
     /// A path that is deliberately refused rather than silently approximated.
     Unimplemented(&'static str),
+    /// A `--override-tensor` rule this build cannot honour, said out loud.
+    ///
+    /// Owned rather than `&'static str` because the useful message quotes the
+    /// user's own pattern back at them: a rule that matches nothing looks
+    /// identical to one that was never given.
+    BadOverride(String),
 }
 
 impl fmt::Display for ArchError {
@@ -73,6 +81,7 @@ impl fmt::Display for ArchError {
             ArchError::Ggml(e) => write!(f, "{e}"),
             ArchError::Kv(e) => write!(f, "{e}"),
             ArchError::Unimplemented(what) => write!(f, "not implemented: {what}"),
+            ArchError::BadOverride(why) => write!(f, "--override-tensor {why}"),
             ArchError::ContextTooLong { tokens, limit } => write!(
                 f,
                 "{tokens} tokens in one pass; this path takes {limit} at a time. \

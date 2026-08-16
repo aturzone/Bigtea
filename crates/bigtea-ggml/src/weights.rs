@@ -228,7 +228,21 @@ impl<'ctx> WeightSet<'ctx> {
         &mut self,
         backend: &crate::backend::Backend,
         ctx: &Context,
-    ) -> Result<(crate::backend::DeviceBuffer, UploadReport), GgmlError> {
+    ) -> Result<(Option<crate::backend::DeviceBuffer>, UploadReport), GgmlError> {
+        // **Nothing to place is not an out-of-memory.** `ggml_backend_alloc_ctx_
+        // tensors_from_buft` returns null both for "the device refused" and for
+        // "there was nothing to allocate", and reporting the second as the
+        // first told a user who wrote `-ot "*=CPU"` that their card was full.
+        if self.pending.is_empty() {
+            return Ok((
+                None,
+                UploadReport {
+                    tensors: 0,
+                    bytes: 0,
+                    seconds: 0.0,
+                },
+            ));
+        }
         let buffer = backend.alloc(ctx)?;
         let started = std::time::Instant::now();
         let mut bytes = 0usize;
@@ -244,7 +258,7 @@ impl<'ctx> WeightSet<'ctx> {
             bytes += data.as_bytes().len();
         }
         Ok((
-            buffer,
+            Some(buffer),
             UploadReport {
                 tensors,
                 bytes,

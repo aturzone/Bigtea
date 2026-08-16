@@ -345,7 +345,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "device    {:>7.2} GiB allocated, free {free_before:.2} -> {free_after:.2} GiB",
-        buffer.bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+        buffer.as_ref().map_or(0, |b| b.bytes()) as f64 / (1024.0 * 1024.0 * 1024.0),
     );
     println!(
         "load total {:>6.2}s  ({:.2}s disk + {:.2}s bus)",
