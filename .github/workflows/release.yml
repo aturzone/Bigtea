@@ -207,6 +207,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      # This job builds nothing, so a checkout looks like waste -- but `gh`
+      # infers the repository from the git remote, and `--notes-from-tag` is
+      # refused outright when `--repo` is passed instead ("using
+      # `--notes-from-tag` with `--repo` is not supported"). `fetch-depth: 0`
+      # brings the tags, which is where the notes come from.
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - uses: actions/download-artifact@v4
         with: { path: dist, merge-multiple: true }
       - run: ls -la dist
@@ -221,17 +228,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          if ! gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
             # --verify-tag refuses to invent a tag that does not exist, and
             # --notes-from-tag uses the annotated tag's own message rather than
             # generating a commit list nobody wrote.
-            gh release create "$TAG" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "$TAG" \
-              --notes-from-tag \
-              --verify-tag
+            gh release create "$TAG" --title "$TAG" --notes-from-tag --verify-tag
           fi
-          gh release upload "$TAG" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+          gh release upload "$TAG" dist/* --clobber
           echo "### Published \`$TAG\`" >> $GITHUB_STEP_SUMMARY
-          gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" --json assets \
+          gh release view "$TAG" --json assets \
             -q '.assets[] | "- \(.name)  \(.size) bytes"' >> $GITHUB_STEP_SUMMARY
