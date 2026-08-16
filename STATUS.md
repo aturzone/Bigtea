@@ -5,8 +5,14 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-16 · **Version**: v0.0.3 · **Branch**: `main` ·
-**Open PRs**: none. #83, #84 and #85 are merged and their branches deleted.
+**Last updated**: 2026-08-16 · **Version**: **v0.0.3, released** · **Branch**:
+`main` · **Open PRs**: none. #83-#89 merged, every branch deleted.
+
+**The release is out**: <https://github.com/aturzone/Chaos/releases/tag/v0.0.3>
+— Linux, macOS and Windows archives, verified by downloading the published
+Windows zip, running `install.ps1` from it, and generating text with the
+installed binary (`chaos-run llama "The largest ocean on Earth is"` →
+*"the Pacific Ocean, which covers an area"*, 18.94 tok/s).
 
 **The project is now called `chaos`.** Every crate, binary, environment variable
 and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
@@ -2230,6 +2236,27 @@ All 21 container-backed V4-Flash tests pass with it active, including the
 element-sum comparisons against llama.cpp — the overlap changes *when* bytes are
 read, never which. `CHAOS_PREFETCH_OVERLAP=0` disables it;
 `CHAOS_PREFETCH_READERS` tunes the split.
+
+## The release workflow had two bugs, and only a real tag could find them (2026-08-16)
+
+`release.yml` had never been fired against a tag. It was written, it asserted
+that every binary starts, and `STATUS.md` carried *"not yet fired against a real
+tag"* as a known unknown. Both failures were in the same final step, and in both
+the three platform builds and the installer smoke test passed first — so the
+archives were built correctly and then thrown away.
+
+1. **`gh release upload` requires a release, and a tag push does not create
+   one.** `release not found`, exit 1. Fixed by creating it when missing, with
+   `--verify-tag` so it cannot invent a tag.
+2. **`gh` refuses `--notes-from-tag` alongside `--repo`.** `--repo` was there
+   because the job checks nothing out. Fixed by checking out at `fetch-depth: 0`
+   — which is also what brings the tag the notes come from — and dropping
+   `--repo` from every `gh` call in the job.
+
+**A workflow that has never run is not a workflow that works**, and neither bug
+is visible by reading: both are about a command's behaviour rather than the
+YAML. The step now prints what it attached, with sizes, so a future silent
+success is at least a checkable one.
 
 ## Running it no longer starts with a path (2026-08-16)
 
