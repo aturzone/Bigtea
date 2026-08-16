@@ -2176,6 +2176,36 @@ element-sum comparisons against llama.cpp — the overlap changes *when* bytes a
 read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
 `BIGTEA_PREFETCH_READERS` tunes the split.
 
+## Generation on Qwen3-30B is 0.90x, not 2x behind (2026-08-16)
+
+`CLAUDE.md` has said in bold, for months: *"Generation is still ~2x behind (1.07
+vs 2.16) — do not claim otherwise."* **It no longer reproduces.**
+
+Both engines run **alternately in one session**, five pairs, medians:
+
+| | Bigtea | llama.cpp | ratio |
+|---|---:|---:|---:|
+| generation tok/s | **3.03** | **3.35** | 0.90x |
+| prefill tok/s | **1.22** | **1.17** | 1.04x |
+
+**This does not claim parity and certainly not a lead.** 0.90x is behind, and
+the generation ranges overlap almost completely (2.67–3.59 against 2.89–3.69).
+What can be said is that the gap is now inside this setup's noise, and that the
+specific "2x" figure is dead. Prefill is the tighter comparison: our five runs
+span 3%, the reference's span 50%.
+
+Caveats stated rather than buried: short prompt, and by the fifth pair the page
+cache is warm. Both engines get that equally because the runs alternate.
+
+Nothing was aimed at this number. It moved because of everything that landed
+since — the `-t`/`-tb` split, `compute()` once per phase, a file handle per
+reader, frequency-gated cache admission, R2's overlap and R3's KV cache.
+
+**The rule: re-run the headline before quoting it.** Third retraction here, and
+the first that moved a number *in our favour* — which is not better. The
+"generation is 2x behind" framing had been steering which work got picked. Full
+node: `research/qwen3moe-generation-parity-2026-08-16.md`.
+
 ## The GPU does not help a streaming MoE model — 4.3x slower (2026-08-16)
 
 `-ngl` is a smooth win on a dense model. On the model this project exists for it

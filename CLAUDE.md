@@ -6,7 +6,7 @@
 
 - **What it is**: a Rust inference runner whose job is running models that do *not* fit in memory. Keeps the always-read weights resident, streams routed experts from disk per token. Borrows `ggml` for arithmetic; owns memory, residency, streaming, and the token loop.
 - **Proven**: Qwen3-30B-A3B (17.28 GiB container) generates correct text on a 15.7 GiB machine holding 0.93 GiB resident + a 6.26 GiB expert cache.
-- **Prefill beats llama.cpp** at 565 (27.6 vs 23.6) and 2206 tokens (36.6 vs 33.6), and matches it at 4395 and 8775; `-b 4096` gives 43.6 vs 40.3. **Generation is still ~2x behind** (1.07 vs 2.16) — do not claim otherwise. llama.cpp also runs the 144 GB V4-Flash once `--no-repack` is passed, so "larger than RAM" is not a differentiator. Full ladder, retracted claims, and one experiment that failed: `docs/graph/research/head-to-head-llamacpp-2026-08-05.md`.
+- **Prefill beats llama.cpp** at 565 (27.6 vs 23.6) and 2206 tokens (36.6 vs 33.6), and matches it at 4395 and 8775; `-b 4096` gives 43.6 vs 40.3. **Generation was ~2x behind (1.07 vs 2.16); re-measured 2026-08-16 it is 0.90x** (3.03 vs 3.35, five alternating pairs) — still behind, now inside the noise. The 2x figure is dead; do not quote it, and do not claim a lead either (`qwen3moe-generation-parity-2026-08-16.md`). llama.cpp also runs the 144 GB V4-Flash once `--no-repack` is passed, so "larger than RAM" is not a differentiator. Full ladder, retracted claims, and one experiment that failed: `docs/graph/research/head-to-head-llamacpp-2026-08-05.md`.
 - Graph docs live in `/docs/graph/`; read `INDEX.md` first, then only the 2–3 nodes a task links to.
 
 ## Build / test / run
