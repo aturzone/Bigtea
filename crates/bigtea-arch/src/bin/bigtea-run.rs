@@ -3221,13 +3221,27 @@ fn run_streaming(
     };
     if let Some(index) = want_device {
         match runner.use_device(index) {
-            Ok(()) => match gpu_layers {
-                Some(n) => {
-                    runner.set_gpu_layers(n);
-                    bigtea_arch::info!("device     {index}, first {n} blocks resident on it");
+            Ok(()) => {
+                match gpu_layers {
+                    Some(n) => {
+                        runner.set_gpu_layers(n);
+                        bigtea_arch::info!("device     {index}, first {n} blocks resident on it");
+                    }
+                    None => bigtea_arch::info!("device     {index}, weights resident on it"),
                 }
-                None => bigtea_arch::info!("device     {index}, weights resident on it"),
-            },
+                // **On a streaming MoE model the card makes it SLOWER, and the
+                // user finds out four minutes into a 17 GiB run otherwise.**
+                // Measured on Qwen3-30B-A3B: generation 2.61 tok/s on the CPU,
+                // 1.44 at `-ngl 12`, 0.61 at `-ngl 48` -- a 4.3x loss, spread
+                // under 2% over three runs. Experts run on the host either way,
+                // so offloading attention buys nothing and pays a host round
+                // trip for the activation at every one of 48 blocks.
+                if config.is_moe() {
+                    bigtea_arch::info!(
+                        "WARNING    this model streams experts, and the device path MEASURED 4.3x SLOWER generation on Qwen3-30B-A3B (2.61 -> 0.61 tok/s). Experts run on the host whatever -ngl says, so the card only adds a round trip per block. See gpu-does-not-help-streaming-moe-2026-08-16.md"
+                    );
+                }
+            }
             Err(e) => return Err(format!("--device {index}: {e}").into()),
         }
         if !tensor_overrides.is_empty() {
