@@ -2,7 +2,7 @@ name: Release
 
 # Build redistributable binaries on a tag and attach them to the GitHub Release.
 #
-# Today the only way to try Bigtea is to install the GNU Rust toolchain, install
+# Today the only way to try Chaos is to install the GNU Rust toolchain, install
 # MSYS2, build ggml by hand and set an environment variable. That is a wall in
 # front of every potential user, and it is the largest single thing standing
 # between the project and anyone actually running it.
@@ -113,14 +113,14 @@ jobs:
         run: |
           cd target/release
           fail=0
-          for b in bigtea-run bigtea-probe bigtea-model-info bigtea-meta gguf-info bigtea-loadbench; do
+          for b in chaos-run chaos-probe chaos-model-info chaos-meta gguf-info chaos-loadbench; do
             exe="./$b${{ matrix.ext }}"
             test -f "$exe" || { echo "::error::$b was not built"; fail=1; continue; }
             # No arguments: every one of these prints usage and exits non-zero,
             # which is fine. A load-time failure exits without printing at all.
-            # bigtea-probe with no flags would measure disk bandwidth, so give
+            # chaos-probe with no flags would measure disk bandwidth, so give
             # it the cheap path; everything else prints usage and exits.
-            if [ "$b" = "bigtea-probe" ]; then args=(--help); else args=(); fi
+            if [ "$b" = "chaos-probe" ]; then args=(--help); else args=(); fi
             out=$("$exe" "${args[@]}" 2>&1 || true)
             if [ -z "$out" ]; then
               echo "::error::$b produced no output — it probably failed before main (missing runtime?)"
@@ -135,11 +135,11 @@ jobs:
         shell: bash
         run: |
           cd target/release
-          echo "### Dynamic dependencies of \`bigtea-run\` (${{ matrix.name }})" >> $GITHUB_STEP_SUMMARY
+          echo "### Dynamic dependencies of \`chaos-run\` (${{ matrix.name }})" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          if [ "${{ runner.os }}" = "Linux" ]; then ldd bigtea-run >> $GITHUB_STEP_SUMMARY || true
-          elif [ "${{ runner.os }}" = "macOS" ]; then otool -L bigtea-run >> $GITHUB_STEP_SUMMARY || true
-          else objdump -p bigtea-run.exe | grep 'DLL Name' >> $GITHUB_STEP_SUMMARY || true
+          if [ "${{ runner.os }}" = "Linux" ]; then ldd chaos-run >> $GITHUB_STEP_SUMMARY || true
+          elif [ "${{ runner.os }}" = "macOS" ]; then otool -L chaos-run >> $GITHUB_STEP_SUMMARY || true
+          else objdump -p chaos-run.exe | grep 'DLL Name' >> $GITHUB_STEP_SUMMARY || true
           fi
           echo '```' >> $GITHUB_STEP_SUMMARY
 
@@ -147,9 +147,9 @@ jobs:
         shell: bash
         run: |
           VER="${GITHUB_REF_NAME:-dev}"
-          DIR="bigtea-${VER}-${{ matrix.name }}"
+          DIR="chaos-${VER}-${{ matrix.name }}"
           mkdir -p "$DIR"
-          for b in bigtea-run bigtea-probe bigtea-model-info bigtea-meta gguf-info bigtea-loadbench; do
+          for b in chaos-run chaos-probe chaos-model-info chaos-meta gguf-info chaos-loadbench; do
             cp "target/release/$b${{ matrix.ext }}" "$DIR/"
           done
           cp README.md LICENSE NOTICE CHANGELOG.md STATUS.md "$DIR/"
@@ -158,12 +158,12 @@ jobs:
           else
             tar czf "$DIR.tar.gz" "$DIR"
           fi
-          ls -la bigtea-*.${{ matrix.archive }}
+          ls -la chaos-*.${{ matrix.archive }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: bigtea-${{ matrix.name }}
-          path: bigtea-*.${{ matrix.archive }}
+          name: chaos-${{ matrix.name }}
+          path: chaos-*.${{ matrix.archive }}
           if-no-files-found: error
 
   publish:

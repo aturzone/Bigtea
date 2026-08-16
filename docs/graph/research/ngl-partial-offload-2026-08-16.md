@@ -12,7 +12,7 @@ ever run — and chasing that produced the more useful result: **a greedy text
 diff is not a valid acceptance test for a GPU path, in any engine.** The
 kernels disagree by 0.37–0.71 in the logits while the model's own margin falls
 to 0.399, so the flip is arithmetic. The device picks the same token on 8 of 8
-first tokens. The measurement that shows this is in `bigtea-gpubench` now,
+first tokens. The measurement that shows this is in `chaos-gpubench` now,
 because the old one — `sum(|logits[0..64]|)` to four decimals — could not have
 failed.
 
@@ -68,7 +68,7 @@ llama.cpp, Llama-3.2-1B, --temp 0
   -ngl 99  The speed of light is approximately 299,792,458 meters per second.
 ```
 
-Bigtea flips on the same two prompts, and on `A triangle has` it flips the
+Chaos flips on the same two prompts, and on `A triangle has` it flips the
 *opposite* way. **A CPU kernel and a Vulkan kernel do not produce bit-identical
 sums; greedy decoding turns a last-bit difference into a different word.** So
 "the completion changed when I moved layers to the GPU" is not by itself
@@ -140,7 +140,7 @@ pins them to opposite backends.
 
 ## The 1-in-8 is arithmetic, not a bug — measured, same day
 
-`bigtea-gpubench` grew `--prompt <text>` and a real comparison. The old check was
+`chaos-gpubench` grew `--prompt <text>` and a real comparison. The old check was
 `sum(|logits[0..64]|)` to four decimals, and **Phase A reported "logit checksums
 agree" on it** — sixty-four entries of a 128k vocabulary, summed and rounded,
 which cannot see the top token move. It is kept as a tripwire; the verdict below

@@ -14,7 +14,7 @@ same direction: they described a ceiling that was ours rather than the machine's
 an unexamined assumption behind: that compute was ~1.0 s per token and therefore
 a floor at ~1 tok/s.
 
-`bigtea-kernelbench` (new) times the expert FFN with the weights **already in
+`chaos-kernelbench` (new) times the expert FFN with the weights **already in
 memory**, so the arithmetic is measured without the disk in the way:
 
 ```
@@ -34,7 +34,7 @@ memcpy on this machine, which is what a matrix-vector product against 4-bit
 weights should look like. The kernel is at DRAM bandwidth and there is nothing
 to win there.
 
-Measured against the real runner (`BIGTEA_BLOCK_TIMING=1`, single-token step,
+Measured against the real runner (`CHAOS_BLOCK_TIMING=1`, single-token step,
 2.66–3.11 GiB of the always-read set not resident):
 
 | phase | before | share |
@@ -68,7 +68,7 @@ another however many threads issue them. The drive never left queue depth 1,
 where an NVMe delivers a fraction of its rated throughput. The 1.59 → 1.99 gain
 came from overlapping user-space work, not from the device.
 
-`bigtea-iobench` (new) runs the identical scattered 4 MiB reads with one variable
+`chaos-iobench` (new) runs the identical scattered 4 MiB reads with one variable
 — shared handle, or one handle per thread:
 
 ```
@@ -87,7 +87,7 @@ ceiling, so that ceiling was the handle too.
 
 ### Implemented
 
-- `bigtea_model::Shard` opens a pool of `READER_HANDLES = 8` handles per shard,
+- `chaos_model::Shard` opens a pool of `READER_HANDLES = 8` handles per shard,
   at load time rather than mid-stream. `Shard::reader(slot)` hands one out, and
   falls back to the primary handle if the pool could not be opened, so a
   descriptor limit costs throughput rather than the run.
@@ -102,7 +102,7 @@ ceiling, so that ceiling was the handle too.
 
 ### Measured end to end
 
-Same prompt, same build except the change, `BIGTEA_BLOCK_TIMING=1`:
+Same prompt, same build except the change, `CHAOS_BLOCK_TIMING=1`:
 
 | | before | after | gain |
 |---|---:|---:|---:|
@@ -112,7 +112,7 @@ Same prompt, same build except the change, `BIGTEA_BLOCK_TIMING=1`:
 | generation | 0.182 tok/s | 0.227 tok/s | — |
 
 **The 1.32x on expert reads is the clean number** — it is independent of how much
-happened to be resident, and it matches `bigtea-iobench`'s 1.31x prediction.
+happened to be resident, and it matches `chaos-iobench`'s 1.31x prediction.
 
 The step and tok/s rows are **not** a clean A/B: the two runs had 3.11 and 2.66
 GiB of the always-read set missing respectively, so the second was slightly
@@ -123,7 +123,7 @@ end-to-end A/B needs stable free RAM and has not been run.
 ## What this changes about the ceiling
 
 At full residency a token is expert reads plus ~0.6 s of everything else. Expert
-reads were 2.03 s and are now 1.54 s, and **`bigtea-iobench` says the drive has
+reads were 2.03 s and are now 1.54 s, and **`chaos-iobench` says the drive has
 no more to give at this access pattern** — 2.69 GiB/s is where per-handle
 flattens too.
 

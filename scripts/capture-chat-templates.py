@@ -1,6 +1,6 @@
 """Capture llama.cpp's own rendering of every chat template it knows.
 
-The output is a fixture the Rust tests compare against, so "Bigtea renders the
+The output is a fixture the Rust tests compare against, so "Chaos renders the
 `gpt-oss` template correctly" means "byte-identical to what llama.cpp produced,
 on this command line, on this day" rather than "it looked right to me".
 
@@ -10,7 +10,7 @@ show up after tokenization (a template that emits a space before a special
 token, say), and the prompt the model actually sees is the thing worth
 matching. `--verbose-prompt` prints exactly that, token by token.
 
-    python scripts/capture-chat-templates.py > crates/bigtea-tokenizer/tests/chat-templates.txt
+    python scripts/capture-chat-templates.py > crates/chaos-tokenizer/tests/chat-templates.txt
 
 Newline tokens print as a quote, a real newline, and a quote on the next line,
 so the parse cannot be line-based -- it splits on the log's timestamp prefix

@@ -1,5 +1,5 @@
 ---
-topic: "Bigtea's chat framing against llama.cpp's, both paths, on token IDs — two silent bugs found and fixed, three models where we invent a template llama.cpp does not"
+topic: "Chaos's chat framing against llama.cpp's, both paths, on token IDs — two silent bugs found and fixed, three models where we invent a template llama.cpp does not"
 status: measured 2026-08-15, three rendering differences open
 links: [llamacpp-flag-audit.md, parity-band-discriminator-2026-08-15.md]
 ---
@@ -8,10 +8,10 @@ links: [llamacpp-flag-audit.md, parity-band-discriminator-2026-08-15.md]
 
 `scripts/jinja-vs-llamacpp.py` says, in its own docstring:
 
-> Compare Bigtea's Jinja rendering against `llama.cpp --jinja`.
+> Compare Chaos's Jinja rendering against `llama.cpp --jinja`.
 
 It does not. It runs `llama-completion` **twice** — once with `--jinja`, once
-with `--no-jinja` — and never invokes Bigtea at all. What it measures is real and
+with `--no-jinja` — and never invokes Chaos at all. What it measures is real and
 worth keeping: **llama.cpp's hardcoded renderer disagrees with llama.cpp's own
 Jinja on 5 of 18 containers**, which is the disagreement our family matcher has
 to pick a side of. But it is not evidence about our engine, and it was being read
@@ -20,11 +20,11 @@ as though it were.
 Same failure as the `REFUSED` table's `--jinja` row: a description that outlived
 the code, still true-sounding, still being quoted.
 
-`scripts/jinja-bigtea-vs-llamacpp.py` runs the four-way that settles it:
+`scripts/jinja-chaos-vs-llamacpp.py` runs the four-way that settles it:
 
 ```
-bigtea --jinja   vs  llama.cpp --jinja      does OUR Jinja match THEIRS?
-bigtea           vs  llama.cpp --no-jinja   does our family matcher match?
+chaos --jinja   vs  llama.cpp --jinja      does OUR Jinja match THEIRS?
+chaos           vs  llama.cpp --no-jinja   does our family matcher match?
 ```
 
 on **token IDs rather than rendered text**, because the tokens are what the model
@@ -35,7 +35,7 @@ look.
 ## What it found immediately: BOS twice
 
 ```
-bigtea --jinja : [2, 2, 105, 2364, 107, 86404, ...]
+chaos --jinja : [2, 2, 105, 2364, 107, 86404, ...]
 llama.cpp      : [2,    105, 2364, 107, 86404, ...]
 ```
 
@@ -65,10 +65,10 @@ llama.cpp emits the user text and nothing else:
 
 ```
 starcoder2   llama.cpp: [14776]                      <- "HI", and that is all
-             bigtea   : [2964, 63, 18273, 222, 514, 63, 37211, 222, 17595, 63]
+             chaos   : [2964, 63, 18273, 222, 514, 63, 37211, 222, 17595, 63]
                                                      <- "System: SYS\nUser: HI\nAssistant:"
 MiniLM       llama.cpp: [101, 7632, 102]             <- [CLS] hi [SEP]
-             bigtea   : [101, 2291, 1024, ... 102]
+             chaos   : [101, 2291, 1024, ... 102]
 ```
 
 Ours is a deliberate fallback and it announces itself (*"chat template not
@@ -90,7 +90,7 @@ the next time rather than inherited.
 `tinyllama`, family path only — our Jinja and llama.cpp's Jinja already agree:
 
 ```
-bigtea   : ... 14816, 29903,  2, 29871, 13, 29966 ...   <- `</s>` between turns
+chaos   : ... 14816, 29903,  2, 29871, 13, 29966 ...   <- `</s>` between turns
 llama.cpp: ... 14816, 29903,     29966 ...              <- no separator
 ```
 
@@ -107,7 +107,7 @@ it in the tokenizer:
 ```
 input      <|user|>\nSYS\nHI<|end|>\n<|assistant|>\n
 llama.cpp  [1, 32010, 317, 21554, 13, 17628, 32007, 32001]                       8 tokens
-bigtea     [1, 32010, 29871, 13, 14816, 29903, 13, 17628, 32007, 29871, 13, ...] 14
+chaos     [1, 32010, 29871, 13, 14816, 29903, 13, 17628, 32007, 29871, 13, ...] 14
 ```
 
 llama.cpp drops whitespace **following a special token**
@@ -275,7 +275,7 @@ larger prompt list.
 same literal string was the step that mattered. The remaining three are genuinely
 in the rendering, and none is a silent-position bug of the BOS or RSTRIP kind.
 
-All three are reachable from `python scripts/jinja-bigtea-vs-llamacpp.py
+All three are reachable from `python scripts/jinja-chaos-vs-llamacpp.py
 <model.gguf>`, which prints both sides' token IDs. **Rule out the tokenizer
 first**: render the prompt, feed the identical string to both engines with `-p`,
 and see whether they still disagree. Two of the three bugs found today were on

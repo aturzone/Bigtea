@@ -31,12 +31,12 @@ branch for v2 that reads real v2 containers wrongly — every string and array
 length taken from the wrong four bytes — and a test built on the same wrong
 premise would have agreed with it.
 
-Bigtea's reader already accepted `2..=3` with 64-bit lengths, so **it was already
+Chaos's reader already accepted `2..=3` with 64-bit lengths, so **it was already
 correct**; what D2 actually needed was the proof, which is what this delivers.
 
 ## What is tested
 
-`crates/bigtea-gguf/tests/container_versions.rs`, with headers built byte by
+`crates/chaos-gguf/tests/container_versions.rs`, with headers built byte by
 byte in `tests/common/mod.rs` — no download, and the builder can declare a length
 that disagrees with the bytes after it, which is what D1 needs next.
 

@@ -1,7 +1,7 @@
 # The tok/s-versus-offload frontier: a smooth dial, not a switch
 
 **2026-08-16.** Qwen3-4B-Q4_K_M (2.33 GiB), RTX 3050 6 GB via Vulkan, i7-13650HX.
-`bigtea-run -n 16 --temp 0`, three runs per point, **median** reported.
+`chaos-run -n 16 --temp 0`, three runs per point, **median** reported.
 
 `-ngl` landed the same day with no performance number attached, which is a gap
 worth closing rather than leaving: a placement flag whose effect on speed is
@@ -40,8 +40,8 @@ something, prefill peaks at 36". That is false. The three runs at `-ngl 36` were
 being explained.
 
 This is the third time this project has caught a confident causal story built on
-one GPU run, and the first two both reached a published number. `bigtea-gpubench`
-refuses `--repeat 1` without `--force` for exactly this reason; `bigtea-run` has
+one GPU run, and the first two both reached a published number. `chaos-gpubench`
+refuses `--repeat 1` without `--force` for exactly this reason; `chaos-run` has
 no such guard, so a sweep driven from the shell has to bring its own.
 
 ## What this is not
@@ -52,7 +52,7 @@ GiB of VRAM, the largest model at the speed you want* — needs a model that doe
 **not** fit, and this is not that measurement.
 
 It also is not a comparison. llama.cpp was not run on this ladder; the numbers
-here are Bigtea against itself.
+here are Chaos against itself.
 
 ## Open
 

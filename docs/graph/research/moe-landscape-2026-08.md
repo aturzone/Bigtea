@@ -51,7 +51,7 @@ specific details do not.
   discussion thread in full; these numbers do not appear anywhere in it or in web search. The
   discussion's *real* cited numbers are different: "top 10% of experts take ~80% of hits"
   (measured on Qwen3.5-122B), "~99% simulated hit rate at 69% expert budget" (cited prior work),
-  and throughput gains of +7%–+57% (PR) / +25% on GLM-5.1 754B (RFC). If Bigtea needs a citable
+  and throughput gains of +7%–+57% (PR) / +25% on GLM-5.1 754B (RFC). If Chaos needs a citable
   break-even/ceiling figure, use these real ones, not 45.89%/70%.
 - Status: PR **closed, not merged**; Discussion/RFC **open** as of 2026-08-02.
 
@@ -163,40 +163,40 @@ Created 2026-04-06, last pushed 2026-04-08 — matches "Apr 2026."
 
 - The physical-law convergence the advisory flags (WASTE / ds4 / leloch's RFC all landing on
   similar cache-budget and break-even-hit-rate reasoning) is real in spirit but the llama.cpp-side
-  specific numbers (45.89%/70%) the advisory cites don't exist in the primary source — Bigtea's
+  specific numbers (45.89%/70%) the advisory cites don't exist in the primary source — Chaos's
   benchmark schema should still carry a `regime` field, just cite the RFC's real numbers (~80% of
   hits from top 10% of experts, +7–57%/+25% throughput gains) if referencing this work.
 - **ktransformers observability (T4/T5) is still open ground** — confirmed nothing shipped, no
   roadmap commitment, and the two nearest-adjacent open issues (#2093, #2003) are about placement/
-  I/O, not observability. This is the least contested part of Bigtea's plan.
+  I/O, not observability. This is the least contested part of Chaos's plan.
 - **llama.cpp side is more contested than the original gaps node suggests, but still open**: a
   real, working (if unmerged) expert-cache implementation exists (leloch's PR/branches), with an
   active RFC discussion. It has not merged as of 2026-08-02 — mainline llama.cpp still has the
-  #20757 gap in practice — but it is closer to shipping than a cold feature request. Bigtea's
+  #20757 gap in practice — but it is closer to shipping than a cold feature request. Chaos's
   ADR "track upstream dynamically" amendment is the correct posture: if `moe-cache`/`v3-expert-
-  cache` merges before Bigtea's relevant ticket lands, that ticket should become "expose upstream's
+  cache` merges before Chaos's relevant ticket lands, that ticket should become "expose upstream's
   new flag + hit-rate metric" rather than build one from scratch.
 - **DwarfStar (ds4)** is the most credible adjacent project (~20k stars in 3 months) but occupies
   a different lane: a narrow, single-model-family engine (DeepSeek V4/GLM 5.2 only) on
   Mac-primary/CUDA/ROCm, not a general wrapper over ktransformers/llama.cpp. It doesn't directly
-  compete with Bigtea's wrapper-core scope, but its shipped UX (disk-persistent KV cache, 80%
+  compete with Chaos's wrapper-core scope, but its shipped UX (disk-persistent KV cache, 80%
   auto-budget resolver) is a concrete bar for what "good" cache-budget UX looks like, worth
-  referencing when Bigtea designs its own auto-tuning ticket.
+  referencing when Chaos designs its own auto-tuning ticket.
 - **FATE/llama-moe-cache (ongunm)** is a tiny (8-star), single-author, narrow (~500 LoC) extension
   — not a competitive threat, but a working proof that GPU-lane predictive prefetch can hit
   >99% in a favorable (small-model, ample-VRAM-headroom) case. Its AGPL/commercial dual license
-  means Bigtea should not vendor its code even for reference implementation without checking terms.
+  means Chaos should not vendor its code even for reference implementation without checking terms.
 - **Net**: no project has shipped a general, cross-engine (ktransformers + llama.cpp),
   install+auto-tune+observability wrapper. Individual gaps are each being chipped at by narrow,
   single-purpose, mostly-unmerged/unshipped efforts (leloch's branches, ongunm's extension,
   ktransformers' placement/residency issues) rather than a unified product — which is still
-  Bigtea's opening. The gaps node's original open question ("no independent comparison of
+  Chaos's opening. The gaps node's original open question ("no independent comparison of
   solo-user experience between the two projects") still stands.
 
 ## Open questions
 
 - Whether leloch's Discussion #24528 (or a follow-up PR) merges into llama.cpp mainline, and on
-  what timeline — directly determines whether Bigtea's llama.cpp-side observability/cache ticket
+  what timeline — directly determines whether Chaos's llama.cpp-side observability/cache ticket
   scope should shift to "wrap upstream's new flag" instead of building from scratch.
 - Whether ktransformers' #2093 (EMA-based expert placement) or #2003 (MESH residency) ship, and
   whether either exposes any hit-rate/observability signal as a side effect.

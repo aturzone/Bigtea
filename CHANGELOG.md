@@ -30,7 +30,7 @@ caching at random. See
 
 ### Added
 
-- `BIGTEA_ROUTING_DUMP=<path>` writes raw `pass,layer,expert,count` rows, so two
+- `CHAOS_ROUTING_DUMP=<path>` writes raw `pass,layer,expert,count` rows, so two
   runs can be compared offline and passes are not conflated.
 - `tools/routing/` — the prompts, capture script and analysis behind the above.
 - `STATUS.md` — one canonical statement of where the project stands and what
@@ -47,7 +47,7 @@ In the order the measurements justify — see
 - Overlap expert reads with compute. 2.3s of I/O and 1.0s of compute per token
   run serially; llama.cpp gets this overlap free from `mmap`. Layers 0-2 route by
   token id, so their expert set is knowable before any compute runs.
-- Model downloader (`bigtea pull`) resolving names to Hugging Face repos, with
+- Model downloader (`chaos pull`) resolving names to Hugging Face repos, with
   resume, checksums and a disk-space check before starting.
 - Quant selection from the hardware probe, with the tok/s prediction stated
   *before* a 144 GB download begins.
@@ -64,7 +64,7 @@ Findings, a retraction, and the measurement that changes the project's direction
 
 ### Added
 
-- `BIGTEA_ROUTING=1` prints how often each expert of each layer is actually
+- `CHAOS_ROUTING=1` prints how often each expert of each layer is actually
   selected, and what the hot set would cost to keep resident.
 
 ### Discovered
@@ -92,19 +92,19 @@ that are. See
 
 ### Retracted
 
-**v0.0.1's claim that Bigtea leads llama.cpp on DeepSeek-V4-Flash.** It claimed
-3.0x faster load and 1.20x faster prefill. Both were false: Bigtea's numbers were
+**v0.0.1's claim that Chaos leads llama.cpp on DeepSeek-V4-Flash.** It claimed
+3.0x faster load and 1.20x faster prefill. Both were false: Chaos's numbers were
 measured fresh and llama.cpp's were copied from a two-day-old document taken under
 different free-RAM conditions, so the engines were never run back to back. Run
 back to back, twice:
 
-| | Bigtea | llama.cpp |
+| | Chaos | llama.cpp |
 |---|---:|---:|
 | load | 10.0s | 10.5s |
 | prefill, per prompt token | 2440 ms | **1503 ms** |
 | generation | 0.064 tok/s | **0.21–0.31 tok/s** |
 
-**Bigtea leads on nothing on this model.** It remains ahead on Qwen3-30B-A3B
+**Chaos leads on nothing on this model.** It remains ahead on Qwen3-30B-A3B
 prefill at 565 and 2206 tokens, measured back to back.
 
 ## [0.0.1] — 2026-08-07
@@ -126,8 +126,8 @@ llama.cpp's element sums.
   share of the bytes. Parallel reads had been tried and reverted twice before;
   the difference is batch size — per-tensor groups are 6 slices at generation
   time, and the thread spawns cost more than the queue depth buys.
-- `BIGTEA_THREADS` selects the thread count per graph evaluation, and
-  `BIGTEA_BLOCK_TIMING` now reports each phase of a block separately.
+- `CHAOS_THREADS` selects the thread count per graph evaluation, and
+  `CHAOS_BLOCK_TIMING` now reports each phase of a block separately.
 
 ### Performance
 
@@ -135,19 +135,19 @@ DeepSeek-V4-Flash, same machine, both engines' command lines and outputs in
 [`v4flash-vs-llamacpp-2026-08-07.md`](docs/graph/research/v4flash-vs-llamacpp-2026-08-07.md):
 
 > **⚠ Retracted the same day.** This section originally claimed 3.0x faster load
-> and 1.20x faster prefill. Both were wrong: Bigtea's numbers were fresh and
+> and 1.20x faster prefill. Both were wrong: Chaos's numbers were fresh and
 > llama.cpp's were copied from a two-day-old document taken under different
 > free-RAM conditions, so the two engines were never run back to back. Corrected
 > figures, measured back to back twice:
 
-| | Bigtea | llama.cpp | |
+| | Chaos | llama.cpp | |
 |---|---:|---:|:--|
 | load | 10.0s | 10.5s | parity |
 | prefill, per prompt token | 2440 ms | **1503 ms** | llama.cpp 1.62x faster |
 | generation | 0.064 tok/s | **0.21-0.31 tok/s** | llama.cpp 3-4x faster |
 
-**Bigtea leads on nothing on this model.** The speedups below are real and
-measured against Bigtea's own previous version; they simply did not close the gap.
+**Chaos leads on nothing on this model.** The speedups below are real and
+measured against Chaos's own previous version; they simply did not close the gap.
 
 A single-token forward pass costs **4.0s**. That is what one step of a KV-cached
 loop will cost — 0.25 tok/s — and it is the number to plan against, because the
@@ -160,10 +160,10 @@ loop will cost — 0.25 tok/s — and it is the number to plan against, because 
 - macOS: Accelerate framework was never linked, though ggml's cmake enables it by
   default and calls vDSP.
 - macOS: OpenMP was demanded unconditionally; AppleClang ships none.
-  `BIGTEA_GGML_OPENMP` overrides the per-platform default.
+  `CHAOS_GGML_OPENMP` overrides the per-platform default.
 - The documented `cmake` line built **shared** ggml libraries, so a new user
   following the README got no `.a` archives at all.
-- `bigtea-arch` now fails with one actionable message when ggml is missing,
+- `chaos-arch` now fails with one actionable message when ggml is missing,
   instead of a wall of unresolved imports.
 - Declared MSRV was 1.74 while the code used a 1.82 API. Now 1.82.
 
@@ -192,10 +192,10 @@ not built yet. See [README](README.md#status) for what is and is not there.
   instead of 300%.
 - **Residency with a hard budget**, which reports what did not fit, what
   re-reading it costs per token, and which processes to close to fix it.
-- `bigtea-run` — prefill and generation.
-- `bigtea-probe` — RAM, disk, GPU, and what to close.
-- `bigtea-model-info` — fit prediction and tok/s estimate before running.
-- `bigtea-meta`, `gguf-info`, `bigtea-loadbench` — container and I/O inspection.
+- `chaos-run` — prefill and generation.
+- `chaos-probe` — RAM, disk, GPU, and what to close.
+- `chaos-model-info` — fit prediction and tok/s estimate before running.
+- `chaos-meta`, `gguf-info`, `chaos-loadbench` — container and I/O inspection.
 - 157 unit tests and 16 container-backed tests.
 
 ### Performance
@@ -205,9 +205,9 @@ engines produce identical, correct output; llama.cpp is measured with a warm pag
 cache. Full command lines and outputs in
 [`head-to-head-llamacpp-2026-08-05.md`](docs/graph/research/head-to-head-llamacpp-2026-08-05.md).
 
-Qwen3-30B-A3B Q4_K_M prefill, Bigtea / llama.cpp:
+Qwen3-30B-A3B Q4_K_M prefill, Chaos / llama.cpp:
 
-| tokens | Bigtea | llama.cpp |
+| tokens | Chaos | llama.cpp |
 |---:|---:|---:|
 | 565 | **27.64** | 23.55 |
 | 2206 | **36.60** | 33.59 |
@@ -220,7 +220,7 @@ Qwen3-30B-A3B Q4_K_M prefill, Bigtea / llama.cpp:
 - **Generation is slower than llama.cpp.** DeepSeek-V4-Flash: 0.077 tok/s against
   0.45, because the V4-Flash path has no KV cache yet and each token re-runs the
   whole sequence. Qwen3-30B-A3B: 1.07 against 2.16, about 2x. On V4-Flash
-  **Bigtea leads on nothing** — see the retraction above. It is ahead only on
+  **Chaos leads on nothing** — see the retraction above. It is ahead only on
   Qwen3-30B-A3B prefill at 565 and 2206 tokens.
 - **Linux and macOS build and pass the unit tests in CI, but no model has been
   run on either.** macOS additionally has no direct-I/O path — `F_NOCACHE` needs
@@ -240,7 +240,7 @@ Qwen3-30B-A3B Q4_K_M prefill, Bigtea / llama.cpp:
   requires a competitor's exact command line and output before any competitive
   claim is citable.
 
-[Unreleased]: https://github.com/aturzone/Bigtea/compare/v0.0.2...HEAD
-[0.0.2]: https://github.com/aturzone/Bigtea/releases/tag/v0.0.2
-[0.0.1]: https://github.com/aturzone/Bigtea/releases/tag/v0.0.1
-[0.0.0]: https://github.com/aturzone/Bigtea/releases/tag/v0.0.0
+[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/aturzone/Chaos/releases/tag/v0.0.2
+[0.0.1]: https://github.com/aturzone/Chaos/releases/tag/v0.0.1
+[0.0.0]: https://github.com/aturzone/Chaos/releases/tag/v0.0.0

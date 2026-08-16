@@ -23,8 +23,8 @@ That is the finding that was worth 1.32x on expert reads
 (`the-plateau-was-ours-2026-08-10.md`). But:
 
 ```
-crates/bigtea-model/src/lib.rs:158   const READER_HANDLES: usize = 8;
-crates/bigtea-arch/src/deepseek4_forward.rs:542   const READERS: usize = 8;
+crates/chaos-model/src/lib.rs:158   const READER_HANDLES: usize = 8;
+crates/chaos-arch/src/deepseek4_forward.rs:542   const READERS: usize = 8;
 ```
 
 **The expert read already uses all eight.** `read_expert_slices` fans out over

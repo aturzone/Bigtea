@@ -14,17 +14,17 @@ fresh clone builds in 22s and runs V4-Flash.
 **Measured back to back against llama.cpp on DeepSeek-V4-Flash** (this is the
 honest scoreboard; do not quote anything else):
 
-| | Bigtea | llama.cpp |
+| | Chaos | llama.cpp |
 |---|---:|---:|
 | load | 10.0s | 10.5s |
 | prefill, per prompt token | 2440 ms | **1503 ms** |
 | generation | 0.064 tok/s | **0.21–0.31 tok/s** |
 
-**Bigtea leads on nothing on V4-Flash.** It leads on Qwen3-30B-A3B prefill at 565
+**Chaos leads on nothing on V4-Flash.** It leads on Qwen3-30B-A3B prefill at 565
 and 2206 tokens. A claim of leading V4-Flash was published in v0.0.1 and
 retracted the same day — see `v4flash-vs-llamacpp-2026-08-07.md`.
 
-**Today's gains** (all against Bigtea's own previous version, all verified
+**Today's gains** (all against Chaos's own previous version, all verified
 against the llama.cpp oracle): prefill 32.4s → 10.1s for 5 tokens (**2.2x**),
 generation 0.042 → 0.077 tok/s, single-token pass 7.9s → 4.0s.
 
@@ -80,7 +80,7 @@ Answered on eight prompts across four subjects:
   (actually 1.60) and the "~48 GiB desktop" claim (unsupported). See the
   correction block on `routing-skew-changes-everything.md`.
 - Tooling is committed: `tools/routing/capture.sh` + `analyse.py`,
-  and `BIGTEA_ROUTING_DUMP=<path>` writes raw per-layer counts.
+  and `CHAOS_ROUTING_DUMP=<path>` writes raw per-layer counts.
 
 ### R0.1 — Does prompt routing predict *generated*-token routing?  ✅ **DONE 2026-08-08 — yes**
 
@@ -131,7 +131,7 @@ rate reported beside footprint and tok/s.
 ### R2 — Overlap I/O with compute
 
 Both engines read the same bytes from the same drive; llama.cpp's mmap lets the
-kernel read ahead **while the CPU computes the previous layer**. Bigtea reads,
+kernel read ahead **while the CPU computes the previous layer**. Chaos reads,
 waits, computes, reads: measured **2.3s I/O + 1.0s compute, strictly serial**.
 
 - **R2.1** Within a block: `gate` and `up` are needed before `down`'s matmul, so
@@ -223,11 +223,11 @@ Generation re-runs the whole sequence per token, so 0.064 tok/s is an artefact.
 ### R4 — Fit the always-read set
 
 7.38 GiB; fits only above ~10.5 GiB free. Worth 0.7s/token when it does not.
-Bigtea already names the processes to close and the cost per token.
+Chaos already names the processes to close and the cost per token.
 
 ### R5 — The product (`lts-0-0-0.md` T1–T5, unchanged)
 
-`bigtea pull` from Hugging Face with resume and checksums · quant selection from
+`chaos pull` from Hugging Face with resume and checksums · quant selection from
 the probe with the tok/s prediction stated *before* a 144 GB download ·
 self-configuration · **OpenAI-compatible `/v1/chat/completions`, the single item
 that makes it usable from a coding agent** · prebuilt binaries.
@@ -236,7 +236,7 @@ that makes it usable from a coding agent** · prebuilt binaries.
 
 One binary that reads the probe and configures itself: on 8 GiB, 16, 48 or 128,
 pick the quant, the cache size, the prefill block, the I/O mode — and **say what
-tok/s to expect before doing anything.** `bigtea-model-info` already predicts;
+tok/s to expect before doing anything.** `chaos-model-info` already predicts;
 it needs the skew model folded in, because a hot-set cache changes the
 prediction completely.
 
@@ -276,9 +276,9 @@ Ideas, roughly by expected value:
    usable holds **~9-10 indices**. **R0 caveat: it must be warmed, not pinned** —
    pinned it inherits the 37.5% cross-subject figure, barely above a random 25%.
    Three blockers before any of this is testable: no CUDA toolkit on this machine,
-   the linked ggml has no CUDA backend built, and Bigtea's zero-copy weight
+   the linked ggml has no CUDA backend built, and Chaos's zero-copy weight
    binding hands ggml a host pointer, which a device tier cannot do. Nothing in
-   the codebase touches the GPU today — `bigtea-probe` only detects it.
+   the codebase touches the GPU today — `chaos-probe` only detects it.
 5. **Speculative decoding**, ~2.2x, proven, independent of all the above, needs a
    draft model sharing V4-Flash's tokenizer.
 6. **Not this**: contextual sparsity. Measured dead — V4-Flash's experts are 9.1%

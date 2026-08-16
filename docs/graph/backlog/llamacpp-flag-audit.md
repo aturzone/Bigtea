@@ -1,5 +1,5 @@
 ---
-topic: Every one of llama.cpp's 182 flags, categorised against what Bigtea has — the real denominator for "all of its options", replacing an estimate that was never checked
+topic: Every one of llama.cpp's 182 flags, categorised against what Chaos has — the real denominator for "all of its options", replacing an estimate that was never checked
 status: audited 2026-08-10, tracked
 links: [lts-parity-criteria.md]
 ---
@@ -19,7 +19,7 @@ which is why it can be stated exactly:
 
 ```
 $ llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u   # 182
-  intersected with bigtea-run's match arms                                      # 158 implemented
+  intersected with chaos-run's match arms                                      # 158 implemented
   intersected with its REFUSED table                                            #  24 declined
   in neither                                                                    #   0
 ```
@@ -33,7 +33,7 @@ set, and the consequence was not "the flag errors". The fallback arm took any
 leftover token as the prompt, so:
 
 ```
-$ bigtea-run -m model.gguf -fa off "hello"
+$ chaos-run -m model.gguf -fa off "hello"
 ```
 
 set `prompt = "-fa"`, discarded `"hello"`, exited **0**, and fluently completed
@@ -58,7 +58,7 @@ into a comparison of a run with itself.
 | RoPE, YaRN, context shift | 15 | **9 done 2026-08-11**; the other 6 refused, see below |
 | logging | 13 | **11 done 2026-08-11**; status moved to stderr |
 | **GPU** | 15 | **won't** — no backend to apply them to |
-| fetch / Hugging Face | 9 | partly covered by `bigtea-pull`, different spelling |
+| fetch / Hugging Face | 9 | partly covered by `chaos-pull`, different spelling |
 | reasoning / speculative draft | 8 | gap |
 | KV cache type / prompt cache | 7 | **done 2026-08-11** -- both halves |
 | chat template | 6 | **6 done** — `--jinja`/`--chat-template-file` were "won't" and are implemented; the retraction is below |
@@ -76,7 +76,7 @@ accepted them; the count did not see them.
 Measured from the parser instead:
 
 ```
-$ grep -oE '"(-{1,2}[a-zA-Z0-9][a-zA-Z0-9-]*)"' bigtea-run.rs     | tr -d '"' | grep '^--' | sort -u | wc -l
+$ grep -oE '"(-{1,2}[a-zA-Z0-9][a-zA-Z0-9-]*)"' chaos-run.rs     | tr -d '"' | grep '^--' | sort -u | wc -l
 106
 ```
 
@@ -86,7 +86,7 @@ description, and it drifts.
 
 **"All of them" is not the right target and this table is why.** Fifteen are
 GPU-only on an engine with no GPU backend; several more (`--no-mmap`,
-`--mlock`, `--direct-io`) describe a loading strategy Bigtea does not use
+`--mlock`, `--direct-io`) describe a loading strategy Chaos does not use
 because it owns residency itself, which is the entire design. Implementing
 those as no-ops that accept the flag and change nothing would be worse than not
 having them — that is precisely the failure `-t` had for weeks.
@@ -105,7 +105,7 @@ existing temperature/top-k/top-p/min-p/penalties.
 accepted, echoed, and silently doing nothing:
 
 1. `is_greedy()` short-circuited to the raw argmax, so `--logit-bias` and
-   `--ignore-eos` were ignored at temperature 0, which is Bigtea's default.
+   `--ignore-eos` were ignored at temperature 0, which is Chaos's default.
 2. `--mirostat 2` alone produced **byte-identical output to greedy**, twice:
    once through `is_greedy`, then again through the temperature-0 early return.
    llama.cpp's default temperature is 0.8 and ours is 0, so "mirostat with no
@@ -117,7 +117,7 @@ Caught by tests and by running the flags against a real model and reading the
 output. **Two of the three are invisible in any test that only checks the
 process exits zero**, which is what makes this category worth the care.
 
-## Done 2026-08-11 — interaction, and Bigtea has a REPL
+## Done 2026-08-11 — interaction, and Chaos has a REPL
 
 `-i`/`--interactive`, `-cnv`/`--conversation`, `-st`/`--single-turn`,
 `--multiline-input`, `--in-prefix`, `--in-suffix`, `--in-prefix-bos`,
@@ -131,7 +131,7 @@ tokens, because everything said so far is already in the cache. Verified as a
 real conversation rather than a mechanism:
 
 ```
-$ bigtea-run <llama-3.2-1b> "Name the capital of France in one word." \
+$ chaos-run <llama-3.2-1b> "Name the capital of France in one word." \
     -n 24 -cnv -sys "You are terse. Answer with one word only."
 chat       llama3 template
 Paris.
@@ -149,7 +149,7 @@ Two things that would otherwise be silent:
   answer ends the next one instantly, and the session looks hung.
 
 `--keep` is deliberately **not** accepted. It controls what survives a context
-shift, and Bigtea has no context shift — accepting it would be a flag that does
+shift, and Chaos has no context shift — accepting it would be a flag that does
 nothing, which is the exact failure this audit exists to prevent.
 
 ## Done 2026-08-11 — RoPE and YaRN, 9 of the 15
@@ -171,7 +171,7 @@ inverts every long-context model, silently.
 Overrides are **printed**, not applied quietly:
 
 ```
-$ bigtea-run <llama-3.2-1b> ... --rope-freq-base 50000 --rope-scale 2
+$ chaos-run <llama-3.2-1b> ... --rope-freq-base 50000 --rope-scale 2
 rope       overridden: freq_base 500000 -> 50000, freq_scale 1 -> 0.5
 ```
 
@@ -193,18 +193,18 @@ keep the full window cache, so the flag has nothing to switch).
 **The flags are the smaller half. The real change is that status now goes to
 stderr.** Everything the runner says about itself — shape, residency, prefill
 timing — is diagnostics; the generated text is output. They shared stdout, so
-`bigtea-run … > answer.txt` captured a 16-line header along with the answer and
+`chaos-run … > answer.txt` captured a 16-line header along with the answer and
 there was no way to separate them.
 
 ```
-$ bigtea-run <llama-3.2-1b> "The capital of France is" -n 6 --log-disable 2>/dev/null
+$ chaos-run <llama-3.2-1b> "The capital of France is" -n 6 --log-disable 2>/dev/null
  Paris. The capital of France
 
-$ bigtea-run … --log-file bt.log 2>/dev/null | head -3
+$ chaos-run … --log-file bt.log 2>/dev/null | head -3
  Paris. The capital of France
    [bt.log: 16 lines, starting "model      llama (direct (cache bypassed))"]
 
-$ bigtea-run … --log-timestamps --log-prefix
+$ chaos-run … --log-timestamps --log-prefix
    0.152 I model      llama (direct (cache bypassed))
 ```
 
@@ -228,7 +228,7 @@ would continue it, growing the penalty geometrically with how long the run
 already is.
 
 ```
-$ bigtea-run <llama-3.2-1b> "The sea is blue. The sea is blue. The sea is blue. The sea is" -n 14
+$ chaos-run <llama-3.2-1b> "The sea is blue. The sea is blue. The sea is blue. The sea is" -n 14
  blue. The sea is blue. The sea is blue. The sea      <- stuck
 
 $ ... --dry-multiplier 1.5
@@ -274,7 +274,7 @@ chain, so the constraint costs nothing in practice.
 
 ```
 $ ... --samplers "top_k;top_q"
-bigtea-run: --samplers: unknown stage "top_q"
+chaos-run: --samplers: unknown stage "top_q"
   known stages: top_k, typ_p, top_p, min_p, xtc, temperature
   penalties, dry and top_n_sigma act on logits and always run first
 $ echo $?
@@ -296,10 +296,10 @@ to do rather than how it is driven: the KV cache is the memory that grows with
 context, and it is the axis this project competes on.
 
 ```
-$ bigtea-run <llama-3.2-1b> "The capital of France is" -n 10
+$ chaos-run <llama-3.2-1b> "The capital of France is" -n 10
 kv cache   15 positions, 0.5 MiB, f16
 
-$ bigtea-run <llama-3.2-1b> "The capital of France is" -n 10 -ctk q8_0 -ctv q8_0
+$ chaos-run <llama-3.2-1b> "The capital of France is" -n 10 -ctk q8_0 -ctv q8_0
 kv cache   15 positions, 0.2 MiB, q8_0
 ```
 
@@ -340,13 +340,13 @@ perplexity number beside it is the thing this audit exists to prevent.
 
 **`--no-mmap` lands on the same switch as `--no-direct-io`**, because what it
 means -- "do not let the OS page cache hold the weights" -- is what direct I/O
-already does here. Both are real modes in `bigtea-io`, so this is a genuine
+already does here. Both are real modes in `chaos-io`, so this is a genuine
 switch rather than an accepted no-op:
 
 ```
-$ bigtea-run <model> ...
+$ chaos-run <model> ...
 model      llama (direct (cache bypassed))
-$ bigtea-run <model> ... --no-direct-io
+$ chaos-run <model> ... --no-direct-io
 model      llama (buffered (page cache in use))
 ```
 
@@ -357,7 +357,7 @@ at. Overriding beats editing a multi-gigabyte file, and the run says which
 override it used. Proven load-bearing rather than merely printed:
 
 ```
-$ bigtea-run <llama-3.2-1b> -f prose.txt -n 10
+$ chaos-run <llama-3.2-1b> -f prose.txt -n 10
  similar with the invention of the printing press. Befor
 
 $ ... --override-kv llama.rope.freq_base=float:1000
@@ -375,7 +375,7 @@ container has been corrected.
 
 Muscle memory is the stated reason for copying a CLI, and until now the model
 and prompt could **only** be positional: someone typing
-`bigtea-run -m model.gguf -p "hi"` got a file-not-found for `-m`. The first
+`chaos-run -m model.gguf -p "hi"` got a file-not-found for `-m`. The first
 argument is now treated as the path only when it is not a flag.
 
 `--interactive-first` is not an alias for `-i` and is implemented as its own
@@ -383,7 +383,7 @@ thing: the user speaks before the model does.
 
 ```
 $ printf 'What is 2 plus 2?
-' | bigtea-run -m <llama-3.2-1b>     -p "You are a calculator." -n 10 -if -cnv
+' | chaos-run -m <llama-3.2-1b>     -p "You are a calculator." -n 10 -if -cnv
 > The answer is... 4!
 ```
 
@@ -412,7 +412,7 @@ accepted or rejected whole -- which is what makes it useful for a prompt that
 was *edited* rather than repeated exactly:
 
 ```
-$ bigtea-run <same model> -f edited.txt --prompt-cache pc.bin
+$ chaos-run <same model> -f edited.txt --prompt-cache pc.bin
 prompt cache  reused 115 of 121 tokens
 ```
 
@@ -461,7 +461,7 @@ rendered with its own code, so accepting a file would honour some and silently
 ignore others.
 
 The objection was right and the conclusion was wrong: silently ignoring some was
-never the only alternative to declining all. `crates/bigtea-jinja` evaluates the
+never the only alternative to declining all. `crates/chaos-jinja` evaluates the
 container's own template and **refuses, loudly and by name, any construct outside
 the subset it implements** — so a template it cannot handle produces an error,
 not a quiet fallback to the wrong framing. That is the property the refusal was
@@ -472,7 +472,7 @@ This paragraph outlived the code by three commits and was still being cited. The
 
 ### `--mlock` - done 2026-08-11, and it is not one call
 
-Bigtea's whole design is deciding what stays in RAM. That decision is undone if
+Chaos's whole design is deciding what stays in RAM. That decision is undone if
 the OS pages the resident set out, and this project has **measured** the
 consequence: past ~6 GiB the expert cache reached a 71% hit rate while being the
 slowest configuration tested, because the hits were page faults in disguise.
@@ -485,7 +485,7 @@ look implemented, return an error nobody checks, and lock nothing** — which is
 why this was deferred a tick rather than shipped quickly.
 
 ```
-$ bigtea-run <llama-3.2-1b> ... --mlock
+$ chaos-run <llama-3.2-1b> ... --mlock
 mlock      0.31 GiB pinned in physical memory; 0.44 GiB of repacked weights
            are in ggml arena and not covered
 resident   146 tensors, 0.74 GiB
@@ -520,7 +520,7 @@ it.
 
 That is the same failure as the flag count this document carried for eight
 commits — **anything that enumerates the flags is a second copy of the parser
-and will drift.** So `build.rs` now scans `bigtea-run.rs` for the string
+and will drift.** So `build.rs` now scans `chaos-run.rs` for the string
 literals its `match` arms are made of and emits the list. Currently **119 long
 flags**, and the check that found the drift now reports 0 phantom and 0
 missing.
@@ -534,11 +534,11 @@ this audit, and the standard `-t` failed for weeks.
 `REFUSED` is consulted from the fallback arm of the argument match, so any flag
 that later gains an explicit arm *shadows* its own row and the row goes
 unreachable while still reading as a statement about the binary. `--jinja` sat
-in exactly that state — the row said "no Jinja engine" while `bigtea-jinja`
+in exactly that state — the row said "no Jinja engine" while `chaos-jinja`
 evaluated templates one arm above it. Nothing failed; the table simply lied, and
 this document, generated from it, lied too.
 
-`declined_flags_actually_decline` extracts the table from `bigtea-run.rs` at test
+`declined_flags_actually_decline` extracts the table from `chaos-run.rs` at test
 time and runs the binary once per row. **The exit code alone does not
 discriminate** — a shadowed flag parses fine and then dies on the missing model,
 exiting 2 exactly as a refusal does. The message is the evidence, so the test
@@ -553,7 +553,7 @@ requires `is not supported` and not merely a status.
 | ~~`--check-tensors`~~ | **retracted and implemented.** "Would have to dequantise every tensor" was wrong: the f16 block scales are checkable without dequantising anything, and a bad scale is exactly where a ruined quantise shows up. See the 2026-08-11 entry above |
 | ~~`--cpu-mask`, `--cpu-range`, `--cpu-strict`~~ | **retracted and implemented.** "No thread-affinity layer" described the code, not the difficulty: it is `SetThreadAffinityMask` and `sched_setaffinity`, one syscall each. `--poll` stayed behind because it is genuinely about ggml's threadpool internals |
 | ~~`--ubatch-size`~~ | **retracted and implemented.** "`-b` is the only batch dimension here" was true and still is — so `-ub` takes the *smaller* of the two and says which it took, which is what the flag means on one dimension |
-| ~~`--fit`, `--fit-ctx`, `--fit-target`~~ | **retracted and implemented.** "`bigtea-model-info --budget` answers this already" was an argument for a different spelling, not against the flag. A user with a llama.cpp command line cannot reach a second binary |
+| ~~`--fit`, `--fit-ctx`, `--fit-target`~~ | **retracted and implemented.** "`chaos-model-info --budget` answers this already" was an argument for a different spelling, not against the flag. A user with a llama.cpp command line cannot reach a second binary |
 | ~~`--numa`~~ | **partly implemented.** `--numa isolate` binds to one node's CPUs and is real. `distribute` and `numactl` place *individual threads* on chosen nodes, which needs the threadpool ggml owns — those two are refused by name, in their own message |
 | ~~`--jinja`, `--chat-template-file`~~ | **retracted and implemented.** The argument was "a half-implemented Jinja silently produces the wrong framing" — correct, and answered by building an engine that **refuses what it cannot evaluate** rather than guessing. See the Jinja section above |
 

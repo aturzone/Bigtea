@@ -322,5 +322,5 @@ pruning pipeline has already been built and shipped for K3 specifically (by a th
   calibration algorithm, keep WASTE's kernel) is a reasoned proposal, entirely unbuilt and
   unmeasured.
 - Everything already flagged as open in `k3-on-16gb-feasibility.md` (per-layer trunk byte
-  non-uniformity, large-block-random-read bandwidth vs. sequential, whether Bigtea should pursue
+  non-uniformity, large-block-random-read bandwidth vs. sequential, whether Chaos should pursue
   this at all) still applies and is not re-litigated here.

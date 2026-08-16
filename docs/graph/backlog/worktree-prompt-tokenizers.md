@@ -11,8 +11,8 @@ the branches merge cleanly.
 
 | | crates it owns | branch |
 |---|---|---|
-| **Main session** | `bigtea-arch`, `bigtea-model`, `bigtea-io`, `bigtea-plan`, `bigtea-probe`, `bigtea-ggml` | `ticket/r7-factored-experts` |
-| **Worktree session** | `bigtea-tokenizer`, `bigtea-gguf` | `ticket/r8-tokenizers-and-containers` |
+| **Main session** | `chaos-arch`, `chaos-model`, `chaos-io`, `chaos-plan`, `chaos-probe`, `chaos-ggml` | `ticket/r7-factored-experts` |
+| **Worktree session** | `chaos-tokenizer`, `chaos-gguf` | `ticket/r8-tokenizers-and-containers` |
 
 The one shared file is `docs/graph/backlog/lts-parity-criteria.md`. The worktree
 session updates **only its own rows** (A6, D1, D2), which keeps the diff to
@@ -25,9 +25,9 @@ folds them in.
 ## Setting it up
 
 ```bash
-cd C:/Projects/Bigtea
-git worktree add ../Bigtea-tok -b ticket/r8-tokenizers-and-containers
-cd ../Bigtea-tok
+cd C:/Projects/Chaos
+git worktree add ../Chaos-tok -b ticket/r8-tokenizers-and-containers
+cd ../Chaos-tok
 ```
 
 Then start Claude Code there and paste the prompt below.
@@ -40,8 +40,8 @@ Copy everything between the lines.
 
 ---
 
-You are working on **Bigtea**, a Rust CPU inference runner for GGUF models, in a
-git worktree at `C:/Projects/Bigtea-tok` on branch
+You are working on **Chaos**, a Rust CPU inference runner for GGUF models, in a
+git worktree at `C:/Projects/Chaos-tok` on branch
 `ticket/r8-tokenizers-and-containers`.
 
 **Read `STATUS.md` and `docs/graph/backlog/lts-parity-criteria.md` first.** The
@@ -52,12 +52,12 @@ parity with llama.cpp on the models people actually run.
 
 You own exactly two crates:
 
-- **`crates/bigtea-tokenizer`**
-- **`crates/bigtea-gguf`**
+- **`crates/chaos-tokenizer`**
+- **`crates/chaos-gguf`**
 
-**Do not modify anything under `crates/bigtea-arch`, `crates/bigtea-model`,
-`crates/bigtea-io`, `crates/bigtea-ggml`, `crates/bigtea-plan` or
-`crates/bigtea-probe`.** Another session is working in those right now and a
+**Do not modify anything under `crates/chaos-arch`, `crates/chaos-model`,
+`crates/chaos-io`, `crates/chaos-ggml`, `crates/chaos-plan` or
+`crates/chaos-probe`.** Another session is working in those right now and a
 change there will collide. If a task seems to need one, stop and write down what
 you needed instead — do not reach across.
 
@@ -79,7 +79,7 @@ precompiled character map applied first. Unlocks T5 and mT5.
 
 **D2 — GGUF v2 containers.** v3 works; v2 is untested. The difference is that v2
 writes array lengths as `u32` where v3 uses `u64`. Find the version check in
-`bigtea-gguf`, handle both, and write a test that builds a v2 header in memory
+`chaos-gguf`, handle both, and write a test that builds a v2 header in memory
 and parses it — do **not** download a v2 model just for this.
 
 **D1 — metadata robustness.** Build a small corpus of hand-written malformed
@@ -90,7 +90,7 @@ test written by hand; no fuzzing crate — the workspace has **no external
 dependencies** and that is deliberate.
 
 **A6c — pre-tokenizer variants.** `tokenizer.ggml.pre` selects a splitting regex
-and Bigtea currently ignores it. `llama-bpe`, `deepseek-llm`, `qwen2` and
+and Chaos currently ignores it. `llama-bpe`, `deepseek-llm`, `qwen2` and
 `falcon` differ in how they split digits and contractions, and the wrong one
 shifts every token boundary. Read the value, implement the ones you can test
 against a real container, and **refuse or warn loudly** on one you cannot.
@@ -100,7 +100,7 @@ against a real container, and **refuse or warn loudly** on one you cannot.
 - **Commit and push after each ticket.** Do not batch them.
 - Push with the token from `C:/Projects/.env`, inline in the URL, output
   redacted: `TOKEN=$(grep '^GITHUB_TOKEN=' /c/Projects/.env | cut -d= -f2-)` then
-  `git push "https://${TOKEN}@github.com/aturzone/Bigtea.git" <branch> 2>&1 | sed "s|${TOKEN}|[REDACTED]|g"`.
+  `git push "https://${TOKEN}@github.com/aturzone/Chaos.git" <branch> 2>&1 | sed "s|${TOKEN}|[REDACTED]|g"`.
   **Never** echo the token, never put it in git config.
 - `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all`
   must stay clean. All tests must pass.
@@ -109,7 +109,7 @@ against a real container, and **refuse or warn loudly** on one you cannot.
   So test the pieces separately — splitting, merging, byte fallback, round trip
   — and against a **real container** wherever one exists, not only against
   strings you invented for the matcher.
-- Test against real vocabularies: `crates/bigtea-tokenizer/tests/real_vocab.rs`
+- Test against real vocabularies: `crates/chaos-tokenizer/tests/real_vocab.rs`
   already does this for BPE and SPM and is the pattern to follow. Mark
   container-backed tests `#[ignore]` with a reason.
 - **Do not claim an architecture or tokenizer works until you have read its
@@ -124,7 +124,7 @@ against a real container, and **refuse or warn loudly** on one you cannot.
 ```bash
 export PATH="/c/msys64/mingw64/bin:$PATH"
 export GGML_LIB_DIR=C:/Projects/llamacpp-unsloth/build/ggml/src
-cargo test --release -p bigtea-tokenizer -p bigtea-gguf
+cargo test --release -p chaos-tokenizer -p chaos-gguf
 ```
 
 Windows needs the **GNU** Rust toolchain. `.cargo/config.toml` already sets

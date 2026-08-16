@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest something Bigtea should do
+description: Suggest something Chaos should do
 labels: [enhancement]
 body:
   - type: textarea

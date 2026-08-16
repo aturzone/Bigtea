@@ -75,7 +75,7 @@ Run **b**'s `in-prompt` column reads 100.0% at top-64 and should be ignored: a
 
 ## Method, and why the deltas are trustworthy
 
-`bigtea-run` regenerates statelessly: pass *k* re-runs prefill over prompt plus
+`chaos-run` regenerates statelessly: pass *k* re-runs prefill over prompt plus
 *k* generated tokens. The model is causal, so token *i*'s routing is identical in
 every pass containing it — which makes `pass[k] - pass[k-1]` **exactly** the
 routing of the one token generated in between.
@@ -89,8 +89,8 @@ tokens, and the tool now reports the churn and analyses the clean prefix instead
 of discarding the run. **The assertion is why that was noticed at all.**
 
 ```
-BIGTEA_ROUTING=1 BIGTEA_ROUTING_DUMP=gen/code_a.csv \
-  bigtea-run DeepSeek-V4-Flash-...-00001-of-00005.gguf "<166-token prompt>" -n 16
+CHAOS_ROUTING=1 CHAOS_ROUTING_DUMP=gen/code_a.csv \
+  chaos-run DeepSeek-V4-Flash-...-00001-of-00005.gguf "<166-token prompt>" -n 16
 python tools/routing/analyse_gen.py gen/code_a.csv
 ```
 

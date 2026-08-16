@@ -1,0 +1,15 @@
+[package]
+name = "chaos-io"
+description = "Cache-bypassing aligned reads for streaming weights from disk."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[[bin]]
+name = "chaos-iobench"
+path = "src/bin/chaos-iobench.rs"
+test = false

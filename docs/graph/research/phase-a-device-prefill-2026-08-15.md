@@ -1,6 +1,6 @@
 # Phase A: the card runs the model, and the number was wrong twice
 
-**2026-08-15.** The GPU bar moves: Bigtea's own binary runs a full Qwen3-4B
+**2026-08-15.** The GPU bar moves: Chaos's own binary runs a full Qwen3-4B
 prefill on an RTX 3050. **The current figure is 1.33-1.52x**, from the repeat
 harness. Two earlier figures from this same day are retracted below — 0.42x and
 1.62-1.78x — and the second one reached a merge-commit headline before it was
@@ -106,7 +106,7 @@ prompt, back to back, three consecutive runs. The CPU side gets all 20 threads,
 which is what prefill wants — a mistuned baseline would flatter the card.
 
 ```bash
-bigtea-gpubench C:/Projects/models/qwen3-4b/Qwen3-4B-Q4_K_M.gguf
+chaos-gpubench C:/Projects/models/qwen3-4b/Qwen3-4B-Q4_K_M.gguf
 ```
 
 | run | cpu tok/s | device tok/s | ratio |
@@ -189,7 +189,7 @@ does not move for free either.
 
 ## Method notes
 
-- `bigtea-gpubench` loads the model fresh for each target, so `load` is honest
+- `chaos-gpubench` loads the model fresh for each target, so `load` is honest
   rather than warm.
 - The CPU baseline is `-t 20`, not the default and not `-t 4`. Prefill is
   compute-bound and wants every thread; quoting a 4-thread CPU prefill would
@@ -198,7 +198,7 @@ does not move for free either.
   That is the rule this node was written to establish.
 - Logit checksums are compared because **a wrong device path returns plausible
   numbers, never an error** — the standing failure mode in this project.
-- `BIGTEA_PREFILL_TOKENS` overrides the batch, which is how the 1-token row was
+- `CHAOS_PREFILL_TOKENS` overrides the batch, which is how the 1-token row was
   taken; it exists because "works at 1, dies at 512" and "dies at 1" are
   different bugs.
 

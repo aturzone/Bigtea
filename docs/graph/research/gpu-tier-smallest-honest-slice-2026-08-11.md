@@ -46,7 +46,7 @@ Every weight in this engine is a **host pointer written straight into
 `tensor->data`**. One function, one line:
 
 ```rust
-// crates/bigtea-ggml/src/weights.rs:286
+// crates/chaos-ggml/src/weights.rs:286
 let ptr = data.as_bytes().as_ptr() as *mut c_void;
 unsafe { tensor.set_data_ptr(ptr) };
 ```
@@ -64,7 +64,7 @@ fails reproduces the failure mode this project keeps paying for.
 
 ## Why "N dense layers in VRAM" fails, twice
 
-`bigtea-model-info --budget 6`, the two MoE models on disk:
+`chaos-model-info --budget 6`, the two MoE models on disk:
 
 | model | always-read (dense) | routed experts | total |
 |---|---:|---:|---:|

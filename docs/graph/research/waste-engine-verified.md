@@ -140,7 +140,7 @@ because the project moved. This is itself a finding (see below).
     - **HTTP surface**: `serve/` is an OpenAI-compatible server, stdlib-Python + ctypes into
       `libwaste.{so,dylib,dll}` — `python3 -m serve <model.waste> --port 8000`, then standard
       `POST /v1/chat/completions` with `{"model":..., "messages":[...]}`. Same shape as
-      llama.cpp/vLLM servers Bigtea already wraps conceptually.
+      llama.cpp/vLLM servers Chaos already wraps conceptually.
     - **Native C API**: `src/waste.h`, ~26 functions, no global state (per CLAUDE.md) — an FFI
       integration point if a wrapper ever needs deeper control than CLI/HTTP.
     - **Env/config toggles**: `WASTE_VERIFY`, `WASTE_PURGEABLE`, `WASTE_MLOCK`, `WASTE_Q8`, and
@@ -162,28 +162,28 @@ CPU for this workload; CUDA/ROCm/BLAS are explicitly unimplemented ("the flag re
 
 ## Limitations + wrapper-relevant gaps
 
-- **No GPU acceleration path at all on Bigtea's target platform.** Bigtea's v1 scope is
+- **No GPU acceleration path at all on Chaos's target platform.** Chaos's v1 scope is
   Linux+NVIDIA (per `../research/mvp-scope.md`); WASTE has zero CUDA/ROCm support (issue #11,
   open, "CUDA backend: what would have to be true for it to pay" — the maintainers themselves are
   unconvinced it's worth building), and the one GPU backend that exists (Metal) is *slower* than
   CPU for this architecture ("several hundred small dependent matvecs per token, the worst
-  possible shape for an accelerator" — docs/BACKENDS.md). A Bigtea wrapper around WASTE would get
+  possible shape for an accelerator" — docs/BACKENDS.md). A Chaos wrapper around WASTE would get
   no VRAM-offload story whatsoever — the opposite of ktransformers/llama.cpp's whole value
-  proposition that Bigtea's other research nodes are built around.
+  proposition that Chaos's other research nodes are built around.
 - **Model-family lock-in: only Kimi K3 and Kimi-Linear-48B, ever.** The `.waste` converter
   (`tools/convert.py`) and the residual-VQ quantization scheme are hand-built for Moonshot's
   specific KDA+MLA-hybrid latent-MoE architecture (docs/FORMAT.md, docs/ENGINE.md: docs are
   explicitly Kimi/Moonshot-specific, no generic-architecture converter or plan). **No DeepSeek
-  support of any kind** — this is the single biggest gap relative to Bigtea's own DeepSeek-class
-  MoE focus (`../research/mvp-scope.md`): wrapping WASTE today would not serve Bigtea's target
-  model family at all without WASTE (or Bigtea) building an entirely new converter + kernel path.
+  support of any kind** — this is the single biggest gap relative to Chaos's own DeepSeek-class
+  MoE focus (`../research/mvp-scope.md`): wrapping WASTE today would not serve Chaos's target
+  model family at all without WASTE (or Chaos) building an entirely new converter + kernel path.
 - **Inherently sub-1-tok/s at the flagship model regardless of tuning** (0.3–0.6 tok/s range
   across the week's docs for K3) — this is a physics/I/O-bandwidth ceiling, not something a
   wrapper can fix; only relevant for curiosity/correctness runs, not serving.
 - **No concurrent/multi-user serving.** `waste_ctx` is explicitly not thread-safe; the server
   "serializes on one lock" (advisory §8, corroborated by the docs' own stated design). Measured
   batching ceiling is only 1.63× and "doesn't compose with read-ahead," no MTP head in the open
-  release. This is *worse* than the batching/concurrency gaps Bigtea already found in
+  release. This is *worse* than the batching/concurrency gaps Chaos already found in
   llama.cpp/ktransformers (`ktransformers-vs-llamacpp-moe-offload-gaps.md`) — WASTE doesn't even
   attempt concurrent serving yet.
 - **Windows/portability still unclaimed in places**: only MinGW-w64 cross-compile is CI-verified;
@@ -198,8 +198,8 @@ CPU for this workload; CUDA/ROCm/BLAS are explicitly unimplemented ("the flag re
   cgroup pressure (#14) and the CUDA-backend feasibility debate (#11).
 - **No runtime observability/metrics surface found** (no Prometheus-style `/metrics`, unlike
   llama.cpp) — the closest thing is `waste plan`'s pre-flight budget report, which overlaps
-  conceptually with Bigtea's own `hardware-profiler.md` backlog rather than replacing the
-  per-expert/cache-hit-rate observability gap Bigtea already identified as open in both
+  conceptually with Chaos's own `hardware-profiler.md` backlog rather than replacing the
+  per-expert/cache-hit-rate observability gap Chaos already identified as open in both
   llama.cpp and ktransformers.
 - **Conversion is a separate, Python-dependent offline stage** — inference itself needs zero
   third-party deps, but getting a model *into* `.waste` format needs Python + torch + safetensors
@@ -210,7 +210,7 @@ CPU for this workload; CUDA/ROCm/BLAS are explicitly unimplemented ("the flag re
   having ~1.4 TB of source weights reachable somewhere.
 - **Numbers are a genuinely moving target.** This verification's own paging-cliff table pull
   (2026-08-02) disagreed substantially with the advisory's (sourced ~2026-07-31) despite both
-  presumably being accurate snapshots of the same repo four days apart — a caution for Bigtea's
+  presumably being accurate snapshots of the same repo four days apart — a caution for Chaos's
   own `benchmarking-methodology.md` concerns about pinning commit SHAs when citing any external
   project's numbers, WASTE very much included.
 
@@ -245,5 +245,5 @@ CPU for this workload; CUDA/ROCm/BLAS are explicitly unimplemented ("the flag re
 - Precise Show HN posting date/points/comment count (HN item 49098966 rate-limited/blocked direct
   fetch during this pass).
 - Whether the paging-cliff and other benchmark tables should be treated as re-measured on every
-  Bigtea decision that cites WASTE, given how fast they moved between 07-31 and 08-02 in this
+  Chaos decision that cites WASTE, given how fast they moved between 07-31 and 08-02 in this
   pass alone.

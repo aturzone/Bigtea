@@ -1,6 +1,6 @@
-# Contributing to Bigtea
+# Contributing to Chaos
 
-Thanks for looking. Bigtea is a small project with an unusual amount of written
+Thanks for looking. Chaos is a small project with an unusual amount of written
 reasoning behind it, and the fastest way to be useful is to read a little of it
 before writing code.
 
@@ -81,16 +81,16 @@ Note that **Linux and macOS build and pass the unit tests in CI, but no model
 has been run on either.** Direct I/O is `O_DIRECT` on Linux and
 `FILE_FLAG_NO_BUFFERING` on Windows; **macOS has no direct-I/O path at all** and
 falls back to buffered reads, because `F_NOCACHE` must be set after opening via
-`fcntl` and that is not written yet. If you run Bigtea on Linux or macOS — even
+`fcntl` and that is not written yet. If you run Chaos on Linux or macOS — even
 if it just fails — that is a genuinely useful bug report.
 
 ## Good first issues
 
 - Run it on Linux or macOS and report what happens.
-- `bigtea-probe` on unusual hardware: report what it gets wrong.
+- `chaos-probe` on unusual hardware: report what it gets wrong.
 - Documentation: if something in the README did not work, that is a bug.
 - Architectures: adding one is well-bounded work with a clear oracle to check
-  against. `crates/bigtea-arch/src/qwen3.rs` is the smaller example to copy.
+  against. `crates/chaos-arch/src/qwen3.rs` is the smaller example to copy.
 
 ## Reporting a bug
 

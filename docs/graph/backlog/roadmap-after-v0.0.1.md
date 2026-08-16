@@ -63,7 +63,7 @@ reason is **one architectural difference, not a hundred small ones**.
 
 Both engines read the same ~3.2 GiB per token from the same drive. llama.cpp
 `mmap`s the container and the kernel reads ahead **while the CPU computes the
-previous layer**. Bigtea reads a layer's experts, waits, computes, reads the
+previous layer**. Chaos reads a layer's experts, waits, computes, reads the
 next. Per token, measured on our side:
 
 ```
@@ -74,7 +74,7 @@ overlapped:  max(2.3, 1.0) = 2.3s        -> 30% faster, and it is the whole gap
 ```
 
 **That is the work. It is bounded, it is not research, and it is the only thing
-standing between Bigtea and parity.**
+standing between Chaos and parity.**
 
 ---
 
@@ -111,7 +111,7 @@ that is what a cached step will cost.
 7.38 GiB, and it fits only when ~10.5 GiB is free. Worth 0.7s/token when it does
 not.
 
-- **T3.1** Bigtea already reports which processes to close and what the shortfall
+- **T3.1** Chaos already reports which processes to close and what the shortfall
   costs per token. Verify that advice on Linux and macOS.
 - **T3.2** Offer a smaller quant when it cannot fit, rather than running slowly
   and silently.
@@ -137,7 +137,7 @@ Ordered by evidence, not by appeal.
 
 Unchanged from `lts-0-0-0.md`, and none of it blocks on performance.
 
-- `bigtea pull <model>` from Hugging Face — resume, checksums, disk-space check
+- `chaos pull <model>` from Hugging Face — resume, checksums, disk-space check
   before starting a 144 GB download
 - Quant selection from the probe, with the tok/s prediction stated *before*
   downloading

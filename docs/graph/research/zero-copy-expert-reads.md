@@ -23,7 +23,7 @@ Measured. It was the gap, and there was a second, larger one behind it.
 **Three full copies**, one of them purely to change the shape of a pointer, on
 11.5 GiB per prefill.
 
-## Measured: `crates/bigtea-model/tests/expert_read_cost.rs`
+## Measured: `crates/chaos-model/tests/expert_read_cost.rs`
 
 120 slices of `blk.5.ffn_up_exps.weight` (0.53 GiB), each a different expert so
 no read can be served by a previous one, cache-bypassing throughout:
@@ -83,15 +83,15 @@ addressed by T0.2 residency) and compute (28%).
 
 ## What changed
 
-- `bigtea-io`: `SkewedBuf`, and `DirectFile::read_at_into`, which splits a read
+- `chaos-io`: `SkewedBuf`, and `DirectFile::read_at_into`, which splits a read
   into `[head fragment][directly transferred middle][tail fragment]` and returns
   **how many bytes it had to copy** — not a bool, because a 4 MiB slice with two
   bounced edge sectors is 99.9% direct and a bool would hide that.
-- `bigtea-model`: `read_range_into`.
-- `bigtea-ggml`: `WeightSet::bind` takes `impl WeightBytes` — anything heap-owned
+- `chaos-model`: `read_range_into`.
+- `chaos-ggml`: `WeightSet::bind` takes `impl WeightBytes` — anything heap-owned
   that derefs to `[u8]` — instead of `impl Into<Arc<[u8]>>`, so the caller's own
   allocation is kept rather than copied into a differently-shaped one.
-- `bigtea-arch`: `bind_expert_slices` reads each slice straight into its final
+- `chaos-arch`: `bind_expert_slices` reads each slice straight into its final
   position in a skewed stack.
 
 ## For anyone porting this elsewhere

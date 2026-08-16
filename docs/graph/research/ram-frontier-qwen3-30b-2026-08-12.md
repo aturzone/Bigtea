@@ -60,7 +60,7 @@ cache on an unverified model is measuring the bug.
 ```bash
 # One run, repeated. `--cache GIB` is the whole point: the engine owns that
 # many GiB of expert cache and nothing else decides.
-./target/release/bigtea-run.exe \
+./target/release/chaos-run.exe \
     -m /c/Projects/models/qwen3moe/Qwen3-30B-A3B-Q4_K_M.gguf \
     -p "The capital of France is" -n 16 --temp 0 --cache <1|2|4|6|8|10|12>
 ```

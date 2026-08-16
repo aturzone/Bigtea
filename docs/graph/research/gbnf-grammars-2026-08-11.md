@@ -4,7 +4,7 @@ status: resolved
 links: [../backlog/llamacpp-flag-audit.md, ../backlog/lts-parity-criteria.md]
 ---
 
-`crates/bigtea-grammar` parses GBNF, compiles it to a stack matcher, and turns
+`crates/chaos-grammar` parses GBNF, compiles it to a stack matcher, and turns
 the bytes generated so far into the set of token ids that may legally come next.
 Four of llama.cpp's 182 flags depend on it: `--grammar`, `--grammar-file`,
 `--json-schema`, `--json-schema-file`.
@@ -27,7 +27,7 @@ crate has **no dependencies at all** — not on ggml, not even on the tokenizer,
 because the vocabulary arrives as bytes the caller already has. It is in the CI
 job that proves the ggml-free crates build on a machine with no C toolchain.
 
-Deliberately **not** wired into `sample.rs` or `bigtea-run.rs`: another session
+Deliberately **not** wired into `sample.rs` or `chaos-run.rs`: another session
 owns those files.
 
 ## What C3 gets wrong if you write the tests yourself

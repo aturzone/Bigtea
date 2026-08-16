@@ -24,7 +24,7 @@ caveat stated rather than withheld. Same standing as the node it extends.
 ```bash
 # 3 rounds x -n {16,64,256} x --cache {1,2,4,6,8,12}, interleaved on BOTH axes,
 # free RAM sampled before and after every row.
-./target/release/bigtea-run.exe -m Qwen3-30B-A3B-Q4_K_M.gguf \
+./target/release/chaos-run.exe -m Qwen3-30B-A3B-Q4_K_M.gguf \
     -p "The capital of France is" -n $N --temp 0 --cache $B --force
 ```
 

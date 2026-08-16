@@ -12,7 +12,7 @@ if we do not win, say so and do not ship the claim.*
 ## Measured, 2026-08-07
 
 ```
-./target/release/bigtea-run.exe \
+./target/release/chaos-run.exe \
   C:/Projects/models/v4flash/DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf \
   "The capital of France is" -n 5
 
@@ -50,7 +50,7 @@ worth writing down because it changes what "adding a KV cache" is for.
 
 ## The profile, re-measured per phase
 
-`BIGTEA_BLOCK_TIMING=1`, block 42 of a 5-token pass:
+`CHAOS_BLOCK_TIMING=1`, block 42 of a 5-token pass:
 
 ```
 arena 0.00   dense 0.08 (147 MiB)   qkv 0.01   attn 0.01   tail 0.10   ffn 0.30
@@ -83,9 +83,9 @@ listed as a measurement rather than a hypothesis on purpose.
 ## Threads: a hypothesis raised and refuted in one command
 
 ```
-BIGTEA_THREADS=4    prefill 5 tokens in 20.4s
-BIGTEA_THREADS=12   prefill 5 tokens in 20.5s
-BIGTEA_THREADS=20   prefill 5 tokens in 20.7s
+CHAOS_THREADS=4    prefill 5 tokens in 20.4s
+CHAOS_THREADS=12   prefill 5 tokens in 20.5s
+CHAOS_THREADS=20   prefill 5 tokens in 20.7s
 ```
 
 Five times the threads, no change. The natural explanation was **threadpool
@@ -98,9 +98,9 @@ would buy parallelism and pay for it in spawn cost.
 It is wrong. Extending the sweep downwards refutes it in one line:
 
 ```
-BIGTEA_THREADS=1    prefill 5 tokens in 94.8s     <- no threads spawned at all
-BIGTEA_THREADS=2    prefill 5 tokens in 23.0s
-BIGTEA_THREADS=12   prefill 5 tokens in 20.0s
+CHAOS_THREADS=1    prefill 5 tokens in 94.8s     <- no threads spawned at all
+CHAOS_THREADS=2    prefill 5 tokens in 23.0s
+CHAOS_THREADS=12   prefill 5 tokens in 20.0s
 ```
 
 One thread spawns nothing, so under the threadpool theory it should have been

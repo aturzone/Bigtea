@@ -18,7 +18,7 @@ selections against a uniform-router null of 6.8-7.4% at the same sample size —
 | published below | measured on eight prompts |
 |---|---|
 | top-64 = **97.8%** | **90.5%** in-sample, and only **53.7%** on a prompt the set was not chosen from |
-| chi-square **7805** | not a valid statistic — `bigtea-run` regenerates statelessly, so each generated token re-counts the whole prompt. Measured: 1282 → 5464 → 11469 for 1, 4, 8 passes of one prompt, with coverage unchanged |
+| chi-square **7805** | not a valid statistic — `chaos-run` regenerates statelessly, so each generated token re-counts the whole prompt. Measured: 1282 → 5464 → 11469 for 1, 4, 8 passes of one prompt, with coverage unchanged |
 | 34.27 GiB → **33.6 tok/s** disk floor | **1.60 tok/s** at the same size, because the hot set does not transfer between prompts |
 | 20 tok/s needs a **~48 GiB desktop** | unsupported. 96.3% hit rate needed; a pinned cache gives 76.7% at 68.5 GiB |
 
@@ -32,7 +32,7 @@ input; the input was one in-sample measurement, and that is the whole lesson.
 
 ## The measurement
 
-`BIGTEA_ROUTING=1`, DeepSeek-V4-Flash, a real coding prompt, all 43 layers,
+`CHAOS_ROUTING=1`, DeepSeek-V4-Flash, a real coding prompt, all 43 layers,
 every routing decision counted:
 
 ```
@@ -133,7 +133,7 @@ win on this hardware, and it is worth having: the current implementation manages
   *slowest* configuration measured, because cached bytes got paged out and a
   "hit" became a page fault in disguise. **That is a real risk here and the
   reason the cache must own its memory rather than rely on the page cache.**
-  Bigtea already owns its allocations, which is precisely why it can do this and
+  Chaos already owns its allocations, which is precisely why it can do this and
   an mmap-based engine cannot.
 
 ## Next, in order

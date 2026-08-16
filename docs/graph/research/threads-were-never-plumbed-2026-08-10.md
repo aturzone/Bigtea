@@ -8,10 +8,10 @@ Two findings, and the first is what made the second visible.
 
 ## 1. The flag did nothing
 
-`bigtea-run -t N` set `BIGTEA_THREADS`, and **only `deepseek4_forward.rs` ever
+`chaos-run -t N` set `CHAOS_THREADS`, and **only `deepseek4_forward.rs` ever
 read it**. Every other architecture — qwen3, qwen3moe, llama, phi3, gemma2 —
 computed its own count from `available_parallelism()` and ignored the flag. A
-second, differently spelled variable (`BIGTEA_EXPERT_THREADS`) was read in
+second, differently spelled variable (`CHAOS_EXPERT_THREADS`) was read in
 `StreamingRunner::new` into a binding named `_threads` and discarded, so that
 override had never worked either.
 
@@ -30,9 +30,9 @@ fixing that was worth 1.30x.
 Not by reading the code. By running:
 
 ```
-$ bigtea-run Qwen3-4B-Q4_K_M.gguf "..." -n 16 -t 1
+$ chaos-run Qwen3-4B-Q4_K_M.gguf "..." -n 16 -t 1
     time: 0.0s disk, 1.0s qkv, 0.7s attention, 1.7s ffn, ...
-$ bigtea-run Qwen3-4B-Q4_K_M.gguf "..." -n 16 -t 20
+$ chaos-run Qwen3-4B-Q4_K_M.gguf "..." -n 16 -t 20
     time: 0.0s disk, 1.0s qkv, 0.7s attention, 1.7s ffn, ...
 ```
 
@@ -64,7 +64,7 @@ repetitions, generation only, `-n 32`.
 Generation streams every weight once per token and does almost no arithmetic per
 byte, so it saturates DRAM long before it runs out of cores; past that point
 threads only contend, and the E-cores make it worse. This is a property of the
-hardware, not of Bigtea — llama.cpp shows the same curve on the same machine:
+hardware, not of Chaos — llama.cpp shows the same curve on the same machine:
 
 ```
 $ llama-bench -m Qwen3-4B-Q4_K_M.gguf -n 128 -p 0 -r 3 -t 1,4,8,20
@@ -97,7 +97,7 @@ Same model, same binary, 519-token prompt, `-n 1`:
 Prefill multiplies a whole block at once, so it is compute-bound and scales with
 cores. **The best generation count is close to the worst prefill count.** One
 `-t` cannot serve both; llama.cpp spells the second one `-tb` /
-`--threads-batch` and now so does Bigtea. The count follows the *token count* of
+`--threads-batch` and now so does Chaos. The count follows the *token count* of
 the step rather than the call site, because `forward_cached` serves both phases.
 
 ## 4. A calibration that failed, and why it was deleted rather than tuned
@@ -152,14 +152,14 @@ $ llama-bench -m Llama-3.2-1B-Instruct-Q4_K_M.gguf -n 64 -p 0 -r 3
 | CPU | 10 | tg64 | 20.91 ± 0.65 |
 ```
 
-| generation | Bigtea | llama.cpp | verdict |
+| generation | Chaos | llama.cpp | verdict |
 |---|---:|---:|---|
 | Qwen3-4B, **both at default** | **8.01** | 6.52 ± 0.33 | **1.23x ahead** |
 | Llama-3.2-1B, **both at default** | 20.05 | 20.91 ± 0.65 | 1.04x behind — parity |
 | Qwen3-4B, **both hand-tuned** | 7.64 (t=2) | 9.16 ± 0.43 (t=4) | **1.20x behind** |
 | Llama-3.2-1B, **both hand-tuned** | 21.95 (t=2) | 27.85 ± 1.98 (t=4) | **1.27x behind** |
 
-**Both rows are true and neither may be quoted alone.** Out of the box Bigtea is
+**Both rows are true and neither may be quoted alone.** Out of the box Chaos is
 ahead on Qwen3-4B because it measures the machine and llama.cpp uses a fixed
 default. Given the same care on both sides, **llama.cpp is still faster**, by
 1.20x and 1.27x. The auto-tuning is a real advantage for a user who types no
@@ -215,7 +215,7 @@ tiny nodes per layer.
 
 ## V4-Flash has the same curve, and still has its old default
 
-`deepseek4_forward.rs` reads `BIGTEA_THREADS` directly and does **not** go
+`deepseek4_forward.rs` reads `CHAOS_THREADS` directly and does **not** go
 through the tuner, so the flagship model still defaults to every core. Swept
 with `-t`, `"The capital of France is"`, `-n 4`:
 
@@ -238,8 +238,8 @@ promptly lost 1.29x:
 
 So this file needed the same split as the dense path, not a cap. `threads()`
 reads a batch size that `forward` sets — the single funnel both `prefill` and
-`step` pass through — and resolves the two counts through `BIGTEA_THREADS` and
-`BIGTEA_THREADS_BATCH`.
+`step` pass through — and resolves the two counts through `CHAOS_THREADS` and
+`CHAOS_THREADS_BATCH`.
 
 **This retires a line that was in `CLAUDE.md`**: "4/12/20 threads all cost the
 same on a V4-Flash prefill". That was measured at **5 tokens**, where the pass

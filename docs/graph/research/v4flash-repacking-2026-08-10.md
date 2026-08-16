@@ -71,7 +71,7 @@ V4-Flash figure this project has recorded against llama.cpp passes
 `--no-repack`, a detail that had been noted as a quirk without the reason being
 established.
 
-Bigtea's repacking is per tensor and backed by residency, so the same container
+Chaos's repacking is per tensor and backed by residency, so the same container
 loads, reports `0 repacked`, and runs. **That is a difference in kind, not in
 speed**: no tokens per second are won, and `--no-repack` gets llama.cpp running
 too. It is worth recording only because "repacking on this model" reads like an
@@ -99,7 +99,7 @@ decided** — `extra` is checked after `ggml_backend_tensor_alloc` and before
 
 **This was reachable from the dense path too.** `load_resident` offers every
 resident tensor, and `is_repackable` accepts `Q8_0` and `Q2_K`. Any
-`*.Q8_0.gguf` — an ordinary thing to download — would have ended `bigtea-run`
+`*.Q8_0.gguf` — an ordinary thing to download — would have ended `chaos-run`
 with an access violation on x86 before printing a token. None of the Q4_K_M
 containers on this machine contain a `Q8_0` 2-D weight, which is the only reason
 it had not been seen.

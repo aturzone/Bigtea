@@ -27,12 +27,12 @@ and language are crossed rather than confounded. 145–198 tokens each, giving
 870–1188 routing decisions per layer.
 
 ```
-BIGTEA_ROUTING=1 BIGTEA_ROUTING_DUMP=csv/<name>.csv \
-  bigtea-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf "<prompt>" -n 1
+CHAOS_ROUTING=1 CHAOS_ROUTING_DUMP=csv/<name>.csv \
+  chaos-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf "<prompt>" -n 1
 ```
 
 `-n 1` is load-bearing: **one prefill, no generation** (see the last section for
-why that matters). `BIGTEA_ROUTING_DUMP` is new — it writes raw
+why that matters). `CHAOS_ROUTING_DUMP` is new — it writes raw
 `layer,expert,count` rows, which is what makes two runs comparable at all.
 
 **Layers 0-2 are excluded from every number here.** They select out of
@@ -131,7 +131,7 @@ that performs like an oracle.
 coverage. The 17-token smoke prompt gives 98.8% coverage at chi **1282**. High
 chi and high coverage are opposite ends of prompt length.
 
-They co-occur when the same short prompt is counted repeatedly. `bigtea-run`
+They co-occur when the same short prompt is counted repeatedly. `chaos-run`
 regenerates **statelessly** — every generated token re-runs prefill over the
 whole sequence — so `routing_report` counts one prompt once per pass. Same
 17-token prompt, three depths:
@@ -196,4 +196,4 @@ that a claim needs its command line and output pasted was applied to
   ceiling, and ignore this project's own warning that a cached byte which gets
   paged out is a page fault in disguise. Only tok/s at a stated footprint counts.
 - Prompts, captures, and the analysis script are reproducible from
-  `BIGTEA_ROUTING_DUMP` plus `analyse.py`; the raw CSVs are not committed.
+  `CHAOS_ROUTING_DUMP` plus `analyse.py`; the raw CSVs are not committed.

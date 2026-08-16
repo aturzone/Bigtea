@@ -20,7 +20,7 @@ is enough to state something about the model rather than about the runner:
 > **DeepSeek trained V4-Flash with no redundancy left to harvest. Its experts are
 > mutually distinct, internally dense, and its router spreads real weight across
 > all six selections. The 6-of-256 routing is the whole of this architecture's
-> sparsity, and Bigtea already exploits it.**
+> sparsity, and Chaos already exploits it.**
 
 That is a genuinely useful result — negative results of this shape save the next
 person months — and it closes the two remaining ideas that could have delivered a
@@ -48,7 +48,7 @@ runner, where the same structure would buy bandwidth instead.
 
 ### The measurement
 
-`bigtea-spectrum`, new — no forward pass, no tokenizer, no GPU, only the weights.
+`chaos-spectrum`, new — no forward pass, no tokenizer, no GPU, only the weights.
 It accumulates `G = Σ_i W_iᵀW_i` one expert at a time (the full bank dequantised
 is 8.6 GB and would not fit; one expert is 33 MB, so memory is flat in the sample
 size), recovers the top eigenspace by randomised subspace iteration, and reports
@@ -91,7 +91,7 @@ The standing assumption, written into `the-big-bang.md` as Tier 3: *"The top-1
 expert carries most of the weight mass; the 6th contributes little."* If true,
 reading three experts instead of six is a free 2x.
 
-Measured (`BIGTEA_ROUTING_WEIGHTS=1`, renormalised weights, sorted descending,
+Measured (`CHAOS_ROUTING_WEIGHTS=1`, renormalised weights, sorted descending,
 mean over 43 layers × 15 tokens, captured with `-n 1` so regeneration cannot
 double-count):
 
@@ -184,14 +184,14 @@ model this size:
 
 > **What is the tok/s-versus-RAM frontier for a 144 GB model?**
 
-Bigtea is the only engine that can produce it. `llama.cpp` `mmap`s the container
+Chaos is the only engine that can produce it. `llama.cpp` `mmap`s the container
 and hands residency to the kernel's LRU; it cannot be told to use exactly N GiB,
-so it cannot be swept. Bigtea owns residency by construction, and the sweep is
+so it cannot be swept. Chaos owns residency by construction, and the sweep is
 `--budget` in a loop.
 
 The same curve answers the product question directly and honestly: *given your
 machine, here is the largest model that runs at the speed you want* — which is
-`bigtea-model-info`'s job, and currently it predicts from a model rather than
+`chaos-model-info`'s job, and currently it predicts from a model rather than
 from measurement.
 
 ## What was NOT tested

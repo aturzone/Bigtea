@@ -80,7 +80,7 @@ Key properties worth internalizing:
 - `usage.waste` is a runtime-learned hotlist (LFRU preload; cold 1602→warm 1175 misses on
   Kimi-Linear, 61%→72% hit).
 
-## 4. The memory model — the most important part for Bigtea
+## 4. The memory model — the most important part for Chaos
 
 ### The floor is one token's working set
 
@@ -199,4 +199,4 @@ real test that could kill it* (their "Gates" — Gate H saved a 1.4 TB download 
 cannot stream it). Wrong numbers are recorded as wrong, not quietly corrected. The README
 carries no comparison table and invites counter-examples. This honesty is a competitive asset —
 it is the reason the project is being taken seriously within a week of release, and it is a
-standard Bigtea's own graph (T0 recorder-gate, 5% CV gate) is already positioned to match.
+standard Chaos's own graph (T0 recorder-gate, 5% CV gate) is already positioned to match.

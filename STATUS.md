@@ -1,4 +1,4 @@
-# STATUS — where Bigtea is, and what is left
+# STATUS — where Chaos is, and what is left
 
 **Read this first, in any session.** It is the single place that says what is
 true today. Update it in the same commit as any change that moves a number or
@@ -71,7 +71,7 @@ decoding as a new crate, then **R2** (overlap disk reads with compute).
 
 ## In one paragraph
 
-Bigtea is a Rust inference runner for models that do **not** fit in memory. It
+Chaos is a Rust inference runner for models that do **not** fit in memory. It
 keeps the always-read weights resident and streams routed experts from disk per
 token, borrowing `ggml` for arithmetic while owning memory, residency, streaming
 and the token loop. It runs DeepSeek-V4-Flash (144 GB) and Qwen3-30B-A3B on a
@@ -90,7 +90,7 @@ models. **Absolute tok/s drifts up to 25% with machine state, so only
 within-session comparisons are quoted**, and each number below is a median of
 the rounds actually run.
 
-| model | phase | Bigtea | llama.cpp | verdict |
+| model | phase | Chaos | llama.cpp | verdict |
 |---|---|---:|---:|---|
 | Qwen3-4B (dense, fits RAM) | prefill | **76.5** | 69.3 | parity → ahead |
 | Qwen3-4B | generation | **5.97** | 5.54 | **1.08x ahead** |
@@ -110,7 +110,7 @@ were deficits:
   clearest possible demonstration of why cross-session numbers are worthless.
 
 **On the streaming model, run order dominates the result.** Whichever engine
-runs second is slower — Bigtea 3.92 running first against llama.cpp 3.60, and
+runs second is slower — Chaos 3.92 running first against llama.cpp 3.60, and
 2.71 running second against 2.93. A warm-to-warm protocol (each engine twice,
 compare the seconds) is the only one that says anything, and it says parity.
 
@@ -119,7 +119,7 @@ and is unchanged: prefill 1.25x behind, generation at parity. See below.
 
 ### Coverage — this is the real gap
 
-| | Bigtea | llama.cpp | gap |
+| | Chaos | llama.cpp | gap |
 |---|---:|---:|---|
 | architectures **diffed against the reference** | **13** | 141 declared | the big one |
 | chat templates | 26 | 54 | half |
@@ -129,11 +129,11 @@ and is unchanged: prefill 1.25x behind, generation at parity. See below.
 | GPU backends | **1** (Vulkan, *not verified*) | CUDA, Metal, Vulkan, SYCL, HIP | 4 |
 
 The architecture number is not comparable as written: llama.cpp *declares* 141
-and Bigtea's 8 are ones whose output was diffed token for token against it.
+and Chaos's 8 are ones whose output was diffed token for token against it.
 Nobody has checked all 141. But 8 is still 8.
 
 **The honest one-line answer: on this machine, for CPU inference on the models
-we support, Bigtea is as fast as llama.cpp. It supports far less.**
+we support, Chaos is as fast as llama.cpp. It supports far less.**
 
 ## The honest scoreboard
 
@@ -141,7 +141,7 @@ Never quote a comparison without the model name and the phase.
 **All V4-Flash rows below were measured back to back on 2026-08-10** with 9.3 GiB
 free, which is the first time the whole 7.38 GiB always-read set fitted.
 
-| model | phase | Bigtea | llama.cpp | verdict |
+| model | phase | Chaos | llama.cpp | verdict |
 |---|---|---:|---:|---|
 | **V4-Flash** | prefill | 2060 ms/tok | **1644 ms/tok** | **1.25x behind** |
 | **V4-Flash** | generation, 9 tok | 0.344 tok/s | **0.39** | 1.13x behind |
@@ -152,7 +152,7 @@ free, which is the first time the whole 7.38 GiB always-read set fitted.
 | Qwen3-30B-A3B | generation | **2.63** | **4.21 ± 0.28** | **1.60x behind** |
 
 **The Qwen3-30B generation row moved twice on 2026-08-10 and both corrections
-matter.** Bigtea went 1.07 → **2.63** (2.46x) purely from the thread tuner
+matter.** Chaos went 1.07 → **2.63** (2.46x) purely from the thread tuner
 choosing **one** thread for the expert matmuls. And the llama.cpp reference is
 **4.21 ± 0.28** at its own best (`-t 4`), not the 2.16 previously recorded — so
 this is still a **deficit**, and a re-measured one, not a win.
@@ -164,13 +164,13 @@ must not be quoted as one.
 The trend is the interesting part: 0.344 at 9 tokens, 0.363 at 23, 0.374 at 47,
 with the expert cache's hit rate climbing 9.7% → 20.2% → 23.5% as it warms.
 llama.cpp is flat because it has nothing that warms. **Longer answers should
-favour Bigtea**, and that is measurable but not yet measured past 47 tokens.
+favour Chaos**, and that is measurable but not yet measured past 47 tokens.
 
 Sources, with both command lines and outputs:
 `docs/graph/research/v4flash-vs-llamacpp-2026-08-07.md` and
 `head-to-head-llamacpp-2026-08-05.md`.
 
-**Two claims are retracted and must never be repeated**: that Bigtea leads
+**Two claims are retracted and must never be repeated**: that Chaos leads
 llama.cpp on V4-Flash load/prefill, and that llama.cpp cannot run models larger
 than RAM. It runs the 144 GB model with `--no-repack`. "Larger than RAM" is not
 the differentiator; **tok/s at a stated footprint under an owned residency
@@ -182,7 +182,7 @@ policy** is.
   16 container-backed tests. `clippy -D warnings` and `fmt` enforced.
 - **V4-Flash port complete and verified** against llama.cpp element-sums: all 43
   blocks, all three attention builders, both routing schemes.
-- **Prefill 2.2x faster** than Bigtea's own previous version (32.4s → 10.1s at 5
+- **Prefill 2.2x faster** than Chaos's own previous version (32.4s → 10.1s at 5
   tokens), via skewed direct reads, batched expert reads and 24→6 graph
   evaluations per block.
 - **R0 answered** (2026-08-08): the router is genuinely skewed, but **the hot
@@ -207,7 +207,7 @@ policy** is.
 | **R1** | frequency-gated expert cache on the deepseek4 path | **built 2026-08-08, inert until R3** | implemented, tested against the oracle, sized from the probe, `--cache <GiB>` now works on this path. Warms on the prompt, never pinned. Cannot pay while a pass still reads ~123 distinct experts per layer |
 | **R2** | overlap I/O with compute | ready, but smaller than it looks | per block it is ~53 ms read against ~23 ms compute, so the ceiling is ~1.4x — and all three expert tensors already read in one batched call, with everything after depending on them. Scoped against the code in the handoff |
 | **R4** | fit the always-read set | user-side | 7.38 GiB; needs ~10.5 GiB free. Worth 0.7s/token. The runner already names the processes to close |
-| **R5** | the product | **started** | `bigtea pull`, quant selection from the probe, self-configuration, **OpenAI-compatible `/v1/chat/completions`**, prebuilt binaries |
+| **R5** | the product | **started** | `chaos pull`, quant selection from the probe, self-configuration, **OpenAI-compatible `/v1/chat/completions`**, prebuilt binaries |
 | **R6** | run well on any machine | not started | one binary that reads the probe, configures itself, and says what tok/s to expect *before* doing anything |
 
 **The order is not a preference, it is a dependency.** Expert reads are
@@ -229,7 +229,7 @@ Strategy and the bets beyond R6: `docs/graph/backlog/the-big-bang.md`.
 
 ## R3 — the KV cache works
 
-**Generation no longer re-runs the sequence.** `bigtea-run` keeps one cache for
+**Generation no longer re-runs the sequence.** `chaos-run` keeps one cache for
 the session: the prompt fills it, each token appends a single row.
 
 ```
@@ -282,7 +282,7 @@ starts helping:
 | 47 tokens | 1.5 GiB | 23.5% | **0.374** |
 
 Earlier, under memory pressure, the same cache *hurt*: a byte given to it came
-out of residency, where it would have been read on every token. `bigtea-run`
+out of residency, where it would have been read on every token. `chaos-run`
 refuses a cache while the always-read set is still streaming, and that rule is
 now confirmed from both sides — it hurt at 2.43 GiB resident, it helps at 7.38.
 
@@ -314,7 +314,7 @@ Everything still alive, multiplied, is **3.1x**.
 
 Three findings, all first measurements:
 
-1. **The expert bank is full-rank.** `bigtea-spectrum` (new) asked whether all
+1. **The expert bank is full-rank.** `chaos-spectrum` (new) asked whether all
    256 experts in a layer share a subspace — if they did, one resident basis plus
    small per-expert coefficients would cut bytes by `4096/r` *and* cut flops. A
    rank-512 basis holds **20.4%** of the bank's energy against **16.6%** for
@@ -334,13 +334,13 @@ Together with the earlier 9.1%-negligible result that is four independent probes
 and four negatives, which says something about the model rather than the runner:
 **V4-Flash has no redundancy left to harvest.** Its experts are mutually
 distinct, internally dense, and its router spreads real weight across all six.
-The 6-of-256 is the whole of this architecture's sparsity and Bigtea already
+The 6-of-256 is the whole of this architecture's sparsity and Chaos already
 exploits it.
 
 **So 3.21 GiB/token is what this model costs, not an artefact.** 20 tok/s does
 not need a better runner; it needs the active weights to stop coming from disk.
 That makes the next question a measurable one nobody has published: **what is
-the tok/s-versus-RAM frontier for a 144 GB model?** Bigtea can sweep it because
+the tok/s-versus-RAM frontier for a 144 GB model?** Chaos can sweep it because
 it owns residency; an `mmap` engine cannot be told to use exactly N GiB.
 
 ## The plateau was ours, not the drive's (2026-08-10) — 1.32x on expert reads
@@ -348,7 +348,7 @@ it owns residency; an `mmap` engine cannot be told to use exactly N GiB.
 Two written-down "facts" were ceilings we had built. Full detail and both new
 tools: `docs/graph/research/the-plateau-was-ours-2026-08-10.md`.
 
-**Where a token actually goes**, measured with `BIGTEA_BLOCK_TIMING=1`:
+**Where a token actually goes**, measured with `CHAOS_BLOCK_TIMING=1`:
 
 | phase | before | share |
 |---|---:|---:|
@@ -357,14 +357,14 @@ tools: `docs/graph/research/the-plateau-was-ours-2026-08-10.md`.
 | tail + graph overhead | 1.10 s | 20% |
 | **expert matmul** | **0.18 s** | **3%** |
 
-**76% of a token is disk; the arithmetic is 3%.** `bigtea-kernelbench` (new)
+**76% of a token is disk; the arithmetic is 3%.** `chaos-kernelbench` (new)
 times the expert FFN with weights already in RAM: 3.02 ms per block at **24.7
 GiB/s**, which is *above* single-threaded memcpy on this machine. The kernel is
 at DRAM speed and there is nothing to win in it.
 
 **All four readers shared one file handle.** A Windows handle without
 `FILE_FLAG_OVERLAPPED` is synchronous and the OS serialises reads on it, so the
-drive never left queue depth 1. `bigtea-iobench` (new), identical reads, one
+drive never left queue depth 1. `chaos-iobench` (new), identical reads, one
 variable:
 
 | threads | shared handle | one handle each |
@@ -479,12 +479,12 @@ There is no error anywhere in that path. `encode` now partitions on the
 container's CONTROL and USER_DEFINED tokens and maps each to its own id;
 the framed prompt above is **17 tokens**, not 40-odd.
 
-`bigtea-serve` now parses `messages[]` with roles in order and applies the
+`chaos-serve` now parses `messages[]` with roles in order and applies the
 template, instead of concatenating the contents.
 
 ## C3 the server streams, samples and stops (2026-08-10)
 
-`bigtea-serve` answered one way: greedy, no sampling controls, and
+`chaos-serve` answered one way: greedy, no sampling controls, and
 `finish_reason` was **always** `"length"` because nothing checked for
 end-of-sequence. It also buffered the whole answer before sending a byte.
 
@@ -500,7 +500,7 @@ Now:
 Two details that would have been wrong quietly:
 
 - **The default temperature is 1.0, not 0.0.** OpenAI's default is sampling;
-  a client that sends no `temperature` does not expect greedy. `bigtea-run`
+  a client that sends no `temperature` does not expect greedy. `chaos-run`
   keeps greedy as its default for the opposite reason — it keeps a wrong
   forward pass diagnosable.
 - **Stop sequences are matched against the accumulated text, not the token**,
@@ -510,14 +510,14 @@ Two details that would have been wrong quietly:
 
 ### Chat framing against llama.cpp, both paths — one bug, four open (2026-08-15)
 
-`scripts/jinja-vs-llamacpp.py` claims in its docstring to compare "Bigtea's Jinja
-rendering against `llama.cpp --jinja`" and **never runs Bigtea** — it runs
+`scripts/jinja-vs-llamacpp.py` claims in its docstring to compare "Chaos's Jinja
+rendering against `llama.cpp --jinja`" and **never runs Chaos** — it runs
 llama.cpp twice, `--jinja` against `--no-jinja`. That measurement is real and
 worth keeping (the reference disagrees with **itself** on 5 of 18 containers) but
 it was being cited for a claim it does not test. Same failure as the `REFUSED`
 row: a description that outlived the code.
 
-`scripts/jinja-bigtea-vs-llamacpp.py` runs the four-way that does, on **token IDs
+`scripts/jinja-chaos-vs-llamacpp.py` runs the four-way that does, on **token IDs
 rather than rendered text**. It found a real bug on its first execution: **BOS was
 being emitted twice** under `--jinja`, because the template contains the literal
 `<bos>` *and* `encode` prepended one. gemma-3, Llama-3.2, internlm2, Phi-3 were
@@ -608,7 +608,7 @@ dominates. **Qwen3-4B fits in RAM, so this is the first measurement of the
 compute path on its own.** Both command lines and outputs:
 `docs/graph/research/qwen3-4b-vs-llamacpp-2026-08-10.md`.
 
-| Qwen3-4B dense, CPU, 20 threads | Bigtea | llama.cpp | verdict |
+| Qwen3-4B dense, CPU, 20 threads | Chaos | llama.cpp | verdict |
 |---|---:|---:|---|
 | prefill (matched, 519 vs 512) | **83.4 tok/s** | **88.3** | **1.06x behind** |
 | generation (128 tok, 3 reps) | **4.3 tok/s** | **5.28 ± 0.33** (tg128) | **1.23x behind** |
@@ -623,7 +623,7 @@ prompt, `llama-completion` both sides:
 |---|---:|
 | llama.cpp, repacking on (default) | **88.26** |
 | llama.cpp, `--no-repack` | 63.68 |
-| Bigtea | 60.29 |
+| Chaos | 60.29 |
 
 **Without repacking the two engines are 6% apart** — expected, since both link
 the same ggml. Ruled out by measurement on the way: thread count (8–20 all
@@ -637,8 +637,8 @@ kernel itself (our FFN runs at 472 GFLOP/s against a measured Q4_K ceiling of
 | Qwen3-4B prefill, 519 tokens | tok/s |
 |---|---:|
 | llama.cpp | 88.3 |
-| **Bigtea** | **83.4** |
-| Bigtea, `--no-repack` | 58.6 |
+| **Chaos** | **83.4** |
+| Chaos, `--no-repack` | 58.6 |
 
 **1.42x, and the prefill deficit goes 1.46x → 1.06x.** 216 tensors, 1.64 GiB
 rearranged.
@@ -652,7 +652,7 @@ the opposite of how it first looked. Enabling it changed Llama-3.2's
 continuation, which read as a regression until the reference was actually
 consulted. Raw greedy completion, same container:
 
-| prompt | llama.cpp | Bigtea repacked | Bigtea unpacked |
+| prompt | llama.cpp | Chaos repacked | Chaos unpacked |
 |---|---|---|---|
 | "The largest ocean on Earth is the" | "Pacific Ocean, covering an area of approximately" | **same** | "which covers an area of" |
 | "Water boils at" | "100 degrees Celsius at standard atmospheric pressure" | same | same |
@@ -697,7 +697,7 @@ E llama_model_load: error loading model: unable to allocate CPU_REPACK buffer
 ```
 
 137 GiB. That is why every V4-Flash figure here passes `--no-repack`, a quirk
-that had been recorded without its cause. Bigtea repacks per tensor, so the same
+that had been recorded without its cause. Chaos repacks per tensor, so the same
 container loads, reports `0 repacked`, and runs. **No tok/s is won by this** —
 it is a difference in kind, and `--no-repack` gets llama.cpp running too.
 
@@ -705,7 +705,7 @@ it is a difference in kind, and `--no-repack` gets llama.cpp running too.
 `tensor->extra` to `nullptr` when there is no kernel and returns
 `GGML_STATUS_SUCCESS`; `set_tensor` then dereferences it. No assert, no error
 code — `STATUS_ACCESS_VIOLATION` and the process is gone. `is_repackable`
-accepts `Q8_0` and `Q2_K`, so **any `*.Q8_0.gguf` would have killed `bigtea-run`
+accepts `Q8_0` and `Q2_K`, so **any `*.Q8_0.gguf` would have killed `chaos-run`
 on x86 before printing a token.** None of the Q4_K_M containers here hold a
 `Q8_0` 2-D weight, which is the only reason it had never been seen. `repack` now
 reads what ggml actually decided instead of trusting the shape check.
@@ -729,7 +729,7 @@ per token. Routing them through it needed two guards the streaming path lacked
 | **Llama-3.2-1B** | — | **10.12** | 12.91 | **1.28x behind** |
 
 Cached and uncached produce **byte-identical** text on Qwen3-4B;
-`BIGTEA_UNCACHED=1` keeps the old path reachable so that stays checkable.
+`CHAOS_UNCACHED=1` keeps the old path reachable so that stays checkable.
 
 Two bugs found while measuring, both fixed:
 
@@ -737,7 +737,7 @@ Two bugs found while measuring, both fixed:
   2 GiB, and `ggml` answers exhaustion with `GGML_ASSERT`, not an error. The
   arena is now computed from the shape — and the term that was missing is that
   it is **per layer**: one graph spans all 36 blocks in one context and `ggml`
-  frees nothing inside a context. `bigtea-run` now refuses a prompt that will
+  frees nothing inside a context. `chaos-run` now refuses a prompt that will
   not fit, naming the arena needed and the longest prompt that would work.
 - **The output projection ran on every position.** `build_graph` projected the
   whole sequence through the 151936-wide output matrix and used one row — 253
@@ -762,7 +762,7 @@ That is the failure mode this project is most expensive at, and it is the one
 thing a runner whose pitch is *"it tells you the truth about your machine"*
 cannot do. So `VERIFIED_ARCHITECTURES` is now a list of what has actually been
 run and read — `deepseek4, llama, qwen3, qwen3moe` — and anything else is
-**refused with the reason**. `bigtea-run --force` runs it anyway; **the server
+**refused with the reason**. `chaos-run --force` runs it anyway; **the server
 does not offer that escape hatch at all**, because an API client has no way to
 see that an answer is unsound.
 
@@ -787,7 +787,7 @@ not exist outside it), final-logit soft-capping at 30, and embedding scaling by
 
 ```
 llama.cpp   The capital of France is **Paris**. 🇫
-Bigtea      The capital of France is **Paris**.
+Chaos      The capital of France is **Paris**.
 ```
 
 **Its 4096-token sliding window is not implemented, so anything past 4096 is
@@ -843,12 +843,12 @@ Qwen3-4B, 96 tokens:
 **The deficit that follows from it is 1.23x, not 1.15x**, and the difference is
 a lesson rather than a rounding error. 5.13 was measured at 96 tokens against a
 llama.cpp run that happened to report 5.90; re-measured at the *same* 128 tokens
-`llama-bench` uses, with 3 repetitions, llama.cpp is **5.28 ± 0.33** and Bigtea
+`llama-bench` uses, with 3 repetitions, llama.cpp is **5.28 ± 0.33** and Chaos
 is **4.3**. Generation slows as context grows, so a shorter run flatters us —
 and a single un-repeated reference run has a ±0.33 spread that is a third of the
 gap being claimed. Both sides now get matched length and repetitions.
 
-Llama-3.2-1B, same treatment: Bigtea **13.5**, llama.cpp **16.21 ± 0.29** —
+Llama-3.2-1B, same treatment: Chaos **13.5**, llama.cpp **16.21 ± 0.29** —
 **1.20x behind**. An earlier single llama.cpp run read 12.91, which would have
 made this a *win*. It is not one.
 
@@ -861,7 +861,7 @@ This is the third time this exact fact has cost time — it is already in
 Full write-up, every command line both sides:
 `docs/graph/research/threads-were-never-plumbed-2026-08-10.md`.
 
-`-t N` set `BIGTEA_THREADS` and **only `deepseek4_forward.rs` read it.** Every
+`-t N` set `CHAOS_THREADS` and **only `deepseek4_forward.rs` read it.** Every
 other architecture computed its own count from `available_parallelism()`. What
 exposed it: `-t 1` and `-t 20` produced *bit-identical* phase timings. An
 earlier sweep reading 4.07/4.00/4.31/4.67 tok/s had been recorded as "threads
@@ -902,7 +902,7 @@ Interleaved A/B, same session, `-n 64`, 3 reps:
 
 ### Against llama.cpp — both cells, neither quotable alone
 
-| generation | Bigtea | llama.cpp | verdict |
+| generation | Chaos | llama.cpp | verdict |
 |---|---:|---:|---|
 | Qwen3-4B, **both at default** | **8.01** | 6.52 ± 0.33 (t=10) | **1.23x ahead** |
 | Llama-3.2-1B, **both at default** | 20.05 | 20.91 ± 0.65 (t=10) | 1.04x — parity |
@@ -949,7 +949,7 @@ batched `mul_mat_id` form is genuinely faster (expert compute 7.0 s → 4.2 s ov
 `Arc<[u8]>` and making them contiguous costs ~1.02 GB of copying per token —
 about what the kernel saves. Generation went **1.34 → 1.27 tok/s**.
 
-`bigtea-kernelbench`'s 11.17 GiB/s for the batched form is real and was
+`chaos-kernelbench`'s 11.17 GiB/s for the batched form is real and was
 misleading: **it binds the model's already-stacked expert tensor zero-copy.** A
 kernel benchmark measures the kernel, not the data movement needed to feed it.
 
@@ -965,7 +965,7 @@ tok/s-versus-RAM frontier work. Full numbers:
 
 ### V4-Flash has the same curve and still has its old default — 1.28x unclaimed
 
-`deepseek4_forward.rs` reads `BIGTEA_THREADS` directly and does not go through
+`deepseek4_forward.rs` reads `CHAOS_THREADS` directly and does not go through
 the tuner, so the flagship model still defaults to every core:
 
 | threads | 1 | 2 | **4** | 8 | 20 *(its default)* |
@@ -1011,7 +1011,7 @@ refused. Now the even layers get a second mask with the old keys closed off.
 Verified three ways, because two of them prove nothing alone:
 
 1. **Below the window** output is unchanged (`**Paris**.`) — a regression check.
-2. **Above the window** (5201 tokens, greedy, `-no-cnv` on both sides) Bigtea and
+2. **Above the window** (5201 tokens, greedy, `-no-cnv` on both sides) Chaos and
    llama.cpp produce the same continuation.
 3. **The layer parity is load-bearing** — flipping it to odd-slide changes the
    output on the same prompt. Without this, check 2 is also consistent with the
@@ -1038,7 +1038,7 @@ until the block grows enough to eat it.**
 | Gemma-2-2b prefill, 5200 tokens | best of each | verdict |
 |---|---:|---|
 | llama.cpp | **127.35** (t=20) | — |
-| Bigtea | 114.99 (t=4) | **1.11x behind** |
+| Chaos | 114.99 (t=4) | **1.11x behind** |
 
 At `-t 4` on both sides it reads 114.99 against 76.76 — 1.50x ahead — because
 prefill wants every core and llama.cpp was being handicapped. Run the opposing
@@ -1047,10 +1047,10 @@ command at the setting its own author would choose.
 ## Quality is measured now — perplexity, and it agrees with llama.cpp (2026-08-10)
 
 Every correctness check in this project had been *"does it say Paris"*, which
-catches a broken forward pass and nothing subtler. `bigtea-run --ppl-chunk N`
+catches a broken forward pass and nothing subtler. `chaos-run --ppl-chunk N`
 reports perplexity with llama.cpp's exact windowing:
 
-| perplexity, 128-token chunks | Bigtea | llama.cpp | difference |
+| perplexity, 128-token chunks | Chaos | llama.cpp | difference |
 |---|---:|---:|---:|
 | Llama-3.2-1B-Instruct Q4_K_M | **29.0909** | 29.2456 ± 6.49 | **0.53%** |
 | Qwen3-4B Q4_K_M | **33.6434** | 34.0293 ± 9.64 | **1.13%** |
@@ -1074,7 +1074,7 @@ Full table and every refusal with its reason:
 `docs/graph/backlog/llamacpp-flag-audit.md`.
 
 llama.cpp has **182** long flags, counted from `llama-completion --help`. The
-parity doc had said "~100", which was a guess. Bigtea now accepts **106**.
+parity doc had said "~100", which was a guess. Chaos now accepts **106**.
 
 | bucket | | state |
 |---|---:|---|
@@ -1134,7 +1134,7 @@ memory**.
 llama.cpp.** Its output is now identical; it was not before.
 
 ```
-bigtea (before)  **Paris**.
+chaos (before)  **Paris**.
 llama.cpp        :  a) Paris  b) Lyon  c) Marseille  d)
 ```
 
@@ -1218,19 +1218,19 @@ the shell suggests it and the binary rejects it.
 
 Same failure as the flag count this project carried for eight commits.
 **Anything that enumerates the flags is a second copy of the parser and will
-drift**, so `build.rs` now scans `bigtea-run.rs` for the string literals its
+drift**, so `build.rs` now scans `chaos-run.rs` for the string literals its
 `match` arms are made of and generates the list: **119 long flags**, 0 phantom,
 0 missing.
 
 ## Chat templates 25 -> 54, and 11 of the old ones were wrong (2026-08-11)
 
-llama.cpp knows 54 template names. Bigtea knew 25 — **and eleven of those
+llama.cpp knows 54 template names. Chaos knew 25 — **and eleven of those
 rendered differently from the reference**, which nothing had ever checked.
 
 The oracle is `scripts/capture-chat-templates.py`: it runs llama.cpp with
 `--verbose-prompt` and reconstructs, token by token, the exact prompt it builds
 for every template it knows. That capture is a fixture in the repo and a test
-replays all of it. "Bigtea supports `gpt-oss`" now means **byte-identical to
+replays all of it. "Chaos supports `gpt-oss`" now means **byte-identical to
 llama.cpp on a recorded command line**, not "it looked right".
 
 **52 of 54 match exactly.** The two skipped are Hunyuan variants whose bytes the
@@ -1281,7 +1281,7 @@ falls back to llama.cpp's literal when there is not — the fixture test passes
 | `--infill` | suppress fill-in-the-middle control tokens |
 | `--grammar-lazy` | hold a grammar back until the model writes a trigger, then constrain everything after it |
 
-Bigtea now implements **20 of llama.cpp's 20** sampler entry points.
+Chaos now implements **20 of llama.cpp's 20** sampler entry points.
 
 **Adaptive-p was written in the wrong slot first**, and the mistake is worth
 recording because it looked plausible: it went next to mirostat, *before* the
@@ -1316,7 +1316,7 @@ says `0` rather than pretending.
 **Updated 2026-08-14, and the previous headline was false.** It read "every
 llama.cpp flag is now recognised" while `--flash-attn`/`-fa` was in neither the
 implemented set nor the declined one — and an unrecognised flag was not an
-error, it became the *prompt*. `bigtea-run -m m.gguf -fa off "hello"` ran with
+error, it became the *prompt*. `chaos-run -m m.gguf -fa off "hello"` ran with
 `prompt = "-fa"`, discarded `"hello"`, and exited **0**. The claim was checked by
 reading a table; the gap was in the code the table does not describe.
 
@@ -1326,7 +1326,7 @@ The counts are now **computed from both sources** rather than tallied:
 llama-completion --help | grep -oE '\-\-[a-zA-Z0-9][a-zA-Z0-9-]*' | sort -u   # 182
 ```
 
-intersected with `bigtea-run`'s match arms and with its `REFUSED` table:
+intersected with `chaos-run`'s match arms and with its `REFUSED` table:
 
 | | count |
 |---|---:|
@@ -1341,7 +1341,7 @@ An unknown `-` token is now an error, with `--` as the escape hatch for a prompt
 that genuinely starts with a dash. `declined_flags_actually_decline` extracts the
 `REFUSED` table from source at test time and runs the binary once per row, so the
 table cannot drift from the binary again — it had, silently: `--jinja` sat in the
-table claiming "no Jinja engine" while `bigtea-jinja` evaluated templates one
+table claiming "no Jinja engine" while `chaos-jinja` evaluated templates one
 match arm above it, and because `REFUSED` is consulted from the *fallback* arm,
 the explicit arm shadowed the row. Dead code that lies.
 
@@ -1349,8 +1349,8 @@ A command line copied from llama.cpp now runs or explains itself, instead of
 dying on an unknown flag. What it never does is quietly do less than it says:
 
 ```
-$ bigtea-run -m m.gguf --n-gpu-layers 32
-bigtea-run: --n-gpu-layers is not supported: no GPU backend exists
+$ chaos-run -m m.gguf --n-gpu-layers 32
+chaos-run: --n-gpu-layers is not supported: no GPU backend exists
   Declined rather than ignored: a run never quietly does less
   than its command line says. Drop the flag to continue.
 $ echo $?
@@ -1369,7 +1369,7 @@ not a summary of it:
 
 | n | flags | why |
 |---:|---|---|
-| 10 | `--device`, `--list-devices`, `--gpu-layers`, `--n-gpu-layers`, `--main-gpu`, `--split-mode`, `--tensor-split`, `--kv-offload`, `--op-offload`, `--override-tensor` | **no GPU backend exists.** `bigtea-probe` detects the card and nothing uses it; a VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer (`weights.rs:286`). Scoped 2026-08-11 in `research/gpu-tier-smallest-honest-slice-2026-08-11.md`: this machine has **no CUDA toolkit at all**, and dense-layers-in-VRAM is a 1.10x ceiling on the model where it fits and doesn't fit on the model where it would matter |
+| 10 | `--device`, `--list-devices`, `--gpu-layers`, `--n-gpu-layers`, `--main-gpu`, `--split-mode`, `--tensor-split`, `--kv-offload`, `--op-offload`, `--override-tensor` | **no GPU backend exists.** `chaos-probe` detects the card and nothing uses it; a VRAM tier needs a CUDA-enabled ggml *and* a non-zero-copy binding path, since weights are bound by handing ggml a host pointer (`weights.rs:286`). Scoped 2026-08-11 in `research/gpu-tier-smallest-honest-slice-2026-08-11.md`: this machine has **no CUDA toolkit at all**, and dense-layers-in-VRAM is a 1.10x ceiling on the model where it fits and doesn't fit on the model where it would matter |
 | 4 | `--cache-type-{k,v}-draft`, `--spec-draft-type-{k,v}` | speculative decoding measured ~1.4x here, not the literature's 2.2x, and is a net loss below ~0.75 acceptance |
 | 2 | `--grp-attn-n`, `--grp-attn-w` | self-extend, which needs a change to `stream.rs` |
 | 2 | `--parallel`, `--defrag-thold` | one sequence by design; an append-only KV cache that cannot fragment |
@@ -1391,7 +1391,7 @@ that gap is stated where the flag is documented rather than by declining it.
 
 Three more implemented in the same batch: `--mmap` (the default, spelled out),
 `--ubatch-size` (takes the smaller of it and `-b`, and says which), and
-`--swa-full`, which **is already the behaviour** — Bigtea's KV cache is always
+`--swa-full`, which **is already the behaviour** — Chaos's KV cache is always
 full and the window lives in the attention mask, so it reports that rather than
 accepting the flag silently.
 
@@ -1402,9 +1402,9 @@ Seven flags moved from **declined** to **implemented**: `-hf`, `--hf-repo`,
 command now downloads and runs:
 
 ```
-$ bigtea-run -hf Qwen/Qwen2-0.5B-Instruct-GGUF/qwen2-0_5b-instruct-q4_k_m.gguf \
+$ chaos-run -hf Qwen/Qwen2-0.5B-Instruct-GGUF/qwen2-0_5b-instruct-q4_k_m.gguf \
              -p "The capital of France is" -n 8 --temp 0
-model      fetched .../bigtea/models/Qwen--Qwen2-0.5B-Instruct-GGUF--qwen2-0_5b-...gguf
+model      fetched .../chaos/models/Qwen--Qwen2-0.5B-Instruct-GGUF--qwen2-0_5b-...gguf
  Paris. It is the most populous city
 ```
 
@@ -1499,7 +1499,7 @@ Verified by corrupting 4 KiB of a known-good container at a known offset:
 
 ```
 check      blk.12.ffn_up.weight: non-finite block scale at block 72335
-bigtea-run: 1 tensor(s) hold non-finite values. This container is damaged
+chaos-run: 1 tensor(s) hold non-finite values. This container is damaged
 ```
 
 The refusal this retracts claimed a values-level scan "would have to dequantise
@@ -1524,7 +1524,7 @@ is worse than none.
 
 ### `--fit`, `--fit-target`, `--fit-ctx`
 
-The one flag group where Bigtea should be *ahead* rather than level: llama.cpp
+The one flag group where Chaos should be *ahead* rather than level: llama.cpp
 asks "will this fit in device memory" from outside the engine, and owning
 residency is this project's whole design.
 
@@ -1568,7 +1568,7 @@ what `-t` failed to do for weeks while being accepted and echoed.
 
 I refused these earlier for "no thread-affinity layer". **That premise was
 wrong in the same way `--prio`'s and `--warmup`'s were**: process affinity is
-one syscall, and every thread ggml spawns inherits it. Bigtea does not need to
+one syscall, and every thread ggml spawns inherits it. Chaos does not need to
 own a threadpool to pin one. Three refusals in a row have now turned out to
 rest on a wrong premise rather than a real limit — the pattern is refusing on
 *architecture* ("we have no X layer") when the flag only needs a *syscall*.
@@ -1598,7 +1598,7 @@ Flags: **147 implemented, 44 declined**, of 191 recognised. Tests **435**.
 generated under a 24-token limit:
 
 ```
-$ bigtea-run -m m.gguf -p "Once upon a time" -n 40 -c 24 --keep 4
+$ chaos-run -m m.gguf -p "Once upon a time" -n 40 -c 24 --keep 4
 shift      context full: kept 4, dropped 9. ...
 generated  40 tokens in 1.6s (25.10 tok/s)
 ```
@@ -1729,7 +1729,7 @@ The eight-prompt sweep found it. Llama-3.2-1B:
 
 ```
 FAIL  SELECT name, COUNT(*) FROM users WHERE
-  bigtea   :  age > 18 AND gender = 'male' GROUP BY name;
+  chaos   :  age > 18 AND gender = 'male' GROUP BY name;
   llama.cpp:  age > 18 GROUP BY name HAVING COUNT(*) > 1;
 ```
 
@@ -1753,7 +1753,7 @@ Ticket: `docs/graph/backlog/rope-freqs-ignored.md`. The fix is three lines in
 ### The harness also cried wolf once, and that is worth as much
 
 TinyLlama reported a FAIL on `Q: What is 17 plus 25? A:` where both engines
-answered ` 42`. llama.cpp prints `[end of text]` on EOS and Bigtea stops
+answered ` 42`. llama.cpp prints `[end of text]` on EOS and Chaos stops
 silently — **the generated tokens were identical.** Stripped now.
 
 A harness that cries wolf is worse than no harness: the first thing anyone does
@@ -1803,7 +1803,7 @@ operators: in, not, is defined, is string, is not none
 ```
 
 **No macros, no imports, no inheritance, three filters.** That is a
-self-contained crate with no dependencies, the same shape as `bigtea-grammar`
+self-contained crate with no dependencies, the same shape as `chaos-grammar`
 — a weekend, not a quarter.
 
 The acceptance test already exists: `chat-templates.txt` is llama.cpp's own
@@ -1844,9 +1844,9 @@ three or more unstable in eight exits non-zero is what keeps the addition
 honest.
 
 One correction back to that session: their report says `-b 1` reproduces **both**
-Phi-3 near-ties byte-identically against Bigtea. Re-run here, only the
+Phi-3 near-ties byte-identically against Chaos. Re-run here, only the
 arithmetic prompt does; `The capital of France is` gives `Paris. Paris is known
-for its rich history` under `-b 1` against Bigtea's `Paris. <|assistant|> That's
+for its rich history` under `-b 1` against Chaos's `Paris. <|assistant|> That's
 correct!`. The classification is unchanged — the reference is unstable there
 under all three configurations — but the stated reason was not reproducible.
 
@@ -1856,7 +1856,7 @@ The container's own template is evaluated when asked, and **declines loudly** on
 anything the engine does not fully understand:
 
 ```
-$ bigtea-run -m Qwen2-0.5B --jinja -sys SYS -p HI
+$ chaos-run -m Qwen2-0.5B --jinja -sys SYS -p HI
 chat       template evaluated (--jinja)
 prompt     "<|im_start|>system
 SYS<|im_end|>
@@ -1864,7 +1864,7 @@ SYS<|im_end|>
 HI<|im_end|>
 ..."
 
-$ bigtea-run -m Llama-3.2-1B --jinja -sys SYS -p HI
+$ chaos-run -m Llama-3.2-1B --jinja -sys SYS -p HI
 prompt     "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 
@@ -1873,11 +1873,11 @@ Today Date: 13 Aug 2026
 
 SYS..."
 
-$ bigtea-run -m Phi-3-mini --jinja -sys SYS -p HI
+$ chaos-run -m Phi-3-mini --jinja -sys SYS -p HI
 chat       template has no system branch; merging it into the first user turn
 chat       template evaluated (--jinja)
 
-$ bigtea-run -m gemma-2-2b-it --jinja -sys SYS -p HI
+$ chaos-run -m gemma-2-2b-it --jinja -sys SYS -p HI
 chat       --jinja declined: template rejected this conversation: System role not supported
            falling back to the family matcher.
 ```
@@ -1927,7 +1927,7 @@ it was a missing variable becoming the literal text `None`.
 ## Adapters: loaded and checked, applied nowhere (2026-08-13)
 
 `--lora`, `--lora-scaled`, `--control-vector`, `--control-vector-scaled`,
-`--control-vector-layer-range`. `bigtea-model/src/adapter.rs`, 8 unit tests.
+`--control-vector-layer-range`. `chaos-model/src/adapter.rs`, 8 unit tests.
 
 **The loader is deliberately separate from the application.** Applying either is
 a change to the forward pass; deciding whether an adapter *belongs to this
@@ -1950,8 +1950,8 @@ apply it would produce base-model output under a command line asking for a
 fine-tune, and nothing downstream could tell:
 
 ```
-$ bigtea-run -m model.gguf --lora adapter.gguf
-bigtea-run: adapters are checked but NOT YET APPLIED -- the forward-pass half is
+$ chaos-run -m model.gguf --lora adapter.gguf
+chaos-run: adapters are checked but NOT YET APPLIED -- the forward-pass half is
 unimplemented, so this run would give you base-model output. Drop the adapter
 flags to continue.
 ```
@@ -1961,7 +1961,7 @@ Flags: **170 implemented, 25 declined**, of 195 recognised. Tests **492**.
 ## RWKV: the fifth tokenizer family (2026-08-13)
 
 llama.cpp has five real vocabulary types — SPM, BPE, WPM, UGM, RWKV. This had
-four. `crates/bigtea-tokenizer/src/rwkv.rs`, 8 unit tests plus 6 through the
+four. `crates/chaos-tokenizer/src/rwkv.rs`, 8 unit tests plus 6 through the
 public `from_metadata` path.
 
 It is **greedy longest match over a trie of raw byte strings**: no merge table,
@@ -2045,7 +2045,7 @@ doc, run in the same session as the number it is compared against.**
 export GGML_LIB_DIR=C:/Projects/llamacpp-unsloth/build/ggml/src
 cargo test --release          # 168 tests (+16 container-backed, --ignored)
 cargo build --release
-./target/release/bigtea-probe        # RAM/disk/GPU + what to close
+./target/release/chaos-probe        # RAM/disk/GPU + what to close
 ```
 
 Windows needs the **GNU** Rust toolchain and `C:\msys64\mingw64\bin` on PATH —
@@ -2067,7 +2067,7 @@ internet.
 ## Hardware this is measured on
 
 15.7 GiB RAM (typically 3–10 GiB free), NVMe at **2.37 GiB/s** measured,
-RTX 3050 6 GB laptop. **No GPU code exists** — `bigtea-probe` detects the card,
+RTX 3050 6 GB laptop. **No GPU code exists** — `chaos-probe` detects the card,
 nothing in the compute path touches it.
 
 ## Working rules
@@ -2081,14 +2081,14 @@ nothing in the compute path touches it.
 
 ## R10.1 — constrained decoding: GBNF and JSON schema (2026-08-11)
 
-`crates/bigtea-grammar` (new, **no dependencies at all** — not ggml, not even
+`crates/chaos-grammar` (new, **no dependencies at all** — not ggml, not even
 the tokenizer) parses GBNF, compiles it to a stack matcher, and turns the bytes
 generated so far into the token ids that may legally come next. Detail:
 `docs/graph/research/gbnf-grammars-2026-08-11.md`.
 
 Unlocks 4 of the 182 flags: `--grammar`, `--grammar-file`, `--json-schema`,
 `--json-schema-file`. **The library is done; the CLI wiring is not** —
-`sample.rs` and `bigtea-run.rs` belong to another session, so the hook stops at
+`sample.rs` and `chaos-run.rs` belong to another session, so the hook stops at
 one function:
 
 ```rust
@@ -2173,8 +2173,8 @@ Two things that had to be right first:
 
 All 21 container-backed V4-Flash tests pass with it active, including the
 element-sum comparisons against llama.cpp — the overlap changes *when* bytes are
-read, never which. `BIGTEA_PREFETCH_OVERLAP=0` disables it;
-`BIGTEA_PREFETCH_READERS` tunes the split.
+read, never which. `CHAOS_PREFETCH_OVERLAP=0` disables it;
+`CHAOS_PREFETCH_READERS` tunes the split.
 
 ## V4-Flash measured, and the parallel-experts port is dead (2026-08-16)
 
@@ -2213,7 +2213,7 @@ slices contiguously *as it reads them*, so this path already runs the batched
 `mul_mat_id` form — the ~1.02 GB/token gather that killed the Qwen3 version is
 here the read that had to happen anyway. No headroom and no mechanism.
 
-**The drive is not the fixable part either.** `bigtea-iobench` on a shard of this
+**The drive is not the fixable part either.** `chaos-iobench` on a shard of this
 model tops out at **2.74 GiB/s at four handles** and does not climb at 8, 16 or
 32, so the 8-handle pool is not the limit. The gap to the achieved 1.88 GiB/s is
 the **per-block barrier**: nothing can be queued while a block computes, because
@@ -2307,7 +2307,7 @@ workers on three prompts.
 
 **Four is not a core count.** The plateau is 4–6 and falls by 8 because this
 model selects eight experts per token; past that there is nothing left to split.
-`BIGTEA_EXPERT_WORKERS` overrides it, `1` restores the old path exactly.
+`CHAOS_EXPERT_WORKERS` overrides it, `1` restores the old path exactly.
 
 Scope: **generation only** — the batched prefill path is untouched and measured
 flat at 1.30–1.32 across every worker count. 1.10x rather than 1.29x end to end
@@ -2321,7 +2321,7 @@ vs 2.16) — do not claim otherwise."* **It no longer reproduces.**
 
 Both engines run **alternately in one session**, five pairs, medians:
 
-| | Bigtea | llama.cpp | ratio |
+| | Chaos | llama.cpp | ratio |
 |---|---:|---:|---:|
 | generation tok/s | **3.03** | **3.35** | 0.90x |
 | prefill tok/s | **1.22** | **1.17** | 1.04x |
@@ -2375,7 +2375,7 @@ that does not.** Every GPU number published here — 25.6x on a kernel,
 1.33–1.52x on a Qwen3-4B prefill, 1.79x on the `-ngl` frontier — was measured on
 a model that fits, and none of them predicted this one.
 
-`bigtea-run` warns, with the measurement in the message, when a device is opened
+`chaos-run` warns, with the measurement in the message, when a device is opened
 on a model that streams experts. Full node:
 `research/gpu-does-not-help-streaming-moe-2026-08-16.md`.
 
@@ -2509,7 +2509,7 @@ diff at all**. The GPU tier is not verified and must not be called finished.
 **The first reading of this was wrong.** One prompt swept over `-ngl 0..17` had
 us changing at 5 values and llama.cpp at none, which looks exactly like our bug.
 Eight prompts reversed it: llama.cpp answers `A triangle has a base of 5 units`
-at `-ngl 0` and `a base of 10 cm` at `-ngl 99`, and Bigtea flips the *opposite*
+at `-ngl 0` and `a base of 10 cm` at `-ngl 99`, and Chaos flips the *opposite*
 way. A CPU kernel and a Vulkan kernel do not produce bit-identical sums and
 greedy decoding turns the last bit into a different word — in both engines.
 
@@ -2535,7 +2535,7 @@ mixed graph had computed when it had not. And `splits() >= 2` was asserted on a
 **single-node** graph, which cannot split however its operands are placed: an
 unfalsifiable assertion, only revealed when a real card started evaluating it.
 
-**The 1-in-8 turned out to be arithmetic, measured the same day.** `bigtea-gpubench`
+**The 1-in-8 turned out to be arithmetic, measured the same day.** `chaos-gpubench`
 grew `--prompt <text>` and a real comparison — the old one was
 `sum(|logits[0..64]|)` to four decimals, which is what Phase A's "logit
 checksums agree" rested on and cannot see the top token move. On all eight
@@ -2599,7 +2599,7 @@ Raw, CSA and HCA, since prompt length decides which builder runs. `raw_span` is
 a pure function with unit tests covering wraparound, the batch limit and the
 property the whole design rests on: no two positions in one span share a slot.
 
-~~**Still stale, and not mine to change**: `bigtea-serve.rs` reports
+~~**Still stale, and not mine to change**: `chaos-serve.rs` reports
 `context_limit() = 256` for deepseek4, so the server refuses sequences the engine
 now handles. One line, and it belongs to whoever owns that file.~~
 
@@ -2620,7 +2620,7 @@ stablelm -> ??地なutorsemie路emieemieا起
 
 The qwen2 CJK-noise signature. What is missing, after #60's Q/K/V bias support:
 
-1. **`bigtea-ggml` has no LayerNorm.** It binds `ggml_rms_norm` and not
+1. **`chaos-ggml` has no LayerNorm.** It binds `ggml_rms_norm` and not
    `ggml_norm`. LayerNorm subtracts the mean and carries a **bias**; RMSNorm
    does neither. The tell is `attn_norm.bias` in the container, and the metadata
    key being `attention.layer_norm_epsilon` rather than `..._rms_epsilon`.
@@ -2649,7 +2649,7 @@ remaining difference is in the tokenizer.
 
 What the dense path gained, all detected from the container rather than by name:
 
-- **LayerNorm.** `bigtea-ggml` now binds `ggml_norm` beside `ggml_rms_norm`.
+- **LayerNorm.** `chaos-ggml` now binds `ggml_norm` beside `ggml_rms_norm`.
   A norm carrying a bias *is* a LayerNorm — RMSNorm never centres and has no
   shift — and substituting one was the fluent CJK noise both models produced.
 - **The full bias set.** `attn_output`, `ffn_up`, `ffn_down` and the norms,
@@ -2682,7 +2682,7 @@ is the plain GPT-2 rule. A6c refused every unknown `pre` **by name** and then
 guessed the absent case, which is the same mistake one layer down.
 
 The fix is a `default` GPT-2 variant in `pretok.rs` plus one line in
-`crates/bigtea-tokenizer/src/lib.rs` — a file another session owns, so it is
+`crates/chaos-tokenizer/src/lib.rs` — a file another session owns, so it is
 reported rather than taken.
 
 Regression sweep after these changes, `parity-check.sh` at 32 tokens: gemma2,
@@ -2701,8 +2701,8 @@ falls back to its `LLAMA_VOCAB_PRE_TYPE_DEFAULT` GPT-2 rule.
 
 ```
 llama-tokenize  "def fibonacci(n):"  ->  def / ' fibonacci' / ( / n / '):'   5
-bigtea, before                       ->                                      4
-bigtea, after                        ->                                      5
+chaos, before                       ->                                      4
+chaos, after                        ->                                      5
 ```
 
 A6c refused every *unknown* `pre` **by name** and then quietly guessed the
@@ -2769,8 +2769,8 @@ the symptom, because the model is answering a slightly different question.
 in eight is ordinary; five is a bug not yet found.
 
 Also fixed in the harness: `llama-completion` prints ` [end of text]` on EOS and
-Bigtea prints no equivalent, so any model terminating early read as a FAIL whose
-two sides were identical (`bigtea: 42` vs `llama.cpp: 42 [end of text]`).
+Chaos prints no equivalent, so any model terminating early read as a FAIL whose
+two sides were identical (`chaos: 42` vs `llama.cpp: 42 [end of text]`).
 
 ### What the four architectures actually needed
 
@@ -2844,7 +2844,7 @@ bus added.
 CUDA-enabled ggml": there is **no CUDA toolkit on this machine at all** —
 `nvcc` absent, no `ggml-cuda.a` — only a CUDA-capable driver (610.74).
 
-**Blocker (b) is one line.** `crates/bigtea-ggml/src/weights.rs:286` writes a
+**Blocker (b) is one line.** `crates/chaos-ggml/src/weights.rs:286` writes a
 host pointer into `tensor->data`. `ggml-cuda` cannot be handed one; a device
 tensor is filled by a copy. So a GPU path is a second `bind_shared` plus a
 scheduler, not a flag.
@@ -2971,7 +2971,7 @@ unstable under the widened harness.
 
 **2026-08-15, and it corrects the line directly above.** The harness classified a
 disagreement by asking *"does llama.cpp disagree with itself here?"* and the
-report read as though that settled *"is Bigtea's output one of the things it
+report read as though that settled *"is Chaos's output one of the things it
 disagrees between?"* Those come apart precisely where it matters, and **the nine
 of eleven `unstable` verdicts that turned out to be real bugs were all the second
 kind**. Same model, same prompts, same build, with the two separated:
@@ -2996,14 +2996,14 @@ we share, and would be the lead.
 
 Two prompts are still outside the band. `Q: What is 17 plus 25? A:` was examined
 first because arithmetic has a right answer, and **it came back the opposite way
-to the guess**: Bigtea emits `42`, exactly as every reference configuration does.
+to the guess**: Chaos emits `42`, exactly as every reference configuration does.
 The earlier "it skips the answer" reading was an artefact of capturing the two
 sides with different tail-truncation. It was flagged as not citable before anyone
 acted on it, which is the only reason it cost nothing.
 
 The reference spans **three distinct outputs across five configurations** on that
 prompt — `42`, `A: 42` on its own line, and `17 + 25 = 42` — so the continuation
-after the answer is barely determined at all. Bigtea is a fourth, agreeing with
+after the answer is barely determined at all. Chaos is a fourth, agreeing with
 `-fa off` at the token where the reference splits. **That is weak evidence of a
 defect, not strong**: the bugs this harness has caught (Llama-3.2's RoPE,
 Falcon3's short prefill) broke prompts that had a determined answer, and this one
@@ -3020,7 +3020,7 @@ fails too.
 
 `research/gpu-the-card-works-vulkan-not-cuda-2026-08-15.md`, 2026-08-15.
 
-**GPU is still 0%.** Nothing here is Bigtea. This is the precondition the ticket
+**GPU is still 0%.** Nothing here is Chaos. This is the precondition the ticket
 set — *if llama.cpp cannot use the card, we cannot either* — answered in an hour
 rather than three days, which is what step 1 was for.
 
@@ -3080,12 +3080,12 @@ is prefill on a model that fits in VRAM, the one slice this card can plausibly w
 
 ## The GPU tier, Phase A: the card runs a full prefill — at 1.33–1.52x
 
-`research/phase-a-device-prefill-2026-08-15.md`, 2026-08-15. Bigtea's own binary
+`research/phase-a-device-prefill-2026-08-15.md`, 2026-08-15. Chaos's own binary
 runs a complete Qwen3-4B prefill on an RTX 3050 through Vulkan, every weight
 resident on the card.
 
 ```bash
-bigtea-gpubench C:/Projects/models/qwen3-4b/Qwen3-4B-Q4_K_M.gguf --repeat 3
+chaos-gpubench C:/Projects/models/qwen3-4b/Qwen3-4B-Q4_K_M.gguf --repeat 3
 ```
 
 | | cpu (`-t 20`) | device | ratio |
@@ -3101,7 +3101,7 @@ per process. **The repeat harness says 1.33–1.52x and that is the number.** An
 earlier 0.42x was a cold Vulkan pipeline cache — the driver persists compiled
 shaders to disk, so run 1 of any GPU path is a different program from run 2.
 
-**Two rules came out of it, both now enforced by `bigtea-gpubench` itself.**
+**Two rules came out of it, both now enforced by `chaos-gpubench` itself.**
 A GPU measurement needs **repeats** — `--repeat 1` is refused without `--force`.
 And **nothing expensive belongs inside the timed region**: the first harness
 reloaded 2.32 GiB per run and swung the CPU baseline 26.48–67.35 tok/s, a 2.5x

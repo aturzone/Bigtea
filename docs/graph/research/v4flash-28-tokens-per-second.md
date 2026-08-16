@@ -165,7 +165,7 @@ kernel, no new quantiser, no accuracy loss — the same weights in a different o
 ## MEASURED, PART 2: V4-Flash's experts are NOT 90% sparse — the plan above is wrong
 
 The layout result stands. The premise it serves does not. Instrumented the real SwiGLU
-activations (`BIGTEA_SPARSITY=1`), all 43 blocks, and binned every one of the 2048
+activations (`CHAOS_SPARSITY=1`), all 43 blocks, and binned every one of the 2048
 intermediate neurons by its magnitude relative to that block's peak:
 
 ```

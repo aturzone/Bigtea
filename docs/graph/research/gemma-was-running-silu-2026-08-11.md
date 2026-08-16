@@ -8,7 +8,7 @@ Two bugs, found while chasing a third. `gemma2` was in
 `VERIFIED_ARCHITECTURES`; it had never been diffed against llama.cpp.
 
 ```
-$ bigtea-run -m gemma-2-2b-it-Q4_K_M.gguf -p "The capital of France is" -n 16 --temp 0
+$ chaos-run -m gemma-2-2b-it-Q4_K_M.gguf -p "The capital of France is" -n 16 --temp 0
  **Paris**.
 
 $ llama-completion -m gemma-2-2b-it-Q4_K_M.gguf -p "The capital of France is" \
@@ -59,7 +59,7 @@ The difference was where the `1/sqrt(head_dim)` goes.
 | | Q entering the kernel | `scale` argument |
 |---|---|---|
 | llama.cpp | pre-scaled by 0.0625 | 1.0 |
-| Bigtea | raw | 0.0625 |
+| Chaos | raw | 0.0625 |
 
 ggml folds the cap into the scale before the loop:
 
@@ -103,7 +103,7 @@ Three prompts, 32 tokens, `--temp 0`, both engines, back to back. Output
 identical token for token on **gemma-2-2b-it** and **gemma-3-1b-it**:
 
 ```
-bigtea-run -m <model> -p "<prompt>" -n 32 --temp 0
+chaos-run -m <model> -p "<prompt>" -n 32 --temp 0
 llama-completion -m <model> -p "<prompt>" -n 32 --temp 0 --no-warmup -no-cnv
 ```
 

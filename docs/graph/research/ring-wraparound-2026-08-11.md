@@ -103,7 +103,7 @@ at one length verifies a path it did not change.
 
 ## Left stale, deliberately — and closed since
 
-`bigtea-serve.rs` reported `context_limit() = 256` for deepseek4 when this was
+`chaos-serve.rs` reported `context_limit() = 256` for deepseek4 when this was
 written, so the **server refused sequences the engine had started handling**.
 That file belonged to another session and was not touched here.
 

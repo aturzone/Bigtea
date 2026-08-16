@@ -22,7 +22,7 @@ matter how good the kernel that follows is.
 
 ### Why the kernelbench evidence was misleading
 
-`bigtea-kernelbench` measured the batched form at 11.17 GiB/s and 2.86x thread
+`chaos-kernelbench` measured the batched form at 11.17 GiB/s and 2.86x thread
 scaling, and that is real — **but it binds the model's already-stacked expert
 tensor zero-copy.** The streaming path holds the selected experts as unrelated
 `Arc<[u8]>` and has to build the stack itself. The ticket named this caveat
@@ -40,7 +40,7 @@ moves it. That mistake alone cost 12 s of a 27 s run (0.88 tok/s against 1.34).
 
 **Bind the whole stacked expert tensor and pass the real expert ids.** No copy at
 all, and the full 1.7x on expert compute. That requires the expert tensor to be
-**resident**, which is exactly what llama.cpp gets from mmap and what Bigtea
+**resident**, which is exactly what llama.cpp gets from mmap and what Chaos
 gives up in order to run a 144 GB model on 15.7 GiB.
 
 But it is not always given up: **Qwen3-30B-A3B is 17.28 GiB and fits on a 32 GB
@@ -122,11 +122,11 @@ conservative one.
 
 ## The measurement that would have killed it — DONE, and it says build
 
-`bigtea-kernelbench` already does exactly this experiment: it binds the
+`chaos-kernelbench` already does exactly this experiment: it binds the
 **stacked** expert tensor and runs `mul_mat_id`, which is the batched form.
 
 ```
-$ bigtea-kernelbench Qwen3-30B-A3B-Q4_K_M.gguf --reps 3 --threads
+$ chaos-kernelbench Qwen3-30B-A3B-Q4_K_M.gguf --reps 3 --threads
 layer 20, 6 experts, 2048 x 768 per matrix, 17.5 MiB resident
 
 TOKENS    MS/PASS    MS/TOKEN    GFLOP/s      GiB/s
@@ -163,14 +163,14 @@ token and is untouched by any of it; see the note at the bottom.
 
 - **That llama.cpp's 4-thread peak means our path can reach one.** It uses
   `ggml_mul_mat_id` over the *whole stacked* expert tensor with an index tensor,
-  which it can do because it mmaps the entire model. Bigtea streams a subset and
+  which it can do because it mmaps the entire model. Chaos streams a subset and
   cannot bind the stacked tensor — **it has to build a stack of the 8 selected
   experts and pass ids `0..8`.** That is the copy above, and it is why our
   version is worth ~1.45x where llama.cpp's costs nothing.
 
 ## How to build it
 
-`bigtea-kernelbench` lines ~265-275 are working reference code for the batched
+`chaos-kernelbench` lines ~265-275 are working reference code for the batched
 form, including `Context::mul_mat_id`, which already exists in the wrapper. The
 change in `expert_ffn_single` is:
 

@@ -5,11 +5,11 @@ machine. Both engines run **alternately in one session**, five pairs, medians.
 `llama-completion` from `llamacpp-unsloth/build/bin`, CPU build.
 
 ```
-bigtea-run  <model> "The capital of France is" -n 16 --temp 0 --force
+chaos-run  <model> "The capital of France is" -n 16 --temp 0 --force
 llama-completion -m <model> -p "The capital of France is" -n 16 --temp 0 --no-warmup -no-cnv
 ```
 
-| | Bigtea | llama.cpp | ratio |
+| | Chaos | llama.cpp | ratio |
 |---|---:|---:|---:|
 | generation tok/s | **3.03** `[2.67 2.92 3.03 3.38 3.59]` | **3.35** `[2.89 3.00 3.35 3.60 3.69]` | 0.90x |
 | prefill tok/s | **1.22** `[1.21 1.22 1.22 1.24 1.25]` | **1.17** `[1.04 1.10 1.17 1.19 1.56]` | 1.04x |
@@ -28,12 +28,12 @@ and never re-run.
 ## What it does not claim
 
 **Not parity, and certainly not a lead.** 0.90x is *behind*, and the generation
-spread is wide on both sides — Bigtea 2.67–3.59, llama.cpp 2.89–3.69, ranges
+spread is wide on both sides — Chaos 2.67–3.59, llama.cpp 2.89–3.69, ranges
 overlapping almost completely. What can be said is that **the gap is now inside
 the measurement noise of this setup**, and that the specific "2x" figure is
 dead.
 
-Prefill at 1.04x is the tighter number: Bigtea's five runs span 1.21–1.25 (3%)
+Prefill at 1.04x is the tighter number: Chaos's five runs span 1.21–1.25 (3%)
 against llama.cpp's 1.04–1.56 (50%), so the medians are comparable but the
 reference is the noisy one there.
 
@@ -70,19 +70,19 @@ that does not, and it is worse for planning, because the whole "generation is
 Same protocol, five alternating pairs, with `parallel-experts-2026-08-16.md`
 merged.
 
-| pair | Bigtea | llama.cpp | ahead |
+| pair | Chaos | llama.cpp | ahead |
 |---:|---:|---:|---|
 | 1 | 3.53 | 3.62 | llama.cpp |
 | 2 | 3.81 | 3.87 | llama.cpp |
-| 3 | 3.60 | 3.25 | Bigtea |
-| 4 | 3.31 | 2.96 | Bigtea |
-| 5 | 3.03 | 2.53 | Bigtea |
+| 3 | 3.60 | 3.25 | Chaos |
+| 4 | 3.31 | 2.96 | Chaos |
+| 5 | 3.03 | 2.53 | Chaos |
 
 Medians 3.53 against 3.25 — 1.09x — and prefill 1.22 against 1.25, 0.98x.
 
 **This is parity and nothing more.** The paired count is 3–2, the ranges overlap
 almost entirely (3.03–3.81 against 2.53–3.87), and **both series decline across
-the session** (Bigtea 3.53 → 3.03, llama.cpp 3.62 → 2.53), which after hours of
+the session** (Chaos 3.53 → 3.03, llama.cpp 3.62 → 2.53), which after hours of
 back-to-back 17 GiB runs looks like thermal drift rather than anything about
 either engine. Alternating controls for that *between* the two, which is why the
 paired count is the number to read and the medians are not.

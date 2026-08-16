@@ -11,7 +11,7 @@ remaining list, so the honest unit of work is the feature and not the model.
 ## What they actually produce today
 
 ```
-bigtea-run -m stablelm-2-1_6b-chat.Q4_K_M.gguf -p "The capital of France is" -n 10 --force
+chaos-run -m stablelm-2-1_6b-chat.Q4_K_M.gguf -p "The capital of France is" -n 10 --force
   -> ��地なutorsemie路emieemieا起
 ```
 
@@ -21,7 +21,7 @@ cannot express them.
 
 ## The two things the dense path does not have
 
-**1. LayerNorm.** `bigtea-ggml` binds `ggml_rms_norm` and **not `ggml_norm`**.
+**1. LayerNorm.** `chaos-ggml` binds `ggml_rms_norm` and **not `ggml_norm`**.
 RMSNorm scales by the root-mean-square and has weight only; LayerNorm subtracts
 the mean, divides by the standard deviation, and has **weight and bias**. They
 are not interchangeable, and substituting one is not an error — it is the noise
@@ -65,7 +65,7 @@ verify in a sitting.
 
 Order to build it:
 
-1. Bind `ggml_norm` in `bigtea-ggml` beside `rms_norm`. (`ctx.gelu()` already
+1. Bind `ggml_norm` in `chaos-ggml` beside `rms_norm`. (`ctx.gelu()` already
    exists — `ggml_gelu`, the tanh approximation, **not** `ggml_gelu_erf`, which
    is a different function.)
 2. A `norm_kind` on the config, chosen by whether `attn_norm.bias` exists —

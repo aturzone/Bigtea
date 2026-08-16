@@ -10,9 +10,9 @@ Links: [gpu-tier-smallest-honest-slice-2026-08-11.md](gpu-tier-smallest-honest-s
 
 ## GPU is still 0%
 
-Nothing below is Bigtea. This is llama.cpp on the same machine in the same
+Nothing below is Chaos. This is llama.cpp on the same machine in the same
 session, which is the *precondition* the ticket set — "if llama.cpp cannot use
-the card, we cannot either." It can. The bar does not move until `bigtea-run`
+the card, we cannot either." It can. The bar does not move until `chaos-run`
 prints a prefill tok/s with the card doing work.
 
 ## CUDA is not a toolkit install here, it is a toolchain migration
@@ -158,7 +158,7 @@ slice the ticket named and the only one this card can plausibly win.
 ## Open
 
 - **Does `ggml_backend_sched` earn its place before a single-device path
-  exists?** The smallest honest Bigtea slice is Qwen3-4B entirely on the device,
+  exists?** The smallest honest Chaos slice is Qwen3-4B entirely on the device,
   where no mixed-device graph is needed at all.
 - **What does the upload cost on a model that fits?** 2.32 GiB at PCIe speed,
   once, at load. Amortised across a session it is probably free; that is a
