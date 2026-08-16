@@ -28,16 +28,22 @@ a token uses six of 256 — are read from disk as routing selects them.
 $ chaos-run DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf "The capital of France is" -n 8
 model      deepseek4 (direct (cache bypassed))
 shape      43 blocks, 4096 embd, 64 heads, 256 experts (6 used, 1 shared)
-resident   loaded 286 tensors, 6.53 GiB of 6.53 GiB budget in 4.9s (1.44 GB/s)
-           0.85 GiB did not fit and will be re-read from disk on EVERY token (~0.6s each)
-           closing these would free up to 1.94 GiB:
-             chrome.exe                   1.40 GiB (13 processes)
-             Telegram.exe                 0.54 GiB
+prompt     5 tokens
+resident   loaded 534 tensors, 7.24 GiB of 7.24 GiB budget in 4.9s (1.58 GB/s); 0.14 GiB did not fit and will be re-read every token
+           0.14 GiB will be re-read from disk on EVERY token (~0.1s each)
+           closing these would free up to 1.19 GiB:
+             claude.exe                   1.19 GiB (12 processes)
            that is enough to make the whole model resident.
-prefill    5 tokens in 7.9s (0.63 tok/s)
-output      Paris.
-generate   8 tokens in 20.2s (0.396 tok/s, 2.5s per token)
+loaded     7.6s
+prefill    5 tokens in 8.0s (0.63 tok/s)
+output      Paris.",
+    "The capital of France
+generate   7 tokens in 16.4s (0.428 tok/s, 2.3s per token)
 ```
+
+*(A real transcript, unedited, on the machine described below. 0.428 tok/s is a
+single run and the median of three is 0.394 — see the table further down; single
+runs are not what this project quotes.)*
 
 That last block is the point of the project. It is not a progress bar: it is the
 size of your shortfall, what the shortfall costs per token, and the names of the
@@ -101,10 +107,11 @@ cargo test --release
 
 `GGML_LIB_DIR` is checked at build time. **Nine of the ten crates build without
 it** — the container parser, hardware probe, planner, I/O layer, model resolver,
-tokenizer, grammar and template engine are all useful on a machine that has never
-compiled a line of C. Only `chaos-arch`, the inference engine itself, needs it,
-and when it is missing you get one actionable message rather than a wall of
-unresolved imports.
+tokenizer, grammar, template engine and even the FFI crate itself are all usable
+on a machine that has never compiled a line of C, and CI builds, tests and lints
+exactly those nine to keep that true. Only `chaos-arch`, the inference engine,
+needs it, and when it is missing you get one actionable message rather than a
+wall of unresolved imports.
 
 <details>
 <summary><strong>Windows</strong> — needs the GNU toolchain, not MSVC</summary>
@@ -175,7 +182,10 @@ $ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json'
  "finish_reason":"stop"}],"usage":{"prompt_tokens":41,"completion_tokens":3,"total_tokens":44}}
 ```
 
-`chaos-run --help` lists all 165 flags. A handful worth knowing:
+`chaos-run --help` lists the 86 flags worth listing; the other 79 are the long
+tail of llama.cpp compatibility and are audited in
+[`llamacpp-flag-audit.md`](docs/graph/backlog/llamacpp-flag-audit.md). A handful
+worth knowing:
 
 | flag | meaning |
 |---|---|
