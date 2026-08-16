@@ -154,6 +154,19 @@ chaos-serve model.gguf --port 8080        # OpenAI-compatible server
 
 For a split model, pass **any one shard**; the rest are discovered automatically.
 
+Two things about your first run, both deliberate:
+
+- **It will be slow, once, if it uses the GPU.** ggml's Vulkan backend compiles
+  its shader set on first use and the driver then caches it on disk. Measured:
+  1.63 tok/s on the first `--auto` run of a fresh install, **9.0–9.6 tok/s on
+  every run after it**. Nothing is wrong.
+- **A model whose architecture has not been diffed against llama.cpp is
+  refused**, by name, with the list of the 13 that have. That includes
+  `qwen3moe`, so **Qwen3-30B-A3B needs `--force`** — it scores 2 exact, 4
+  near-tie and 2 outside the band on the eight-prompt sweep, and this runner will
+  not pretend that is verified. A wrong forward pass produces fluent nonsense,
+  never an error, which is why the default is refusal.
+
 ```console
 $ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
     -d '{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":6}'

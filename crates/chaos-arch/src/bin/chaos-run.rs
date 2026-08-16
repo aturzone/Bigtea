@@ -3323,15 +3323,22 @@ fn run_streaming(
         (None, false) => 1 << 30,
     };
     let mut runner = StreamingRunner::new(model, config.clone(), budget as usize);
-    chaos_arch::info!(
-        "cache      {:.2} GiB for experts (headroom {:.2} GiB: {:.2} kv + {:.2} arenas + {:.2} fit-target){}",
-        budget as f64 / GIB,
-        headroom as f64 / GIB,
-        kv_estimate as f64 / GIB,
-        arena_estimate as f64 / GIB,
-        base_headroom as f64 / GIB,
-        if fit.on { "" } else { " [--fit off]" }
-    );
+    // **Only on a model that has routed experts.** On a dense model nothing ever
+    // streams, so the budget is a ceiling on an empty cache -- and printing
+    // "cache 8.41 GiB for experts" under a 2.3 GiB dense model reads like the
+    // runner is about to allocate three times the model. It is the first line a
+    // new user sees under `--auto`, and it was frightening for no reason.
+    if config.is_moe() {
+        chaos_arch::info!(
+            "cache      {:.2} GiB for experts (headroom {:.2} GiB: {:.2} kv + {:.2} arenas + {:.2} fit-target){}",
+            budget as f64 / GIB,
+            headroom as f64 / GIB,
+            kv_estimate as f64 / GIB,
+            arena_estimate as f64 / GIB,
+            base_headroom as f64 / GIB,
+            if fit.on { "" } else { " [--fit off]" }
+        );
+    }
 
     // `--fit-ctx` is the floor `--fit` may settle on, and this is the one
     // question this project is built to answer: given this machine, how much

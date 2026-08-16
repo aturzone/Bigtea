@@ -2231,6 +2231,36 @@ element-sum comparisons against llama.cpp — the overlap changes *when* bytes a
 read, never which. `CHAOS_PREFETCH_OVERLAP=0` disables it;
 `CHAOS_PREFETCH_READERS` tunes the split.
 
+## Clone-to-run, checked before the release (2026-08-16)
+
+**23 s from `git clone` to twelve binaries; 566 tests, 0 failed.** Run from a
+fresh clone of `main`, not from a working tree. Full transcript:
+`research/from-zero-2026-08-16.md`.
+
+A fresh machine needs Rust 1.82+ (the **GNU** toolchain on Windows), MSYS2 with
+`mingw64/bin` on PATH **to build and not to run**, one ggml build for the CPU
+path and a **second** with `-DGGML_VULKAN=ON` for anything touching the device.
+Nothing else, and no network after the clone.
+
+**Two things surprise a first-time user, and only one was a bug.**
+
+1. **`--auto` read 1.63 tok/s against 6.85 with no flags** on a machine that had
+   never run the binary — and that was nearly recorded as `--auto` being
+   catastrophically wrong. It is ggml's Vulkan backend compiling its shader set
+   inside the timed region. Alternating four pairs warm: **9.20 / 9.63 / 9.00 /
+   9.46 against 7.57 / 7.84 / 7.47 / 7.24 — `--auto` is 1.23x ahead, four of
+   four.** `CLAUDE.md`'s "discard the first run" is what caught it. **It is still
+   a real user experience**: the first run after an install is slow, once, and
+   nothing says why. Not yet fixed.
+2. **The demo model refuses to run.** `qwen3moe` is deliberately off
+   `VERIFIED_ARCHITECTURES`, so Qwen3-30B-A3B needs `--force`. Correct, and now
+   documented rather than discovered.
+
+**One fix shipped from it**: the expert-cache line printed on dense models too —
+`cache 8.41 GiB for experts` under a 2.3 GiB model that has none — which is the
+first line `--auto` shows and reads like a memory bug. Gated on the model
+actually having routed experts.
+
 ## V4-Flash is at parity with llama.cpp, and the old deficit is retracted (2026-08-16)
 
 **Supersedes the "V4-Flash prefill 1.62x behind, generation 3-4x behind" rows
