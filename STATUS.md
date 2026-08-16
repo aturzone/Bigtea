@@ -5,8 +5,8 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-16 · **Version**: v0.0.2 · **Branch**: `main` ·
-**Open PRs**: #84 (rebrand), #85 (docs), #86 (release).
+**Last updated**: 2026-08-16 · **Version**: v0.0.3 · **Branch**: `main` ·
+**Open PRs**: none. #83, #84 and #85 are merged and their branches deleted.
 
 **The project is now called `chaos`.** Every crate, binary, environment variable
 and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
