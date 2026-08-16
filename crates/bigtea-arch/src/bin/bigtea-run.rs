@@ -3236,8 +3236,11 @@ fn run_streaming(
         }
         if op_offload {
             runner.set_op_offload(true)?;
+            // **Measured slower, and said so at the moment it is switched
+            // on.** Burying this in a node nobody reads is the same as not
+            // knowing it.
             bigtea_arch::info!(
-                "op-offload ggml_backend_sched places each operation; host weights are NOT repacked"
+                "op-offload ggml_backend_sched places each operation. MEASURED SLOWER on Qwen3-4B: 64.4 vs 79.2 prefill tok/s at ~900 tokens, because this engine submits ~5 graphs per block so weight copies amortise over a block rather than a pass, and scheduling also gives up the 1.39x repack. See op-offload-cannot-pay-2026-08-16.md"
             );
         }
     }
