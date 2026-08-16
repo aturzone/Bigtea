@@ -4411,11 +4411,31 @@ fn run(
 /// user is the only one who can decide whether closing an editor is worth
 /// paying less of it. Naming the processes turns "it's slow" into a choice.
 ///
-/// The saving is quoted as a range because a re-read costs somewhere between
-/// the drive's sequential rate and what these scattered tensor reads actually
-/// achieve; promising the optimistic end would be a lie the first time someone
-/// timed it.
-fn report_residency_shortfall(report: &chaos_model::LoadReport, machine: &chaos_probe::Machine) {
+/// # Why the cost is measured here rather than derived from the load
+///
+/// This line used to read `(~1.1s each)`, from `missing / report.bytes_per_sec()`
+/// — the rate the **load** achieved, 1.55-1.67 GB/s on this machine. That is the
+/// wrong denominator and it **overstated the cost by ~1.6x**: the load is
+/// essentially one stream, while the spill comes back as a per-block prefetch
+/// across the whole handle pool.
+/// `research/v4flash-ram-frontier-2026-08-16.md` fitted the true marginal cost
+/// at **0.395 s/GiB** (2.53 GiB/s) over a four-point balloon sweep, R² = 0.997,
+/// against the ~0.66 s/GiB the load rate implied. It matters because this line
+/// is what the "closing these would free N GiB" advice below is weighed
+/// against: an inflated cost oversells closing an editor.
+///
+/// It is **not** fixed by hardcoding 0.395 — that is one drive on one machine.
+/// [`chaos_model::measure_spill_rate`] re-reads a sample of the spilled tensors
+/// through the same pool and times it, so the figure is measured on whatever
+/// machine is running. When that measurement is unavailable the load rate is
+/// still used, but then it is labelled as the bound it is rather than quoted as
+/// the cost.
+fn report_residency_shortfall(
+    report: &chaos_model::LoadReport,
+    resident: &chaos_model::ResidentSet,
+    model: &Model,
+    machine: &chaos_probe::Machine,
+) {
     if report.complete() {
         return;
     }
@@ -4423,17 +4443,35 @@ fn report_residency_shortfall(report: &chaos_model::LoadReport, machine: &chaos_
     if missing == 0 {
         return; // the shortfall is undownloaded weights, not RAM
     }
-    // What re-reading them costs per token, at the rate this load just achieved.
-    let rate = if report.bytes_per_sec() > 0.0 {
-        report.bytes_per_sec()
-    } else {
-        1e9
-    };
     chaos_arch::info!(
-        "           {:.2} GiB will be re-read from disk on EVERY token (~{:.1}s each)",
-        missing as f64 / GIB,
-        missing as f64 / rate
+        "           {:.2} GiB will be re-read from disk on EVERY token",
+        missing as f64 / GIB
     );
+    match chaos_model::measure_spill_rate(model, resident.skipped()) {
+        // Measured on the spilled tensors themselves, through the same handle
+        // pool. Still an estimate — it cannot reproduce the contention with the
+        // expert reads, nor the overlap that hides part of it — so it is quoted
+        // as approximate with the rate it rests on named, not as the cost.
+        Some(rate) => chaos_arch::info!(
+            "           ~{:.1}s of each, at a measured {:.2} GiB/s on these tensors",
+            missing as f64 / rate,
+            rate / GIB
+        ),
+        // No sample, so the only rate in hand is the load's — and the prefetch
+        // reads faster than that, so it bounds the cost rather than stating it.
+        None => {
+            let rate = if report.bytes_per_sec() > 0.0 {
+                report.bytes_per_sec()
+            } else {
+                1e9
+            };
+            chaos_arch::info!(
+                "           at most ~{:.1}s of each, bounded by this load's {:.2} GB/s",
+                missing as f64 / rate,
+                rate / 1e9
+            );
+        }
+    }
 
     let holders = chaos_probe::processes::grouped(256 << 20);
     if holders.is_empty() {
@@ -4509,7 +4547,7 @@ fn run_deepseek4(
     let budget = machine.usable_ram_for_weights(reserve);
     let (mut resident, report) = ResidentSet::load(model, budget)?;
     chaos_arch::info!("resident   {report}");
-    report_residency_shortfall(&report, &machine);
+    report_residency_shortfall(&report, &resident, model, &machine);
 
     // Rearrange the always-read weights into the layout the CPU kernels want,
     // once, before any block runs.

@@ -39,7 +39,7 @@ mod resident;
 pub mod validate;
 
 pub use discover::discover_shards;
-pub use resident::{LoadReport, ResidentSet, SkipReason, Skipped};
+pub use resident::{measure_spill_rate, LoadReport, ResidentSet, SkipReason, Skipped};
 
 #[derive(Debug)]
 pub enum Error {
@@ -159,7 +159,7 @@ impl Shard {
 ///
 /// Eight is where the per-handle curve above flattens. Higher costs descriptors
 /// and buys nothing; the drive is saturated by then.
-const READER_HANDLES: usize = 8;
+pub(crate) const READER_HANDLES: usize = 8;
 
 /// A model spread across one or more GGUF shards.
 pub struct Model {
