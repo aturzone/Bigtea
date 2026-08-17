@@ -1,0 +1,35 @@
+# The native Windows app.
+#
+# Windows-only and deliberately not part of the default build: everything else
+# in this workspace compiles on three platforms, and a crate full of `HWND`
+# would end that. It is listed as a workspace member so `cargo test` sees it,
+# and every Win32 item is behind `#[cfg(windows)]` so a Linux CI run compiles an
+# empty binary rather than failing.
+#
+# **No dependencies, like everything else here.** The window, the controls, the
+# painting and the process control are raw `extern "system"` declarations
+# against libraries Windows already ships. A GUI toolkit would be the largest
+# dependency in the project by an order of magnitude, and the rule that there
+# are none is the reason a release binary starts on a machine with no runtime.
+[package]
+name = "chaos-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Native Windows app for Chaos: pick a model, run it, watch it work."
+
+[dependencies]
+chaos-model = { path = "../chaos-model" }
+
+[[bin]]
+name = "chaos-app"
+path = "src/main.rs"
+test = false
+
+[lib]
+name = "chaos_app"
+path = "src/lib.rs"
