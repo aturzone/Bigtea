@@ -12,6 +12,7 @@ members = [
     "crates/chaos-jinja",
     "crates/chaos-arch",
     "crates/chaos-app",
+    "crates/chaos-setup",
 ]
 
 [workspace.package]

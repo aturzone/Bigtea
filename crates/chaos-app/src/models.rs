@@ -40,6 +40,24 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Where the app puts what it downloads.
+///
+/// The same `~/.chaos/models` the installer creates and `find` searches first
+/// after `CHAOS_MODELS`, so a download appears in the list without any
+/// configuration. Getting this wrong once already cost a release: the installer
+/// made one directory and the downloader wrote to another.
+pub fn default_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("CHAOS_MODELS") {
+        if !d.is_empty() {
+            return PathBuf::from(d);
+        }
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        return PathBuf::from(home).join(".chaos").join("models");
+    }
+    PathBuf::from("models")
+}
+
 /// Every shard of a split container, so the size is the model's and not
 /// shard one's. `find` reports the first shard; the rest sit beside it.
 fn total_bytes(first: &std::path::Path) -> Option<u64> {

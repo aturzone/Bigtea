@@ -69,6 +69,13 @@ name = "chaos-probe"
 version = "0.0.3"
 
 [[package]]
+name = "chaos-setup"
+version = "0.0.3"
+dependencies = [
+ "chaos-app",
+]
+
+[[package]]
 name = "chaos-tokenizer"
 version = "0.0.3"
 dependencies = [

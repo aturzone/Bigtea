@@ -240,6 +240,8 @@ extern "system" {
     pub fn GetDlgItem(hDlg: HWND, nIDDlgItem: i32) -> HWND;
     pub fn GetWindowTextW(hWnd: HWND, lpString: *mut u16, nMaxCount: i32) -> i32;
     pub fn GetWindowTextLengthW(hWnd: HWND) -> i32;
+    pub fn GetWindowRect(hWnd: HWND, lpRect: *mut RECT) -> BOOL;
+    pub fn ScreenToClient(hWnd: HWND, lpPoint: *mut POINT) -> BOOL;
 }
 
 #[link(name = "gdi32")]
@@ -322,3 +324,157 @@ pub const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
 
 pub const BLACK: COLORREF = rgb(0, 0, 0);
 pub const WHITE: COLORREF = rgb(255, 255, 255);
+
+// -- the registry, and telling the world PATH changed ------------------------
+//
+// Used by the installer. A per-user install writes exactly two places: its own
+// folder, and `HKEY_CURRENT_USER`. Nothing here needs administrator rights.
+
+pub type HKEY = *mut c_void;
+pub const HKEY_CURRENT_USER: HKEY = 0x8000_0001u32 as usize as HKEY;
+pub const KEY_READ: u32 = 0x0002_0019;
+pub const KEY_WRITE: u32 = 0x0002_0006;
+pub const REG_SZ: u32 = 1;
+pub const HWND_BROADCAST: HWND = 0xFFFF_usize as HWND;
+pub const WM_SETTINGCHANGE: u32 = 0x001A;
+pub const SMTO_ABORTIFHUNG: u32 = 0x0002;
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegOpenKeyExW(k: HKEY, sub: *const u16, opt: u32, sam: u32, out: *mut HKEY) -> i32;
+    fn RegCreateKeyExW(
+        k: HKEY,
+        sub: *const u16,
+        reserved: u32,
+        class: *const u16,
+        options: u32,
+        sam: u32,
+        sa: *const c_void,
+        out: *mut HKEY,
+        disp: *mut u32,
+    ) -> i32;
+    fn RegQueryValueExW(
+        k: HKEY,
+        name: *const u16,
+        reserved: *const u32,
+        ty: *mut u32,
+        data: *mut u8,
+        len: *mut u32,
+    ) -> i32;
+    fn RegSetValueExW(
+        k: HKEY,
+        name: *const u16,
+        reserved: u32,
+        ty: u32,
+        data: *const u8,
+        len: u32,
+    ) -> i32;
+    fn RegCloseKey(k: HKEY) -> i32;
+    fn RegDeleteTreeW(k: HKEY, sub: *const u16) -> i32;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    pub fn SendMessageTimeoutW(
+        hWnd: HWND,
+        Msg: u32,
+        wParam: WPARAM,
+        lParam: LPARAM,
+        flags: u32,
+        timeout: u32,
+        result: *mut usize,
+    ) -> isize;
+}
+
+/// Read a string value, or `None` if the key or value is absent.
+/// Reads only from `HKEY_CURRENT_USER`, and takes no hive parameter.
+///
+/// An `HKEY` is a raw pointer, so accepting one would make this a safe function
+/// that dereferences whatever it is handed. A per-user install writes exactly
+/// one hive, so the hive is not a parameter and the signature has no pointer in
+/// it at all.
+pub fn hkcu_read_string(sub: &str, name: &str) -> Option<String> {
+    let root = HKEY_CURRENT_USER;
+    unsafe {
+        let mut k: HKEY = std::ptr::null_mut();
+        if RegOpenKeyExW(root, wide(sub).as_ptr(), 0, KEY_READ, &mut k) != 0 {
+            return None;
+        }
+        let n = wide(name);
+        let mut len: u32 = 0;
+        // Ask for the size first: a PATH can be far longer than any buffer
+        // guessed up front, and truncating it here would silently destroy it
+        // on the next write.
+        let rc = RegQueryValueExW(
+            k,
+            n.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut len,
+        );
+        if rc != 0 || len == 0 {
+            RegCloseKey(k);
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        let rc = RegQueryValueExW(
+            k,
+            n.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            &mut len,
+        );
+        RegCloseKey(k);
+        if rc != 0 {
+            return None;
+        }
+        let u16s: Vec<u16> = buf
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&c| c != 0)
+            .collect();
+        Some(String::from_utf16_lossy(&u16s))
+    }
+}
+
+/// Write a string value, creating the key if needed.
+pub fn hkcu_write_string(sub: &str, name: &str, value: &str) -> bool {
+    let root = HKEY_CURRENT_USER;
+    unsafe {
+        let mut k: HKEY = std::ptr::null_mut();
+        let mut disp: u32 = 0;
+        if RegCreateKeyExW(
+            root,
+            wide(sub).as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            KEY_WRITE,
+            std::ptr::null(),
+            &mut k,
+            &mut disp,
+        ) != 0
+        {
+            return false;
+        }
+        let v = wide(value);
+        let bytes: Vec<u8> = v.iter().flat_map(|c| c.to_le_bytes()).collect();
+        let rc = RegSetValueExW(
+            k,
+            wide(name).as_ptr(),
+            0,
+            REG_SZ,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        );
+        RegCloseKey(k);
+        rc == 0
+    }
+}
+
+pub fn hkcu_delete_key(sub: &str) -> bool {
+    let root = HKEY_CURRENT_USER;
+    unsafe { RegDeleteTreeW(root, wide(sub).as_ptr()) == 0 }
+}

@@ -21,9 +21,6 @@
 // `main` still runs; only the console allocation is suppressed.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-#[cfg(windows)]
-mod win32;
-
 #[cfg(not(windows))]
 fn main() {
     eprintln!(
@@ -39,8 +36,8 @@ fn main() {
 
 #[cfg(windows)]
 mod windows_app {
-    use crate::win32::*;
-    use chaos_app::{art, client, models};
+    use chaos_app::win32::*;
+    use chaos_app::{art, catalog, client, models};
     use std::cell::RefCell;
     use std::process::{Child, Command};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +52,10 @@ mod windows_app {
     const ID_CACHE: i32 = 107;
     const ID_THREADS: i32 = 108;
     const ID_REFRESH: i32 = 109;
+    const ID_INSTALLED: i32 = 110;
+    const ID_AVAILABLE: i32 = 111;
+    const ID_GET: i32 = 112;
+    const ID_PORT: i32 = 113;
 
     const SIDEBAR: i32 = 300;
     const PAD: i32 = 14;
@@ -70,6 +71,13 @@ mod windows_app {
         tokens: u32,
         started: Option<std::time::Instant>,
         status: String,
+    }
+
+    /// Which set of models the sidebar lists.
+    #[derive(PartialEq, Clone, Copy)]
+    enum Tab {
+        Installed,
+        Available,
     }
 
     struct Ui {
@@ -90,6 +98,9 @@ mod windows_app {
         port: u16,
         history: Vec<(String, String)>,
         answer: String,
+        tab: Tab,
+        offers: Vec<catalog::Offer>,
+        free_bytes: u64,
     }
 
     thread_local! {
@@ -260,11 +271,37 @@ mod windows_app {
             ID_SEND,
             hinst,
         );
+        let installed = child(
+            hwnd,
+            "BUTTON",
+            "INSTALLED",
+            BS_OWNERDRAW | WS_TABSTOP,
+            ID_INSTALLED,
+            hinst,
+        );
+        let available = child(
+            hwnd,
+            "BUTTON",
+            "AVAILABLE",
+            BS_OWNERDRAW | WS_TABSTOP,
+            ID_AVAILABLE,
+            hinst,
+        );
+        let get = child(
+            hwnd,
+            "BUTTON",
+            "DOWNLOAD",
+            BS_OWNERDRAW | WS_TABSTOP,
+            ID_GET,
+            hinst,
+        );
+        let port = child(hwnd, "EDIT", "8231", WS_BORDER | WS_TABSTOP, ID_PORT, hinst);
         let cache = child(hwnd, "EDIT", "", WS_BORDER | WS_TABSTOP, ID_CACHE, hinst);
         let threads = child(hwnd, "EDIT", "", WS_BORDER | WS_TABSTOP, ID_THREADS, hinst);
 
         for h in [
-            list, out, input, load, unload, refresh, send, cache, threads,
+            list, out, input, load, unload, refresh, send, cache, threads, installed, available,
+            get, port,
         ] {
             SendMessageW(h, WM_SETFONT, font as WPARAM, 1);
         }
@@ -297,9 +334,44 @@ mod windows_app {
                 port: 8231,
                 history: Vec::new(),
                 answer: String::new(),
+                tab: Tab::Installed,
+                offers: catalog::offers(),
+                free_bytes: free_memory_bytes(),
             })
         });
         rescan();
+    }
+
+    /// Physical memory currently free, for the "would this run here" verdict.
+    ///
+    /// `chaos-probe` reports this properly; the app needs one number and not a
+    /// dependency on the probe crate, so it asks Windows directly.
+    fn free_memory_bytes() -> u64 {
+        #[repr(C)]
+        struct MemStatus {
+            length: u32,
+            memory_load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page: u64,
+            avail_page: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_extended: u64,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GlobalMemoryStatusEx(buffer: *mut MemStatus) -> i32;
+        }
+        unsafe {
+            let mut m: MemStatus = std::mem::zeroed();
+            m.length = std::mem::size_of::<MemStatus>() as u32;
+            if GlobalMemoryStatusEx(&mut m) != 0 {
+                m.avail_phys
+            } else {
+                0
+            }
+        }
     }
 
     /// Re-read the models directory into the list.
@@ -310,22 +382,47 @@ mod windows_app {
             unsafe {
                 SendMessageW(ui.list, LB_RESETCONTENT, 0, 0);
             }
-            ui.entries = models::list();
-            if ui.entries.is_empty() {
-                let t = wide("no models found -- put a .gguf in ~/.chaos/models");
-                unsafe {
-                    SendMessageW(ui.list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
-                }
-            } else {
-                for e in &ui.entries {
-                    let t = wide(&models::row(e));
-                    unsafe {
-                        SendMessageW(ui.list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
+            ui.free_bytes = free_memory_bytes();
+            match ui.tab {
+                Tab::Installed => {
+                    ui.entries = models::list();
+                    if ui.entries.is_empty() {
+                        let t = wide("nothing installed -- try AVAILABLE");
+                        unsafe {
+                            SendMessageW(ui.list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
+                        }
+                    } else {
+                        for e in &ui.entries {
+                            let t = wide(&models::row(e));
+                            unsafe {
+                                SendMessageW(ui.list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
+                            }
+                        }
                     }
                 }
-                unsafe {
-                    SendMessageW(ui.list, LB_SETCURSEL, 0, 0);
+                Tab::Available => {
+                    for o in &ui.offers {
+                        let t = wide(&catalog::row(o, ui.free_bytes));
+                        unsafe {
+                            SendMessageW(ui.list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
+                        }
+                    }
                 }
+            }
+            unsafe {
+                SendMessageW(ui.list, LB_SETCURSEL, 0, 0);
+                // Only the buttons that mean something in this tab.
+                let installed = ui.tab == Tab::Installed;
+                EnableWindow(
+                    ui.load,
+                    if installed && ui.server.is_none() {
+                        1
+                    } else {
+                        0
+                    },
+                );
+                EnableWindow(GetDlgItem(ui.main, ID_GET), if installed { 0 } else { 1 });
+                InvalidateRect(ui.main, std::ptr::null(), 1);
             }
         });
     }
@@ -485,6 +582,67 @@ mod windows_app {
         set_status("unloaded -- the memory is back");
     }
 
+    /// Fetch the selected catalogue entry with `chaos-pull`.
+    ///
+    /// A child process again, for the same reason as the server: `chaos-pull`
+    /// already knows how to resume, verify and place a five-shard container,
+    /// and a second downloader in the window would be a second thing to get
+    /// wrong about a 155 GB file.
+    fn download_selected() {
+        let (offer, exe) = UI.with(|u| {
+            let b = u.borrow();
+            let Some(ui) = b.as_ref() else {
+                return (None, None);
+            };
+            let sel = unsafe { SendMessageW(ui.list, LB_GETCURSEL, 0, 0) };
+            let o = (sel >= 0)
+                .then(|| ui.offers.get(sel as usize))
+                .flatten()
+                .map(|o| (o.name.clone(), o.quant.clone(), o.bytes));
+            (o, std::env::current_exe().ok())
+        });
+        let (Some((name, quant, bytes)), Some(exe)) = (offer, exe) else {
+            set_status("select something to download");
+            return;
+        };
+        let pull = exe.with_file_name("chaos-pull.exe");
+        if !pull.exists() {
+            set_status("chaos-pull.exe is missing from this folder");
+            return;
+        }
+        let dir = models::default_dir();
+        let _ = std::fs::create_dir_all(&dir);
+
+        set_status(&format!(
+            "downloading {name} {quant}, {} -- this runs in the background",
+            models::human_size(bytes)
+        ));
+
+        std::thread::spawn(move || {
+            let mut cmd = Command::new(&pull);
+            cmd.arg(&name)
+                .arg("--quant")
+                .arg(&quant)
+                .arg("--dir")
+                .arg(&dir)
+                .arg("--yes");
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            let msg = match cmd.status() {
+                Ok(st) if st.success() => format!("{name} {quant} downloaded"),
+                Ok(st) => format!("download failed (exit {})", st.code().unwrap_or(-1)),
+                Err(e) => format!("could not start chaos-pull: {e}"),
+            };
+            let mut sh = shared().lock().unwrap();
+            sh.status = msg;
+            sh.finished = true;
+            drop(sh);
+            notify();
+        });
+    }
+
     fn notify() {
         UI.with(|u| {
             if let Some(ui) = u.borrow().as_ref() {
@@ -631,25 +789,32 @@ mod windows_app {
         UI.with(|u| {
             let b = u.borrow();
             let Some(ui) = b.as_ref() else { return };
-            let top = PAD * 2 + LOGO_PX + 26;
-            let btn_h = 30;
-            let list_h = h - top - PAD * 4 - btn_h * 2 - 46;
-
-            MoveWindow(ui.list, PAD, top, SIDEBAR - PAD * 2, list_h.max(60), 1);
-            let by = top + list_h.max(60) + PAD;
+            let btn_h = 28;
             let bw = (SIDEBAR - PAD * 3) / 2;
+            // The two tabs sit directly above the list they switch between.
+            let tab_y = PAD * 2 + LOGO_PX + 24;
+            MoveWindow(ui.dlg(ID_INSTALLED), PAD, tab_y, bw, btn_h, 1);
+            MoveWindow(ui.dlg(ID_AVAILABLE), PAD * 2 + bw, tab_y, bw, btn_h, 1);
+
+            let top = tab_y + btn_h + 8;
+            // Three rows of controls plus two labelled setting rows below the
+            // list; the list takes whatever is left.
+            let list_h = h - top - PAD * 3 - btn_h * 3 - 62;
+            MoveWindow(ui.list, PAD, top, SIDEBAR - PAD * 2, list_h.max(60), 1);
+
+            let by = top + list_h.max(60) + PAD;
             MoveWindow(ui.load, PAD, by, bw, btn_h, 1);
             MoveWindow(ui.unload, PAD * 2 + bw, by, bw, btn_h, 1);
-            MoveWindow(ui.refresh_handle(), PAD, by + btn_h + 8, bw, btn_h, 1);
-            MoveWindow(ui.cache, PAD * 2 + bw, by + btn_h + 8, bw / 2 - 4, btn_h, 1);
-            MoveWindow(
-                ui.threads,
-                PAD * 2 + bw + bw / 2 + 4,
-                by + btn_h + 8,
-                bw / 2 - 4,
-                btn_h,
-                1,
-            );
+            let r2 = by + btn_h + 6;
+            MoveWindow(ui.dlg(ID_GET), PAD, r2, bw, btn_h, 1);
+            MoveWindow(ui.refresh_handle(), PAD * 2 + bw, r2, bw, btn_h, 1);
+
+            // Settings row: each box sits under a label painted in WM_PAINT.
+            let r3 = r2 + btn_h + 24;
+            let sw = (SIDEBAR - PAD * 4) / 3;
+            MoveWindow(ui.cache, PAD, r3, sw, btn_h, 1);
+            MoveWindow(ui.threads, PAD * 2 + sw, r3, sw, btn_h, 1);
+            MoveWindow(ui.dlg(ID_PORT), PAD * 3 + sw * 2, r3, sw, btn_h, 1);
 
             let rx = SIDEBAR;
             let rw = w - rx - PAD;
@@ -669,8 +834,13 @@ mod windows_app {
     }
 
     impl Ui {
+        /// A control by id. The ones created after the struct was written are
+        /// reached this way rather than growing the struct a field at a time.
+        fn dlg(&self, id: i32) -> HWND {
+            unsafe { GetDlgItem(self.main, id) }
+        }
         fn refresh_handle(&self) -> HWND {
-            unsafe { GetDlgItem(self.main, ID_REFRESH) }
+            self.dlg(ID_REFRESH)
         }
     }
 
@@ -767,9 +937,42 @@ mod windows_app {
                 line.as_ptr(),
                 status.encode_utf16().count() as i32,
             );
-            let hint = "cache GiB / threads";
-            let hw = wide(hint);
-            TextOutW(hdc, PAD, r.bottom - 24, hw.as_ptr(), hint.len() as i32);
+            // Labels for the three setting boxes. Painted rather than made
+            // into STATIC controls: three more windows to colour, position and
+            // keep in step, for text that never changes.
+            let mut lr = RECT::default();
+            GetWindowRect(ui.cache, &mut lr);
+            let mut here = POINT {
+                x: lr.left,
+                y: lr.top,
+            };
+            ScreenToClient(hwnd, &mut here);
+            let sw = (SIDEBAR - PAD * 4) / 3;
+            for (i, label) in ["cache GiB", "threads", "port"].iter().enumerate() {
+                let w = wide(label);
+                TextOutW(
+                    hdc,
+                    PAD + (PAD + sw) * i as i32,
+                    here.y - 18,
+                    w.as_ptr(),
+                    label.len() as i32,
+                );
+            }
+
+            // Which tab is showing, marked by a rule under it rather than a
+            // fill -- the same trick the buttons use for availability.
+            let tab_y = PAD * 2 + LOGO_PX + 24 + 28;
+            let bw = (SIDEBAR - PAD * 3) / 2;
+            let (ux, uw) = if ui.tab == Tab::Installed {
+                (PAD, bw)
+            } else {
+                (PAD * 2 + bw, bw)
+            };
+            let upen = CreatePen(0, 2, WHITE);
+            let uold = SelectObject(hdc, upen);
+            Rectangle(hdc, ux, tab_y + 1, ux + uw, tab_y + 3);
+            SelectObject(hdc, uold);
+            DeleteObject(upen);
         });
 
         EndPaint(hwnd, &ps);
@@ -906,6 +1109,23 @@ mod windows_app {
                     (ID_UNLOAD, BN_CLICKED) => unload_model(),
                     (ID_SEND, BN_CLICKED) => send_prompt(),
                     (ID_REFRESH, BN_CLICKED) => rescan(),
+                    (ID_GET, BN_CLICKED) => download_selected(),
+                    (ID_INSTALLED, BN_CLICKED) => {
+                        UI.with(|u| {
+                            if let Some(ui) = u.borrow_mut().as_mut() {
+                                ui.tab = Tab::Installed;
+                            }
+                        });
+                        rescan();
+                    }
+                    (ID_AVAILABLE, BN_CLICKED) => {
+                        UI.with(|u| {
+                            if let Some(ui) = u.borrow_mut().as_mut() {
+                                ui.tab = Tab::Available;
+                            }
+                        });
+                        rescan();
+                    }
                     (ID_LIST, LBN_SELCHANGE) => {}
                     _ => {}
                 }
