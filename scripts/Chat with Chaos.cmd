@@ -5,6 +5,11 @@ REM The CLI is the real interface and stays the real interface. This exists
 REM because "unpack a zip and get a chat window" is a different job from "learn
 REM a flag", and someone who wants the second can still type it.
 REM
+REM Every executable is called by its full path, built from %~dp0. `cd /d`
+REM alone was not enough -- launched from Explorer, a bare `chaos-serve.exe`
+REM came back "not recognized" even though the file was right there, and the
+REM failure was invisible because the script had already printed "Starting".
+REM
 REM Deliberately a .cmd and not a compiled .exe launcher: a second executable
 REM would need signing, would trip Smart App Control on a fresh download, and
 REM would hide the server's log -- which is the thing worth seeing when a model
@@ -20,7 +25,7 @@ echo.
 echo   C H A O S
 echo.
 
-if not exist "chaos-run.exe" (
+if not exist "%~dp0chaos-run.exe" (
   echo   chaos-run.exe is not next to this script.
   echo   Run this from the unpacked archive, where the .exe files live.
   echo.
@@ -30,7 +35,7 @@ if not exist "chaos-run.exe" (
 
 REM Bare `chaos-run` lists what it can find. If nothing is listed there is no
 REM point starting a server that cannot load anything.
-chaos-run.exe >"%TEMP%\chaos-models.txt" 2>&1
+"%~dp0chaos-run.exe" >"%TEMP%\chaos-models.txt" 2>&1
 findstr /C:"no models found" "%TEMP%\chaos-models.txt" >nul
 if not errorlevel 1 (
   echo   No models found yet.
@@ -58,7 +63,7 @@ REM waiting beats one the user has to remember to open.
 start "" "http://127.0.0.1:%PORT%"
 
 REM No model named: chaos-serve picks the only one, or lists them and exits.
-chaos-serve.exe --port %PORT%
+"%~dp0chaos-serve.exe" --port %PORT%
 
 echo.
 echo   The server has stopped.
