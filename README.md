@@ -13,7 +13,7 @@
   <a href="https://github.com/aturzone/Chaos/releases"><img alt="version" src="https://img.shields.io/badge/version-0.0.3-orange"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue"></a>
   <a href="https://github.com/aturzone/Chaos/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aturzone/Chaos/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-575%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-583%20passing-brightgreen">
 </p>
 
 ---
@@ -50,8 +50,14 @@ five shards you never work out which shard to open.
 ```bash
 chaos-run qwen3 "write a haiku" -n 64 --auto   # --auto reads your machine and configures itself
 chaos-probe                                    # what can this machine run, and what should you close?
-chaos-serve qwen3 --port 8080                  # OpenAI-compatible server
+chaos-serve qwen3 --port 8080                  # then open http://127.0.0.1:8080
 ```
+
+**`chaos-serve` gives you a window as well as a socket.** Open its address in a
+browser and you get a chat interface; point a coding agent at
+`/v1/chat/completions` and it gets the OpenAI API. Same process, same model
+loaded once. The page is compiled into the binary — no CDN, no fonts, no
+install, and it works with the network cable out.
 
 <details>
 <summary>Two things about your first run, both deliberate</summary>
@@ -140,19 +146,24 @@ Tokenizers        83%  [################....]  5 of 6 families
 Samplers          80%  [################....]  16 of 20
 Architectures      9%  [#...................]  13 of the 141 it declares
 GPU backends      20%  [####................]  1 of 5, Vulkan only
+Browser UI        33%  [######..............]  2 of 6 things a chat UI needs
 V4-Flash speed     2%  [....................]  0.394 of 20 tok/s
-GUI                0%  [....................]  not planned, CLI only
 ```
 
 Where those numbers come from, in the same order: 17 flags are declined with a
 written reason and **0 are unrecognised**; the two missing templates are Hunyuan
 variants; the tokenizer families are BPE, SPM, WordPiece, Unigram and RWKV; the
 sampler audit was 2026-08-11; **every one of the 13 architectures was diffed
-against llama.cpp at 8 prompts**, which is what counts as verified here; and the
+against llama.cpp at 8 prompts**, which is what counts as verified here; the
 Vulkan device path is bound but **not** verified — it fails 1 of those 8 prompts
-where the CPU path fails none.
+where the CPU path fails none; and the UI **sends and streams**, with no model
+picker, stop button, saved history or sampler controls.
 
-The last two bars are the honest ones. **`V4-Flash speed` will not move, and we
+The first four are enforced by tests rather than counted by hand
+(`refused_flags_decline`, `jinja_agrees_with_families`), which is why they have
+stopped drifting.
+
+The last bar is the honest one. **`V4-Flash speed` will not move, and we
 measured how far it cannot move.** A token is 1.56 s of expert reading plus
 **0.84 s that never touches the disk** — so with the entire 144 GB model resident
 in RAM, this CPU tops out at **1.19 tok/s**. 20 tok/s is a 50 ms token: the fixed

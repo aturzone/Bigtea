@@ -1,0 +1,10 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "chaos-ui",
+      "url": "http://localhost:8099",
+      "port": 8099
+    }
+  ]
+}

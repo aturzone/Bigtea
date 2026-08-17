@@ -162,6 +162,8 @@ jobs:
           # anyone on those platforms would rather have than a script.
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp scripts/install.ps1 "$DIR/"
+            # The double-click path: starts the server and opens the browser.
+            cp "scripts/Chat with Chaos.cmd" "$DIR/"
           fi
           if [ "${{ matrix.archive }}" = "zip" ]; then
             7z a "$DIR.zip" "$DIR" >/dev/null

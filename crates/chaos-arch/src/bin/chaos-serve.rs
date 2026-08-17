@@ -88,9 +88,21 @@ fn main() -> ExitCode {
             }
         }
     }
+    // With no model named and exactly one on the machine, serve that one.
+    // There is no ambiguity to resolve and nothing to warn about, and it is what
+    // makes a double-click launcher possible -- a shortcut cannot know the name
+    // of a file the user has not put there yet. Two or more, and it still lists
+    // them and stops, because picking one silently would load the wrong model
+    // for minutes before saying so.
     if path.is_empty() {
-        usage();
-        return ExitCode::from(2);
+        let found = chaos_model::find::list();
+        if found.len() == 1 {
+            eprintln!("model      {} (the only one found)", found[0].label);
+            path = found[0].path.to_string_lossy().into_owned();
+        } else {
+            usage();
+            return ExitCode::from(2);
+        }
     }
 
     // The same name lookup the runner has, so `chaos-serve qwen3` works and the
@@ -128,6 +140,7 @@ fn usage() {
     }
     println!();
     println!("Serves an OpenAI-compatible endpoint on 127.0.0.1:");
+    println!("  GET  /                      the browser interface -- open this");
     println!("  POST /v1/chat/completions   the one an agent calls");
     println!("  GET  /v1/models             what is loaded");
     println!("  GET  /health                readiness, and what the engine is doing");
@@ -287,7 +300,11 @@ fn run_loop(
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr)?;
     println!("ready      {addr} in {:.1}s", t0.elapsed().as_secs_f64());
-    println!("           POST /v1/chat/completions");
+    // The URL comes first and on its own line: most terminals make it
+    // clickable, and someone who wanted a window rather than a socket should
+    // not have to read an endpoint list to find the interface.
+    println!("           open       http://{addr}");
+    println!("           for agents POST /v1/chat/completions");
     println!(
         "           context {} tokens, one request at a time",
         engine.context_limit()
@@ -296,8 +313,40 @@ fn run_loop(
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
+                // **A browser opens speculative connections and leaves them
+                // idle.** This loop is single-threaded, so without a deadline it
+                // blocks in `read_request` on a socket that will never send
+                // anything, and the server is dead until that peer gives up --
+                // no error, no log line, just nothing.
+                //
+                // It survived because every client until now was an agent, and
+                // an agent connects in order to send immediately. Opening the
+                // page in a browser wedged it on the first try.
+                //
+                // Read-side only: writes can legitimately take minutes on a
+                // model that generates at 0.4 tok/s.
+                //
+                // **Three seconds, not thirty.** The deadline is also how long
+                // a real request waits behind a speculative one, since this
+                // loop serves them in order -- at 20s the page took 17.9s to
+                // load behind one idle socket, which is a hang as far as anyone
+                // watching is concerned. On loopback a client that means to
+                // send has sent within microseconds, so 3s is enormous slack
+                // for a real request and a small toll for a dead one.
+                //
+                // The real fix is accepting concurrently and serialising only
+                // the engine; that is a bigger change than this page justifies,
+                // and "one request at a time" is a documented property here.
+                if let Err(e) = s.set_read_timeout(Some(std::time::Duration::from_secs(3))) {
+                    eprintln!("could not set a read timeout: {e}");
+                }
                 if let Err(e) = handle(s, &engine, tokenizer) {
-                    eprintln!("request failed: {e}");
+                    // A peer that connected and said nothing is routine, not a
+                    // fault; anything else is worth printing.
+                    let msg = e.to_string();
+                    if !msg.contains("timed out") && !msg.contains("os error 10060") {
+                        eprintln!("request failed: {e}");
+                    }
                 }
             }
             Err(e) => eprintln!("accept failed: {e}"),
@@ -358,7 +407,16 @@ fn handle(
     let started = std::time::Instant::now();
 
     let (status, body) = match (req.method.as_str(), req.target.as_str()) {
-        ("GET", "/health") | ("GET", "/") => (
+        // The browser interface. Served from the binary with nothing external
+        // to fetch, so a machine with no network still gets the whole page.
+        ("GET", "/") => {
+            return send_html(stream, chaos_arch::ui::PAGE, &req, started);
+        }
+        // Every browser asks for this on every page load. Answering "nothing
+        // here" is one line; leaving it a 404 puts a red error in the log for
+        // an entirely normal request.
+        ("GET", "/favicon.ico") => (204, String::new()),
+        ("GET", "/health") => (
             200,
             format!(
                 r#"{{"status":"ok","model":"{}","context_limit":{}}}"#,
@@ -424,6 +482,7 @@ fn handle(
 
     let reason = match status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         501 => "Not Implemented",
         _ => "Not Found",
@@ -440,6 +499,45 @@ fn handle(
     stream.flush()?;
     eprintln!(
         "{} {} -> {status} in {:.1}s",
+        req.method,
+        req.target,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Write one HTML response and close.
+///
+/// The JSON path hardcodes `Content-Type: application/json`, and a page served
+/// under that type is displayed as source rather than rendered -- so this is a
+/// second writer rather than a parameter on the first.
+fn send_html(
+    mut stream: TcpStream,
+    page: &str,
+    req: &Request,
+    started: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Built by concatenation, for the reason the SSE path below already
+    // records: a wrapped multi-line literal ships headers with the source's
+    // indentation on them. That happened here -- `Content-Type` went out with
+    // nine leading spaces, which curl folded into the previous line, so the
+    // declared length (7658) and what a client actually read (7802) disagreed.
+    // A browser given that either truncates the page or waits for bytes that
+    // never arrive, and the response is still a 200 the whole time.
+    let head = [
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        &format!("Content-Length: {}\r\n", page.len()),
+        "Cache-Control: no-store\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+    ]
+    .concat();
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(page.as_bytes())?;
+    stream.flush()?;
+    eprintln!(
+        "{} {} -> 200 in {:.1}s",
         req.method,
         req.target,
         started.elapsed().as_secs_f64()
