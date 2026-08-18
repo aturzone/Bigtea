@@ -192,6 +192,9 @@ pub const BI_RGB: u32 = 0;
 pub const TRANSPARENT: i32 = 1;
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// The child must outlive the parent that spawned it -- used by the
+/// uninstaller, which cannot delete the directory it is running from.
+pub const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 #[link(name = "user32")]
 extern "system" {
