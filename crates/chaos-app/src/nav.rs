@@ -134,6 +134,7 @@ pub const IDM_DOWNLOAD: i32 = 512;
 pub const IDM_DELETE: i32 = 513;
 pub const IDM_COPY_ENDPOINT: i32 = 514;
 pub const IDM_API_KEY: i32 = 515;
+pub const IDM_TEST_CONNECTION: i32 = 516;
 pub const IDM_PAGE_CHAT: i32 = 520;
 pub const IDM_PAGE_MODELS: i32 = 521;
 pub const IDM_PAGE_MONITOR: i32 = 522;
@@ -367,6 +368,7 @@ mod tests {
             .collect();
         let menus = [
             IDM_API_KEY,
+            IDM_TEST_CONNECTION,
             IDM_RESCAN,
             IDM_OPEN_MODELS_DIR,
             IDM_EXIT,

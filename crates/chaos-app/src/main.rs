@@ -78,6 +78,14 @@ mod windows_app {
         tokens: u32,
         started: Option<Instant>,
         status: String,
+        /// A message box the UI thread must put up: its text, and whether it is
+        /// good news.
+        ///
+        /// **A worker cannot show one itself.** `MessageBoxW` with an owner
+        /// window belonging to another thread is undefined, and what it does
+        /// here is nothing at all -- the connection test ran, passed, set the
+        /// status line, and displayed no dialog whatsoever.
+        report: Option<(String, bool)>,
     }
 
     /// Which set of models the MODELS page lists.
@@ -351,6 +359,7 @@ mod windows_app {
         sep(model);
         add(model, nav::IDM_COPY_ENDPOINT, "&Copy endpoint\tCtrl+E");
         add(model, nav::IDM_API_KEY, "Require an &API key");
+        add(model, nav::IDM_TEST_CONNECTION, "&Test the connection");
         popup(bar, model, "&Model");
 
         let view = CreatePopupMenu();
@@ -468,6 +477,7 @@ mod windows_app {
         enable(nav::IDM_DOWNLOAD, on_models && !installed);
         enable(nav::IDM_DELETE, on_models && installed && !running);
         enable(nav::IDM_COPY_ENDPOINT, running);
+        enable(nav::IDM_TEST_CONNECTION, running);
         // Ticked when a key is required, so the menu answers "is one set?"
         // without anybody having to open the settings file.
         let keyed = UI.with(|u| {
@@ -1422,6 +1432,69 @@ Any value a client sends is accepted.                      The server still list
         repaint();
     }
 
+    /// Do what a coding agent does, and say what happened.
+    ///
+    /// **"Point your agent at this URL" is advice, not evidence.** A user whose
+    /// agent will not connect has no way to tell whether the fault is the port,
+    /// the key, the model or the client, and the usual answer -- try `curl` --
+    /// is not one most people have. This runs the three requests an
+    /// OpenAI-compatible client makes and reports each.
+    fn test_connection() {
+        let (port, key, running) = UI.with(|u| {
+            let b = u.borrow();
+            b.as_ref()
+                .map(|ui| (ui.port, ui.cfg.api_key.clone(), ui.loaded.is_some()))
+                .unwrap_or((0, None, false))
+        });
+        if !running {
+            set_status("load a model first -- there is nothing to connect to");
+            show_page(Page::Models);
+            return;
+        }
+        set_status("testing the connection...");
+        // On a worker: the completion it makes is a real one, and on a large
+        // model that is seconds. Freezing the window to prove it is not frozen
+        // would be its own joke.
+        std::thread::spawn(move || {
+            let checks = client::check(port, key.as_deref());
+            let all = checks.iter().all(|c| c.ok);
+            let mut msg = String::new();
+            for c in &checks {
+                msg.push_str(&format!(
+                    "{}  {}
+    {}
+
+",
+                    if c.ok { "[ ok ]" } else { "[fail]" },
+                    c.name,
+                    c.detail
+                ));
+            }
+            msg.push_str(&if all {
+                format!(
+                    "Any OpenAI-compatible agent will work. Paste these into it:\n\n\
+                     Base URL   http://127.0.0.1:{port}/v1\n\
+                     API key    {}\n\n\
+                     In Hermes: provider \"custom\", and that base URL.",
+                    key.as_deref().unwrap_or("not required -- send any value")
+                )
+            } else {
+                "Something in the chain is not answering. The failing line above                  says which."
+                    .to_string()
+            });
+            let mut sh = shared().lock().unwrap();
+            sh.status = if all {
+                "connection test passed".into()
+            } else {
+                "connection test failed".into()
+            };
+            // Handed to the UI thread rather than shown here; see `Shared`.
+            sh.report = Some((msg, all));
+            drop(sh);
+            notify();
+        });
+    }
+
     fn send_prompt() {
         if busy().load(Ordering::SeqCst) {
             return;
@@ -1518,12 +1591,29 @@ Any value a client sends is accepted.                      The server still list
 
     /// Drain what the worker produced. Runs on the UI thread only.
     fn drain() {
-        let (text, finished, tokens, elapsed) = {
+        let (text, finished, tokens, elapsed, report) = {
             let mut s = shared().lock().unwrap();
             let t = std::mem::take(&mut s.pending);
             let e = s.started.map(|i| i.elapsed().as_secs_f64()).unwrap_or(0.0);
-            (t, s.finished, s.tokens, e)
+            (t, s.finished, s.tokens, e, s.report.take())
         };
+        // A report a worker produced, written into the transcript rather than
+        // put up as a message box.
+        //
+        // **A modal box was the first attempt and it was the wrong tool twice
+        // over.** Shown from the worker it never appeared at all -- an owner
+        // window belonging to another thread is undefined and here does
+        // nothing. Moved to this thread it works, but a connection report is
+        // exactly the text somebody needs to copy into a bug report or an agent
+        // config, and a message box is the one place Windows will not let you
+        // select from. The transcript is selectable, scrollable and already on
+        // screen.
+        if let Some((msg, _good)) = report {
+            // An EDIT wants CRLF; a bare LF renders as a box.
+            let body = msg.replace("\r\n", "\n").replace('\n', "\r\n");
+            append_out(&format!("\r\n{body}\r\n"));
+            show_page(Page::Chat);
+        }
         if !text.is_empty() {
             // EDIT controls want CRLF; a bare LF renders as a box.
             append_out(&text.replace("\r\n", "\n").replace('\n', "\r\n"));
@@ -3328,6 +3418,10 @@ Any value a client sends is accepted.                      The server still list
                     }
                     nav::IDM_API_KEY => {
                         toggle_api_key();
+                        return 0;
+                    }
+                    nav::IDM_TEST_CONNECTION => {
+                        test_connection();
                         return 0;
                     }
                     nav::IDM_MANUAL => {
