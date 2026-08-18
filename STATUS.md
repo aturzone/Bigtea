@@ -20,7 +20,7 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **641 tests** (56 binaries, 0 failed, 31 ignored — the V4-Flash set
+**Current**: **669 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
 needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
 clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
@@ -69,7 +69,49 @@ could not have done its job either: a pool collapsed onto one handle measures
 "unlucky". The plausibility bounds stay, the comparative claim lives in the
 research node where it was measured under control.
 
-**Current**: **641 tests**, 0 failed.
+**Current**: **669 tests**, 0 failed.
+
+## The app has four pages and a menu (2026-08-18)
+
+Atur's verdict on the 0.0.6 window: *"too messy and not user friendly … why is
+all click in one slot … where is settings, where is model management, where is
+the menu"*. He was right, and the reason was structural: **everything was on one
+screen because the window had been grown one button at a time**, so a model
+list, a download catalogue, four actions and three settings shared one 380px
+column.
+
+**It is now four pages** — CHAT, MODELS, MONITOR, SETTINGS — reachable from a
+navigation rail, a menu bar, or `Ctrl+1`..`Ctrl+4`, with a strip on every page
+saying what is running, at what endpoint, and how fast. MODELS gives each model
+its own page: status, endpoint, context, threads, cache, uptime, tokens served.
+SETTINGS exposes all nine fields the file holds; the old window showed three.
+
+The design follows Hermes' own `apps/desktop/DESIGN.md`, which Atur asked it to
+match, with his `#0000F2` in place of Hermes' `#0053FD`. Two new modules carry
+what the window used to hardcode: `theme.rs` (the palette, light and dark) and
+`nav.rs` (which page owns which control). Both are plain data and testable
+without a window server, which is where this crate's bugs have always been.
+
+**Two rules are now enforced at the source level**, because neither is
+observable at runtime: no Win32 call while the state is mutably borrowed (a
+`RefCell` double borrow under `panic = "abort"` is silent process death), and no
+colour named outside `theme.rs`. Contrast is asserted numerically — every
+text-on-ground pair clears 4.5:1 in both palettes.
+
+**Verified by screenshot, not by building.** Every page captured, pixels
+sampled (`#F5F5FC` chrome, `#E7E7FE` accent wash), a model loaded and a
+conversation generated at 15.4 tok/s through the new shell.
+
+**Measured negative**: the menu bar cannot be darkened. `SetPreferredAppMode`
+(uxtheme ordinal 135) resolves and runs on 10.0.26200 and changes nothing,
+before or after window creation; the code was removed rather than shipped as a
+no-op. Scrollbars *are* fixable and were — `#F0F0F0` to `#171717`.
+
+**Still missing**: MONITOR cannot show streamed bytes, expert read rate or cache
+residency. The engine measures all three and prints them to its log; nothing
+carries them over the socket. The page says so on its face.
+
+**Current**: **669 tests**, 0 failed.
 
 ## v0.0.6 — the app actually works now (2026-08-18)
 
@@ -138,7 +180,7 @@ nothing streams and the whole file must fit. It is what makes the app say
 `qwen3-32b 19.8 GB needs 19.8 GB - too big` honestly on this laptop, while
 `v4flash 155 GB needs 7.92 GB - streams`.
 
-**641 tests** (was 575), clippy 0, fmt clean.
+**669 tests** (was 641), clippy 0, fmt clean.
 
 ## 20 tok/s on V4-Flash is closed, with a number (2026-08-16)
 

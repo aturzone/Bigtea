@@ -276,3 +276,50 @@ are the measurement that killed one.
   (`rustup default stable-x86_64-pc-windows-gnu`) plus MSYS2 mingw64 on PATH.
   `[[bin]]` targets set `test = false` — empty harnesses are pointless and Smart
   App Control blocks unsigned fresh binaries.
+
+## The window
+
+Every entry here cost a rebuild and a screenshot. **A GUI is not verified by
+compiling**, and three of these were believed fixed before a pixel was measured.
+
+- **Never hold a `RefCell` borrow across a call Windows can re-enter.**
+  `SendMessageW`, `EnableWindow`, `SetWindowTextW`, `MoveWindow`, `ShowWindow`
+  and `SetFocus` can all dispatch `WM_CTLCOLOR*` synchronously, which borrows
+  the same cell. Under `panic = "abort"` the double borrow is instant, silent
+  process death — no message, no log, no stack. Pull handles and data *out* of
+  the borrow, drop it, then talk to Windows. `tests/ui_rules.rs` enforces this
+  textually, and found three more instances the day it was written.
+- **Find controls by id, not by storing handles in the state.** `GetDlgItem`
+  needs only the window handle, which can live in an atomic — so no action
+  function needs a borrow open in order to locate a control. This removes the
+  bug above by construction rather than by discipline.
+- **A `thread_local!` is invisible to worker threads.** `notify()` read the UI
+  handle from one, saw `None` on every worker, posted nothing, and every
+  generated token was received and discarded while the status line said
+  "ready". Anything a background thread needs goes in an atomic or a `Mutex`.
+- **A read-only `EDIT` silently ignores `EM_REPLACESEL`** — no error, no text.
+  Clear `ES_READONLY`, append, set it again.
+- **`GetWindowText` returns empty for a control owned by another process**, so
+  a cross-process UI test reads every box as empty whether the app works or
+  not. This cost an hour and nearly produced a fix for a bug that did not
+  exist. `WM_GETTEXT` sent with `SendMessage` *does* work across processes;
+  otherwise a screenshot is the evidence.
+- **Windows draws the menu bar, and it does not follow dark mode.**
+  `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)` darkens the title bar
+  only. `SetPreferredAppMode` (uxtheme ordinal 135, with `FlushMenuThemes` at
+  136) is what every dark Win32 app calls; on 10.0.26200 the ordinals resolve,
+  the call runs, and the bar still measures `#FFFFFF` — tried both before and
+  after window creation. **It was removed rather than shipped as a no-op.**
+  Scrollbars *are* fixable: `SetWindowTheme(h, "DarkMode_Explorer", NULL)` on
+  each control moves them from `#F0F0F0` to `#171717`, and that call alone is
+  sufficient — the app-mode call contributed nothing to it either.
+- **Owner-draw is the only way to colour a button or a list selection.** A
+  themed push button ignores `WM_CTLCOLORBTN` entirely and the selection bar is
+  the system highlight.
+- **`ne`-style geometry belongs in one function.** The settings page positions
+  its boxes in `layout` and draws their labels in `paint`; two independent walks
+  of the same list is how a label lands over the wrong box. One function returns
+  the run, both callers use it.
+- **Do not do file I/O while painting.** Counting a model's shards in the
+  detail panel meant a directory scan per repaint, and the transcript repaints
+  on every token. Count it once, in the rescan.

@@ -138,6 +138,9 @@ pub const LBS_OWNERDRAWFIXED: u32 = 0x0010;
 pub const LBS_HASSTRINGS: u32 = 0x0040;
 
 pub const SW_SHOW: i32 = 5;
+/// Hide a control without destroying it. `show_page` reveals one page's
+/// controls and hides the rest; nothing is ever torn down.
+pub const SW_HIDE: i32 = 0;
 
 // -- messages ---------------------------------------------------------------
 
@@ -157,6 +160,9 @@ pub const WM_APP_TICK: u32 = 0x8000 + 1;
 pub const WM_DRAWITEM: u32 = 0x002B;
 pub const ODS_SELECTED: u32 = 0x0001;
 pub const ODS_DISABLED: u32 = 0x0004;
+/// The control has the caret. Owner-draw means Windows draws no focus ring,
+/// so keyboard users would otherwise have no idea where they are.
+pub const ODS_FOCUS: u32 = 0x0010;
 pub const ODT_LISTBOX: u32 = 2;
 
 #[repr(C)]
@@ -515,4 +521,262 @@ pub fn hkcu_write_string(sub: &str, name: &str, value: &str) -> bool {
 pub fn hkcu_delete_key(sub: &str) -> bool {
     let root = HKEY_CURRENT_USER;
     unsafe { RegDeleteTreeW(root, wide(sub).as_ptr()) == 0 }
+}
+
+// -- menus -------------------------------------------------------------------
+//
+// A menu bar is the one place a Windows application is expected to list
+// everything it can do. The old window had none, so every capability had to be
+// a button, and the buttons had to share one column.
+
+pub const MF_STRING: u32 = 0x0000;
+pub const MF_POPUP: u32 = 0x0010;
+pub const MF_SEPARATOR: u32 = 0x0800;
+pub const MF_CHECKED: u32 = 0x0008;
+pub const MF_UNCHECKED: u32 = 0x0000;
+pub const MF_BYCOMMAND: u32 = 0x0000;
+pub const MF_ENABLED: u32 = 0x0000;
+pub const MF_GRAYED: u32 = 0x0001;
+
+/// One accelerator. `fVirt` carries `FVIRTKEY` plus modifiers; `key` is a
+/// virtual-key code, not a character, whenever `FVIRTKEY` is set.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ACCEL {
+    pub fVirt: u8,
+    pub key: u16,
+    pub cmd: u16,
+}
+
+pub const FVIRTKEY: u8 = 0x01;
+pub const FCONTROL: u8 = 0x08;
+pub type HACCEL = *mut c_void;
+
+pub const VK_ESCAPE: u16 = 0x1B;
+pub const VK_RETURN: u16 = 0x0D;
+pub const VK_F5: u16 = 0x74;
+
+#[link(name = "user32")]
+extern "system" {
+    pub fn CreateMenu() -> HMENU;
+    pub fn CreatePopupMenu() -> HMENU;
+    pub fn AppendMenuW(hMenu: HMENU, uFlags: u32, uIDNewItem: usize, lpNewItem: *const u16)
+        -> BOOL;
+    pub fn SetMenu(hWnd: HWND, hMenu: HMENU) -> BOOL;
+    pub fn DrawMenuBar(hWnd: HWND) -> BOOL;
+    pub fn CheckMenuRadioItem(hmenu: HMENU, first: u32, last: u32, check: u32, flags: u32) -> BOOL;
+    pub fn EnableMenuItem(hMenu: HMENU, uIDEnableItem: u32, uEnable: u32) -> BOOL;
+    pub fn GetMenu(hWnd: HWND) -> HMENU;
+    pub fn CreateAcceleratorTableW(paccel: *const ACCEL, cAccel: i32) -> HACCEL;
+    pub fn TranslateAcceleratorW(hWnd: HWND, hAccTable: HACCEL, lpMsg: *mut MSG) -> i32;
+    pub fn SetFocus(hWnd: HWND) -> HWND;
+    pub fn SetTimer(hWnd: HWND, nIDEvent: usize, uElapse: u32, lpTimerFunc: usize) -> usize;
+    pub fn KillTimer(hWnd: HWND, uIDEvent: usize) -> BOOL;
+    pub fn TrackMouseEvent(lpEventTrack: *mut TRACKMOUSEEVENT) -> BOOL;
+    pub fn OpenClipboard(hWndNewOwner: HWND) -> BOOL;
+    pub fn EmptyClipboard() -> BOOL;
+    pub fn SetClipboardData(uFormat: u32, hMem: *mut c_void) -> *mut c_void;
+    pub fn CloseClipboard() -> BOOL;
+    pub fn DrawTextW(
+        hdc: HDC,
+        lpchText: *const u16,
+        cchText: i32,
+        lprc: *mut RECT,
+        format: u32,
+    ) -> i32;
+}
+
+pub const WM_TIMER: u32 = 0x0113;
+pub const WM_MOUSEMOVE: u32 = 0x0200;
+pub const WM_MOUSELEAVE: u32 = 0x02A3;
+pub const WM_ERASEBKGND: u32 = 0x0014;
+pub const WM_GETMINMAXINFO: u32 = 0x0024;
+pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_SETCURSOR: u32 = 0x0020;
+pub const WM_INITMENUPOPUP: u32 = 0x0117;
+
+/// Clipboard format for UTF-16 text, which is the only one worth writing.
+pub const CF_UNICODETEXT: u32 = 13;
+pub const GMEM_MOVEABLE: u32 = 0x0002;
+
+#[repr(C)]
+pub struct TRACKMOUSEEVENT {
+    pub cbSize: u32,
+    pub dwFlags: u32,
+    pub hwndTrack: HWND,
+    pub dwHoverTime: u32,
+}
+
+pub const TME_LEAVE: u32 = 0x0000_0002;
+
+#[repr(C)]
+pub struct MINMAXINFO {
+    pub ptReserved: POINT,
+    pub ptMaxSize: POINT,
+    pub ptMaxPosition: POINT,
+    pub ptMinTrackSize: POINT,
+    pub ptMaxTrackSize: POINT,
+}
+
+// -- text ---------------------------------------------------------------------
+
+/// `DrawTextW` flags. `TextOutW` cannot align, wrap or ellipsise, which is why
+/// the old button labels were centred by guessing seven pixels a character.
+pub const DT_LEFT: u32 = 0x0000;
+pub const DT_CENTER: u32 = 0x0001;
+pub const DT_RIGHT: u32 = 0x0002;
+pub const DT_VCENTER: u32 = 0x0004;
+pub const DT_SINGLELINE: u32 = 0x0020;
+pub const DT_WORDBREAK: u32 = 0x0010;
+pub const DT_END_ELLIPSIS: u32 = 0x0000_8000;
+pub const DT_CALCRECT: u32 = 0x0400;
+pub const DT_NOPREFIX: u32 = 0x0800;
+
+#[repr(C)]
+#[derive(Default)]
+pub struct SIZE {
+    pub cx: i32,
+    pub cy: i32,
+}
+
+#[link(name = "gdi32")]
+extern "system" {
+    pub fn GetTextExtentPoint32W(hdc: HDC, lpString: *const u16, c: i32, psizl: *mut SIZE) -> BOOL;
+    pub fn CreateCompatibleDC(hdc: HDC) -> HDC;
+    pub fn CreateCompatibleBitmap(hdc: HDC, cx: i32, cy: i32) -> HGDIOBJ;
+    pub fn BitBlt(
+        hdc: HDC,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        hdcSrc: HDC,
+        x1: i32,
+        y1: i32,
+        rop: u32,
+    ) -> BOOL;
+    pub fn DeleteDC(hdc: HDC) -> BOOL;
+    pub fn MoveToEx(hdc: HDC, x: i32, y: i32, lppt: *mut POINT) -> BOOL;
+    pub fn LineTo(hdc: HDC, x: i32, y: i32) -> BOOL;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    pub fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> *mut c_void;
+    pub fn GlobalLock(hMem: *mut c_void) -> *mut c_void;
+    pub fn GlobalUnlock(hMem: *mut c_void) -> BOOL;
+}
+
+/// `EM_SETMARGINS`: an `EDIT` puts its text flush against the border otherwise,
+/// which on a design built out of whitespace is the one control that has none.
+pub const EM_SETMARGINS: u32 = 0x00D3;
+pub const EC_LEFTMARGIN: WPARAM = 0x0001;
+pub const EC_RIGHTMARGIN: WPARAM = 0x0002;
+
+#[link(name = "shell32")]
+extern "system" {
+    fn ShellExecuteW(
+        hwnd: HWND,
+        lpOperation: *const u16,
+        lpFile: *const u16,
+        lpParameters: *const u16,
+        lpDirectory: *const u16,
+        nShowCmd: i32,
+    ) -> *mut c_void;
+}
+
+/// Hand something to the shell to open -- a folder in Explorer, a URL in the
+/// browser. Wrapped so no caller has to build five wide strings for the two
+/// arguments that ever vary.
+pub fn shell_open(target: &str) {
+    unsafe {
+        let op = wide("open");
+        let f = wide(target);
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            f.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOW,
+        );
+    }
+}
+
+/// Put text on the clipboard.
+///
+/// The endpoint is the single most copied string in this app -- it is what you
+/// paste into a coding agent -- and retyping `http://127.0.0.1:8231/v1` from a
+/// screenshot is exactly the kind of small friction that makes a window feel
+/// like a demo.
+///
+/// Returns whether it worked, because a clipboard held open by another process
+/// is a real and silent failure.
+///
+/// # Safety
+/// `hwnd` is handed to `OpenClipboard`, which will use it as a window handle.
+/// A safe function taking a raw pointer and passing it to Windows is a safe
+/// function that dereferences whatever it is given -- the same reason
+/// `hkcu_read_string` refuses to take an `HKEY`.
+pub unsafe fn set_clipboard_text(hwnd: HWND, text: &str) -> bool {
+    let utf16 = wide(text);
+    unsafe {
+        if OpenClipboard(hwnd) == 0 {
+            return false;
+        }
+        EmptyClipboard();
+        let bytes = utf16.len() * 2;
+        let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if h.is_null() {
+            CloseClipboard();
+            return false;
+        }
+        let p = GlobalLock(h);
+        if p.is_null() {
+            CloseClipboard();
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(utf16.as_ptr(), p as *mut u16, utf16.len());
+        GlobalUnlock(h);
+        // On success the clipboard owns the block; freeing it here would be a
+        // double free the next paste discovers.
+        let ok = !SetClipboardData(CF_UNICODETEXT, h).is_null();
+        CloseClipboard();
+        ok
+    }
+}
+
+// -- dark mode beyond the client area ----------------------------------------
+//
+// `DwmSetWindowAttribute` darkens the title bar and nothing else. A dark Chaos
+// came up with light scrollbars, measured at `#F0F0F0` against a `#0D0D0E`
+// page, because a scrollbar is drawn by the system from the control's theme
+// class rather than from anything the parent says.
+//
+// The menu bar has no such fix and is still light in dark mode -- see the note
+// in `main.rs`'s `sync_titlebar`, which records what was tried and measured.
+
+#[link(name = "uxtheme")]
+extern "system" {
+    /// Documented. Naming a control's theme class is how a scrollbar is told
+    /// to draw itself dark.
+    pub fn SetWindowTheme(hwnd: HWND, sub_app: *const u16, sub_id: *const u16) -> i32;
+}
+
+/// Put one control's scrollbars into the matching theme.
+///
+/// # Safety
+/// `hwnd` is passed to `SetWindowTheme`, which treats it as a live window.
+pub unsafe fn set_control_theme(hwnd: HWND, dark: bool) {
+    if hwnd.is_null() {
+        return;
+    }
+    let name = wide(if dark {
+        "DarkMode_Explorer"
+    } else {
+        "Explorer"
+    });
+    unsafe {
+        SetWindowTheme(hwnd, name.as_ptr(), std::ptr::null());
+    }
 }

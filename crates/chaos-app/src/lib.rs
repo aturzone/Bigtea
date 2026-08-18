@@ -8,7 +8,11 @@ pub mod art;
 pub mod catalog;
 pub mod client;
 pub mod models;
+/// Where every control lives: four pages, and the id of each thing on them.
+pub mod nav;
 pub mod settings;
+/// The design tokens. Nothing outside this module names a colour.
+pub mod theme;
 /// Raw Win32, shared with `chaos-setup` so there is one set of declarations
 /// rather than two that can drift apart.
 #[cfg(windows)]

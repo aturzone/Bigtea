@@ -10,6 +10,7 @@
 //! preferences are gone. Parsing is hand-rolled because the workspace has no
 //! serialisation crate and this is thirty lines.
 
+use crate::theme::Mode;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -34,6 +35,9 @@ pub struct Settings {
     pub auto: bool,
     /// Run an architecture that has not been diffed against llama.cpp.
     pub force: bool,
+    /// Light or dark. Persisted because a window that forgets which way round
+    /// it is every launch is not a preference, it is a flicker.
+    pub mode: Mode,
     /// Keys read but not understood, preserved on write.
     unknown: BTreeMap<String, String>,
 }
@@ -52,6 +56,8 @@ impl Default for Settings {
             models_dir: None,
             auto: false,
             force: false,
+            // Hermes' desktop defaults to light, and so does this.
+            mode: Mode::Light,
             unknown: BTreeMap::new(),
         }
     }
@@ -91,6 +97,7 @@ impl Settings {
                 }
                 "auto" => s.auto = truthy(v),
                 "force" => s.force = truthy(v),
+                "mode" => s.mode = Mode::parse(v).unwrap_or(s.mode),
                 _ => {
                     s.unknown.insert(k.to_string(), v.to_string());
                 }
@@ -120,6 +127,7 @@ impl Settings {
         out.push_str(&opt("models_dir", self.models_dir.clone()));
         out.push_str(&format!("auto = {}\n", self.auto));
         out.push_str(&format!("force = {}\n", self.force));
+        out.push_str(&format!("mode = {}\n", self.mode.as_str()));
         for (k, v) in &self.unknown {
             out.push_str(&format!("{k} = {v}\n"));
         }
@@ -142,6 +150,23 @@ impl Settings {
                 .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
         std::fs::write(&p, self.render()).map_err(|e| format!("cannot write {}: {e}", p.display()))
+    }
+
+    /// Back to measured everything, without touching the view preference or
+    /// any key a newer build wrote.
+    ///
+    /// A method rather than `..Default::default()` at the call site, because
+    /// `unknown` is private: struct-update syntax from outside this module
+    /// would not compile, and making the field public to allow it would let any
+    /// caller drop the keys it exists to preserve.
+    pub fn reset_engine(&mut self) {
+        let keep_mode = self.mode;
+        let keep_unknown = std::mem::take(&mut self.unknown);
+        *self = Settings {
+            mode: keep_mode,
+            unknown: keep_unknown,
+            ..Settings::default()
+        };
     }
 
     /// The arguments these settings imply, for `chaos-serve`.
@@ -200,6 +225,7 @@ mod tests {
             models_dir: Some(r"D:\models".into()),
             auto: true,
             force: true,
+            mode: Mode::Dark,
             ..Settings::default()
         };
         assert_eq!(Settings::parse(&s.render()), s);
@@ -282,6 +308,29 @@ mod tests {
     #[test]
     fn the_model_is_the_first_argument() {
         assert_eq!(Settings::default().serve_args("mymodel")[0], "mymodel");
+    }
+
+    /// A reset returns every engine setting to measured, and touches neither
+    /// the theme nor a key this build does not understand.
+    #[test]
+    fn a_reset_keeps_the_theme_and_the_unknown_keys() {
+        let mut s = Settings::parse(
+            "cache_gib = 9
+threads = 12
+port = 9999
+mode = dark
+from_the_future = 7
+",
+        );
+        s.reset_engine();
+        assert_eq!(s.cache_gib, None, "cache was not reset");
+        assert_eq!(s.threads, None, "threads were not reset");
+        assert_eq!(s.port, Settings::default().port, "the port was not reset");
+        assert_eq!(s.mode, Mode::Dark, "the reset flipped the lights");
+        assert!(
+            s.render().contains("from_the_future = 7"),
+            "the reset dropped a key a newer build wrote"
+        );
     }
 
     /// Settings live outside the install, so upgrading or uninstalling Chaos
