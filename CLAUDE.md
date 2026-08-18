@@ -21,7 +21,7 @@ export GGML_LIB_DIR=C:/Projects/llamacpp-unsloth/build/ggml/src   # PowerShell: 
 # GPU work needs build-vulkan/ggml/src instead. That build has NO Vulkan archive,
 # and the GPU tests SKIP rather than fail without a card -- so a green "6 passed"
 # was once reported for a file whose two GPU tests never ran once.
-cargo test --release          # 679 tests
+cargo test --release          # 693 tests
 cargo test --release --test deepseek4_forward -- --ignored   # 19 V4-Flash, needs the container
 cargo build --release
 ./target/release/chaos-run <name-or-path> "prompt" -n 16   # bare `chaos-run` lists models

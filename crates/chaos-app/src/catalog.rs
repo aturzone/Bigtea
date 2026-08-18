@@ -20,6 +20,13 @@ pub struct Offer {
     pub always_read: u64,
     pub shards: u32,
     pub arch: String,
+    /// Why Chaos cannot run this yet, if it cannot.
+    ///
+    /// **Listed rather than hidden.** A catalogue that shows only what works
+    /// answers "where is the model I read about?" with silence, and the honest
+    /// answer is a sentence: this container needs something the engine does not
+    /// implement. Hiding it also means the next person asks again.
+    pub unsupported: Option<&'static str>,
 }
 
 /// Everything fetchable, flattened to one row per quantisation.
@@ -34,6 +41,7 @@ pub fn offers() -> Vec<Offer> {
                 always_read: q.always_read_bytes,
                 shards: q.shards,
                 arch: e.arch.to_string(),
+                unsupported: chaos_model::catalogue::why_not_runnable(e.arch),
             });
         }
     }
@@ -62,10 +70,16 @@ pub fn verdict(o: &Offer, free_bytes: u64) -> Verdict {
 
 /// One line for the list.
 pub fn row(o: &Offer, free_bytes: u64) -> String {
-    let mark = match verdict(o, free_bytes) {
-        Verdict::Resident => "fits",
-        Verdict::Streams => "streams",
-        Verdict::TooBig => "too big",
+    // An unsupported architecture outranks the fit verdict: "streams" is true
+    // and useless if the engine will refuse the container on load.
+    let mark = if o.unsupported.is_some() {
+        "not supported yet"
+    } else {
+        match verdict(o, free_bytes) {
+            Verdict::Resident => "fits",
+            Verdict::Streams => "streams",
+            Verdict::TooBig => "too big",
+        }
     };
     let shards = if o.shards > 1 {
         format!(" [{} files]", o.shards)
@@ -95,7 +109,40 @@ mod tests {
             always_read: always,
             shards: 1,
             arch: "a".into(),
+            unsupported: None,
         }
+    }
+
+    /// An architecture the engine cannot run outranks the fit verdict: telling
+    /// someone a 22 GB container "streams" is true and useless if loading it
+    /// will be refused.
+    #[test]
+    fn an_unsupported_model_says_so_instead_of_its_fit() {
+        let mut o = offer(22_000_000_000, 2_600_000_000);
+        o.unsupported = Some("needs a rope mode Chaos does not implement");
+        let r = row(&o, 8_000_000_000);
+        assert!(r.contains("not supported"), "{r}");
+        assert!(!r.contains("streams"), "{r}");
+    }
+
+    /// Every entry the real catalogue offers carries a verdict one way or the
+    /// other, and the new Qwen containers are present rather than hidden.
+    #[test]
+    fn the_catalogue_lists_the_new_qwen_and_marks_it() {
+        let all = offers();
+        let q = all
+            .iter()
+            .find(|o| o.name.starts_with("qwen3.6"))
+            .expect("the new Qwen models are not offered at all");
+        assert!(
+            q.unsupported.is_some(),
+            "qwen3.6 is offered as runnable; the engine does not implement its rope mode"
+        );
+        assert!(
+            all.iter()
+                .any(|o| o.name == "v4flash" && o.unsupported.is_none()),
+            "V4-Flash must still be offered as runnable"
+        );
     }
 
     /// The whole point of the project: a container far larger than memory still

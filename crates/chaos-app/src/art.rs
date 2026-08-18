@@ -130,7 +130,12 @@ mod tests {
     #[test]
     fn the_gui_master_is_antialiased() {
         assert_eq!(HI.len(), HI_W * HI_H);
-        assert!(HI_W >= 256, "the GUI master is only {HI_W}px");
+        // A compile-time check: the master's size is a constant, so this is a
+        // statement about the generated file rather than a runtime condition.
+        // If someone regenerates it smaller, the crate stops building.
+        const _: () = assert!(HI_W >= 256, "the GUI master must be at least 256px");
+        // And it must be square, which the rest of the scaling assumes.
+        assert_eq!(HI_W, HI_H);
         let mid = HI.iter().filter(|&&v| (24..232).contains(&v)).count();
         assert!(
             mid > HI.len() / 200,

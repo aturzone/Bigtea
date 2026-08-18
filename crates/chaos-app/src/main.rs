@@ -2084,10 +2084,16 @@ mod windows_app {
             }
             Tab::Available => {
                 let o = ui.offers.get(i)?;
-                let state = match catalog::verdict(o, ui.free_bytes) {
-                    catalog::Verdict::Resident => "fits entirely in memory",
-                    catalog::Verdict::Streams => "streams from disk on this machine",
-                    catalog::Verdict::TooBig => "too big for this machine",
+                let state = match o.unsupported {
+                    // Said first, because it decides whether the rest matters:
+                    // "streams" is true and useless if the engine will refuse
+                    // the container the moment it is loaded.
+                    Some(why) => why,
+                    None => match catalog::verdict(o, ui.free_bytes) {
+                        catalog::Verdict::Resident => "fits entirely in memory",
+                        catalog::Verdict::Streams => "streams from disk on this machine",
+                        catalog::Verdict::TooBig => "too big for this machine",
+                    },
                 };
                 let rows = vec![
                     ("download".into(), models::human_size(o.bytes)),

@@ -1451,3 +1451,38 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod catalogue_agreement {
+    /// **The catalogue's idea of what runs must be this engine's idea.**
+    ///
+    /// `chaos_model::catalogue::RUNNABLE_ARCHS` exists because the app and
+    /// `chaos-pull` decide whether to offer a download *before* the engine is
+    /// involved, and neither depends on this crate. That is a second copy of a
+    /// fact, so this test — which lives on the side that owns the fact — is what
+    /// keeps it from drifting. A model offered as runnable that this engine
+    /// refuses is a download button that wastes 22 GB.
+    #[test]
+    fn the_catalogue_agrees_with_the_verified_list() {
+        use chaos_model::catalogue::{why_not_runnable, CATALOGUE, RUNNABLE_ARCHS};
+        let verified: std::collections::HashSet<&str> =
+            super::VERIFIED_ARCHITECTURES.iter().copied().collect();
+        let runnable: std::collections::HashSet<&str> = RUNNABLE_ARCHS.iter().copied().collect();
+        assert_eq!(
+            runnable, verified,
+            "RUNNABLE_ARCHS and VERIFIED_ARCHITECTURES disagree; \
+             the difference is either a model offered that cannot run, or one \
+             withheld that can"
+        );
+        // And every catalogue entry's verdict must follow from that list.
+        for e in CATALOGUE {
+            assert_eq!(
+                why_not_runnable(e.arch).is_none(),
+                verified.contains(&e.arch),
+                "{} ({}) is offered inconsistently with the verified list",
+                e.name,
+                e.arch
+            );
+        }
+    }
+}

@@ -435,6 +435,12 @@ fn the_fit_verdict_uses_the_resident_requirement() {
     let mut streams = None;
     let mut too_big = None;
     for o in catalog::offers() {
+        // A container the engine cannot run reports that instead of its fit,
+        // which is the right precedence and would otherwise fail this test for
+        // the wrong reason.
+        if o.unsupported.is_some() {
+            continue;
+        }
         let row = catalog::row(&o, sixteen_gb);
         if o.bytes > sixteen_gb && o.always_read < sixteen_gb {
             streams = Some(row.clone());

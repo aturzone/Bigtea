@@ -1576,7 +1576,7 @@ mod setup {
                 draw_item(&*(lp as *const DRAWITEMSTRUCT));
                 1
             }
-            WM_ERASEBKGND => return 1,
+            WM_ERASEBKGND => 1,
             WM_APP_TICK => {
                 // The worker moved a step. Repaint, and when the run is over
                 // switch to the report -- the window never closes itself.
@@ -1596,7 +1596,7 @@ mod setup {
                     sync_screen();
                 }
                 InvalidateRect(hwnd, std::ptr::null(), 1);
-                return 0;
+                0
             }
             WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
                 let (fg, bg, brush) = S.with(|s| {
