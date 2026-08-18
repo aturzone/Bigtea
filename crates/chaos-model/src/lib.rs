@@ -32,6 +32,7 @@ use chaos_io::{DirectFile, IoMode, SkewedBuf};
 
 pub mod adapter;
 pub mod catalogue;
+pub mod complete;
 mod discover;
 pub mod download;
 pub mod find;

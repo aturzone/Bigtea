@@ -37,6 +37,13 @@ fn qwen() -> Option<Tokenizer> {
     )
 }
 
+fn phi4() -> Option<Tokenizer> {
+    load(
+        "CHAOS_TEST_PHI4",
+        r"C:\Users\atur\.chaos\models\phi-4-Q4_K_M.gguf",
+    )
+}
+
 fn llama() -> Option<Tokenizer> {
     load(
         "CHAOS_TEST_LLAMA",
@@ -168,4 +175,52 @@ fn an_unverified_pre_tokenizer_is_refused_by_name() {
         let text = err.to_string();
         assert!(text.contains(unknown), "must name the variant: {text}");
     }
+}
+
+/// Phi-4 asks for `dbrx`, whose expression is `llama3`'s byte for byte.
+///
+/// **The reason it is not simply another name in the `llama-bpe` arm** is
+/// everything llama.cpp sets *beside* the pre-type: its `llama3` branch sets
+/// `ignore_merges` and `add_bos`, and its `dbrx` branch sets neither. Phi-4
+/// declares no `tokenizer.ggml.add_bos_token`, so the alias would have added a
+/// BOS from the default and shifted every position by one.
+///
+/// Every expectation below is `llama-tokenize` on this exact container.
+#[test]
+fn phi4_declares_dbrx_and_matches_llama_cpp() {
+    let Some(tk) = phi4() else {
+        eprintln!("skipping: no Phi-4 container");
+        return;
+    };
+    assert_eq!(tk.pre_tokenizer(), PreTokenizer::Dbrx);
+    check(
+        &tk,
+        &[
+            ("4567", &[10961, 22]),
+            ("12345678", &[4513, 10961, 2495]),
+            ("don't", &[15357, 956]),
+            (
+                "What is the capital of France? One short sentence.",
+                &[3923, 374, 279, 6864, 315, 9822, 30, 3861, 2875, 11914, 13],
+            ),
+            ("def fibonacci(n):", &[755, 76798, 1471, 1680]),
+            ("Hello, world!", &[9906, 11, 1917, 0]),
+        ],
+        "phi-4 (dbrx)",
+    );
+}
+
+/// **No BOS.** `llama-tokenize` returns eleven ids for the sentence above and
+/// none of them is a beginning-of-sequence marker; a twelfth in front would be
+/// one position of drift through the whole forward pass. This is the half of
+/// the `dbrx` behaviour that a regex comparison cannot catch.
+#[test]
+fn phi4_adds_no_bos() {
+    let Some(tk) = phi4() else {
+        eprintln!("skipping: no Phi-4 container");
+        return;
+    };
+    let ids = tk.encode("What is the capital of France? One short sentence.");
+    assert_eq!(ids.len(), 11, "{ids:?}");
+    assert_eq!(ids[0], 3923, "a BOS was prepended: {ids:?}");
 }

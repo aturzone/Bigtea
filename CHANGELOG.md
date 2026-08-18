@@ -10,6 +10,111 @@ While the major version is `0`, anything may change in a minor release.
 
 Nothing yet.
 
+## [0.0.8] — 2026-08-19
+
+Every dropdown on the settings page was two pixels tall. A model in its own
+folder was invisible. A download that stopped half way looked finished. All
+three were reported by Atur in one message, all three are fixed, and all three
+now have a test.
+
+### The settings dropdowns open
+
+**Measured, on this machine: the dropped list was 32 pixels tall in 0.0.7 and
+is 238 in 0.0.8.** A combo box in Win32 is sized by the height of its *dropped
+list*, not of its closed box, and `layout` was passing it the row height. The
+options were all there — `CB_GETCOUNT` reported three to six of them — and the
+list they opened into had two pixels of room after the closed control took its
+share. Clicking one looked exactly like a control that ignores the mouse.
+
+`metric::COMBO_VISIBLE` now sizes them for eight rows, and the constant carries
+the reason so nobody sets it back.
+
+### Models are found where models are actually kept
+
+- **The `models folder` setting is read by the engine.** It was written to
+  `settings.txt` by the app and consulted by nothing — the worst of the three
+  possible behaviours, because it looked like it worked. `chaos_model::find`
+  reads it now, so `chaos-run` and `chaos-serve` honour it too.
+- **Several folders, separated by `;`.** A 144 GB container does not live beside
+  a 2 GB one. Both `CHAOS_MODELS` and the setting take a list, in the platform's
+  own separator.
+- **One level of subfolders is searched.** A five-shard model lives in its own
+  directory; a scan that stopped at the top level reported "no models installed"
+  with 145 GB plainly there. This is how DeepSeek-V4-Flash became visible in the
+  app without moving a byte.
+- The search order holds each directory exactly once. `Vec::dedup` removes only
+  *adjacent* duplicates, so the cache directory used to appear twice.
+
+### An unfinished download says so
+
+A truncated `.gguf` has a valid header — the header is written first — so it
+listed beside models that work and failed several seconds into a load, in the
+engine's words. Three of the models on Atur's machine were in that state.
+
+`chaos_gguf::Gguf::expected_file_bytes` reads the container's own tensor index
+and returns where the last tensor ends; a file shorter than that is *provably*
+truncated, with no catalogue, no network and no guess involved. Every shard is
+checked separately.
+
+- **MODELS** marks such a row `(unfinished)`.
+- **LOAD** refuses, naming the shortfall, and points at DOWNLOAD — which
+  resumes.
+- `chaos-run` and `chaos-serve` refuse the same way, before anything is bound:
+  `the download did not finish -- phi-4-Q4_K_M.gguf is 2.48 GB short of the
+  8.89 GB its own index requires (72% written)`.
+
+### Ideogram 4 is in the catalogue, and listed as an image model
+
+It is open-weight — a 9.3B diffusion transformer, GGUF conversions and all — so
+"we cannot get it" was never true. What is true is that generating an image
+needs a sampler loop, a separate text encoder and a VAE, and Chaos is a token
+loop with none of the three. The container says as much itself: **458 tensors
+and zero metadata keys**, so there is no `general.architecture` to dispatch on.
+
+Listed, sized from the repository, and refused with the reason. The route in, if
+it is ever wanted, is `docs/graph/backlog/image-generation-ideogram-4.md`.
+
+### Why Qwen3.5/3.6 cannot run, stated properly
+
+The old refusal blamed interleaved multimodal RoPE. That is real and it is the
+smaller half. Read from the container itself: `full_attention_interval 4` with
+64 blocks means **48 of the 64 layers are a gated delta net with recurrent
+state**, carrying `ssm_conv1d`, `ssm_a`, `ssm_alpha`, `ssm_beta`, `ssm_dt.bias`
+and `ssm_norm` — and a KV cache cannot stand in for a carried state.
+
+The refusal now says that, and `docs/graph/backlog/qwen35-gated-delta-net.md`
+writes down the four pieces of work and how they get verified.
+
+### Phi-4 runs: the `dbrx` pre-tokenizer
+
+Phi-4 downloaded completely and then refused to load — `tokenizer.ggml.pre =
+"dbrx" is not implemented`. Its expression is `llama3`'s byte for byte, and
+llama.cpp says so in a comment above it.
+
+**It is still a separate variant rather than another name in the `llama-bpe`
+arm**, because llama.cpp's `llama3` branch also sets `ignore_merges` and
+`add_bos` and its `dbrx` branch sets neither. Phi-4 declares no
+`tokenizer.ggml.add_bos_token`, so aliasing it would have prepended a BOS from
+the default and shifted every position by one — silently, the way tokenizer bugs
+always fail here.
+
+Checked against `llama-tokenize` on the container: six cases, exact ids, and
+eleven tokens with no BOS for the test sentence. `chaos-run phi-4 --chat` then
+answers *"The capital of France is Paris."*
+
+**`smaug-bpe` shares llama.cpp's arm and is still refused**, because there is no
+Smaug container here to check it against. Identical in the source is not the
+same as verified.
+
+### Verified by running them
+
+Every model on Atur's machine was run with the release build. **Nine generate
+correct text** — Llama-3.2 1B and 3B, Qwen2.5-Coder-7B, Qwen3-4B, Qwen3-8B,
+Qwen3-14B, Gemma-3-4B and 12B, and Phi-4. **DeepSeek-V4-Flash generates**
+(*" Paris."*, 0.340 tok/s, 5 prompt tokens in 8.5 s) from
+`C:\Projects\models\v4flash` without a byte being moved. Qwen3.6-27B is
+refused by architecture, with the reason. Nothing crashed and nothing hung.
+
 ## [0.0.7] — 2026-08-19
 
 The window redesigned around four pages, an installer that looks like one, and

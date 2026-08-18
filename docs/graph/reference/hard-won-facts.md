@@ -289,6 +289,19 @@ compiling**, and three of these were believed fixed before a pixel was measured.
   process death — no message, no log, no stack. Pull handles and data *out* of
   the borrow, drop it, then talk to Windows. `tests/ui_rules.rs` enforces this
   textually, and found three more instances the day it was written.
+- **A combo box's height is the height of its *dropped list*, not of its closed
+  box.** Windows sizes the closed control from its own item height and hands
+  every remaining pixel to the list. `MoveWindow(combo, x, y, w, ROW_HEIGHT)`
+  therefore leaves the list nothing to open into, and clicking the control does
+  visibly nothing — no error, no flicker, identical to a dead control. It is
+  *not* a population bug: `CB_GETCOUNT` reported three to six items the whole
+  time. Measured with `CB_GETDROPPEDCONTROLRECT`: **32 px in v0.0.7, 238 px
+  after passing `CONTROL + ROW * VISIBLE`**. The window still lays out correctly
+  because the control shrinks itself back to the closed height.
+- **`CB_GETDROPPEDCONTROLRECT` measures this from outside the process.** Any
+  tool with the window handle can read it, which is how the before-and-after
+  above was taken against the *installed* v0.0.7 binary rather than from
+  reasoning about a diff.
 - **Find controls by id, not by storing handles in the state.** `GetDlgItem`
   needs only the window handle, which can live in an atomic — so no action
   function needs a borrow open in order to locate a control. This removes the
@@ -376,3 +389,38 @@ compiling**, and three of these were believed fixed before a pixel was measured.
   The IMROPE rope mode that first flagged them is the small part. Running
   Qwen 3.5/3.6 is a hybrid-attention port, not a rope fix, and no amount of
   re-downloading changes that.
+- **How much of Qwen3.6 is not attention: three quarters of it.** The container
+  states `full_attention_interval 4` over 64 blocks, and llama.cpp's rule is
+  `is_recr[i] = (i + 1) % interval != 0` — **48 recurrent layers, 16 attention
+  layers**. The recurrent ones are a gated delta net: `attn_qkv` is `[5120,
+  10240]` where `10240 = 2 * (16 * 128) + 48 * 128`, i.e. q and k over 16 groups
+  and v over 48 heads, all 128 wide, and `ssm_conv1d` is a depthwise causal
+  convolution over the whole of it. A KV cache cannot hold that state: it is
+  carried and rewritten, not appended.
+- **A GGUF states its own length, so a truncated download is provable.** The
+  tensor index gives every tensor an offset and a size; the file cannot end
+  before the last of them. Shorter is truncated, longer is alignment padding.
+  This needs no catalogue and no network — which matters, because a half-written
+  container has a *valid header* (the header is written first) and is otherwise
+  indistinguishable from a finished one in a list. Three models on the
+  development machine were in that state and the app reported all three as ready
+  to run.
+- **Read the header progressively, not in one 32 MB gulp.** Completeness is
+  checked for every model on every rescan. A dense container's header is under a
+  megabyte; a 248,000-token Qwen tokenizer and a MoE index with thousands of
+  expert tensors are what push it into the megabytes. Start at 4 MB and double
+  on a parse failure, or a rescan spends most of a second reading nothing.
+- **A big model lives in its own folder, so the scan has to descend one level.**
+  Five shards weighing 144 GB are not dropped beside a 2 GB file. A top-level-
+  only scan reported "no models installed" with DeepSeek-V4-Flash plainly
+  present in `models/v4flash/`. One level and no further: a models folder
+  pointed at a drive root would otherwise read every directory on it.
+- **A setting the app writes and nothing reads is worse than a missing one.**
+  `models_dir` was saved to `settings.txt` by the window and consulted by no
+  code anywhere, so it looked like it worked and silently did nothing. The
+  reader belongs in `chaos_model::find`, beside the search order, where
+  `chaos-run` and `chaos-serve` get it too.
+- **`Vec::dedup` removes only *adjacent* duplicates.** The models search order
+  named the download cache twice — once from the setting, once by default — and
+  survived it only because the second pass skipped every label it had already
+  seen. Deduplicating a path list wants a set.

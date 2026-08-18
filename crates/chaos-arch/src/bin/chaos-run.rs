@@ -2941,6 +2941,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // **Refuse a half-written container here, by name, rather than three
+    // seconds into a load.** An interrupted download leaves a file with a
+    // perfectly valid header and none of its weights; opening it fails
+    // somewhere deep in tensor binding with a message about offsets.
+    if let Some(why) = chaos_model::complete::why_incomplete(std::path::Path::new(&path)) {
+        eprintln!("chaos-run: {why}");
+        eprintln!("           run `chaos-pull` again -- it resumes.");
+        return ExitCode::from(2);
+    }
 
     chaos_arch::log::configure(logcfg);
     // After the log is configured, so `--log-disable` and `--verbosity 0`

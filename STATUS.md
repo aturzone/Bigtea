@@ -5,8 +5,8 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-17 · **Version**: **v0.0.6, released** · **Branch**:
-`main` · **Open PRs**: none. #83-#92 merged, every branch deleted.
+**Last updated**: 2026-08-19 · **Version**: **v0.0.8** · **Branch**:
+`main` · **Open PRs**: none.
 
 **The release is out**: <https://github.com/aturzone/Chaos/releases/tag/v0.0.3>
 — Linux, macOS and Windows archives, verified by downloading the published
@@ -20,11 +20,68 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **706 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
+**Current**: **729 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
 needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
 clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
 reading, which is the only way that number has ever been right.
+
+## The window's three lies, found by using it (2026-08-19)
+
+Atur listed six things in one message. Three were bugs in which the window said
+something untrue, and each is now fixed with a test that would have caught it.
+
+**1. Every settings dropdown was two pixels tall.** A Win32 combo box is sized
+by the height of its *dropped list*, not of its closed box, and `layout` passed
+it the row height. The options were always there — `CB_GETCOUNT` reported three
+to six per control — and the list they opened into had no room. Measured with
+`CB_GETDROPPEDCONTROLRECT` against the installed binaries: **32 px in v0.0.7,
+238 px in v0.0.8**.
+
+**2. `models folder` was written and never read.** The app saved it to
+`settings.txt`; no code anywhere consulted it. `chaos_model::find` reads it now,
+so `chaos-run` and `chaos-serve` honour it too, it takes several folders
+separated by `;`, and each search folder's immediate subfolders are scanned.
+That last part is why **DeepSeek-V4-Flash became visible without moving a byte**
+— 145 GB in `C:\Projects\models\v4flash`, invisible to a top-level-only scan.
+
+Verified end to end after the fix: `chaos-run v4flash "The capital of France
+is"` → *" Paris."*, 5 prompt tokens in 8.5 s, **0.340 tok/s** generating, with a
+9 GB download running against the same disk.
+
+**3. A half-finished download looked finished.** Three models on Atur's machine
+were truncated and all three were listed as ready. `Gguf::expected_file_bytes`
+reads the container's own tensor index, so a short file is *provably* short —
+no catalogue, no network. MODELS marks the row, LOAD refuses and names the
+shortfall, DOWNLOAD becomes the resume button, and `chaos-run`/`chaos-serve`
+refuse before binding anything.
+
+**Every installed model was then run.** Six generate correct text (Llama-3.2
+1B/3B, Qwen2.5-Coder-7B, Qwen3-4B, Qwen3-8B, Gemma-3-4B/12B), three were refused
+as unfinished, one as an unimplemented architecture, and V4-Flash generates.
+
+### The two that are not fixed, and why
+
+**Qwen3.5 / 3.6 needs a recurrent memory, not a rope fix.** Read from the
+container: `full_attention_interval 4` over 64 blocks means **48 of the 64
+layers are a gated delta net** carrying `ssm_conv1d`, `ssm_a`, `ssm_alpha`,
+`ssm_beta`, `ssm_dt.bias` and `ssm_norm`. A KV cache cannot hold a state that is
+carried and rewritten rather than appended. Four pieces of work, written down in
+[`backlog/qwen35-gated-delta-net.md`](docs/graph/backlog/qwen35-gated-delta-net.md).
+
+**Ideogram 4 is open-weight and is an image model.** Listed in the catalogue,
+sized from the repository, refused with the reason. One image needs four parts —
+the denoiser, its unconditional twin, Qwen3-VL-8B as text encoder, and a VAE —
+and Chaos has code for none of the last three, nor for conv2d, a sampler loop,
+`.safetensors`, or PNG. The container proves the point: **458 tensors and zero
+metadata keys**, so there is not even a `general.architecture` to dispatch on.
+Two honest routes in
+[`backlog/image-generation-ideogram-4.md`](docs/graph/backlog/image-generation-ideogram-4.md).
+
+**Neither is LTS-blocking work that can be faked.** This release is v0.0.8, not
+an LTS: two of the six things asked for are architecture ports, and calling a
+release long-term-supported with them open would be a claim about the wrong
+thing.
 
 ## A browser interface, and what a browser found (2026-08-17)
 
@@ -69,7 +126,7 @@ could not have done its job either: a pool collapsed onto one handle measures
 "unlucky". The plausibility bounds stay, the comparative claim lives in the
 research node where it was measured under control.
 
-**Current**: **706 tests**, 0 failed.
+**Current**: **729 tests**, 0 failed.
 
 ## The app has four pages and a menu (2026-08-18)
 
@@ -111,7 +168,7 @@ no-op. Scrollbars *are* fixable and were — `#F0F0F0` to `#171717`.
 residency. The engine measures all three and prints them to its log; nothing
 carries them over the socket. The page says so on its face.
 
-**Current**: **706 tests**, 0 failed.
+**Current**: **729 tests**, 0 failed.
 
 ## v0.0.6 — the app actually works now (2026-08-18)
 
@@ -180,7 +237,7 @@ nothing streams and the whole file must fit. It is what makes the app say
 `qwen3-32b 19.8 GB needs 19.8 GB - too big` honestly on this laptop, while
 `v4flash 155 GB needs 7.92 GB - streams`.
 
-**706 tests** (was 641), clippy 0, fmt clean.
+**729 tests** (was 706), clippy 0, fmt clean.
 
 ## 20 tok/s on V4-Flash is closed, with a number (2026-08-16)
 

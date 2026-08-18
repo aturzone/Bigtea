@@ -593,3 +593,27 @@ fn the_window_clips_its_children_so_it_does_not_flicker() {
          repaints the transcript, the list and every box"
     );
 }
+
+/// **What a button does depends on which model is selected, so the button
+/// states have to be recomputed when the selection changes.**
+///
+/// They were not. `LBN_SELCHANGE` repainted the page beside the list and left
+/// LOAD and DOWNLOAD showing whatever the *first* row had decided at startup —
+/// so an unfinished download offered LOAD (which then refused) and hid
+/// DOWNLOAD (which is the thing that fixes it). Measured through
+/// `IsWindowEnabled` from outside the process before and after.
+#[test]
+fn changing_the_selection_re_decides_which_buttons_are_live() {
+    let src = main_rs();
+    let arm = src
+        .split("(nav::ID_LIST, LBN_SELCHANGE)")
+        .nth(1)
+        .expect("the list's selection-change arm must exist");
+    // Up to the next match arm.
+    let arm = &arm[..arm.find("(_,").unwrap_or(arm.len().min(400))];
+    assert!(
+        arm.contains("sync_enabled()"),
+        "LBN_SELCHANGE must call sync_enabled(), or the buttons describe the \
+         previously selected model:\n{arm}"
+    );
+}

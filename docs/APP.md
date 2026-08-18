@@ -28,7 +28,7 @@ and pressing UNINSTALL.
 ```
 +----------------+----------------------------------------------+
 | ✳ CHAOS        |  Chat                                        |
-|   v0.0.6       |  Talk to the running model, or point a       |
+|   v0.0.8       |  Talk to the running model, or point a       |
 |                |  coding agent at its endpoint.               |
 | ▎CHAT          |                                              |
 |  MODELS        |  +----------------------------------------+  |
@@ -118,6 +118,18 @@ The key is on the model's page and on MONITOR while a model runs.
 **DELETE** removes an installed model and *every shard* of it, after telling you
 how many files and how many bytes. It refuses while that model is running.
 
+### An unfinished download
+
+A row marked `(unfinished)` is a container that stopped part way. Chaos knows
+because a GGUF states its own length: the tensor index says where the last
+tensor ends, and a file shorter than that is truncated — no catalogue and no
+network involved. **LOAD refuses it and says how much is missing**; **DOWNLOAD**
+finishes it, resuming from what is already on disk.
+
+This matters because the failure is otherwise invisible. A half-written `.gguf`
+has a perfectly valid header — the header is written first — so it sits in the
+list looking exactly like a model that works.
+
 ### MONITOR
 
 What the machine is doing: memory free and in use with a bar, the running
@@ -140,6 +152,11 @@ and what leaving it empty will do:
 | **Performance** | `expert cache`, `generation threads`, `prefill threads` |
 | **Server** | `port` |
 | **Paths** | `models folder` |
+
+**`models folder` takes more than one.** Separate them with `;` and all of them
+are searched, which is how a 144 GB container on another drive appears beside a
+2 GB one. The *first* is where downloads go. The setting is read by the engine
+too, so `chaos-run` and `chaos-serve` see the same models the window does.
 
 **Empty means measured.** Chaos reads the machine and picks a value; typing one
 overrides it. **SAVE** writes the file and reports where. **RESET** returns every
@@ -179,12 +196,17 @@ drawn against. **View → Dark** switches, and the choice persists.
 | | |
 |---|---|
 | the app and binaries | `%LOCALAPPDATA%\Chaos\bin` |
-| models | `%USERPROFILE%\.chaos\models` |
+| models | `%USERPROFILE%\.chaos\models`, plus anything in `models folder` |
 | settings | `%USERPROFILE%\.chaos\settings.txt` |
 | a crash report | `%TEMP%\chaos-app-crash.log` |
 
 **Models are never inside the install.** Uninstalling cannot delete them, and an
 upgrade never touches them.
+
+**A model in its own folder is found.** Each search folder is scanned, and so is
+each of its immediate subfolders — one level, not a walk, because a models
+folder pointed at a whole drive would otherwise read every directory on it. A
+five-shard container in `models/v4flash/` appears as one entry, its first shard.
 
 The settings file is plain text and safe to edit by hand. Keys it does not
 recognise are preserved, so running an older build once will not silently
@@ -196,8 +218,9 @@ If the app closes unexpectedly it writes `%TEMP%\chaos-app-crash.log` and shows
 a message box naming it. **Help → Open crash log** finds it. That file says what
 failed and where — please send it.
 
-A model that will not load is nearly always one of three things: the always-read
-set does not fit (the model's page says `too big for this machine`), the port is
+A model that will not load is nearly always one of four things: the download did
+not finish (the row says `(unfinished)`; press DOWNLOAD), the always-read set
+does not fit (the model's page says `too big for this machine`), the port is
 already taken (change it in SETTINGS), or the architecture has never been diffed
 against llama.cpp and `allow unverified architectures` is off.
 

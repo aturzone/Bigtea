@@ -273,12 +273,23 @@ pub const CATALOGUE: &[Entry] = &[
     //
     // **Listed on purpose, and listed as unrunnable.** Leaving them out was
     // answering "where is the new Qwen?" with silence, and the answer is not
-    // "it does not exist" -- it is that `general.architecture` reads `qwen35`
-    // and `qwen35moe`, and llama.cpp returns `LLAMA_ROPE_TYPE_IMROPE` for both:
-    // interleaved multimodal RoPE, which is neither mode this engine
-    // implements, and it branches on those arches in five other places besides.
+    // "it does not exist".
+    //
+    // It is that these are **hybrid** models, which the container states
+    // outright: `Qwen3.6-27B-Q4_K_M.gguf` carries `qwen35.ssm.conv_kernel 4`,
+    // `ssm.state_size 128`, `ssm.group_count 16`, `ssm.time_step_rank 48` and
+    // `full_attention_interval 4`, and every block holds `ssm_conv1d`,
+    // `ssm_alpha`, `ssm_beta`, `ssm_a`, `ssm_dt.bias` and `ssm_norm`. Following
+    // llama.cpp's `qwen35.cpp`, a layer is recurrent when `(i + 1) % 4 != 0` --
+    // so **48 of the 64 layers are a gated delta net, not attention**. Those
+    // need a recurrent state cache (a conv window and an `[128, 128, 48]` state
+    // per sequence per layer) which this engine does not have; a KV cache
+    // cannot stand in for it. The remaining 16 attention layers additionally
+    // want interleaved multimodal RoPE, four sections wide.
+    //
     // `qwen3.rs` refuses them by name rather than rotating the wrong way and
-    // producing fluent, confident nonsense.
+    // producing fluent, confident nonsense. The route in is written down:
+    // `docs/graph/backlog/qwen35-gated-delta-net.md`.
     //
     // Every byte below was read from the container's own tensor table with
     // `tools/gguf-always-read.py`, which range-fetches the header rather than
@@ -328,6 +339,39 @@ pub const CATALOGUE: &[Entry] = &[
             },
         ],
     },
+    // -- Ideogram 4, which is an image model and not a language model --------
+    //
+    // Open-weight since 3 June 2026: a 9.3B diffusion transformer, and the
+    // GGUF conversions below are the ones `stable-diffusion.cpp` reads.
+    //
+    // **Listed so that "where is Ideogram?" has an answer, and listed as
+    // unrunnable because it is a different kind of program.** Chaos is a token
+    // loop: embed, attend, sample the next token. An image comes out of a
+    // sampler loop over a denoiser, and Ideogram's needs four parts, not one --
+    // this transformer, a second *unconditional* copy of it for classifier-free
+    // guidance, Qwen3-VL-8B as the text encoder, and a VAE to turn latents into
+    // pixels. Three of those four Chaos has no code for.
+    //
+    // The container says so itself: `tools/gguf-always-read.py` reports **458
+    // tensors and zero metadata keys**, so there is no `general.architecture`
+    // to dispatch on and no tokenizer inside. It is a bag of weights for
+    // another engine, not a model container in the sense the rest of this table
+    // means.
+    Entry {
+        name: "ideogram-4",
+        repo: "leejet/ideogram-4-GGUF",
+        stem: "ideogram4-{quant}",
+        arch: "ideogram4",
+        quants: &[Quant {
+            name: "Q4_0",
+            // Measured from the repository, not the model card.
+            bytes: 5_643_820_832,
+            shards: 1,
+            // Dense: a diffusion transformer has no routed experts, so every
+            // byte is read on every one of the sampler's steps.
+            always_read_bytes: 5_643_820_832,
+        }],
+    },
 ];
 
 /// Architectures this engine implements *and* has diffed against llama.cpp.
@@ -365,7 +409,12 @@ pub fn why_not_runnable(arch: &str) -> Option<&'static str> {
     }
     Some(match arch {
         "qwen35" | "qwen35moe" => {
-            "needs interleaved multimodal RoPE, which Chaos does not implement"
+            "three of its four layers are a gated delta net with recurrent \
+             state, not attention, and Chaos has no recurrent memory yet"
+        }
+        "ideogram4" => {
+            "it is an image model -- a diffusion transformer needing a sampler, \
+             a separate text encoder and a VAE, none of which Chaos has"
         }
         "qwen3moe" => "its forward pass does not yet match llama.cpp exactly",
         _ => "this architecture has never been diffed against llama.cpp",
@@ -374,6 +423,31 @@ pub fn why_not_runnable(arch: &str) -> Option<&'static str> {
 
 pub fn find(name: &str) -> Option<&'static Entry> {
     CATALOGUE.iter().find(|e| e.name.eq_ignore_ascii_case(name))
+}
+
+/// The catalogue entry a file on disk came from, matched by its filename.
+///
+/// **This is what turns "your download stopped half way" into a button that
+/// finishes it.** A model already on disk is known by its file, not by the name
+/// it was fetched under, and resuming needs the entry and the quantisation back
+/// again. Matching on the filename the entry itself would produce is exact --
+/// no fuzzy stem comparison, no guessing which quant a `Q4_K_M` in the name
+/// meant.
+///
+/// Takes a plain file name, with or without the `.gguf`, and with or without a
+/// `-00001-of-00005` shard suffix.
+pub fn find_by_file(file: &str) -> Option<(&'static Entry, &'static Quant)> {
+    let want = file.trim_end_matches(".gguf").to_lowercase();
+    for e in CATALOGUE {
+        for q in e.quants {
+            for f in e.files(q) {
+                if f.trim_end_matches(".gguf").to_lowercase() == want {
+                    return Some((e, q));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// What a download would cost and whether the result will run here.
@@ -530,8 +604,60 @@ mod runnable_tests {
             let e = find(name).unwrap_or_else(|| panic!("{name} is not listed"));
             let why = why_not_runnable(e.arch)
                 .unwrap_or_else(|| panic!("{name} now claims to run; move it and update this"));
-            assert!(why.contains("RoPE"), "{name}: {why}");
+            // Names the *blocker*, not a symptom: 48 of the 64 layers are a
+            // gated delta net with recurrent state. The mRoPE the older message
+            // pointed at is real but is the smaller half of the work.
+            assert!(why.contains("recurrent"), "{name}: {why}");
         }
+    }
+
+    /// A file on disk resolves back to the entry that would have fetched it.
+    ///
+    /// This is what makes DOWNLOAD able to *finish* an interrupted fetch: the
+    /// app has a filename and needs the name and quantisation back.
+    #[test]
+    fn a_filename_resolves_to_its_catalogue_entry() {
+        let (e, q) = find_by_file("phi-4-Q4_K_M.gguf").expect("phi-4 is listed");
+        assert_eq!(e.name, "phi4");
+        assert_eq!(q.name, "Q4_K_M");
+
+        // Without the extension, and case-insensitively.
+        assert!(find_by_file("QWEN3-8B-Q4_K_M").is_some());
+
+        // A shard of a split container resolves too, from shard one.
+        let (e, q) = find_by_file("DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf")
+            .expect("v4flash shard one is listed");
+        assert_eq!(e.name, "v4flash");
+        assert_eq!(q.shards, 5);
+
+        assert!(find_by_file("something-nobody-ships.gguf").is_none());
+    }
+
+    /// Every entry's own filenames must resolve to it, or the resume path is a
+    /// coin flip on whichever entry happens to be listed first.
+    #[test]
+    fn every_entry_resolves_from_its_own_filenames() {
+        for e in CATALOGUE {
+            for q in e.quants {
+                let first = &e.files(q)[0];
+                let (got_e, got_q) =
+                    find_by_file(first).unwrap_or_else(|| panic!("{first} resolves to nothing"));
+                assert_eq!(got_e.name, e.name, "{first}");
+                assert_eq!(got_q.name, q.name, "{first}");
+            }
+        }
+    }
+
+    /// Ideogram 4 is listed and refused for being a different kind of model.
+    ///
+    /// It is open-weight and it is on Hugging Face, so "we do not have it" was
+    /// never the answer. The answer is that an image needs a sampler, a text
+    /// encoder and a VAE, and this engine is a token loop.
+    #[test]
+    fn the_image_model_is_listed_and_refused_as_an_image_model() {
+        let e = find("ideogram-4").expect("ideogram-4 is listed");
+        let why = why_not_runnable(e.arch).expect("it must not claim to run");
+        assert!(why.contains("image"), "{why}");
     }
 
     /// **The resident figure is what decides a download.** For a dense model it
