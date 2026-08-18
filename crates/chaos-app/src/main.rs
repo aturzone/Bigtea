@@ -247,6 +247,9 @@ mod windows_app {
             );
 
             set_window_icon(hwnd, hinst);
+            // Published for the worker threads, which cannot reach the
+            // thread-local `UI`.
+            main_window().store(hwnd as usize, Ordering::SeqCst);
             build_controls(hwnd, hinst, black);
             // Restore what was set last time. Done after the controls exist and
             // before the window is shown, so the first paint is already right.
@@ -611,6 +614,13 @@ mod windows_app {
             let ui = OutHandle(out);
             let w = wide(text);
             unsafe {
+                // **The box is ES_READONLY, and a read-only EDIT ignores
+                // EM_REPLACESEL entirely** -- no error, no text, nothing. Every
+                // token the model produced was being dropped here while the
+                // status line cheerfully said "ready". Drop the flag for the
+                // append and put it straight back, so the transcript still
+                // cannot be typed into.
+                SendMessageW(ui.0, EM_SETREADONLY, 0, 0);
                 // Move the caret to the end, then replace an empty selection:
                 // the only way to append to an EDIT without re-sending the
                 // whole buffer, which for a long answer is quadratic.
@@ -618,6 +628,7 @@ mod windows_app {
                 SendMessageW(ui.0, EM_SETSEL, len as WPARAM, len as LPARAM);
                 SendMessageW(ui.0, EM_REPLACESEL, 0, w.as_ptr() as LPARAM);
                 SendMessageW(ui.0, EM_SCROLLCARET, 0, 0);
+                SendMessageW(ui.0, EM_SETREADONLY, 1, 0);
             }
         }
     }
@@ -721,6 +732,10 @@ mod windows_app {
                     ui.server = Some(c);
                     ui.history.clear();
                     ui.loaded = Some(label.clone());
+                    // What the box said, so the endpoint line and the chat
+                    // client both use the port the server was given rather
+                    // than the default they were built with.
+                    ui.port = port;
                     Some((ui.load, ui.unload, ui.out))
                 });
                 if let Some((load, unload, out)) = handles {
@@ -963,14 +978,29 @@ mod windows_app {
         });
     }
 
+    /// The main window handle, readable from any thread.
+    ///
+    /// `UI` is a `thread_local!`, so a worker thread sees `None` in it -- its
+    /// own copy was never initialised. Every background task here needs the
+    /// window handle to wake the UI, so it lives in an atomic as well.
+    fn main_window() -> &'static std::sync::atomic::AtomicUsize {
+        static H: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        &H
+    }
+
+    /// Wake the UI thread so it drains what a worker produced.
+    ///
+    /// **This used to read `UI`, from the worker thread**, where the
+    /// thread-local is `None` -- so it posted nothing, `drain` never ran, and
+    /// every generated token was received and silently discarded. The window
+    /// said "ready" and showed an empty answer.
     fn notify() {
-        UI.with(|u| {
-            if let Some(ui) = u.borrow().as_ref() {
-                unsafe {
-                    PostMessageW(ui.main, WM_APP_TICK, 0, 0);
-                }
+        let h = main_window().load(Ordering::SeqCst);
+        if h != 0 {
+            unsafe {
+                PostMessageW(h as HWND, WM_APP_TICK, 0, 0);
             }
-        });
+        }
     }
 
     fn send_prompt() {
@@ -982,6 +1012,8 @@ mod windows_app {
             let Some(ui) = b.as_ref() else {
                 return (String::new(), 0u16, Vec::new());
             };
+            // `ui.port` is set when the model is loaded, from the port box, so
+            // this is the port the server was actually told to bind.
             (control_text(ui.input), ui.port, ui.history.clone())
         });
         let prompt = prompt.trim().to_string();
@@ -1148,7 +1180,9 @@ mod windows_app {
             let rx = sidebar;
             let rw = w - rx - PAD;
             let in_h = 92;
-            let out_h = h - PAD * 3 - in_h - 34;
+            // 62px: three status lines plus breathing room. It was 34, which
+            // is one line, and the other two were drawn over the input box.
+            let out_h = h - PAD * 3 - in_h - 62;
             MoveWindow(ui.out, rx, PAD, rw, out_h.max(80), 1);
             MoveWindow(ui.input, rx, PAD * 2 + out_h.max(80), rw - 110, in_h, 1);
             MoveWindow(
@@ -1267,7 +1301,11 @@ mod windows_app {
             // The bottom strip carries three things a model runner has to show
             // and this one was not showing at all: what is loaded, where a
             // client can reach it, and what the machine has left.
-            let base = r.bottom - 26;
+            // Three lines above the bottom edge. The endpoint used to sit at
+            // base - 38, which is inside the input box's rectangle, so the one
+            // line telling you where to point a client was painted underneath a
+            // control and never seen.
+            let base = r.bottom - 22;
             put(sidebar, base, &status);
 
             match &ui.loaded {
@@ -1276,14 +1314,14 @@ mod windows_app {
                     // running and there is no way to point anything at it.
                     put(
                         sidebar,
-                        base - 38,
+                        base - 40,
                         &format!(
                             "running  {name}   ->   http://127.0.0.1:{}/v1   (no API key needed, localhost only)",
                             ui.port
                         ),
                     );
                 }
-                None => put(sidebar, base - 38, "no model loaded"),
+                None => put(sidebar, base - 40, "no model loaded"),
             }
 
             // C3: what the machine has, refreshed every time this repaints.
@@ -1292,7 +1330,7 @@ mod windows_app {
             let used = total.saturating_sub(free);
             put(
                 sidebar,
-                base - 19,
+                base - 21,
                 &format!(
                     "memory  {} free of {}   ({}% in use)",
                     models::human_size(free),

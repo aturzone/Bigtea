@@ -175,6 +175,11 @@ pub struct DRAWITEMSTRUCT {
 pub const LB_SETITEMHEIGHT: u32 = 0x01A0;
 pub const LB_GETTEXT: u32 = 0x0189;
 pub const LB_GETTEXTLEN: u32 = 0x018A;
+/// A read-only EDIT **silently ignores `EM_REPLACESEL`**. It returns nothing,
+/// sets no error, and the text simply does not appear -- which is why the
+/// transcript stayed empty while the model was answering normally. Clear the
+/// flag, append, set it again.
+pub const EM_SETREADONLY: u32 = 0x00CF;
 pub const EM_SETSEL: u32 = 0x00B1;
 pub const EM_REPLACESEL: u32 = 0x00C2;
 pub const EM_SCROLLCARET: u32 = 0x00B7;
