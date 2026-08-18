@@ -31,6 +31,7 @@ fn main() {
 
 #[cfg(windows)]
 fn main() {
+    windows_app::install_panic_hook();
     windows_app::run();
 }
 
@@ -115,6 +116,63 @@ mod windows_app {
     fn busy() -> &'static AtomicBool {
         static B: AtomicBool = AtomicBool::new(false);
         &B
+    }
+
+    /// Make a crash say something.
+    ///
+    /// The release profile sets `panic = "abort"`, so a panic is not an
+    /// unwind that can be caught -- the process simply vanishes. With no
+    /// console attached (window subsystem) that means no message, no log and
+    /// nothing to report: the window is there one moment and gone the next.
+    /// That is exactly how the `RefCell` double-borrow in `rescan` presented,
+    /// and it cost far more to find than it should have.
+    ///
+    /// The hook runs *before* the abort, so it still gets to write the file and
+    /// put a box on screen naming it.
+    pub fn install_panic_hook() {
+        std::panic::set_hook(Box::new(|info| {
+            let where_ = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "unknown location".into());
+            let what = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panicked".into());
+
+            let log = std::env::temp_dir().join("chaos-app-crash.log");
+            let text = format!(
+                "chaos-app {}
+{what}
+at {where_}
+",
+                env!("CARGO_PKG_VERSION")
+            );
+            let _ = std::fs::write(&log, &text);
+
+            let msg = format!(
+                "Chaos hit a bug and has to close.
+
+{what}
+at {where_}
+
+                 Written to:
+{}
+
+Please send that file -- it says exactly what went wrong.",
+                log.display()
+            );
+            unsafe {
+                MessageBoxW(
+                    std::ptr::null_mut(),
+                    wide(&msg).as_ptr(),
+                    wide("Chaos").as_ptr(),
+                    MB_ICONERROR,
+                );
+            }
+        }));
     }
 
     pub fn run() {
@@ -375,85 +433,125 @@ mod windows_app {
     }
 
     /// Re-read the models directory into the list.
+    /// Refill the list for the current tab.
+    ///
+    /// **No borrow is held across a Win32 call here, and none may be added.**
+    /// `LB_ADDSTRING` on an owner-draw listbox makes the control ask its parent
+    /// for colours *synchronously*, and that handler borrows `UI`. Holding
+    /// `borrow_mut()` across it is a `RefCell` double borrow, which under
+    /// `panic = "abort"` is instant, silent process death -- which is exactly
+    /// what clicking INSTALLED or AVAILABLE used to do.
+    ///
+    /// So: take a short borrow, build the rows, drop it, then talk to Windows.
     fn rescan() {
-        UI.with(|u| {
-            let mut b = u.borrow_mut();
-            let Some(ui) = b.as_mut() else { return };
-            unsafe {
-                SendMessageW(ui.list, LB_RESETCONTENT, 0, 0);
-            }
-            ui.free_bytes = free_memory_bytes();
-            match ui.tab {
-                Tab::Installed => {
-                    ui.entries = models::list();
-                    if ui.entries.is_empty() {
-                        let t = wide("nothing installed -- try AVAILABLE");
-                        unsafe {
-                            SendMessageW(ui.list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
-                        }
-                    } else {
-                        for e in &ui.entries {
-                            let t = wide(&models::row(e));
-                            unsafe {
-                                SendMessageW(ui.list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
-                            }
+        // Phase 1 -- read state and build the strings. Borrow ends here.
+        let (list, main, load, get, rows, installed, can_load) = {
+            let free = free_memory_bytes();
+            UI.with(|u| {
+                let mut b = u.borrow_mut();
+                let ui = b.as_mut()?;
+                ui.free_bytes = free;
+                let rows: Vec<String> = match ui.tab {
+                    Tab::Installed => {
+                        ui.entries = models::list();
+                        if ui.entries.is_empty() {
+                            vec!["nothing installed -- open AVAILABLE to download one".to_string()]
+                        } else {
+                            ui.entries.iter().map(models::row).collect()
                         }
                     }
-                }
-                Tab::Available => {
-                    for o in &ui.offers {
-                        let t = wide(&catalog::row(o, ui.free_bytes));
-                        unsafe {
-                            SendMessageW(ui.list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
-                        }
-                    }
-                }
-            }
-            unsafe {
-                SendMessageW(ui.list, LB_SETCURSEL, 0, 0);
-                // Only the buttons that mean something in this tab.
+                    Tab::Available => ui.offers.iter().map(|o| catalog::row(o, free)).collect(),
+                };
                 let installed = ui.tab == Tab::Installed;
-                EnableWindow(
+                Some((
+                    ui.list,
+                    ui.main,
                     ui.load,
-                    if installed && ui.server.is_none() {
-                        1
-                    } else {
-                        0
-                    },
-                );
-                EnableWindow(GetDlgItem(ui.main, ID_GET), if installed { 0 } else { 1 });
-                InvalidateRect(ui.main, std::ptr::null(), 1);
+                    ui.dlg(ID_GET),
+                    rows,
+                    installed,
+                    installed && ui.server.is_none(),
+                ))
+            })
+        }
+        .unwrap_or((
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            Vec::new(),
+            true,
+            false,
+        ));
+        if list.is_null() {
+            return;
+        }
+
+        // Phase 2 -- nothing borrowed. Windows may re-enter freely.
+        unsafe {
+            SendMessageW(list, LB_RESETCONTENT, 0, 0);
+            for r in &rows {
+                let t = wide(r);
+                SendMessageW(list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
             }
-        });
+            SendMessageW(list, LB_SETCURSEL, 0, 0);
+            EnableWindow(load, i32::from(can_load));
+            EnableWindow(get, i32::from(!installed));
+            InvalidateRect(main, std::ptr::null(), 1);
+        }
+    }
+
+    /// The window handle, copied out so callers can talk to Windows without
+    /// holding a borrow. See `rescan` for why that matters.
+    fn main_hwnd() -> HWND {
+        UI.with(|u| {
+            u.borrow()
+                .as_ref()
+                .map(|ui| ui.main)
+                .unwrap_or(std::ptr::null_mut())
+        })
     }
 
     fn set_status(text: &str) {
         shared().lock().unwrap().status = text.to_string();
-        UI.with(|u| {
-            if let Some(ui) = u.borrow().as_ref() {
-                unsafe {
-                    InvalidateRect(ui.main, std::ptr::null(), 1);
-                }
+        let h = main_hwnd();
+        if !h.is_null() {
+            unsafe {
+                InvalidateRect(h, std::ptr::null(), 1);
             }
-        });
+        }
     }
 
     fn append_out(text: &str) {
-        UI.with(|u| {
-            let b = u.borrow();
-            let Some(ui) = b.as_ref() else { return };
+        // Handle copied out first: `EM_REPLACESEL` repaints the control, which
+        // asks the parent for colours, which borrows `UI`.
+        let out = UI.with(|u| {
+            u.borrow()
+                .as_ref()
+                .map(|ui| ui.out)
+                .unwrap_or(std::ptr::null_mut())
+        });
+        if out.is_null() {
+            return;
+        }
+        {
+            let ui = OutHandle(out);
             let w = wide(text);
             unsafe {
                 // Move the caret to the end, then replace an empty selection:
                 // the only way to append to an EDIT without re-sending the
                 // whole buffer, which for a long answer is quadratic.
-                let len = GetWindowTextLengthW(ui.out);
-                SendMessageW(ui.out, EM_SETSEL, len as WPARAM, len as LPARAM);
-                SendMessageW(ui.out, EM_REPLACESEL, 0, w.as_ptr() as LPARAM);
-                SendMessageW(ui.out, EM_SCROLLCARET, 0, 0);
+                let len = GetWindowTextLengthW(ui.0);
+                SendMessageW(ui.0, EM_SETSEL, len as WPARAM, len as LPARAM);
+                SendMessageW(ui.0, EM_REPLACESEL, 0, w.as_ptr() as LPARAM);
+                SendMessageW(ui.0, EM_SCROLLCARET, 0, 0);
             }
-        });
+        }
     }
+
+    /// A window handle that has already left the borrow, named so the calls
+    /// below read the same as before the fix.
+    struct OutHandle(HWND);
 
     fn control_text(h: HWND) -> String {
         unsafe {

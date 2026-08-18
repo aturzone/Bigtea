@@ -301,8 +301,33 @@ mod setup {
 
     fn do_uninstall() {
         let prefix = prefix_value();
-        let (_, msg) = uninstall_to(&prefix);
+        let inside = running_inside(&prefix);
+        let (ok, msg) = uninstall_to(&prefix);
         set_status(&msg);
+
+        // **When this window is running from inside the folder being removed,
+        // it has to go.** The staged helper cannot delete a directory while
+        // this process holds an executable open in it, so it retries for ten
+        // seconds and then gives up -- which is what "I cannot uninstall the
+        // app" was. Show the result, then leave.
+        if ok && inside {
+            unsafe {
+                MessageBoxW(
+                    std::ptr::null_mut(),
+                    wide(
+                        "Chaos has been removed.
+
+                         Your models were left where they are.
+
+                         This window will now close so the last files can be deleted.",
+                    )
+                    .as_ptr(),
+                    wide("Chaos Setup").as_ptr(),
+                    MB_ICONINFORMATION,
+                );
+                PostQuitMessage(0);
+            }
+        }
     }
 
     /// Install into `prefix`. Returns success and a message for either mode.
