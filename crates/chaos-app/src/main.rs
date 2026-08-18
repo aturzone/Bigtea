@@ -43,6 +43,8 @@ fn main() {
 
 #[cfg(windows)]
 mod windows_app {
+    use chaos_app::choices::{self, Choice};
+    use chaos_app::download::Download;
     use chaos_app::nav::{self, Page};
     use chaos_app::theme::{self, metric, size, weight, Mode, Rgb, Theme};
     use chaos_app::win32::*;
@@ -77,6 +79,16 @@ mod windows_app {
         tokens: u32,
         started: Option<Instant>,
         status: String,
+        /// Set when `chaos-pull` exits, so the UI stops watching the files.
+        download_done: bool,
+        /// A message box the UI thread must put up: its text, and whether it is
+        /// good news.
+        ///
+        /// **A worker cannot show one itself.** `MessageBoxW` with an owner
+        /// window belonging to another thread is undefined, and what it does
+        /// here is nothing at all -- the connection test ran, passed, set the
+        /// status line, and displayed no dialog whatsoever.
+        report: Option<(String, bool)>,
     }
 
     /// Which set of models the MODELS page lists.
@@ -137,6 +149,15 @@ mod windows_app {
         history: Vec<(String, String)>,
         answer: String,
         cfg: settings::Settings,
+        /// What this machine is, so the settings page can offer values that
+        /// make sense on it rather than an empty box.
+        machine: choices::Machine,
+        /// A download in flight, watched by the bytes it puts on disk.
+        download: Option<Download>,
+        /// The options each dropdown currently holds, by control id. Kept so
+        /// the note under a box follows the *selection* rather than repeating a
+        /// static sentence, and so saving reads the value rather than the label.
+        lists: std::collections::HashMap<i32, Vec<Choice>>,
     }
 
     thread_local! {
@@ -165,6 +186,13 @@ mod windows_app {
 
     fn main_hwnd() -> HWND {
         main_window().load(Ordering::SeqCst) as HWND
+    }
+
+    /// A settings control's handle, for the paint path. Named separately so the
+    /// call inside `paint_settings` reads as what it is: a handle lookup, which
+    /// `GetDlgItem` performs without dispatching a message.
+    fn sel_of(id: i32) -> HWND {
+        ctl(id)
     }
 
     /// A control by id, without borrowing anything.
@@ -268,7 +296,11 @@ mod windows_app {
                 0,
                 class.as_ptr(),
                 title.as_ptr(),
-                WS_OVERLAPPEDWINDOW,
+                // `WS_CLIPCHILDREN`: the timer repaints this window every
+                // second for the uptime and the download bar, and without it
+                // every child control repaints too -- a visible flash across
+                // the whole window, once a second, forever.
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                 120,
                 80,
                 1180,
@@ -335,6 +367,8 @@ mod windows_app {
         add(model, nav::IDM_DELETE, "De&lete selected");
         sep(model);
         add(model, nav::IDM_COPY_ENDPOINT, "&Copy endpoint\tCtrl+E");
+        add(model, nav::IDM_API_KEY, "Require an &API key");
+        add(model, nav::IDM_TEST_CONNECTION, "&Test the connection");
         popup(bar, model, "&Model");
 
         let view = CreatePopupMenu();
@@ -452,6 +486,20 @@ mod windows_app {
         enable(nav::IDM_DOWNLOAD, on_models && !installed);
         enable(nav::IDM_DELETE, on_models && installed && !running);
         enable(nav::IDM_COPY_ENDPOINT, running);
+        enable(nav::IDM_TEST_CONNECTION, running);
+        // Ticked when a key is required, so the menu answers "is one set?"
+        // without anybody having to open the settings file.
+        let keyed = UI.with(|u| {
+            u.borrow()
+                .as_ref()
+                .map(|ui| ui.cfg.api_key.is_some())
+                .unwrap_or(false)
+        });
+        CheckMenuItem(
+            menu,
+            nav::IDM_API_KEY as u32,
+            MF_BYCOMMAND | if keyed { MF_CHECKED } else { MF_UNCHECKED },
+        );
 
         CheckMenuRadioItem(
             menu,
@@ -571,8 +619,26 @@ mod windows_app {
         button(hwnd, "COPY ENDPOINT", nav::ID_COPY_ENDPOINT, hinst);
 
         // Settings: every field the file holds, which is the point of the page.
+        //
+        // **A field with a sensible short list is a dropdown, not a box.** An
+        // empty text box asks "how many threads?", which most people cannot
+        // answer and which has a different right answer on every machine.
+        // `choices::for_field` decides which is which, so the window does not
+        // carry a second copy of that judgement.
+        let probe = probe_machine();
         for f in nav::FIELDS {
-            child(hwnd, "EDIT", "", WS_BORDER | WS_TABSTOP, f.id, hinst);
+            if choices::for_field(f.id, probe).is_some() {
+                child(
+                    hwnd,
+                    "COMBOBOX",
+                    "",
+                    CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
+                    f.id,
+                    hinst,
+                );
+            } else {
+                child(hwnd, "EDIT", "", WS_BORDER | WS_TABSTOP, f.id, hinst);
+            }
         }
         for f in nav::TOGGLES {
             button(hwnd, f.label, f.id, hinst);
@@ -612,16 +678,24 @@ mod windows_app {
             );
         }
         for f in nav::FIELDS {
-            SendMessageW(
-                GetDlgItem(hwnd, f.id),
-                EM_SETMARGINS,
-                EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                (8 | (8 << 16)) as LPARAM,
-            );
+            let h = GetDlgItem(hwnd, f.id);
+            if choices::for_field(f.id, probe).is_some() {
+                // Combo rows, tall enough for the label at body size.
+                SendMessageW(h, CB_SETITEMHEIGHT, 0, 24);
+                SendMessageW(h, CB_SETITEMHEIGHT, usize::MAX, 26);
+            } else {
+                SendMessageW(
+                    h,
+                    EM_SETMARGINS,
+                    EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                    (8 | (8 << 16)) as LPARAM,
+                );
+            }
         }
 
         let t = theme::theme(cfg.mode);
         let port = cfg.port;
+        let machine = probe_machine();
         UI.with(|u| {
             *u.borrow_mut() = Some(Ui {
                 theme: t,
@@ -645,9 +719,29 @@ mod windows_app {
                 history: Vec::new(),
                 answer: String::new(),
                 cfg,
+                machine,
+                download: None,
+                lists: std::collections::HashMap::new(),
             })
         });
         rescan();
+    }
+
+    /// What the machine is, for the settings page.
+    ///
+    /// `chaos-probe` already answers this properly and has no dependencies of
+    /// its own, so the app asks it rather than growing a second, worse copy.
+    /// `measure_bandwidth: false` skips the only slow step -- the disk timing --
+    /// because nothing on this page needs it and the window must not stall on
+    /// startup.
+    fn probe_machine() -> choices::Machine {
+        let m = chaos_probe::Machine::probe(models::default_dir(), false);
+        choices::Machine {
+            cores: m.cpu_threads.max(1) as u32,
+            total_ram: m.ram_total_bytes.unwrap_or(0),
+            free_ram: m.ram_available_bytes.unwrap_or(0),
+            gpu: !m.gpus.is_empty(),
+        }
     }
 
     /// Match the title bar to the palette.
@@ -992,6 +1086,35 @@ mod windows_app {
             return;
         }
 
+        // **Refuse an architecture the engine cannot run, here, before a server
+        // is started.** Without this the app spawned `chaos-serve`, the server
+        // refused the container and exited, and the window went on showing the
+        // model as RUNNING with a green dot -- so the next message came back
+        // "connection actively refused", which reads as a networking fault
+        // rather than as "this model does not work". That is exactly what
+        // happened to Atur with Qwen3.6-27B.
+        let arch = architecture_of(&path);
+        if let Some(why) = arch
+            .as_deref()
+            .and_then(chaos_model::catalogue::why_not_runnable)
+        {
+            set_status(&format!("{label} cannot run: {why}"));
+            unsafe {
+                MessageBoxW(
+                    main_hwnd(),
+                    wide(&format!(
+                        "{label} cannot run in Chaos yet.\n\n{why}.\n\nThe file is fine and \
+                         nothing is wrong with the download -- the engine does not implement \
+                         this architecture. Deleting and fetching it again will not change that."
+                    ))
+                    .as_ptr(),
+                    wide("Chaos").as_ptr(),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+            return;
+        }
+
         // **`cfg.force` is whatever SETTINGS says**, and nothing here overrides
         // it. The previous version set it to `true` unconditionally, which made
         // the toggle on the settings page a decoration: turning it off changed
@@ -1050,6 +1173,26 @@ mod windows_app {
             }
             Err(e) => set_status(&format!("could not start: {e}")),
         }
+    }
+
+    /// The architecture string in a container's header.
+    ///
+    /// Read straight from the GGUF rather than guessed from the filename: the
+    /// name says "Qwen3.6" and the header says `qwen35`, and only one of those
+    /// decides whether the engine can run it.
+    fn architecture_of(path: &std::path::Path) -> Option<String> {
+        use std::io::Read;
+        // Only the head: a GGUF's metadata and tensor table live at the front,
+        // and mapping 16 GB to read one string would stall the window. If the
+        // table is longer than this the parse fails, `None` comes back, and the
+        // load proceeds exactly as it did before -- the server then refuses it,
+        // which is the old behaviour rather than a new failure.
+        const HEAD: usize = 32 << 20;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut buf = Vec::with_capacity(HEAD);
+        f.by_ref().take(HEAD as u64).read_to_end(&mut buf).ok()?;
+        let g = chaos_gguf::Gguf::parse(&buf).ok()?;
+        g.get_str("general.architecture").map(str::to_string)
     }
 
     fn unload_model() {
@@ -1220,8 +1363,19 @@ mod windows_app {
         let dir = models::default_dir();
         let _ = std::fs::create_dir_all(&dir);
 
+        // Everything the watcher needs, worked out before the fetch starts:
+        // which files will appear, and what they will weigh in total.
+        let files: Vec<std::path::PathBuf> = chaos_model::catalogue::find(&name)
+            .and_then(|e| e.quant(&quant).map(|q| (e, q)))
+            .map(|(e, q)| e.files(q).into_iter().map(|f| dir.join(f)).collect())
+            .unwrap_or_default();
+        UI.with(|u| {
+            if let Some(ui) = u.borrow_mut().as_mut() {
+                ui.download = Some(Download::new(format!("{name} {quant}"), files, bytes));
+            }
+        });
         set_status(&format!(
-            "downloading {name} {quant}, {} -- this runs in the background",
+            "downloading {name} {quant}, {}",
             models::human_size(bytes)
         ));
 
@@ -1245,6 +1399,7 @@ mod windows_app {
             let mut sh = shared().lock().unwrap();
             sh.status = msg;
             sh.finished = true;
+            sh.download_done = true;
             drop(sh);
             notify();
         });
@@ -1265,16 +1420,150 @@ mod windows_app {
     /// This is the string you paste into a coding agent, and retyping it off
     /// the screen is exactly the friction that makes a window feel like a demo.
     fn copy_endpoint() {
-        match endpoint() {
-            Some(url) => {
-                if unsafe { set_clipboard_text(main_hwnd(), &url) } {
-                    set_status(&format!("copied {url}"));
-                } else {
-                    set_status("the clipboard is held by another program");
-                }
+        let Some(url) = endpoint() else {
+            set_status("nothing is running, so there is no endpoint yet");
+            return;
+        };
+        let key = UI.with(|u| u.borrow().as_ref().and_then(|ui| ui.cfg.api_key.clone()));
+        // With a key set, both go on the clipboard. Pasting a URL into a client
+        // that then rejects every request for want of a key is the kind of
+        // half-answer that costs an afternoon.
+        let text = match &key {
+            Some(k) => format!(
+                "{url}
+API key: {k}"
+            ),
+            None => url.clone(),
+        };
+        if unsafe { set_clipboard_text(main_hwnd(), &text) } {
+            match key {
+                Some(_) => set_status(&format!("copied {url} and its API key")),
+                None => set_status(&format!("copied {url}")),
             }
-            None => set_status("nothing is running, so there is no endpoint yet"),
+        } else {
+            set_status("the clipboard is held by another program");
         }
+    }
+
+    /// Turn the API key on or off, generating one when turning it on.
+    ///
+    /// **Off by default, and never switched on quietly.** Enabling it would
+    /// start refusing every agent already pointed at this endpoint, so it is a
+    /// deliberate act that shows the key, copies it, and says when it takes
+    /// effect -- a server that is already running was started without it.
+    fn toggle_api_key() {
+        let key = UI.with(|u| {
+            let mut b = u.borrow_mut();
+            let ui = b.as_mut()?;
+            ui.cfg.api_key = match ui.cfg.api_key {
+                Some(_) => None,
+                // 24 bytes from the system generator, hex. **Not derived from
+                // the clock**: a key anyone can guess from roughly when it was
+                // made is worse than no key, because it is trusted.
+                None => random_hex(24),
+            };
+            let _ = ui.cfg.save();
+            Some(ui.cfg.api_key.clone())
+        });
+        let Some(key) = key else { return };
+        let running = UI.with(|u| u.borrow().as_ref().is_some_and(|ui| ui.loaded.is_some()));
+        let msg = match &key {
+            Some(k) => {
+                unsafe {
+                    set_clipboard_text(main_hwnd(), k);
+                }
+                format!(
+                    "An API key is now required.
+
+{k}
+
+It is on your clipboard.                      Paste it into any client that asks for one.
+
+{}",
+                    if running {
+                        "The running model was started without it -- press STOP and LOAD again."
+                    } else {
+                        "It takes effect the next time you load a model."
+                    }
+                )
+            }
+            None => "No API key is required now.
+
+Any value a client sends is accepted.                      The server still listens on 127.0.0.1 only."
+                .to_string(),
+        };
+        unsafe {
+            MessageBoxW(
+                main_hwnd(),
+                wide(&msg).as_ptr(),
+                wide("Chaos").as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        repaint();
+    }
+
+    /// Do what a coding agent does, and say what happened.
+    ///
+    /// **"Point your agent at this URL" is advice, not evidence.** A user whose
+    /// agent will not connect has no way to tell whether the fault is the port,
+    /// the key, the model or the client, and the usual answer -- try `curl` --
+    /// is not one most people have. This runs the three requests an
+    /// OpenAI-compatible client makes and reports each.
+    fn test_connection() {
+        let (port, key, running) = UI.with(|u| {
+            let b = u.borrow();
+            b.as_ref()
+                .map(|ui| (ui.port, ui.cfg.api_key.clone(), ui.loaded.is_some()))
+                .unwrap_or((0, None, false))
+        });
+        if !running {
+            set_status("load a model first -- there is nothing to connect to");
+            show_page(Page::Models);
+            return;
+        }
+        set_status("testing the connection...");
+        // On a worker: the completion it makes is a real one, and on a large
+        // model that is seconds. Freezing the window to prove it is not frozen
+        // would be its own joke.
+        std::thread::spawn(move || {
+            let checks = client::check(port, key.as_deref());
+            let all = checks.iter().all(|c| c.ok);
+            let mut msg = String::new();
+            for c in &checks {
+                msg.push_str(&format!(
+                    "{}  {}
+    {}
+
+",
+                    if c.ok { "[ ok ]" } else { "[fail]" },
+                    c.name,
+                    c.detail
+                ));
+            }
+            msg.push_str(&if all {
+                format!(
+                    "Any OpenAI-compatible agent will work. Paste these into it:\n\n\
+                     Base URL   http://127.0.0.1:{port}/v1\n\
+                     API key    {}\n\n\
+                     In Hermes: provider \"custom\", and that base URL.",
+                    key.as_deref().unwrap_or("not required -- send any value")
+                )
+            } else {
+                "Something in the chain is not answering. The failing line above                  says which."
+                    .to_string()
+            });
+            let mut sh = shared().lock().unwrap();
+            sh.status = if all {
+                "connection test passed".into()
+            } else {
+                "connection test failed".into()
+            };
+            // Handed to the UI thread rather than shown here; see `Shared`.
+            sh.report = Some((msg, all));
+            drop(sh);
+            notify();
+        });
     }
 
     fn send_prompt() {
@@ -1293,11 +1582,11 @@ mod windows_app {
         if prompt.is_empty() {
             return;
         }
-        let (port, history) = UI.with(|u| {
+        let (port, history, key) = UI.with(|u| {
             let b = u.borrow();
             b.as_ref()
-                .map(|ui| (ui.port, ui.history.clone()))
-                .unwrap_or((0, Vec::new()))
+                .map(|ui| (ui.port, ui.history.clone(), ui.cfg.api_key.clone()))
+                .unwrap_or((0, Vec::new(), None))
         });
 
         UI.with(|u| {
@@ -1323,30 +1612,37 @@ mod windows_app {
         busy().store(true, Ordering::SeqCst);
 
         std::thread::spawn(move || {
-            client::chat(port, &history, &prompt, 512, &mut |ev| match ev {
-                client::Event::Token(t) => {
-                    let mut s = shared().lock().unwrap();
-                    s.pending.push_str(&t);
-                    s.tokens += 1;
-                    drop(s);
-                    notify();
-                }
-                client::Event::Done => {
-                    let mut s = shared().lock().unwrap();
-                    s.finished = true;
-                    s.status = "ready".into();
-                    drop(s);
-                    notify();
-                }
-                client::Event::Failed(m) => {
-                    let mut s = shared().lock().unwrap();
-                    s.pending.push_str(&format!("\n[{m}]\n"));
-                    s.finished = true;
-                    s.status = m;
-                    drop(s);
-                    notify();
-                }
-            });
+            client::chat(
+                port,
+                &history,
+                &prompt,
+                512,
+                key.as_deref(),
+                &mut |ev| match ev {
+                    client::Event::Token(t) => {
+                        let mut s = shared().lock().unwrap();
+                        s.pending.push_str(&t);
+                        s.tokens += 1;
+                        drop(s);
+                        notify();
+                    }
+                    client::Event::Done => {
+                        let mut s = shared().lock().unwrap();
+                        s.finished = true;
+                        s.status = "ready".into();
+                        drop(s);
+                        notify();
+                    }
+                    client::Event::Failed(m) => {
+                        let mut s = shared().lock().unwrap();
+                        s.pending.push_str(&format!("\n[{m}]\n"));
+                        s.finished = true;
+                        s.status = m;
+                        drop(s);
+                        notify();
+                    }
+                },
+            );
         });
     }
 
@@ -1366,12 +1662,29 @@ mod windows_app {
 
     /// Drain what the worker produced. Runs on the UI thread only.
     fn drain() {
-        let (text, finished, tokens, elapsed) = {
+        let (text, finished, tokens, elapsed, report) = {
             let mut s = shared().lock().unwrap();
             let t = std::mem::take(&mut s.pending);
             let e = s.started.map(|i| i.elapsed().as_secs_f64()).unwrap_or(0.0);
-            (t, s.finished, s.tokens, e)
+            (t, s.finished, s.tokens, e, s.report.take())
         };
+        // A report a worker produced, written into the transcript rather than
+        // put up as a message box.
+        //
+        // **A modal box was the first attempt and it was the wrong tool twice
+        // over.** Shown from the worker it never appeared at all -- an owner
+        // window belonging to another thread is undefined and here does
+        // nothing. Moved to this thread it works, but a connection report is
+        // exactly the text somebody needs to copy into a bug report or an agent
+        // config, and a message box is the one place Windows will not let you
+        // select from. The transcript is selectable, scrollable and already on
+        // screen.
+        if let Some((msg, _good)) = report {
+            // An EDIT wants CRLF; a bare LF renders as a box.
+            let body = msg.replace("\r\n", "\n").replace('\n', "\r\n");
+            append_out(&format!("\r\n{body}\r\n"));
+            show_page(Page::Chat);
+        }
         if !text.is_empty() {
             // EDIT controls want CRLF; a bare LF renders as a box.
             append_out(&text.replace("\r\n", "\n").replace('\n', "\r\n"));
@@ -1407,28 +1720,107 @@ mod windows_app {
 
     // -- settings ------------------------------------------------------------
 
-    /// Put the stored settings into the boxes.
+    /// The list a field offers on this machine, or `None` if it is typed.
+    fn field_choices(id: i32) -> Option<Vec<Choice>> {
+        let m = UI.with(|u| u.borrow().as_ref().map(|ui| ui.machine))?;
+        choices::for_field(id, m)
+    }
+
+    /// Put the stored settings into the boxes and the dropdowns.
     fn fill_settings_page() {
         let cfg = UI.with(|u| u.borrow().as_ref().map(|ui| ui.cfg.clone()));
         let Some(cfg) = cfg else { return };
-        let put = |id: i32, v: Option<String>| unsafe {
-            SetWindowTextW(ctl(id), wide(&v.unwrap_or_default()).as_ptr());
+
+        let stored = |id: i32| -> String {
+            match id {
+                nav::ID_CACHE => cfg.cache_gib.map(|v| format!("{v}")).unwrap_or_default(),
+                nav::ID_THREADS => cfg.threads.map(|v| v.to_string()).unwrap_or_default(),
+                nav::ID_THREADS_BATCH => {
+                    cfg.threads_batch.map(|v| v.to_string()).unwrap_or_default()
+                }
+                nav::ID_CONTEXT => cfg.context.map(|v| v.to_string()).unwrap_or_default(),
+                nav::ID_NGL => cfg.ngl.map(|v| v.to_string()).unwrap_or_default(),
+                nav::ID_PORT => cfg.port.to_string(),
+                nav::ID_MODELS_DIR => cfg.models_dir.clone().unwrap_or_default(),
+                _ => String::new(),
+            }
         };
-        put(nav::ID_CACHE, cfg.cache_gib.map(|v| format!("{v}")));
-        put(nav::ID_THREADS, cfg.threads.map(|v| v.to_string()));
-        put(
-            nav::ID_THREADS_BATCH,
-            cfg.threads_batch.map(|v| v.to_string()),
-        );
-        put(nav::ID_PORT, Some(cfg.port.to_string()));
-        put(nav::ID_CONTEXT, cfg.context.map(|v| v.to_string()));
-        put(nav::ID_NGL, cfg.ngl.map(|v| v.to_string()));
-        put(nav::ID_MODELS_DIR, cfg.models_dir.clone());
+
+        for f in nav::FIELDS {
+            let h = ctl(f.id);
+            if h.is_null() {
+                continue;
+            }
+            let want = stored(f.id);
+            match field_choices(f.id) {
+                Some(list) => {
+                    // A value the file holds that is not in the list still has
+                    // to be selectable, or saving would silently change it.
+                    let mut list = list;
+                    if !want.is_empty() && !list.iter().any(|c| c.value == want) {
+                        list.push(Choice {
+                            value: want.clone(),
+                            label: format!("{want} (from your settings file)"),
+                            note: "Typed by hand rather than chosen here. Kept as it is.".into(),
+                        });
+                    }
+                    let selected = list.iter().position(|c| c.value == want).unwrap_or(0);
+                    unsafe {
+                        SendMessageW(h, CB_RESETCONTENT, 0, 0);
+                        for c in &list {
+                            let t = wide(&c.label);
+                            SendMessageW(h, CB_ADDSTRING, 0, t.as_ptr() as LPARAM);
+                        }
+                        SendMessageW(h, CB_SETCURSEL, selected, 0);
+                    }
+                    // Cached so paint and save do not rebuild the list, and so
+                    // the note under the box follows the selection.
+                    UI.with(|u| {
+                        if let Some(ui) = u.borrow_mut().as_mut() {
+                            ui.lists.insert(f.id, list);
+                        }
+                    });
+                }
+                None => unsafe {
+                    SetWindowTextW(h, wide(&want).as_ptr());
+                },
+            }
+        }
+    }
+
+    /// The value a settings control currently holds, whichever kind it is.
+    fn field_value(id: i32) -> String {
+        let h = ctl(id);
+        if h.is_null() {
+            return String::new();
+        }
+        let listed = UI.with(|u| {
+            let b = u.borrow();
+            b.as_ref()
+                .map(|ui| ui.lists.contains_key(&id))
+                .unwrap_or(false)
+        });
+        if !listed {
+            return control_text(h).trim().to_string();
+        }
+        let sel = unsafe { SendMessageW(h, CB_GETCURSEL, 0, 0) };
+        if sel < 0 {
+            return String::new();
+        }
+        UI.with(|u| {
+            let b = u.borrow();
+            b.as_ref()
+                .and_then(|ui| ui.lists.get(&id))
+                .and_then(|l| l.get(sel as usize))
+                .map(|c| c.value.clone())
+                .unwrap_or_default()
+        })
     }
 
     /// Read every box back and write the file.
     fn save_settings() {
-        let read = |id: i32| control_text(ctl(id)).trim().to_string();
+        // Reads a dropdown's selected *value* or a box's text, as appropriate.
+        let read = field_value;
         let cache = read(nav::ID_CACHE);
         let threads = read(nav::ID_THREADS);
         let tb = read(nav::ID_THREADS_BATCH);
@@ -1511,13 +1903,21 @@ mod windows_app {
         SetBkMode(hdc, TRANSPARENT);
         let mut rc = r;
         let w: Vec<u16> = s.encode_utf16().collect();
-        DrawTextW(
-            hdc,
-            w.as_ptr(),
-            w.len() as i32,
-            &mut rc,
-            flags | DT_NOPREFIX,
-        );
+        // **Never hand Windows an empty Vec's pointer.** `Vec::as_ptr` on an
+        // empty vector returns a dangling (aligned but unallocated) address and
+        // `DrawTextW` dereferences it. That killed the installer outright the
+        // moment its report reached a blank line -- a stack-cookie failure with
+        // no panic message, because a fault inside an `extern "system"` call
+        // never reaches the panic hook. There is nothing to draw either way.
+        if !w.is_empty() {
+            DrawTextW(
+                hdc,
+                w.as_ptr(),
+                w.len() as i32,
+                &mut rc,
+                flags | DT_NOPREFIX,
+            );
+        }
         SelectObject(hdc, old);
     }
 
@@ -1754,31 +2154,36 @@ mod windows_app {
             t.stroke_3,
         );
 
-        // The mark: the logo drawn in the accent, and the wordmark beside it.
-        // The one brand moment, which is what Hermes reserves `BrandMark` for.
-        let (lw, lh) = art::logo_size();
-        let mono = art::logo_mono();
-        let mut px = vec![0u8; lw * lh * 4];
-        let chan = |c: Rgb, s: u32| ((c >> s) & 0xFF) as u8;
-        for y in 0..lh {
-            for x in 0..lw {
+        // The mark, box-filtered from the 256px master and blended in the
+        // theme's own foreground.
+        //
+        // **Not the accent.** Drawing it blue was a mistake: `#0000F2` is the
+        // brand's *ground* -- what Hermes puts behind its wordmark -- and the
+        // logo itself is black art. And not `StretchDIBits` over a 1-bit 56px
+        // bitmap either, which is what made it a blob at 30 pixels.
+        let box_px = 32usize;
+        let cov = art::logo_scaled(box_px);
+        let chan = |c: Rgb, shift: u32| ((c >> shift) & 0xFF) as i32;
+        let mut px = vec![0u8; box_px * box_px * 4];
+        for y in 0..box_px {
+            for x in 0..box_px {
                 // A DIB with a positive height is bottom-up, so the source row
                 // is mirrored here rather than the image being upside down.
-                let on = mono[(lh - 1 - y) * lw + x];
-                let c = if on { t.accent } else { t.chrome };
-                let i = (y * lw + x) * 4;
-                // A DIB is BGRA. `Rgb` is 0x00BBGGRR, so blue is the high byte
-                // of the colour and the low byte of the pixel.
-                px[i] = chan(c, 16);
-                px[i + 1] = chan(c, 8);
-                px[i + 2] = chan(c, 0);
+                let a = i32::from(cov[(box_px - 1 - y) * box_px + x]);
+                let i = (y * box_px + x) * 4;
+                // A DIB is BGRA; `Rgb` is 0x00BBGGRR, so blue is the colour's
+                // high byte and the pixel's low one.
+                for (o, shift) in [(0usize, 16u32), (1, 8), (2, 0)] {
+                    let (fg, bg) = (chan(t.fg, shift), chan(t.chrome, shift));
+                    px[i + o] = (bg + (fg - bg) * a / 255) as u8;
+                }
                 px[i + 3] = 0;
             }
         }
         let bmi = BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: lw as i32,
-            biHeight: lh as i32,
+            biWidth: box_px as i32,
+            biHeight: box_px as i32,
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB,
@@ -1788,7 +2193,8 @@ mod windows_app {
             biClrUsed: 0,
             biClrImportant: 0,
         };
-        let box_px = 30;
+        let box_px = box_px as i32;
+        // Blitted 1:1, because the filtering already happened at the right size.
         StretchDIBits(
             hdc,
             metric::INSET,
@@ -1797,8 +2203,8 @@ mod windows_app {
             box_px,
             0,
             0,
-            lw as i32,
-            lh as i32,
+            box_px,
+            box_px,
             px.as_ptr() as *const std::ffi::c_void,
             &bmi,
             DIB_RGB_COLORS,
@@ -1846,6 +2252,37 @@ mod windows_app {
 
         let y = top + 8;
         let x = metric::RAIL + metric::INSET;
+
+        // **A download outranks the running model on the strip.** It is the
+        // thing that is happening, it can take an hour, and a window that says
+        // only "downloading" for that hour looks broken -- which is what it did.
+        if let Some(d) = ui.download.as_ref().filter(|d| !d.finished) {
+            let bar_w = client.right - x - metric::INSET - 96;
+            label(hdc, x, y + 1, bar_w, &d.line(), ui.fonts.body_bold, t.fg);
+            let by = y + 26;
+            fill(
+                hdc,
+                RECT {
+                    left: x,
+                    top: by,
+                    right: x + bar_w,
+                    bottom: by + 6,
+                },
+                t.soft,
+            );
+            fill(
+                hdc,
+                RECT {
+                    left: x,
+                    top: by,
+                    right: x + bar_w * d.percent() as i32 / 100,
+                    bottom: by + 6,
+                },
+                t.accent,
+            );
+            return;
+        }
+
         // The status line is the app's running commentary, right-aligned above
         // the STOP button so it never collides with the endpoint.
         let status = {
@@ -2029,6 +2466,13 @@ mod windows_app {
                         format!("http://127.0.0.1:{}/v1", ui.port),
                     ));
                     rows.push((
+                        "API key".into(),
+                        match &ui.cfg.api_key {
+                            Some(k) => k.clone(),
+                            None => "not required -- any value works".into(),
+                        },
+                    ));
+                    rows.push((
                         "context".into(),
                         ui.cfg
                             .context
@@ -2070,10 +2514,16 @@ mod windows_app {
             }
             Tab::Available => {
                 let o = ui.offers.get(i)?;
-                let state = match catalog::verdict(o, ui.free_bytes) {
-                    catalog::Verdict::Resident => "fits entirely in memory",
-                    catalog::Verdict::Streams => "streams from disk on this machine",
-                    catalog::Verdict::TooBig => "too big for this machine",
+                let state = match o.unsupported {
+                    // Said first, because it decides whether the rest matters:
+                    // "streams" is true and useless if the engine will refuse
+                    // the container the moment it is loaded.
+                    Some(why) => why,
+                    None => match catalog::verdict(o, ui.free_bytes) {
+                        catalog::Verdict::Resident => "fits entirely in memory",
+                        catalog::Verdict::Streams => "streams from disk on this machine",
+                        catalog::Verdict::TooBig => "too big for this machine",
+                    },
                 };
                 let rows = vec![
                     ("download".into(), models::human_size(o.bytes)),
@@ -2249,6 +2699,13 @@ mod windows_app {
                     format!("http://127.0.0.1:{}/v1", ui.port),
                 ),
                 (
+                    "API key".into(),
+                    match &ui.cfg.api_key {
+                        Some(k) => k.clone(),
+                        None => "not required -- any value works".into(),
+                    },
+                ),
+                (
                     "uptime".into(),
                     ui.loaded_at
                         .map(|i| human_duration(i.elapsed().as_secs()))
@@ -2335,15 +2792,27 @@ mod windows_app {
             y[c] += 26;
             for f in nav::FIELDS.iter().filter(|f| f.group == *group) {
                 label(hdc, x, y[c] - 1, col, f.label, ui.fonts.body_bold, t.fg);
+                // **The note describes the current selection, not the field.**
+                // A dropdown whose explanation never changes is a dropdown you
+                // have to try in order to understand.
+                let note = ui
+                    .lists
+                    .get(&f.id)
+                    .and_then(|l| {
+                        let sel = unsafe { SendMessageW(sel_of(f.id), CB_GETCURSEL, 0, 0) };
+                        (sel >= 0).then(|| l.get(sel as usize)).flatten()
+                    })
+                    .map(|c| c.note.clone())
+                    .unwrap_or_else(|| f.hint.to_string());
                 text(
                     hdc,
                     RECT {
                         left: x,
                         top: y[c] + 18 + metric::CONTROL + 4,
                         right: x + col,
-                        bottom: y[c] + 18 + metric::CONTROL + 32,
+                        bottom: y[c] + 18 + metric::CONTROL + 34,
                     },
-                    f.hint,
+                    &note,
                     ui.fonts.small,
                     t.fg_tertiary,
                     DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS,
@@ -2570,6 +3039,10 @@ mod windows_app {
             draw_list_row(di, &t, font, font_bold, selected, loaded.as_deref());
             return;
         }
+        if di.CtlType == ODT_COMBOBOX {
+            draw_combo(di, &t, font, font_bold, selected);
+            return;
+        }
 
         let id = di.CtlID as i32;
         let text_s = control_text(di.hwndItem);
@@ -2736,6 +3209,76 @@ mod windows_app {
         }
     }
 
+    /// A dropdown: its closed face, and its rows when open.
+    ///
+    /// Owner-drawn for the same reason the buttons are -- a themed combo ignores
+    /// `WM_CTLCOLOR*` and comes up in the system's greys. `ODS_COMBOBOXEDIT`
+    /// distinguishes the closed control from a row in the open list, which are
+    /// drawn differently: the face carries a chevron, the rows do not.
+    unsafe fn draw_combo(
+        di: &DRAWITEMSTRUCT,
+        t: &Theme,
+        font: HFONT,
+        font_bold: HFONT,
+        selected: bool,
+    ) {
+        let face = di.itemState & ODS_COMBOBOXEDIT != 0;
+        let r = di.rcItem;
+        // The open list sits on the elevated fill so it reads as floating; the
+        // closed face sits on the page.
+        let ground = if face {
+            t.bg
+        } else if selected {
+            t.accent_soft
+        } else {
+            t.soft
+        };
+        fill(di.hDC, r, ground);
+
+        if face {
+            frame(di.hDC, r, t.stroke_1);
+            // **No chevron is drawn here.** `CBS_OWNERDRAWFIXED` hands over the
+            // *items*, not the drop-down button, which Windows keeps painting
+            // itself -- so drawing one produced two, side by side.
+        } else if selected {
+            fill(
+                di.hDC,
+                RECT {
+                    right: r.left + 3,
+                    ..r
+                },
+                t.accent,
+            );
+        }
+
+        if di.itemID == u32::MAX {
+            return;
+        }
+        // The text comes from our own cached list rather than `CB_GETLBTEXT`:
+        // the label is already in hand, and asking the control for it during
+        // its own paint is a message round trip for nothing.
+        let label = UI.with(|u| {
+            let b = u.borrow();
+            b.as_ref()
+                .and_then(|ui| ui.lists.get(&(di.CtlID as i32)))
+                .and_then(|l| l.get(di.itemID as usize))
+                .map(|c| c.label.clone())
+        });
+        let Some(label) = label else { return };
+        text(
+            di.hDC,
+            RECT {
+                left: r.left + 10,
+                right: r.right - if face { 26 } else { 8 },
+                ..r
+            },
+            &label,
+            if face { font_bold } else { font },
+            t.fg,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    }
+
     /// One row of the model list.
     unsafe fn draw_list_row(
         di: &DRAWITEMSTRUCT,
@@ -2884,11 +3427,56 @@ mod windows_app {
                 // Uptime and free memory move on their own; nothing else here
                 // would ever ask for them to be redrawn.
                 let free = free_memory_bytes();
+                // **A child that has exited is not a running model.** The
+                // window used to keep the green dot and the endpoint up after
+                // `chaos-serve` died, so the next message failed with a
+                // connection error and no explanation.
+                let died = UI.with(|u| {
+                    let mut b = u.borrow_mut();
+                    let ui = b.as_mut()?;
+                    let gone = match ui.server.as_mut() {
+                        Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+                        None => false,
+                    };
+                    if !gone {
+                        return None;
+                    }
+                    let name = ui.loaded.clone();
+                    ui.server = None;
+                    ui.loaded = None;
+                    ui.loaded_at = None;
+                    Some(name.unwrap_or_default())
+                });
+                if let Some(name) = died {
+                    sync_enabled();
+                    set_status(&format!(
+                        "{name} stopped on its own -- the engine could not keep it running"
+                    ));
+                }
+                // A download is another process writing files, so the only way
+                // to know how far along it is, is to look at them.
+                let ended = {
+                    let mut sh = shared().lock().unwrap();
+                    std::mem::take(&mut sh.download_done)
+                };
+                let mut rescan_after = false;
                 UI.with(|u| {
                     if let Some(ui) = u.borrow_mut().as_mut() {
                         ui.free_bytes = free;
+                        if let Some(d) = ui.download.as_mut() {
+                            d.done_bytes = chaos_app::download::bytes_on_disk(&d.files);
+                            d.elapsed += f64::from(TICK_MS) / 1000.0;
+                            if ended {
+                                d.finished = true;
+                                rescan_after = true;
+                            }
+                        }
                     }
                 });
+                if rescan_after {
+                    // The finished container is now an installed model.
+                    rescan();
+                }
                 repaint();
                 0
             }
@@ -2914,6 +3502,13 @@ mod windows_app {
             WM_DRAWITEM => {
                 let di = &*(lp as *const DRAWITEMSTRUCT);
                 draw_item(di);
+                1
+            }
+            // Windows asks how tall a row is before it draws one, and the
+            // default is the system font's height -- which clips a 15px label.
+            WM_MEASUREITEM => {
+                let mi = &mut *(lp as *mut MEASUREITEMSTRUCT);
+                mi.itemHeight = 26;
                 1
             }
             WM_COMMAND => {
@@ -2968,6 +3563,14 @@ mod windows_app {
                         copy_endpoint();
                         return 0;
                     }
+                    nav::IDM_API_KEY => {
+                        toggle_api_key();
+                        return 0;
+                    }
+                    nav::IDM_TEST_CONNECTION => {
+                        test_connection();
+                        return 0;
+                    }
                     nav::IDM_MANUAL => {
                         shell_open(MANUAL_URL);
                         return 0;
@@ -3008,6 +3611,9 @@ mod windows_app {
                     // Selecting a different model redraws its page beside the
                     // list, which is the whole point of a page per model.
                     (nav::ID_LIST, LBN_SELCHANGE) => repaint(),
+                    // A settings dropdown changed: the sentence under it
+                    // describes the *selected* option, so it has to be redrawn.
+                    (_, CBN_SELCHANGE) => repaint(),
                     _ => {}
                 }
                 0

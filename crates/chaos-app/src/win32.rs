@@ -119,6 +119,14 @@ pub const WS_CHILD: u32 = 0x4000_0000;
 pub const WS_VISIBLE: u32 = 0x1000_0000;
 pub const WS_VSCROLL: u32 = 0x0020_0000;
 pub const WS_BORDER: u32 = 0x0080_0000;
+/// **The cure for a window that flickers once a second.**
+///
+/// Without it, the parent's `WM_PAINT` paints the whole client area *including*
+/// the rectangles its child controls occupy, and the children then repaint on
+/// top. The transcript, the list and every box flashed on every tick, which is
+/// exactly the "non-stop glitch" Atur reported -- and double-buffering the
+/// parent cannot fix it, because the flicker is the children, not the parent.
+pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
 pub const WS_TABSTOP: u32 = 0x0001_0000;
 
 pub const ES_MULTILINE: u32 = 0x0004;
@@ -566,6 +574,9 @@ extern "system" {
     pub fn DrawMenuBar(hWnd: HWND) -> BOOL;
     pub fn CheckMenuRadioItem(hmenu: HMENU, first: u32, last: u32, check: u32, flags: u32) -> BOOL;
     pub fn EnableMenuItem(hMenu: HMENU, uIDEnableItem: u32, uEnable: u32) -> BOOL;
+    /// A tick beside one item, for a setting that is on or off. Distinct from
+    /// `CheckMenuRadioItem`, which is one-of-many.
+    pub fn CheckMenuItem(hMenu: HMENU, uIDCheckItem: u32, uCheck: u32) -> u32;
     pub fn GetMenu(hWnd: HWND) -> HMENU;
     pub fn CreateAcceleratorTableW(paccel: *const ACCEL, cAccel: i32) -> HACCEL;
     pub fn TranslateAcceleratorW(hWnd: HWND, hAccTable: HACCEL, lpMsg: *mut MSG) -> i32;
@@ -779,4 +790,133 @@ pub unsafe fn set_control_theme(hwnd: HWND, dark: bool) {
     unsafe {
         SetWindowTheme(hwnd, name.as_ptr(), std::ptr::null());
     }
+}
+
+// -- picking a face that actually exists -------------------------------------
+
+#[link(name = "gdi32")]
+extern "system" {
+    /// The face GDI *actually* selected, which is not always the one asked for.
+    pub fn GetTextFaceW(hdc: HDC, c: i32, name: *mut u16) -> i32;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    /// A device context to measure against before there is anything to paint.
+    /// Must be released, not deleted -- `DeleteDC` is for the ones *we* create.
+    pub fn GetDC(hWnd: HWND) -> HDC;
+    pub fn ReleaseDC(hWnd: HWND, hDC: HDC) -> i32;
+}
+
+/// The first of `wanted` that is installed, or `None`.
+///
+/// **`CreateFontW` never fails.** Ask for a face that is not installed and GDI
+/// silently substitutes something else, so a display serif chosen for a wordmark
+/// can quietly become the default UI font and nothing says so. The only way to
+/// find out is to select the font into a DC and ask what came back.
+///
+/// # Safety
+/// `hdc` must be a live device context; the font is selected into it and
+/// restored before returning.
+pub unsafe fn first_available_face(hdc: HDC, wanted: &[&str]) -> Option<String> {
+    for name in wanted {
+        let f = CreateFontW(
+            -20,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            5,
+            0,
+            wide(name).as_ptr(),
+        );
+        if f.is_null() {
+            continue;
+        }
+        let old = SelectObject(hdc, f as HGDIOBJ);
+        let mut buf = [0u16; 64];
+        let n = GetTextFaceW(hdc, buf.len() as i32, buf.as_mut_ptr());
+        SelectObject(hdc, old);
+        DeleteObject(f as HGDIOBJ);
+        if n > 0 {
+            let got = String::from_utf16_lossy(&buf[..(n as usize).saturating_sub(1)]);
+            if got.eq_ignore_ascii_case(name) {
+                return Some(got);
+            }
+        }
+    }
+    None
+}
+
+// -- combo boxes -------------------------------------------------------------
+//
+// A settings page made of empty text boxes asks a question most people cannot
+// answer. These are the dropdowns that replace them, owner-drawn for the same
+// reason the buttons are: a themed combo ignores `WM_CTLCOLOR*`.
+
+/// A list that cannot be typed into: the choices are the choices.
+pub const CBS_DROPDOWNLIST: u32 = 0x0003;
+pub const CBS_OWNERDRAWFIXED: u32 = 0x0010;
+pub const CBS_HASSTRINGS: u32 = 0x0200;
+
+pub const CB_ADDSTRING: u32 = 0x0143;
+pub const CB_RESETCONTENT: u32 = 0x014B;
+pub const CB_SETCURSEL: u32 = 0x014E;
+pub const CB_GETCURSEL: u32 = 0x0147;
+pub const CB_SETITEMHEIGHT: u32 = 0x0153;
+pub const CBN_SELCHANGE: u16 = 1;
+
+pub const ODT_COMBOBOX: u32 = 3;
+pub const ODS_COMBOBOXEDIT: u32 = 0x1000;
+
+/// Windows asks for a row height before it draws one.
+pub const WM_MEASUREITEM: u32 = 0x002C;
+
+#[repr(C)]
+pub struct MEASUREITEMSTRUCT {
+    pub CtlType: u32,
+    pub CtlID: u32,
+    pub itemID: u32,
+    pub itemWidth: u32,
+    pub itemHeight: u32,
+    pub itemData: usize,
+}
+
+// -- randomness --------------------------------------------------------------
+
+#[link(name = "bcrypt")]
+extern "system" {
+    fn BCryptGenRandom(alg: *mut c_void, buf: *mut u8, len: u32, flags: u32) -> i32;
+}
+
+/// `BCRYPT_USE_SYSTEM_PREFERRED_RNG`: no algorithm handle to open or close.
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+
+/// `n` random bytes as lowercase hex, from the system generator.
+///
+/// **Not `SystemTime` mixed with a process id.** An API key derived from the
+/// clock is guessable by anyone who knows roughly when it was made, and the
+/// whole point of the key is that it cannot be guessed. Windows ships a CSPRNG;
+/// this is the two-line way to ask it.
+///
+/// Returns `None` rather than falling back to something weaker: a key that
+/// silently is not random is worse than no key, because it is trusted.
+pub fn random_hex(n: usize) -> Option<String> {
+    let mut buf = vec![0u8; n];
+    let ok = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            n as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    // STATUS_SUCCESS is 0; anything else is a failure worth surfacing.
+    (ok == 0).then(|| buf.iter().map(|b| format!("{b:02x}")).collect())
 }

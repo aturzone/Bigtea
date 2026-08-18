@@ -6,7 +6,13 @@
 
 pub mod art;
 pub mod catalog;
+/// Settings offered as choices computed from the machine, for the many users
+/// who cannot be expected to know what a good thread count is.
+pub mod choices;
 pub mod client;
+/// Watching a download by the bytes it puts on disk, since the downloader is
+/// another process with no console.
+pub mod download;
 pub mod models;
 /// Where every control lives: four pages, and the id of each thing on them.
 pub mod nav;

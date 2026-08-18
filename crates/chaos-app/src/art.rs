@@ -15,6 +15,9 @@
 // The generated luminance bitmap: `LOGO_W`, `LOGO_H`, `LOGO`.
 include!("../../chaos-arch/src/logo_bitmap.rs");
 
+// The mark's outlines: `Poly`, `POLYS`. Geometry, not pixels.
+include!("logo_vector.rs");
+
 /// Threshold the luminance ramp to pure black and white.
 ///
 /// The rasteriser antialiases, which is right for a terminal printing shaded
@@ -29,7 +32,131 @@ pub fn logo_size() -> (usize, usize) {
     (LOGO_W, LOGO_H)
 }
 
-/// A stroke in a glyph, in a 0..1 square, to be scaled at paint time.
+/// The mark at `n` pixels square, as ink coverage.
+///
+/// **Filled from outlines every time, never resampled.** The window used to
+/// draw a 56x56 bitmap stretched to 30 pixels, and then a 256x256 one filtered
+/// down; both are a bitmap at heart and both lose something at a size they were
+/// not made for. `logo_vector.rs` carries the flattened paths instead, so this
+/// scan-converts the actual geometry at whatever size is asked for and there is
+/// no intermediate image anywhere.
+///
+/// Returns coverage: 0 is paper, 255 is full ink. The caller blends its own
+/// foreground through it, which is how one mark works on a light page and a
+/// dark one without a second asset.
+pub fn logo_coverage(n: usize) -> Vec<u8> {
+    let n = n.max(1);
+    // 4x4 subsamples per output pixel. The scanline fill below is hard-edged,
+    // so supersampling is the only source of antialiasing -- and 16 levels is
+    // where the rays stop looking notched at 32px, checked by eye against 8
+    // and 36.
+    const SS: usize = 4;
+    let w = n * SS;
+    let mut grid = vec![0u8; w * w];
+
+    for poly in POLYS {
+        fill_polygon(&mut grid, w, poly, 255u8 * u8::from(poly.ink));
+    }
+
+    // Box-downsample the subsample grid to the requested size.
+    let mut out = vec![0u8; n * n];
+    for y in 0..n {
+        for x in 0..n {
+            let mut sum = 0u32;
+            for sy in y * SS..(y + 1) * SS {
+                for sx in x * SS..(x + 1) * SS {
+                    sum += u32::from(grid[sy * w + sx]);
+                }
+            }
+            out[y * n + x] = (sum / (SS * SS) as u32) as u8;
+        }
+    }
+    out
+}
+
+/// Scan-convert one closed polygon into `grid`, nonzero winding.
+///
+/// The same rule the SVG uses and the same one `tools/rasterise-logo.py`
+/// implements: a span is inside when the accumulated winding is not zero, which
+/// is what leaves the holes in the mark actually hollow. An even-odd fill would
+/// look correct on most of these paths and wrong on the ones that overlap.
+fn fill_polygon(grid: &mut [u8], w: usize, poly: &Poly, value: u8) {
+    let scale = w as f32;
+    let pts = poly.pts;
+    if pts.len() < 3 {
+        return;
+    }
+    // Row range this polygon can touch, so a small path does not walk the
+    // whole bitmap.
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for &(_, y) in pts {
+        lo = lo.min(y);
+        hi = hi.max(y);
+    }
+    let y0 = ((lo * scale).floor().max(0.0)) as usize;
+    let y1 = ((hi * scale).ceil().min(scale)) as usize;
+
+    let mut xs: Vec<(f32, i32)> = Vec::with_capacity(16);
+    for row in y0..y1.min(w) {
+        let yc = row as f32 + 0.5;
+        xs.clear();
+        for i in 0..pts.len() {
+            let (x0, ay) = pts[i];
+            let (x1, by) = pts[(i + 1) % pts.len()];
+            let (ay, by) = (ay * scale, by * scale);
+            // Half-open in y, so a vertex shared by two edges is counted once
+            // and horizontal edges drop out entirely.
+            if (ay <= yc && by > yc) || (by <= yc && ay > yc) {
+                let t = (yc - ay) / (by - ay);
+                let x = (x0 + t * (x1 - x0)) * scale;
+                xs.push((x, if by > ay { 1 } else { -1 }));
+            }
+        }
+        if xs.len() < 2 {
+            continue;
+        }
+        xs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut wind = 0;
+        for k in 0..xs.len() - 1 {
+            wind += xs[k].1;
+            if wind == 0 {
+                continue;
+            }
+            let a = (xs[k].0 + 0.5).max(0.0) as usize;
+            let b = ((xs[k + 1].0 + 0.5).max(0.0) as usize).min(w);
+            for px in a..b {
+                grid[row * w + px] = value;
+            }
+        }
+    }
+}
+
+/// The mark at `n` pixels, cached.
+///
+/// The rail repaints on every generated token, and rasterising 44 polygons each
+/// time would be work done sixteen times a second for a picture that has not
+/// changed. One size is in flight at once, so a single slot is the whole cache.
+pub fn logo_scaled(n: usize) -> Vec<u8> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(usize, Vec<u8>)>> = Mutex::new(None);
+    let n = n.max(1);
+    let mut c = match CACHE.lock() {
+        Ok(c) => c,
+        // A poisoned lock here means another thread panicked mid-render; the
+        // mark is not worth propagating that, so draw it again.
+        Err(e) => e.into_inner(),
+    };
+    if let Some((have, bits)) = c.as_ref() {
+        if *have == n {
+            return bits.clone();
+        }
+    }
+    let bits = logo_coverage(n);
+    *c = Some((n, bits.clone()));
+    bits
+}
+
+/// A stroke in a glyph, in a 0..1 square, to be scaled at paint time./// A stroke in a glyph, in a 0..1 square, to be scaled at paint time.
 pub type Stroke = (f32, f32, f32, f32);
 
 /// Line art for the app's controls, as coordinates rather than pixels.
@@ -87,6 +214,81 @@ mod tests {
     }
 
     /// Strokes stay inside the unit square, or they paint over their neighbours.
+    /// The geometry has to be geometry: enough polygons, enough points, and
+    /// both kinds of fill. A file with only ink paths would draw a solid disc.
+    #[test]
+    fn the_outlines_are_present_and_have_both_fills() {
+        assert!(POLYS.len() > 20, "only {} polygons", POLYS.len());
+        let pts: usize = POLYS.iter().map(|p| p.pts.len()).sum();
+        assert!(pts > 2000, "only {pts} points; the flattener has drifted");
+        assert!(POLYS.iter().any(|p| p.ink), "nothing is inked");
+        assert!(
+            POLYS.iter().any(|p| !p.ink),
+            "nothing is paper -- the holes in the mark would fill in"
+        );
+        for p in POLYS {
+            assert!(p.pts.len() >= 3, "a polygon with {} points", p.pts.len());
+            for &(x, y) in p.pts {
+                // The unit square is the *ink* box, and the art's white backing
+                // plate is deliberately larger than it -- so geometry outside
+                // is normal and the rasteriser clips it. What would not be
+                // normal is a coordinate far enough out to mean the
+                // normalisation is wrong rather than the plate generous.
+                assert!(
+                    (-0.5..=1.5).contains(&x) && (-0.5..=1.5).contains(&y),
+                    "({x}, {y}) is nowhere near the mark; the ink box is wrong"
+                );
+            }
+        }
+        // The inked geometry itself has to sit inside, or the mark is off-centre.
+        for p in POLYS.iter().filter(|p| p.ink) {
+            for &(x, y) in p.pts {
+                assert!(
+                    (-0.02..=1.02).contains(&x) && (-0.02..=1.02).contains(&y),
+                    "an inked point at ({x}, {y}) falls outside the mark's own box"
+                );
+            }
+        }
+    }
+
+    /// **Resolution independence, checked rather than claimed.** Rendering at
+    /// 64 and box-filtering to 32 must land close to rendering at 32 directly.
+    /// A bitmap master resampled to both would agree trivially; outlines filled
+    /// at each size agreeing is what says the geometry is doing the work.
+    #[test]
+    fn the_mark_is_the_same_shape_at_any_size() {
+        let small = logo_coverage(32);
+        let big = logo_coverage(64);
+        let mut folded = vec![0u8; 32 * 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                let mut sum = 0u32;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        sum += u32::from(big[(y * 2 + dy) * 64 + x * 2 + dx]);
+                    }
+                }
+                folded[y * 32 + x] = (sum / 4) as u8;
+            }
+        }
+        let diff: u32 = small
+            .iter()
+            .zip(&folded)
+            .map(|(a, b)| u32::from(a.abs_diff(*b)))
+            .sum();
+        let mean = diff / (32 * 32);
+        assert!(
+            mean < 24,
+            "the shape differs by {mean}/255 on average between sizes"
+        );
+    }
+
+    /// A size of zero must not panic; the rail computes it from window metrics.
+    #[test]
+    fn a_degenerate_size_is_survivable() {
+        assert_eq!(logo_scaled(0).len(), 1);
+    }
+
     #[test]
     fn glyphs_are_inside_their_box() {
         for (name, set) in [

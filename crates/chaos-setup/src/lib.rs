@@ -220,3 +220,156 @@ mod tests {
         assert!(!m.starts_with(&p), "{m:?} is inside {p:?}");
     }
 }
+
+// -- the install, as steps ---------------------------------------------------
+
+/// One thing the installer does, and how it went.
+///
+/// The install used to be a single call that returned a paragraph when it was
+/// over. On a fast machine that is fine; on a slow one it is a frozen window,
+/// and either way it never says *what* it is doing. Hermes' installer shows a
+/// named list with a tick and a duration against each line, which is both nicer
+/// and far easier to send back when something fails -- so this is that.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Step {
+    /// What the user sees. A verb in the present participle: "Writing chaos-run".
+    pub label: String,
+    pub state: StepState,
+    /// How long it took, once it is done.
+    pub millis: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepState {
+    Waiting,
+    Running,
+    Done,
+    Failed,
+}
+
+impl Step {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            state: StepState::Waiting,
+            millis: 0,
+        }
+    }
+}
+
+/// The whole run: the steps, and where it got to.
+#[derive(Clone, Debug, Default)]
+pub struct Progress {
+    pub steps: Vec<Step>,
+    /// Set when a step fails, and the reason. The run stops here.
+    pub failure: Option<String>,
+    /// The closing report, once every step is done.
+    pub report: Vec<String>,
+}
+
+impl Progress {
+    pub fn done_count(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|s| s.state == StepState::Done)
+            .count()
+    }
+
+    /// Completion as a percentage, for the bar.
+    pub fn percent(&self) -> u32 {
+        if self.steps.is_empty() {
+            return 0;
+        }
+        (self.done_count() * 100 / self.steps.len()) as u32
+    }
+
+    pub fn finished(&self) -> bool {
+        self.failure.is_some() || (!self.steps.is_empty() && self.done_count() == self.steps.len())
+    }
+
+    /// The step currently running, for the line the eye should be on.
+    pub fn running(&self) -> Option<usize> {
+        self.steps
+            .iter()
+            .position(|s| s.state == StepState::Running)
+    }
+}
+
+/// A duration as the installer prints it: `405ms`, `1.2s`.
+///
+/// Milliseconds up to a second because most of these steps are a file write and
+/// "0.4s" reads as slower than it is; seconds beyond, because "12480ms" does
+/// not.
+pub fn human_millis(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_run_is_not_finished_and_is_not_complete() {
+        let p = Progress::default();
+        assert_eq!(p.percent(), 0);
+        assert!(!p.finished(), "a run with no steps must not report success");
+    }
+
+    #[test]
+    fn percent_tracks_completed_steps() {
+        let mut p = Progress {
+            steps: (0..4).map(|i| Step::new(format!("s{i}"))).collect(),
+            ..Progress::default()
+        };
+        assert_eq!(p.percent(), 0);
+        p.steps[0].state = StepState::Done;
+        assert_eq!(p.percent(), 25);
+        p.steps[1].state = StepState::Running;
+        assert_eq!(p.percent(), 25, "a running step is not a completed one");
+        for s in p.steps.iter_mut() {
+            s.state = StepState::Done;
+        }
+        assert_eq!(p.percent(), 100);
+        assert!(p.finished());
+    }
+
+    /// **A failed run must never read as finished-successfully.** It is
+    /// finished, but `failure` is what the screen keys off.
+    #[test]
+    fn a_failure_stops_the_run_and_is_visible() {
+        let mut p = Progress {
+            steps: (0..3).map(|i| Step::new(format!("s{i}"))).collect(),
+            ..Progress::default()
+        };
+        p.steps[0].state = StepState::Done;
+        p.steps[1].state = StepState::Failed;
+        p.failure = Some("cannot write chaos-run.exe".into());
+        assert!(p.finished());
+        assert!(p.failure.is_some());
+        assert!(p.percent() < 100, "a failed run must not show 100%");
+    }
+
+    #[test]
+    fn the_running_step_is_findable() {
+        let mut p = Progress {
+            steps: (0..3).map(|i| Step::new(format!("s{i}"))).collect(),
+            ..Progress::default()
+        };
+        assert_eq!(p.running(), None);
+        p.steps[1].state = StepState::Running;
+        assert_eq!(p.running(), Some(1));
+    }
+
+    #[test]
+    fn durations_read_as_durations() {
+        assert_eq!(human_millis(0), "0ms");
+        assert_eq!(human_millis(405), "405ms");
+        assert_eq!(human_millis(999), "999ms");
+        assert_eq!(human_millis(1000), "1.0s");
+        assert_eq!(human_millis(12480), "12.5s");
+    }
+}

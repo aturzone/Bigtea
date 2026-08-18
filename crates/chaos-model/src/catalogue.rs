@@ -90,7 +90,14 @@ pub const CATALOGUE: &[Entry] = &[
             name: "UD-Q4_K_XL",
             bytes: 155_095_240_320,
             shards: 5,
-            always_read_bytes: 7_925_000_000,
+            // **Measured, not estimated.** This was `7_925_000_000` -- a round
+            // number that turned out to be within 0.06% of the truth, but a
+            // guess all the same, and it is the figure the whole project's
+            // headline rests on. Summed from all five shards' tensor tables
+            // with `tools/gguf-always-read.py`: shard 1 carries only metadata,
+            // and 129 expert tensors across shards 2-5 hold 147 GB of the
+            // 155 GB, leaving 4-6% resident per shard.
+            always_read_bytes: 7_920_157_020,
         }],
     },
     Entry {
@@ -100,9 +107,13 @@ pub const CATALOGUE: &[Entry] = &[
         arch: "qwen3moe",
         quants: &[Quant {
             name: "Q4_K_M",
-            bytes: 18_554_000_000,
+            bytes: 18_554_098_112,
             shards: 1,
-            always_read_bytes: 1_000_000_000,
+            // Measured from the tensor table, replacing a round
+            // `1_000_000_000` that happened to be accurate to 0.25%. 144
+            // expert tensors hold 17.55 GB of the 18.55 GB of weights, so 5%
+            // stays resident -- which is why an 18 GB model runs on a laptop.
+            always_read_bytes: 997_554_176,
         }],
     },
     // -- dense models -------------------------------------------------------
@@ -258,7 +269,108 @@ pub const CATALOGUE: &[Entry] = &[
             always_read_bytes: 8_890_306_112,
         }],
     },
+    // -- Qwen 3.5/3.6, which this engine cannot run yet ----------------------
+    //
+    // **Listed on purpose, and listed as unrunnable.** Leaving them out was
+    // answering "where is the new Qwen?" with silence, and the answer is not
+    // "it does not exist" -- it is that `general.architecture` reads `qwen35`
+    // and `qwen35moe`, and llama.cpp returns `LLAMA_ROPE_TYPE_IMROPE` for both:
+    // interleaved multimodal RoPE, which is neither mode this engine
+    // implements, and it branches on those arches in five other places besides.
+    // `qwen3.rs` refuses them by name rather than rotating the wrong way and
+    // producing fluent, confident nonsense.
+    //
+    // Every byte below was read from the container's own tensor table with
+    // `tools/gguf-always-read.py`, which range-fetches the header rather than
+    // the model. The MoE resident figures are measured, not scaled from a
+    // sibling -- 11% at Q4 and 14% at Q2, which are not the same fraction and
+    // could not have been guessed from one another.
+    Entry {
+        name: "qwen3.6-27b",
+        repo: "unsloth/Qwen3.6-27B-GGUF",
+        stem: "Qwen3.6-27B-{quant}",
+        arch: "qwen35",
+        quants: &[
+            Quant {
+                name: "Q4_K_M",
+                bytes: 16_817_244_384,
+                shards: 1,
+                // Dense: every byte is always-read. Measured at 16_806_250_496
+                // of tensor data; the file is larger by its header.
+                always_read_bytes: 16_817_244_384,
+            },
+            Quant {
+                name: "UD-Q4_K_XL",
+                bytes: 17_612_564_704,
+                shards: 1,
+                always_read_bytes: 17_612_564_704,
+            },
+        ],
+    },
+    Entry {
+        name: "qwen3.6-35b-a3b",
+        repo: "unsloth/Qwen3.6-35B-A3B-GGUF",
+        stem: "Qwen3.6-35B-A3B-{quant}",
+        arch: "qwen35moe",
+        quants: &[
+            Quant {
+                name: "UD-Q4_K_XL",
+                bytes: 22_360_456_160,
+                shards: 1,
+                // 120 expert tensors hold 19.7 GB of the 22.3 GB of weights.
+                always_read_bytes: 2_678_180_352,
+            },
+            Quant {
+                name: "UD-Q2_K_XL",
+                bytes: 12_290_628_576,
+                shards: 1,
+                always_read_bytes: 1_751_935_488,
+            },
+        ],
+    },
 ];
+
+/// Architectures this engine implements *and* has diffed against llama.cpp.
+///
+/// Kept here rather than in `chaos-arch` because the catalogue is what the app
+/// and `chaos-pull` consult before a download starts, and neither depends on
+/// the engine. `chaos-arch` depends on *this* crate, so a test up there asserts
+/// the two lists agree -- which is what stops this copy going stale.
+pub const RUNNABLE_ARCHS: &[&str] = &[
+    "baichuan",
+    "deepseek4",
+    "gemma",
+    "gemma2",
+    "gemma3",
+    "internlm2",
+    "llama",
+    "olmo",
+    "phi3",
+    "qwen2",
+    "qwen3",
+    "stablelm",
+    "starcoder2",
+];
+
+/// Why a model cannot run here, or `None` if it can.
+///
+/// **A catalogue that only lists what works is a catalogue that cannot answer
+/// "where is the model I read about".** Every entry is listed; the ones this
+/// engine has not implemented say so, in the sentence a user needs, instead of
+/// being quietly missing or -- far worse -- downloading 22 GB and then
+/// producing fluent nonsense.
+pub fn why_not_runnable(arch: &str) -> Option<&'static str> {
+    if RUNNABLE_ARCHS.contains(&arch) {
+        return None;
+    }
+    Some(match arch {
+        "qwen35" | "qwen35moe" => {
+            "needs interleaved multimodal RoPE, which Chaos does not implement"
+        }
+        "qwen3moe" => "its forward pass does not yet match llama.cpp exactly",
+        _ => "this architecture has never been diffed against llama.cpp",
+    })
+}
 
 pub fn find(name: &str) -> Option<&'static Entry> {
     CATALOGUE.iter().find(|e| e.name.eq_ignore_ascii_case(name))
@@ -377,5 +489,83 @@ mod tests {
         };
         assert!(!plan.always_read_fits());
         assert!(plan.shortfall_bytes() > 3 * GIB);
+    }
+}
+
+#[cfg(test)]
+mod runnable_tests {
+    use super::*;
+
+    /// Every catalogue entry either runs or says why not -- there is no third
+    /// state, and a `None` for an architecture nobody implemented would be a
+    /// download button that produces nonsense.
+    #[test]
+    fn every_entry_is_either_runnable_or_explained() {
+        for e in CATALOGUE {
+            match why_not_runnable(e.arch) {
+                None => assert!(
+                    RUNNABLE_ARCHS.contains(&e.arch),
+                    "{} claims to run on {}, which is not in RUNNABLE_ARCHS",
+                    e.name,
+                    e.arch
+                ),
+                Some(why) => {
+                    assert!(!why.is_empty(), "{} has an empty reason", e.name);
+                    assert!(
+                        why.len() > 20,
+                        "{}: {why:?} is too short to be an explanation",
+                        e.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// The newest Qwen containers are present *and* known to be unrunnable.
+    /// If someone implements the architecture, this test is the reminder to
+    /// move them -- it fails once they become runnable.
+    #[test]
+    fn the_new_qwen_models_are_listed_and_refused() {
+        for name in ["qwen3.6-27b", "qwen3.6-35b-a3b"] {
+            let e = find(name).unwrap_or_else(|| panic!("{name} is not listed"));
+            let why = why_not_runnable(e.arch)
+                .unwrap_or_else(|| panic!("{name} now claims to run; move it and update this"));
+            assert!(why.contains("RoPE"), "{name}: {why}");
+        }
+    }
+
+    /// **The resident figure is what decides a download.** For a dense model it
+    /// is the whole file; for a Mixture-of-Experts it must be a small fraction,
+    /// or the entry is claiming a 22 GB model needs 22 GB resident and the app
+    /// will call it impossible on exactly the machines it was built for.
+    #[test]
+    fn moe_entries_have_a_measured_resident_fraction() {
+        for e in CATALOGUE {
+            let moe = e.arch.contains("moe") || e.arch == "deepseek4";
+            for q in e.quants {
+                let pct = q.always_read_bytes * 100 / q.bytes.max(1);
+                if moe {
+                    assert!(
+                        pct < 40,
+                        "{} {}: {pct}% resident -- that is not a streaming model",
+                        e.name,
+                        q.name
+                    );
+                    assert!(
+                        q.always_read_bytes % 1_000_000 != 0,
+                        "{} {}: {} looks rounded rather than measured",
+                        e.name,
+                        q.name,
+                        q.always_read_bytes
+                    );
+                } else {
+                    assert_eq!(
+                        q.always_read_bytes, q.bytes,
+                        "{} {} is dense, so every byte is always-read",
+                        e.name, q.name
+                    );
+                }
+            }
+        }
     }
 }

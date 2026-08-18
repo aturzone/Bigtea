@@ -94,9 +94,26 @@ the model runs as a child process and Chaos stops it on the way out.
 
 **COPY ENDPOINT** puts `http://127.0.0.1:8231/v1` on the clipboard, which is the
 string you paste into `aider`, `Cline`, `Continue`, or anything else that takes
-a base URL. **There is no API key**: the server binds `127.0.0.1` only and never
-listens on the network, so there is nothing to authenticate. If a client demands
-a key, give it any string.
+a base URL. With a key set it copies both.
+
+### The API key
+
+**Model → Require an API key** turns one on. Chaos generates 24 bytes from the
+system's own random generator, shows it, copies it, and stores it; from then on
+`chaos-serve` refuses any `/v1/*` request without
+`Authorization: Bearer <key>` and answers `401` in the shape an OpenAI client
+expects.
+
+It is **off by default**, deliberately. The server binds `127.0.0.1` only and
+never listens on the network, so a key is not what keeps a stranger out -- what
+keeps them out is that there is no route in. Switching it on by default would
+also start refusing every agent already pointed at an existing install. It is
+here because many clients insist on sending a key, and because a shared machine
+is a real thing.
+
+`/health` and the browser page stay open either way, so the window can still
+tell when a model is up. With no key set, any value a client sends is accepted.
+The key is on the model's page and on MONITOR while a model runs.
 
 **DELETE** removes an installed model and *every shard* of it, after telling you
 how many files and how many bytes. It refuses while that model is running.
@@ -189,7 +206,9 @@ against llama.cpp and `allow unverified architectures` is off.
 Named plainly rather than left to be discovered:
 
 - One model runs at a time.
-- Download progress shows start and finish, not a percentage.
+- Download progress is measured from the bytes on disk, so a paused or
+  restarted fetch is still tracked; it cannot show which *shard* of a
+  five-part container is in flight.
 - No tray icon — closing the window is the way to quit.
 - MONITOR cannot show streamed bytes or cache residency; the engine measures
   them but does not report them over the socket.

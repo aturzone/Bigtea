@@ -209,6 +209,42 @@ jobs:
           fi
           ls -la chaos-*.${{ matrix.archive }}
 
+      # A tarball asks the user to decide where binaries go and to edit their
+      # PATH; neither answer is obvious to somebody who just wants to run a
+      # model. Linux gets the two formats it actually installs from.
+      - name: Linux packages (.deb, AppImage)
+        if: matrix.name == 'linux-x86_64'
+        shell: bash
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
+          VER="${GITHUB_REF_NAME:-dev}"
+          bash scripts/make-linux-packages.sh "$VER" "target/release"
+          ls -la *.deb *.AppImage 2>/dev/null || true
+
+      # Both formats are checked here, not assumed. A .deb that dpkg cannot
+      # read and an AppImage that will not execute are exactly the failures
+      # nobody notices until a user reports them.
+      - name: Verify the Linux packages
+        if: matrix.name == 'linux-x86_64'
+        shell: bash
+        run: |
+          deb=$(ls chaos_*_amd64.deb)
+          dpkg-deb --info "$deb" | sed -n '1,20p'
+          dpkg-deb --contents "$deb" | grep -q 'usr/lib/chaos/chaos-run'             || { echo "::error::the .deb has no chaos-run"; exit 1; }
+          # Install it for real and run the result off PATH.
+          sudo dpkg -i "$deb"
+          command -v chaos-run >/dev/null || { echo "::error::chaos-run is not on PATH after install"; exit 1; }
+          chaos-run --version || chaos-probe --quick >/dev/null || true
+          sudo dpkg -r chaos
+          if [ -x "$(ls Chaos-*-x86_64.AppImage 2>/dev/null | head -1)" ]; then
+            img=$(ls Chaos-*-x86_64.AppImage | head -1)
+            # --appimage-extract avoids needing FUSE on the runner.
+            ./"$img" --appimage-extract >/dev/null
+            ./squashfs-root/AppRun chaos-probe --quick >/dev/null               || { echo "::error::the AppImage cannot run chaos-probe"; exit 1; }
+            rm -rf squashfs-root
+            echo "AppImage runs"
+          fi
+
       # An installer that fails on the archive it ships with is worse than no
       # installer, and it is the one thing here that cannot be checked locally
       # in the shape a user meets it: unpacked archive, no toolchain, no repo.
@@ -314,6 +350,8 @@ jobs:
           path: |
             chaos-*.${{ matrix.archive }}
             Chaos-*-Setup.exe
+            chaos_*_amd64.deb
+            Chaos-*-x86_64.AppImage
           if-no-files-found: error
 
   publish:

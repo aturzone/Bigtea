@@ -48,6 +48,7 @@ fn main() -> ExitCode {
     let mut path = String::new();
     let mut port = 8080u16;
     let mut cache_gib = 0f64;
+    let mut api_key: Option<String> = None;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -74,6 +75,19 @@ fn main() -> ExitCode {
                 if let Some(t) = args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
                     std::env::set_var("CHAOS_THREADS_BATCH", t.to_string());
                 }
+                i += 2;
+            }
+            // **Optional, and off unless asked for.** The server binds
+            // `127.0.0.1` only, so a key is not what keeps a stranger out --
+            // what keeps them out is that there is no route in. It is here
+            // because many OpenAI-compatible clients insist on sending one and
+            // some refuse to work without a value, and because a shared machine
+            // is a real thing.
+            "--api-key" => {
+                api_key = args
+                    .get(i + 1)
+                    .map(|v| v.to_string())
+                    .filter(|v| !v.is_empty());
                 i += 2;
             }
             "-h" | "--help" => {
@@ -114,7 +128,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match serve(&path, port, cache_gib) {
+    match serve(&path, port, cache_gib, api_key) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("chaos-serve: {e}");
@@ -145,10 +159,17 @@ fn usage() {
     println!("  GET  /v1/models             what is loaded");
     println!("  GET  /health                readiness, and what the engine is doing");
     println!();
+    println!("  --api-key <key>   require `Authorization: Bearer <key>` on /v1/*");
+    println!();
     println!("Binds to localhost only: no TLS, one request at a time.");
 }
 
-fn serve(path: &str, port: u16, cache_gib: f64) -> Result<(), Box<dyn std::error::Error>> {
+fn serve(
+    path: &str,
+    port: u16,
+    cache_gib: f64,
+    api_key: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     let model = Model::open_split(path)?;
     let tokenizer = Tokenizer::from_metadata(model.metadata())?;
@@ -212,7 +233,7 @@ fn serve(path: &str, port: u16, cache_gib: f64) -> Result<(), Box<dyn std::error
             fw: &fw,
             config: &config,
         };
-        return run_loop(engine, &tokenizer, port, t0);
+        return run_loop(engine, &tokenizer, port, t0, api_key);
     }
 
     // Dense: Llama, Mistral, Qwen and everything else the qwen3 path covers.
@@ -287,7 +308,7 @@ fn serve(path: &str, port: u16, cache_gib: f64) -> Result<(), Box<dyn std::error
         name: &name,
         config: config.clone(),
     };
-    run_loop(engine, &tokenizer, port, t0)
+    run_loop(engine, &tokenizer, port, t0, api_key)
 }
 
 /// Accept and answer requests, one at a time.
@@ -296,6 +317,7 @@ fn run_loop(
     tokenizer: &Tokenizer,
     port: u16,
     t0: std::time::Instant,
+    api_key: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr)?;
@@ -305,6 +327,12 @@ fn run_loop(
     // not have to read an endpoint list to find the interface.
     println!("           open       http://{addr}");
     println!("           for agents POST /v1/chat/completions");
+    // Whether a key is required is the one thing a client cannot discover by
+    // trying, so it is printed rather than left to a 401.
+    match &api_key {
+        Some(_) => println!("           api key   required on /v1/*"),
+        None => println!("           api key   none -- any value is accepted"),
+    }
     println!(
         "           context {} tokens, one request at a time",
         engine.context_limit()
@@ -340,7 +368,7 @@ fn run_loop(
                 if let Err(e) = s.set_read_timeout(Some(std::time::Duration::from_secs(3))) {
                     eprintln!("could not set a read timeout: {e}");
                 }
-                if let Err(e) = handle(s, &engine, tokenizer) {
+                if let Err(e) = handle(s, &engine, tokenizer, api_key.as_deref()) {
                     // A peer that connected and said nothing is routine, not a
                     // fault; anything else is worth printing.
                     let msg = e.to_string();
@@ -360,6 +388,8 @@ struct Request {
     method: String,
     target: String,
     body: String,
+    /// The `Authorization` header, verbatim, if one was sent.
+    auth: Option<String>,
 }
 
 fn read_request(stream: &TcpStream) -> Result<Request, Box<dyn std::error::Error>> {
@@ -371,6 +401,7 @@ fn read_request(stream: &TcpStream) -> Result<Request, Box<dyn std::error::Error
     let target = parts.next().unwrap_or_default().to_string();
 
     let mut content_length = 0usize;
+    let mut auth: Option<String> = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header)? == 0 {
@@ -380,10 +411,14 @@ fn read_request(stream: &TcpStream) -> Result<Request, Box<dyn std::error::Error
         if trimmed.is_empty() {
             break;
         }
-        if let Some(v) = trimmed.strip_prefix("Content-Length:") {
+        // Header names are case-insensitive per RFC 9110, and clients disagree
+        // about which case they send. Compare lowercased once rather than
+        // guessing the two spellings that happened to be seen first.
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = trimmed.strip_prefix("content-length:") {
-            content_length = v.trim().parse().unwrap_or(0);
+        } else if lower.starts_with("authorization:") {
+            auth = trimmed.split_once(':').map(|(_, v)| v.trim().to_string());
         }
     }
 
@@ -395,95 +430,146 @@ fn read_request(stream: &TcpStream) -> Result<Request, Box<dyn std::error::Error
         method,
         target,
         body: String::from_utf8_lossy(&body).into_owned(),
+        auth,
     })
+}
+
+/// Whether a request carries the key, when one is required.
+///
+/// **Only the `/v1/*` routes are gated.** `/` is the browser interface a person
+/// opens, `/health` is what the app polls to know the model is up, and
+/// `/favicon.ico` is asked for by every browser on every load -- putting a key
+/// in front of those would break the window that starts the server without
+/// protecting anything, since a caller who can reach `127.0.0.1` can read the
+/// key out of the settings file anyway.
+///
+/// The key is compared in full rather than by prefix, and a missing header is
+/// the same failure as a wrong one.
+fn authorised(req: &Request, key: Option<&str>) -> bool {
+    let Some(key) = key else { return true };
+    if !req.target.starts_with("/v1/") {
+        return true;
+    }
+    let Some(header) = req.auth.as_deref() else {
+        return false;
+    };
+    // `Bearer <key>` is what every OpenAI-compatible client sends; a bare key
+    // is accepted too, because some send that instead of arguing about it.
+    let offered = header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
+        .unwrap_or(header)
+        .trim();
+    offered == key
 }
 
 fn handle(
     mut stream: TcpStream,
     engine: &Engine<'_>,
     tokenizer: &Tokenizer,
+    api_key: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let req = read_request(&stream)?;
     let started = std::time::Instant::now();
 
-    let (status, body) = match (req.method.as_str(), req.target.as_str()) {
-        // The browser interface. Served from the binary with nothing external
-        // to fetch, so a machine with no network still gets the whole page.
-        ("GET", "/") => {
-            return send_html(stream, chaos_arch::ui::PAGE, &req, started);
-        }
-        // Every browser asks for this on every page load. Answering "nothing
-        // here" is one line; leaving it a 404 puts a red error in the log for
-        // an entirely normal request.
-        ("GET", "/favicon.ico") => (204, String::new()),
-        ("GET", "/health") => (
-            200,
-            format!(
-                r#"{{"status":"ok","model":"{}","context_limit":{}}}"#,
-                engine.model_name(),
-                engine.context_limit()
-            ),
-        ),
-        ("GET", "/v1/models") => (
-            200,
-            format!(
-                r#"{{"object":"list","data":[{{"id":"{}","object":"model","owned_by":"chaos"}}]}}"#,
-                engine.model_name()
-            ),
-        ),
-        ("POST", "/v1/chat/completions") => {
-            let params = Params::from_body(&req.body);
-            if params.stream {
-                // Streaming owns the socket: headers go out first, then one
-                // event per token, so a client sees words appear instead of
-                // waiting for the whole answer. Nothing more may be written
-                // afterwards, so this returns early.
-                return stream_completion(stream, &req, engine, tokenizer, &params, started);
+    // The shape OpenAI clients expect, so a wrong key reads as a wrong key in
+    // whatever tool is calling rather than as an unexplained failure. Produced
+    // here rather than by an early return, so it goes out through the one
+    // response writer below and cannot drift from it.
+    let unauthorised = !authorised(&req, api_key);
+    let (status, body) = if unauthorised {
+        (
+            401,
+            r#"{"error":{"message":"invalid api key","type":"invalid_request_error","code":"invalid_api_key"}}"#
+                .to_string(),
+        )
+    } else {
+        match (req.method.as_str(), req.target.as_str()) {
+            // The browser interface. Served from the binary with nothing external
+            // to fetch, so a machine with no network still gets the whole page.
+            ("GET", "/") => {
+                return send_html(stream, chaos_arch::ui::PAGE, &req, started);
             }
-            match generate(&req.body, engine, tokenizer, &params, &mut |_| Ok(())) {
-                Ok((text, prompt_tokens, produced, finish)) => (
-                    200,
-                    completion_json(engine.model_name(), &text, prompt_tokens, produced, finish),
-                ),
-                Err(e) => (400, error_json(&e.to_string())),
-            }
-        }
-        // The legacy completions endpoint: same engine, no chat framing. Some
-        // clients and most autocomplete integrations still speak only this.
-        ("POST", "/v1/completions") => {
-            let params = Params::from_body(&req.body);
-            match generate_raw(&req.body, engine, tokenizer, &params, &mut |_| Ok(())) {
-                Ok((text, prompt_tokens, produced, finish)) => (
-                    200,
-                    format!(
-                        r#"{{"id":"chaos","object":"text_completion","model":"{}","choices":[{{"index":0,"text":"{}","finish_reason":"{}"}}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{produced},"total_tokens":{}}}}}"#,
-                        engine.model_name(),
-                        escape(&text),
-                        finish.as_str(),
-                        prompt_tokens + produced
-                    ),
-                ),
-                Err(e) => (400, error_json(&e.to_string())),
-            }
-        }
-        // Embeddings are a different computation, not a cheaper completion:
-        // they need the model's hidden state rather than its logits. This used
-        // to be a 501 saying the graph returns only logits -- true of what it
-        // returned, false about what it computed. See `embed`.
-        ("POST", "/v1/embeddings") => match embed(&req.body, engine, tokenizer) {
-            Ok((vectors, prompt_tokens)) => (
+            // Every browser asks for this on every page load. Answering "nothing
+            // here" is one line; leaving it a 404 puts a red error in the log for
+            // an entirely normal request.
+            ("GET", "/favicon.ico") => (204, String::new()),
+            ("GET", "/health") => (
                 200,
-                embeddings_json(engine.model_name(), &vectors, prompt_tokens),
+                format!(
+                    r#"{{"status":"ok","model":"{}","context_limit":{}}}"#,
+                    engine.model_name(),
+                    engine.context_limit()
+                ),
             ),
-            Err(e) => (400, error_json(&e.to_string())),
-        },
-        _ => (404, error_json("no such endpoint")),
+            ("GET", "/v1/models") => (
+                200,
+                format!(
+                    r#"{{"object":"list","data":[{{"id":"{}","object":"model","owned_by":"chaos"}}]}}"#,
+                    engine.model_name()
+                ),
+            ),
+            ("POST", "/v1/chat/completions") => {
+                let params = Params::from_body(&req.body);
+                if params.stream {
+                    // Streaming owns the socket: headers go out first, then one
+                    // event per token, so a client sees words appear instead of
+                    // waiting for the whole answer. Nothing more may be written
+                    // afterwards, so this returns early.
+                    return stream_completion(stream, &req, engine, tokenizer, &params, started);
+                }
+                match generate(&req.body, engine, tokenizer, &params, &mut |_| Ok(())) {
+                    Ok((text, prompt_tokens, produced, finish)) => (
+                        200,
+                        completion_json(
+                            engine.model_name(),
+                            &text,
+                            prompt_tokens,
+                            produced,
+                            finish,
+                        ),
+                    ),
+                    Err(e) => (400, error_json(&e.to_string())),
+                }
+            }
+            // The legacy completions endpoint: same engine, no chat framing. Some
+            // clients and most autocomplete integrations still speak only this.
+            ("POST", "/v1/completions") => {
+                let params = Params::from_body(&req.body);
+                match generate_raw(&req.body, engine, tokenizer, &params, &mut |_| Ok(())) {
+                    Ok((text, prompt_tokens, produced, finish)) => (
+                        200,
+                        format!(
+                            r#"{{"id":"chaos","object":"text_completion","model":"{}","choices":[{{"index":0,"text":"{}","finish_reason":"{}"}}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{produced},"total_tokens":{}}}}}"#,
+                            engine.model_name(),
+                            escape(&text),
+                            finish.as_str(),
+                            prompt_tokens + produced
+                        ),
+                    ),
+                    Err(e) => (400, error_json(&e.to_string())),
+                }
+            }
+            // Embeddings are a different computation, not a cheaper completion:
+            // they need the model's hidden state rather than its logits. This used
+            // to be a 501 saying the graph returns only logits -- true of what it
+            // returned, false about what it computed. See `embed`.
+            ("POST", "/v1/embeddings") => match embed(&req.body, engine, tokenizer) {
+                Ok((vectors, prompt_tokens)) => (
+                    200,
+                    embeddings_json(engine.model_name(), &vectors, prompt_tokens),
+                ),
+                Err(e) => (400, error_json(&e.to_string())),
+            },
+            _ => (404, error_json("no such endpoint")),
+        }
     };
 
     let reason = match status {
         200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
         501 => "Not Implemented",
         _ => "Not Found",
     };

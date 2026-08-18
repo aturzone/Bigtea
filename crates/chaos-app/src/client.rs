@@ -101,6 +101,112 @@ pub fn health(port: u16) -> bool {
     buf.contains("\"status\":\"ok\"")
 }
 
+/// One line of a connection report.
+pub struct Check {
+    pub name: &'static str,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Do exactly what a coding agent does, and report each step.
+///
+/// **A user should not need `curl` to find out whether their agent will work.**
+/// Every one of these is a request an OpenAI-compatible client makes: `/health`
+/// to see the server is up, `/v1/models` to learn the model's name, and one
+/// tiny completion to prove the whole path -- including the API key, if one is
+/// required, which is the part that silently fails everywhere else.
+///
+/// Blocking; call it on a worker thread.
+pub fn check(port: u16, api_key: Option<&str>) -> Vec<Check> {
+    let mut out = Vec::new();
+    let line = |name, ok, detail: String| Check { name, ok, detail };
+
+    // 1. Is anything listening at all?
+    let up = health(port);
+    out.push(line(
+        "server is up",
+        up,
+        if up {
+            format!("127.0.0.1:{port} answered /health")
+        } else {
+            format!("nothing answered on 127.0.0.1:{port}")
+        },
+    ));
+    if !up {
+        return out;
+    }
+
+    // 2. The call an agent makes to discover the model name.
+    let models = get(port, "/v1/models", api_key);
+    let named = models
+        .as_deref()
+        .and_then(|b| b.split("\"id\":\"").nth(1))
+        .and_then(|r| r.split('"').next())
+        .map(|s| s.to_string());
+    out.push(match &named {
+        Some(n) => line("model list", true, format!("/v1/models offers {n}")),
+        None => line(
+            "model list",
+            false,
+            match &models {
+                Some(b) if b.contains("invalid api key") => {
+                    "refused: the API key is wrong".to_string()
+                }
+                Some(_) => "/v1/models answered, but named no model".to_string(),
+                None => "/v1/models did not answer".to_string(),
+            },
+        ),
+    });
+
+    // 3. The one that matters: a real completion, with the key if there is one.
+    let mut got = String::new();
+    let mut failure = None;
+    chat(
+        port,
+        &[],
+        "Reply with the single word OK.",
+        8,
+        api_key,
+        &mut |e| match e {
+            Event::Token(t) => got.push_str(&t),
+            Event::Failed(m) => failure = Some(m),
+            Event::Done => {}
+        },
+    );
+    let ok = failure.is_none() && !got.trim().is_empty();
+    out.push(line(
+        "a real completion",
+        ok,
+        match (&failure, got.trim()) {
+            (Some(m), _) => format!("failed: {m}"),
+            (None, "") => "the model returned nothing".to_string(),
+            (None, t) => format!(
+                "the model replied {:?}",
+                t.chars().take(40).collect::<String>()
+            ),
+        },
+    ));
+    out
+}
+
+/// A GET, with the key when one is set. Returns the body.
+fn get(port: u16, path: &str, api_key: Option<&str>) -> Option<String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    let auth = match api_key {
+        Some(k) if !k.is_empty() => format!("Authorization: Bearer {k}\r\n"),
+        _ => String::new(),
+    };
+    // CRLF, not LF. Our own server is forgiving about it, but the request line
+    // and headers are specified as CRLF-terminated and this is the shape a
+    // report about compatibility should itself be sending.
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).ok()?;
+    let mut buf = String::new();
+    let _ = s.read_to_string(&mut buf);
+    Some(buf)
+}
+
 /// Send a prompt and hand each token to `on`, as it arrives.
 ///
 /// Blocking, and meant to be called on a worker thread: a 144 GB model takes
@@ -110,6 +216,8 @@ pub fn chat(
     history: &[(String, String)],
     prompt: &str,
     max_tokens: u32,
+    // The key the server was started with, if any.
+    api_key: Option<&str>,
     on: &mut dyn FnMut(Event),
 ) {
     let mut msgs = String::new();
@@ -149,8 +257,15 @@ pub fn chat(
             return;
         }
     };
+    // **The window's own chat sends the key too.** A key the app displays but
+    // does not use would make its own transcript the one client that cannot
+    // talk to the model it just started.
+    let auth = match api_key {
+        Some(k) if !k.is_empty() => format!("Authorization: Bearer {k}\r\n"),
+        _ => String::new(),
+    };
     let head = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     if w.write_all(head.as_bytes()).is_err() || w.write_all(body.as_bytes()).is_err() {

@@ -435,6 +435,12 @@ fn the_fit_verdict_uses_the_resident_requirement() {
     let mut streams = None;
     let mut too_big = None;
     for o in catalog::offers() {
+        // A container the engine cannot run reports that instead of its fit,
+        // which is the right precedence and would otherwise fail this test for
+        // the wrong reason.
+        if o.unsupported.is_some() {
+            continue;
+        }
         let row = catalog::row(&o, sixteen_gb);
         if o.bytes > sixteen_gb && o.always_read < sixteen_gb {
             streams = Some(row.clone());
@@ -528,5 +534,62 @@ fn every_setting_explains_itself() {
     assert!(
         unexplained.is_empty(),
         "these settings never say what empty means: {unexplained:?}"
+    );
+}
+
+/// **A model the engine cannot run must be refused before a server starts.**
+///
+/// Without this the app spawned `chaos-serve`, the server refused the container
+/// and exited, and the window went on showing a green dot and an endpoint — so
+/// the next message came back "connection actively refused", which reads as a
+/// networking fault rather than as "this model does not work".
+#[test]
+fn an_unrunnable_architecture_is_refused_before_a_server_is_started() {
+    let src = main_rs();
+    let body = function_body(&src, "fn load_model()");
+    let guard = body
+        .find("why_not_runnable")
+        .expect("load_model does not check whether the architecture can run");
+    let spawn = body
+        .find("cmd.spawn()")
+        .expect("load_model no longer spawns a server");
+    assert!(
+        guard < spawn,
+        "the architecture is checked after the server is started, which is no \
+         check at all"
+    );
+    assert!(
+        body.contains("architecture_of"),
+        "the architecture is not read from the container; a filename saying \
+         Qwen3.6 does not tell you the header says qwen35"
+    );
+}
+
+/// A child that has exited is not a running model. The window used to keep the
+/// dot and the endpoint after `chaos-serve` died.
+#[test]
+fn a_dead_server_stops_being_reported_as_running() {
+    let src = main_rs();
+    assert!(
+        src.contains("try_wait()"),
+        "nothing ever notices that the engine process has exited"
+    );
+    let tick = function_body(&src, "WM_TIMER =>");
+    assert!(
+        tick.contains("try_wait()"),
+        "the check for a dead child is not on the timer, so it only happens \
+         when something else already went wrong"
+    );
+}
+
+/// **The window must clip its children.** The timer repaints once a second for
+/// the uptime and the download bar; without clipping, every child control
+/// repaints with it and the whole window flashes continuously.
+#[test]
+fn the_window_clips_its_children_so_it_does_not_flicker() {
+    assert!(
+        main_rs().contains("WS_CLIPCHILDREN"),
+        "the main window does not clip its children, so every timer tick \
+         repaints the transcript, the list and every box"
     );
 }
