@@ -226,6 +226,7 @@ Please send that file -- it says exactly what went wrong.",
                 std::mem::size_of::<i32>() as u32,
             );
 
+            set_window_icon(hwnd, hinst);
             build_controls(hwnd, hinst, black);
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
@@ -1164,6 +1165,28 @@ Please send that file -- it says exactly what went wrong.",
             )
         };
         TextOutW(di.hDC, x, y, w.as_ptr(), w.len() as i32);
+    }
+
+    /// Put the embedded icon on the window itself.
+    ///
+    /// The resource compiled into the executable is what Explorer shows for the
+    /// *file*. The title bar, the taskbar button and the Alt-Tab strip read the
+    /// *window's* icon, which is unset until something sends `WM_SETICON` --
+    /// which is why an executable can have a perfectly good icon in Explorer and
+    /// still show a blank page while it is running.
+    ///
+    /// Both sizes: small is the title bar, big is the taskbar. Resource id 1,
+    /// matching what `build.rs` writes into the `.rc`.
+    unsafe fn set_window_icon(hwnd: HWND, hinst: HINSTANCE) {
+        let id = 1u16 as *const u16;
+        let big = LoadImageW(hinst, id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+        if !big.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, big as LPARAM);
+        }
+        let small = LoadImageW(hinst, id, IMAGE_ICON, 16, 16, LR_SHARED);
+        if !small.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small as LPARAM);
+        }
     }
 
     unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {

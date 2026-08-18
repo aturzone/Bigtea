@@ -69,6 +69,50 @@ pub fn path_without(existing: &str, dir: &str) -> String {
         .join(";")
 }
 
+/// What is already installed at `prefix`, if anything.
+///
+/// Read from the manifest the last install wrote plus the recorded version, so
+/// an upgrade can say what it is replacing rather than silently overwriting.
+pub struct Existing {
+    pub version: Option<String>,
+    pub files: usize,
+}
+
+pub fn existing_install(prefix: &Path) -> Option<Existing> {
+    let bin = bin_dir(prefix);
+    if !bin.exists() {
+        return None;
+    }
+    let files = std::fs::read_dir(&bin).map(|d| d.count()).unwrap_or(0);
+    if files == 0 {
+        return None;
+    }
+    Some(Existing {
+        version: std::fs::read_to_string(version_path(prefix))
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        files,
+    })
+}
+
+/// Where the installed version is recorded, so an upgrade can name it.
+pub fn version_path(prefix: &Path) -> PathBuf {
+    prefix.join("version.txt")
+}
+
+/// How an upgrade should describe itself.
+pub fn upgrade_line(before: Option<&Existing>, to: &str) -> String {
+    match before {
+        None => format!("Installing Chaos {to}."),
+        Some(e) => match &e.version {
+            Some(v) if v == to => format!("Reinstalling Chaos {to} over the same version."),
+            Some(v) => format!("Upgrading Chaos {v} -> {to}."),
+            None => format!("Upgrading an older install ({} files) to {to}.", e.files),
+        },
+    }
+}
+
 /// Which of the previously installed names this version no longer ships.
 pub fn stale(previous: &[String], incoming: &[String]) -> Vec<String> {
     previous
@@ -119,6 +163,52 @@ mod tests {
     fn nothing_is_stale_when_nothing_was_dropped() {
         let v = vec!["a.exe".to_string()];
         assert!(stale(&v, &v).is_empty());
+    }
+
+    #[test]
+    fn an_upgrade_says_what_it_replaces() {
+        let from = Existing {
+            version: Some("0.0.4".into()),
+            files: 17,
+        };
+        assert_eq!(
+            upgrade_line(Some(&from), "0.0.6"),
+            "Upgrading Chaos 0.0.4 -> 0.0.6."
+        );
+    }
+
+    #[test]
+    fn a_fresh_install_does_not_claim_to_upgrade() {
+        assert_eq!(upgrade_line(None, "0.0.6"), "Installing Chaos 0.0.6.");
+    }
+
+    /// Re-running the same installer is a legitimate thing to do -- repairing a
+    /// broken install -- and should not be described as an upgrade.
+    #[test]
+    fn the_same_version_is_a_reinstall() {
+        let same = Existing {
+            version: Some("0.0.6".into()),
+            files: 17,
+        };
+        assert!(upgrade_line(Some(&same), "0.0.6").contains("Reinstalling"));
+    }
+
+    /// Installs from before the version file existed still have to be handled.
+    #[test]
+    fn an_unversioned_install_is_still_an_upgrade() {
+        let old = Existing {
+            version: None,
+            files: 12,
+        };
+        let line = upgrade_line(Some(&old), "0.0.6");
+        assert!(line.contains("older install"), "{line}");
+        assert!(line.contains("12 files"), "{line}");
+    }
+
+    #[test]
+    fn the_version_file_sits_beside_the_manifest() {
+        let p = Path::new("X:/prefix");
+        assert_eq!(version_path(p).parent(), manifest_path(p).parent());
     }
 
     /// Models must never live inside the prefix, or uninstalling could delete

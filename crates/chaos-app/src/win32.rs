@@ -191,6 +191,16 @@ pub const DIB_RGB_COLORS: u32 = 0;
 pub const BI_RGB: u32 = 0;
 pub const TRANSPARENT: i32 = 1;
 
+/// `WM_SETICON`, and the two sizes it takes: the small one is the title bar and
+/// the Alt-Tab strip, the big one is the taskbar. Setting only one leaves the
+/// other as the default blank page.
+pub const WM_SETICON: u32 = 0x0080;
+pub const ICON_SMALL: WPARAM = 0;
+pub const ICON_BIG: WPARAM = 1;
+pub const IMAGE_ICON: u32 = 1;
+pub const LR_DEFAULTSIZE: u32 = 0x0000_0040;
+pub const LR_SHARED: u32 = 0x0000_8000;
+
 pub const MB_ICONERROR: u32 = 0x0000_0010;
 pub const MB_OK: u32 = 0x0000_0000;
 pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
@@ -252,6 +262,15 @@ extern "system" {
     /// Used only by the panic hook: with `panic = "abort"` and no console,
     /// a message box is the one place a crash can still say something.
     pub fn MessageBoxW(hWnd: HWND, text: *const u16, caption: *const u16, uType: u32) -> i32;
+    pub fn LoadIconW(hInstance: HINSTANCE, lpIconName: *const u16) -> HICON;
+    pub fn LoadImageW(
+        hInst: HINSTANCE,
+        name: *const u16,
+        ty: u32,
+        cx: i32,
+        cy: i32,
+        fuLoad: u32,
+    ) -> *mut c_void;
 }
 
 #[link(name = "gdi32")]

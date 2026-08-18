@@ -91,7 +91,7 @@ mod setup {
     const ID_UNINSTALL: i32 = 203;
 
     const W: i32 = 720;
-    const H: i32 = 460;
+    const H: i32 = 560;
     const PAD: i32 = 22;
     const LOGO_PX: i32 = 72;
 
@@ -170,6 +170,7 @@ mod setup {
                 std::mem::size_of::<i32>() as u32,
             );
 
+            set_window_icon(hwnd, hinst);
             let font = CreateFontW(
                 -15,
                 0,
@@ -340,6 +341,9 @@ mod setup {
         }
         let prefix = prefix.to_path_buf();
         let bin = bin_dir(&prefix);
+        // Read before a byte is written: afterwards it describes this install
+        // rather than the one being replaced.
+        let before = existing_install(&prefix);
         if let Err(e) = std::fs::create_dir_all(&bin) {
             return (false, format!("cannot create {}: {e}", bin.display()));
         }
@@ -375,18 +379,32 @@ mod setup {
             }
         }
         let _ = std::fs::write(manifest_path(&prefix), incoming.join("\n"));
+        // Recorded so the NEXT installer can say what it is replacing.
+        let _ = std::fs::write(version_path(&prefix), env!("CARGO_PKG_VERSION"));
 
         add_to_path(&bin.to_string_lossy());
         make_shortcut(&bin);
         register_uninstall(&prefix);
 
+        let head = upgrade_line(before.as_ref(), env!("CARGO_PKG_VERSION"));
+        let nl = char::from(10);
         (
             true,
-            format!(
-                "installed {} files. Open a new terminal, or find Chaos in the Start Menu. Models: {}",
-                payload::FILES.len(),
-                models.display()
-            ),
+            [
+                head,
+                String::new(),
+                format!("{} files installed to", payload::FILES.len()),
+                format!("  {}", bin.display()),
+                String::new(),
+                "Models folder".to_string(),
+                format!("  {}", models.display()),
+                String::new(),
+                "Added to your PATH, with a Start Menu entry.".to_string(),
+                "Open a NEW terminal for the PATH change to apply.".to_string(),
+                String::new(),
+                "Next: run chaos-app for the window, or chaos-pull --list for models.".to_string(),
+            ]
+            .join(&nl.to_string()),
         )
     }
 
@@ -504,10 +522,23 @@ mod setup {
                 ),
             );
         }
-        (
-            true,
-            "uninstalled. Your models were left where they are.".into(),
-        )
+        (true, {
+            let nl = char::from(10).to_string();
+            [
+                "Chaos has been removed.".to_string(),
+                String::new(),
+                "Deleted".to_string(),
+                format!("  {}", bin.display()),
+                "Also removed: the PATH entry, the Start Menu shortcut and the".to_string(),
+                "Add/Remove Programs entry.".to_string(),
+                String::new(),
+                "KEPT, on purpose".to_string(),
+                format!("  {}", default_models_dir().display()),
+                "Your downloaded models are untouched. Delete that folder".to_string(),
+                "yourself if you want the space back.".to_string(),
+            ]
+            .join(&nl)
+        })
     }
 
     // -- registry ------------------------------------------------------------
@@ -693,7 +724,14 @@ mod setup {
             t(PAD, PAD * 2 + LOGO_PX + 18, "Install to:");
 
             SelectObject(hdc, s.mono as HGDIOBJ);
-            t(PAD, H - 168, &s.status);
+            // The status is now a report, not a sentence, so it is drawn line
+            // by line. A single TextOutW stops at the first newline and the
+            // rest of the message is simply invisible.
+            let mut y = PAD * 3 + LOGO_PX + 60;
+            for line in s.status.split(char::from(10)) {
+                t(PAD, y, line);
+                y += 18;
+            }
             if s.done {
                 t(
                     PAD,
@@ -758,6 +796,28 @@ mod setup {
             w.as_ptr(),
             w.len() as i32,
         );
+    }
+
+    /// Put the embedded icon on the window itself.
+    ///
+    /// The resource compiled into the executable is what Explorer shows for the
+    /// *file*. The title bar, the taskbar button and the Alt-Tab strip read the
+    /// *window's* icon, which is unset until something sends `WM_SETICON` --
+    /// which is why an executable can have a perfectly good icon in Explorer and
+    /// still show a blank page while it is running.
+    ///
+    /// Both sizes: small is the title bar, big is the taskbar. Resource id 1,
+    /// matching what `build.rs` writes into the `.rc`.
+    unsafe fn set_window_icon(hwnd: HWND, hinst: HINSTANCE) {
+        let id = 1u16 as *const u16;
+        let big = LoadImageW(hinst, id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+        if !big.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, big as LPARAM);
+        }
+        let small = LoadImageW(hinst, id, IMAGE_ICON, 16, 16, LR_SHARED);
+        if !small.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small as LPARAM);
+        }
     }
 
     unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
