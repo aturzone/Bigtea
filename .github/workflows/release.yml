@@ -216,16 +216,28 @@ jobs:
       # that cannot be verified by building it. Silent mode exists so this can
       # run at all: a windows-subsystem binary has no console, and CI has nobody
       # to press a button.
+      # The setup .exe is what most people will download, and the one artefact
+      # that cannot be verified by building it. Silent mode exists so this can
+      # run at all: a windows-subsystem binary has no console, and CI has nobody
+      # to press a button.
+      #
+      # **`& $setup /S` does NOT wait.** A window-subsystem executable detaches
+      # from the shell that started it, so control returns immediately,
+      # `$LASTEXITCODE` is empty, and `$LASTEXITCODE -ne 0` is TRUE because
+      # `$null -ne 0`. The first version of this step failed the release that
+      # way while the installer itself was fine -- it had simply not been given
+      # time to start. Every scripted call needs `Start-Process -Wait`, which is
+      # how NSIS and every other GUI installer behaves too.
       - name: The setup .exe installs, runs and uninstalls (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $setup = Join-Path $PWD 'target/release/chaos-setup.exe'
           $prefix = Join-Path $env:RUNNER_TEMP 'chaos-setup-test'
-          & $setup /S --prefix $prefix
-          if ($LASTEXITCODE -ne 0) {
+          $p = Start-Process -FilePath $setup -ArgumentList '/S', '--prefix', $prefix -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
             Get-Content (Join-Path $prefix 'setup.log') -ErrorAction SilentlyContinue
-            throw "chaos-setup /S exited $LASTEXITCODE"
+            throw "chaos-setup /S exited $($p.ExitCode)"
           }
           $exe = Join-Path $prefix 'bin/chaos-run.exe'
           if (-not (Test-Path $exe)) { throw "chaos-run.exe missing after install" }
@@ -236,7 +248,8 @@ jobs:
           # reach them. A wrong answer here deletes someone's 155 GB download.
           $models = Join-Path $env:USERPROFILE '.chaos/models'
           if (-not (Test-Path $models)) { throw "the models directory was not created" }
-          & $setup /S --uninstall --prefix $prefix
+          $u = Start-Process -FilePath $setup -ArgumentList '/S', '--uninstall', '--prefix', $prefix -Wait -PassThru
+          if ($u.ExitCode -ne 0) { throw "uninstall exited $($u.ExitCode)" }
           if (Test-Path (Join-Path $prefix 'bin')) { throw "uninstall left bin behind" }
           if (-not (Test-Path $models)) { throw "UNINSTALL DELETED THE MODELS DIRECTORY" }
           Write-Host 'setup: install / run / uninstall clean, models untouched'

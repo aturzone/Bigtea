@@ -31,6 +31,15 @@ fn main() {
     // Silent mode, the convention every Windows installer follows -- and the
     // only way this can be exercised by CI, which has no one to press a button.
     // `/S` installs, `/S /uninstall` removes, both without a window.
+    //
+    // **A caller must WAIT for this process.** The binary is built for the
+    // window subsystem, so a shell that starts it gets control back immediately
+    // and sees no exit code at all -- in PowerShell `$LASTEXITCODE` is left
+    // empty, and the natural `if ($LASTEXITCODE -ne 0) { throw }` fires because
+    // `$null -ne 0`. That failed a release once while the installer was working
+    // perfectly; it simply had not been given time to start. Use
+    // `Start-Process -Wait -PassThru` and read `.ExitCode`, or `cmd /c start
+    // /wait`. NSIS and every other GUI installer behave the same way.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let silent = args
         .iter()
