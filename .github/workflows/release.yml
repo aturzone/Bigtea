@@ -229,15 +229,23 @@ jobs:
         shell: bash
         run: |
           deb=$(ls chaos_*_amd64.deb)
-          dpkg-deb --info "$deb" | sed -n '1,20p'
-          dpkg-deb --contents "$deb" | grep -q 'usr/lib/chaos/chaos-run'             || { echo "::error::the .deb has no chaos-run"; exit 1; }
+          dpkg-deb --info "$deb"
+          # **Not a pipe into `grep -q`.** Actions runs steps with
+          # `set -eo pipefail`, and `grep -q` exits the moment it matches, so
+          # `dpkg-deb` takes SIGPIPE and the pipeline reports failure *because
+          # the check succeeded*. That is what failed the first v0.0.7 build.
+          dpkg-deb --contents "$deb" > deb-contents.txt
+          grep -q 'usr/lib/chaos/chaos-run' deb-contents.txt             || { echo "::error::the .deb has no chaos-run"; sed -n '1,40p' deb-contents.txt; exit 1; }
           # Install it for real and run the result off PATH.
           sudo dpkg -i "$deb"
           command -v chaos-run >/dev/null || { echo "::error::chaos-run is not on PATH after install"; exit 1; }
           chaos-run --version || chaos-probe --quick >/dev/null || true
           sudo dpkg -r chaos
-          if [ -x "$(ls Chaos-*-x86_64.AppImage 2>/dev/null | head -1)" ]; then
-            img=$(ls Chaos-*-x86_64.AppImage | head -1)
+          # Same hazard: `ls` of a missing glob is non-zero, and under
+          # `pipefail` that fails the step rather than skipping the check.
+          img=""
+          for f in Chaos-*-x86_64.AppImage; do [ -e "$f" ] && img="$f" && break; done
+          if [ -n "$img" ]; then
             # --appimage-extract avoids needing FUSE on the runner.
             ./"$img" --appimage-extract >/dev/null
             ./squashfs-root/AppRun chaos-probe --quick >/dev/null               || { echo "::error::the AppImage cannot run chaos-probe"; exit 1; }
