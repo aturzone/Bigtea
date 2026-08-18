@@ -353,3 +353,26 @@ compiling**, and three of these were believed fixed before a pixel was measured.
   substitutes silently, so a display serif chosen for a wordmark quietly becomes
   the UI font. Select it into a DC and ask `GetTextFaceW` what actually came
   back; `first_available_face` does this.
+
+## Models on disk
+
+- **`CHAOS_MODELS` overrides the models directory, and an inherited one is
+  invisible.** A session exported it to a scratchpad under `%TEMP%`, and every
+  process launched from that shell — the app, the server, `chaos-pull` — used it
+  silently. A 16.8 GB download landed in a temp folder that gets cleaned, and
+  the app's INSTALLED list showed a model nobody remembered fetching. Check
+  `env | grep CHAOS` before believing where anything is, and unset it in any
+  script that downloads.
+- **Download progress is the bytes on disk, not the downloader's output.**
+  `chaos-pull` resumes with `curl -C -` straight into the final filename, so the
+  file size *is* the progress. That survives the child having no console, being
+  restarted, or changing its output format — none of which parsing stdout does.
+  Count the rate over *this run only*, or a resumed 155 GB container reports an
+  absurd rate in its first second.
+- **`qwen35` and `qwen35moe` are hybrid architectures**, grouped in llama.cpp
+  with `QWEN3NEXT`, `KIMI_LINEAR` and `JAMBA` — `llm_arch_is_hybrid` returns
+  true, and `llm_arch_supports_rs_rollback` returns true only for these two.
+  They carry recurrent state alongside attention, plus multi-token prediction.
+  The IMROPE rope mode that first flagged them is the small part. Running
+  Qwen 3.5/3.6 is a hybrid-attention port, not a rope fix, and no amount of
+  re-downloading changes that.
