@@ -780,3 +780,65 @@ pub unsafe fn set_control_theme(hwnd: HWND, dark: bool) {
         SetWindowTheme(hwnd, name.as_ptr(), std::ptr::null());
     }
 }
+
+// -- picking a face that actually exists -------------------------------------
+
+#[link(name = "gdi32")]
+extern "system" {
+    /// The face GDI *actually* selected, which is not always the one asked for.
+    pub fn GetTextFaceW(hdc: HDC, c: i32, name: *mut u16) -> i32;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    /// A device context to measure against before there is anything to paint.
+    /// Must be released, not deleted -- `DeleteDC` is for the ones *we* create.
+    pub fn GetDC(hWnd: HWND) -> HDC;
+    pub fn ReleaseDC(hWnd: HWND, hDC: HDC) -> i32;
+}
+
+/// The first of `wanted` that is installed, or `None`.
+///
+/// **`CreateFontW` never fails.** Ask for a face that is not installed and GDI
+/// silently substitutes something else, so a display serif chosen for a wordmark
+/// can quietly become the default UI font and nothing says so. The only way to
+/// find out is to select the font into a DC and ask what came back.
+///
+/// # Safety
+/// `hdc` must be a live device context; the font is selected into it and
+/// restored before returning.
+pub unsafe fn first_available_face(hdc: HDC, wanted: &[&str]) -> Option<String> {
+    for name in wanted {
+        let f = CreateFontW(
+            -20,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            5,
+            0,
+            wide(name).as_ptr(),
+        );
+        if f.is_null() {
+            continue;
+        }
+        let old = SelectObject(hdc, f as HGDIOBJ);
+        let mut buf = [0u16; 64];
+        let n = GetTextFaceW(hdc, buf.len() as i32, buf.as_mut_ptr());
+        SelectObject(hdc, old);
+        DeleteObject(f as HGDIOBJ);
+        if n > 0 {
+            let got = String::from_utf16_lossy(&buf[..(n as usize).saturating_sub(1)]);
+            if got.eq_ignore_ascii_case(name) {
+                return Some(got);
+            }
+        }
+    }
+    None
+}

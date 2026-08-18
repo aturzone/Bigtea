@@ -15,6 +15,9 @@
 // The generated luminance bitmap: `LOGO_W`, `LOGO_H`, `LOGO`.
 include!("../../chaos-arch/src/logo_bitmap.rs");
 
+// The GUI master: `HI_W`, `HI_H`, `HI` -- ink coverage at 256x256.
+include!("logo_hi.rs");
+
 /// Threshold the luminance ramp to pure black and white.
 ///
 /// The rasteriser antialiases, which is right for a terminal printing shaded
@@ -27,6 +30,41 @@ pub fn logo_mono() -> Vec<bool> {
 
 pub fn logo_size() -> (usize, usize) {
     (LOGO_W, LOGO_H)
+}
+
+/// The mark at `n` pixels square, as ink coverage.
+///
+/// **This is why the logo stopped looking like a blob.** The window used to
+/// draw the 56x56 terminal bitmap, thresholded to one bit and stretched by
+/// `StretchDIBits` to 30 pixels -- a nearest-neighbour scale of an already
+/// aliased source. Here a 256x256 antialiased master is box-filtered to the
+/// exact size wanted, so every output pixel averages at least a 4x4 footprint
+/// and the rays survive.
+///
+/// Returns coverage, not colour: 0 is paper, 255 is full ink. The caller blends
+/// its own foreground through it, which is how the same mark works on a light
+/// page and a dark one without a second asset.
+pub fn logo_scaled(n: usize) -> Vec<u8> {
+    let n = n.max(1);
+    let mut out = vec![0u8; n * n];
+    for y in 0..n {
+        let y0 = y * HI_H / n;
+        let y1 = (((y + 1) * HI_H) / n).max(y0 + 1).min(HI_H);
+        for x in 0..n {
+            let x0 = x * HI_W / n;
+            let x1 = (((x + 1) * HI_W) / n).max(x0 + 1).min(HI_W);
+            let mut sum = 0u32;
+            let mut count = 0u32;
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    sum += u32::from(HI[sy * HI_W + sx]);
+                    count += 1;
+                }
+            }
+            out[y * n + x] = (sum / count.max(1)) as u8;
+        }
+    }
+    out
 }
 
 /// A stroke in a glyph, in a 0..1 square, to be scaled at paint time.
@@ -87,6 +125,47 @@ mod tests {
     }
 
     /// Strokes stay inside the unit square, or they paint over their neighbours.
+    /// The high-resolution master must actually be high resolution, and must
+    /// carry the mid-tones that thresholding destroys.
+    #[test]
+    fn the_gui_master_is_antialiased() {
+        assert_eq!(HI.len(), HI_W * HI_H);
+        assert!(HI_W >= 256, "the GUI master is only {HI_W}px");
+        let mid = HI.iter().filter(|&&v| (24..232).contains(&v)).count();
+        assert!(
+            mid > HI.len() / 200,
+            "only {mid} pixels are partial ink; this master has been              thresholded and will look like the 56px one did"
+        );
+    }
+
+    /// Scaling must preserve the mark: ink at the size the window draws it.
+    #[test]
+    fn the_mark_survives_being_scaled_down() {
+        for n in [16, 24, 30, 32, 48, 64] {
+            let m = logo_scaled(n);
+            assert_eq!(m.len(), n * n);
+            let ink: u32 = m.iter().map(|&v| u32::from(v)).sum();
+            let mean = ink / (n * n) as u32;
+            assert!(
+                (8..200).contains(&mean),
+                "at {n}px the mark averages {mean}/255 -- it has become a                  blank square or a solid block"
+            );
+            // A box filter over an antialiased master has to produce greys; if
+            // it does not, something has thresholded on the way through.
+            let partial = m.iter().filter(|&&v| (24..232).contains(&v)).count();
+            assert!(
+                partial > 0,
+                "at {n}px every pixel is pure ink or pure paper"
+            );
+        }
+    }
+
+    /// A size of zero must not panic; the rail computes it from window metrics.
+    #[test]
+    fn a_degenerate_size_is_survivable() {
+        assert_eq!(logo_scaled(0).len(), 1);
+    }
+
     #[test]
     fn glyphs_are_inside_their_box() {
         for (name, set) in [

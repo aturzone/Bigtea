@@ -50,7 +50,14 @@ def load_rasteriser():
 
 
 def png_bytes(grid):
-    """A truecolour PNG in memory. Same encoder shape as the README image."""
+    """An **RGBA** PNG in memory -- colour type 6, not 2.
+
+    The alpha channel is the whole point of the rounded corner. A truecolour
+    PNG has nowhere to say "not the icon", so the corners have to be filled with
+    something, and whatever is chosen shows as a square: a white fill made the
+    icon a white tile and the rounding invisible. Windows reads the alpha in a
+    PNG-compressed ICO entry directly.
+    """
     h = len(grid)
     w = len(grid[0])
     raw = b"".join(bytes([0]) + bytes(c for px in row for c in px) for row in grid)
@@ -61,7 +68,7 @@ def png_bytes(grid):
 
     out = io.BytesIO()
     out.write(bytes([137, 80, 78, 71, 13, 10, 26, 10]))
-    out.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)))
+    out.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)))
     out.write(chunk(b"IDAT", zlib.compress(raw, 9)))
     out.write(chunk(b"IEND", b""))
     return out.getvalue()
@@ -88,6 +95,49 @@ def build(path, render):
     return len(images), offset
 
 
+# The tile the mark sits on.
+#
+# Hermes' own `BrandMark` is "the mark on a tile, softly rounded, identical in
+# light and dark", and Atur asked for a curved square -- a bare mark on
+# transparency reads as a smudge on a light taskbar and on a dark one.
+#
+# **The blue is the ground, not the mark.** That was Atur's correction: `#0000F2`
+# is what Hermes puts *behind* a wordmark, so here it is the tile and the mark is
+# knocked out of it in white. The art in the SVG is black on white, so it is
+# inverted on the way in.
+TILE = (0x00, 0x00, 0xF2)
+MARK = (255, 255, 255)
+INK_INSET = 0.16  # the mark occupies the middle 68% of the tile
+RADIUS_FRAC = 0.22  # corner radius as a fraction of the side; iOS-ish, not a circle
+
+
+def rounded_mask(px, ss=4):
+    """Coverage of a rounded square, 0..1 per pixel, supersampled.
+
+    Antialiased by counting subsamples: a hard-edged corner at 16 px is a
+    staircase, and the icon is seen at 16 px more often than at any other size.
+    """
+    r = RADIUS_FRAC * px
+    mask = []
+    for y in range(px):
+        row = []
+        for x in range(px):
+            hits = 0
+            for sy in range(ss):
+                for sx in range(ss):
+                    fx = x + (sx + 0.5) / ss
+                    fy = y + (sy + 0.5) / ss
+                    # Distance into the nearest corner's circle, or inside the
+                    # straight edges.
+                    cx = min(max(fx, r), px - r)
+                    cy = min(max(fy, r), px - r)
+                    if (fx - cx) ** 2 + (fy - cy) ** 2 <= r * r:
+                        hits += 1
+            row.append(hits / (ss * ss))
+        mask.append(row)
+    return mask
+
+
 def main():
     ns = load_rasteriser()
     paths = ns["parse_paths"](ns["SVG"].read_text(encoding="utf-8"))
@@ -95,12 +145,36 @@ def main():
     rasterise = ns["rasterise"]
 
     def render(px):
-        # Supersample 3x and box down, as the README image does -- an icon is
-        # small enough that aliasing on these thin rays is the whole difference
-        # between a mark and a smudge.
-        return rasterise(
-            paths, px, px, px * 3, px * 3, px * 3 / side, px * 3 / side, ss=3, origin=(bx, by)
+        # The mark, rendered smaller than the tile so it has margin, then
+        # composited onto a rounded white square.
+        inner = max(1, int(round(px * (1 - 2 * INK_INSET))))
+        art = rasterise(
+            paths, inner, inner, inner * 3, inner * 3,
+            inner * 3 / side, inner * 3 / side, ss=3, origin=(bx, by),
         )
+        mask = rounded_mask(px)
+        off = (px - inner) // 2
+        grid = []
+        for y in range(px):
+            row = []
+            for x in range(px):
+                iy, ix = y - off, x - off
+                if 0 <= iy < inner and 0 <= ix < inner:
+                    r, g, b = art[iy][ix]
+                    # Ink coverage: the source is black on white, and the mark
+                    # is drawn in white on the tile, so it inverts here.
+                    ink = 1.0 - (r * 299 + g * 587 + b * 114) / 1000.0 / 255.0
+                else:
+                    ink = 0.0
+                colour = tuple(
+                    int(TILE[c] + (MARK[c] - TILE[c]) * ink) for c in range(3)
+                )
+                # Alpha is the rounded square: outside it the icon is simply not
+                # there, which is what makes the corner a curve rather than a
+                # differently-coloured square.
+                row.append(colour + (int(round(mask[y][x] * 255)),))
+            grid.append(row)
+        return grid
 
     out = ROOT / "assets" / "chaos.ico"
     n, size = build(out, render)

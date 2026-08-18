@@ -170,6 +170,59 @@ pub const DARK: Theme = Theme {
     yellow: rgb(0xD6, 0xA5, 0x5E),
 };
 
+/// The installer's palette: Hermes' own setup, which is a different surface
+/// from its desktop and looks it.
+///
+/// Read out of `apps/bootstrap-installer/src/styles.css`: a navy ground
+/// (`--theme-background-seed: #0d2f86`), cream type (`--theme-foreground:
+/// #ffe6cb`), and a card a shade lighter than the ground. **The accent here is
+/// the cream, not the brand blue** -- `#0000F2` on `#0d2f86` is 1.1:1 and
+/// invisible, which is the whole reason Hermes puts its wordmark in cream and
+/// the blue behind it.
+pub const SETUP: Theme = Theme {
+    mode: Mode::Dark,
+    bg: rgb(0x0D, 0x2F, 0x86),
+    chrome: rgb(0x09, 0x28, 0x6F),
+    soft: rgb(0x12, 0x37, 0x8F),
+    soft_active: rgb(0x1B, 0x45, 0xA4),
+
+    fg: rgb(0xFF, 0xE6, 0xCB),
+    // Cream mixed toward the navy ground, rather than an unrelated grey.
+    fg_secondary: rgb(0xC8, 0xB6, 0xAE),
+    fg_tertiary: rgb(0x93, 0x8E, 0x9C),
+    on_accent: rgb(0x0D, 0x2F, 0x86),
+
+    accent: rgb(0xFF, 0xE6, 0xCB),
+    accent_text: rgb(0xFF, 0xE6, 0xCB),
+    accent_soft: rgb(0x1B, 0x45, 0xA4),
+
+    stroke_1: rgb(0x8A, 0x8C, 0xB4),
+    stroke_2: rgb(0x5A, 0x67, 0xA4),
+    stroke_3: rgb(0x30, 0x4A, 0x95),
+    stroke_4: rgb(0x1B, 0x3C, 0x8C),
+
+    green: rgb(0x7A, 0xD1, 0xA8),
+    red: rgb(0xE8, 0x8A, 0x7E),
+    yellow: rgb(0xF0, 0xC9, 0x7A),
+};
+
+/// Display faces for the installer wordmark, best first.
+///
+/// Hermes sets its wordmark in `Collapse`, which is Nous Research's own and not
+/// ours to redistribute. These are the high-contrast serifs Windows machines
+/// actually have; `win32::first_available_face` picks the first that is
+/// installed, because `CreateFontW` substitutes silently and would otherwise
+/// turn a display serif into the UI font with no indication.
+pub const FACE_DISPLAY: &[&str] = &[
+    "Bodoni MT",
+    "Playfair Display",
+    "Didot",
+    "Sitka Display",
+    "Constantia",
+    "Georgia",
+    "Times New Roman",
+];
+
 pub const fn theme(mode: Mode) -> Theme {
     match mode {
         Mode::Light => LIGHT,
@@ -389,6 +442,38 @@ mod tests {
                 w[1]
             );
         }
+    }
+
+    /// The installer's ground is the reason its accent is cream: the brand blue
+    /// on navy is unreadable, and a token table that let someone use it there
+    /// would produce an invisible wordmark.
+    #[test]
+    fn the_setup_palette_reads_on_its_navy() {
+        for (name, fg, bg) in [
+            ("fg on bg", SETUP.fg, SETUP.bg),
+            ("fg on soft", SETUP.fg, SETUP.soft),
+            ("secondary on bg", SETUP.fg_secondary, SETUP.bg),
+            ("on_accent on accent", SETUP.on_accent, SETUP.accent),
+        ] {
+            let c = contrast(fg, bg);
+            assert!(c >= 4.5, "setup: {name} is {c:.2}:1");
+        }
+        assert!(
+            contrast(LIGHT.accent, SETUP.bg) < 2.0,
+            "the brand blue has become readable on the installer ground; if so,              SETUP.accent no longer needs to be the cream"
+        );
+    }
+
+    /// A display face list that is empty, or that leads with something no
+    /// Windows machine has and ends there, gives a wordmark in the UI font.
+    #[test]
+    fn the_display_face_list_ends_somewhere_universal() {
+        assert!(!FACE_DISPLAY.is_empty());
+        assert_eq!(
+            *FACE_DISPLAY.last().unwrap(),
+            "Times New Roman",
+            "the fallback must be a face that ships with every Windows"
+        );
     }
 
     #[test]

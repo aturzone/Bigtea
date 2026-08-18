@@ -323,3 +323,33 @@ compiling**, and three of these were believed fixed before a pixel was measured.
 - **Do not do file I/O while painting.** Counting a model's shards in the
   detail panel meant a directory scan per repaint, and the transcript repaints
   on every token. Count it once, in the rescan.
+
+## The installer
+
+- **`Vec::as_ptr()` on an empty vector is a dangling pointer, and Windows will
+  dereference it.** `DrawTextW` with a zero-length buffer took the installer
+  down the instant its report reached a blank line: a stack-cookie failure
+  (`c0000409`), not an access violation, so it did not even look like a null
+  dereference. Guard every text call on `!is_empty()`.
+- **A panic inside `extern "system"` never reaches the panic hook.** Unwinding
+  out of a non-`C-unwind` function is undefined, so Rust aborts at the boundary
+  — the hook does not run, no log is written, and the window simply vanishes.
+  A `wndproc` is exactly such a function, so nothing that happens during
+  painting can report itself. The only way to find one is to log through it.
+- **The Windows Application event log is the last resort and it does help.**
+  `Get-EventLog -LogName Application` gave the fastfail code and the faulting
+  offset when there was no crash file at all, which is what said "Rust abort"
+  rather than "access violation" and ruled out half the candidates.
+- **An installer needs a log more than any other program here.** It runs once,
+  on a machine that is not yours, and the person running it cannot rerun it
+  under a debugger. `%TEMP%\chaos-setup.log` is written a line at a time,
+  opened and closed per line so an abort cannot lose a buffered write — and it
+  is what found the crash above in one run.
+- **Do the work on a worker, not in the message loop.** The old install ran
+  inside `WM_COMMAND`, so the window was frozen for its whole duration and said
+  nothing about what it was doing. Every step now reports before and after, and
+  the list shows which one is in flight.
+- **`CreateFontW` never fails.** Ask for a face that is not installed and GDI
+  substitutes silently, so a display serif chosen for a wordmark quietly becomes
+  the UI font. Select it into a DC and ask `GetTextFaceW` what actually came
+  back; `first_available_face` does this.

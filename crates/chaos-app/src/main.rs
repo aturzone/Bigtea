@@ -1511,13 +1511,21 @@ mod windows_app {
         SetBkMode(hdc, TRANSPARENT);
         let mut rc = r;
         let w: Vec<u16> = s.encode_utf16().collect();
-        DrawTextW(
-            hdc,
-            w.as_ptr(),
-            w.len() as i32,
-            &mut rc,
-            flags | DT_NOPREFIX,
-        );
+        // **Never hand Windows an empty Vec's pointer.** `Vec::as_ptr` on an
+        // empty vector returns a dangling (aligned but unallocated) address and
+        // `DrawTextW` dereferences it. That killed the installer outright the
+        // moment its report reached a blank line -- a stack-cookie failure with
+        // no panic message, because a fault inside an `extern "system"` call
+        // never reaches the panic hook. There is nothing to draw either way.
+        if !w.is_empty() {
+            DrawTextW(
+                hdc,
+                w.as_ptr(),
+                w.len() as i32,
+                &mut rc,
+                flags | DT_NOPREFIX,
+            );
+        }
         SelectObject(hdc, old);
     }
 
@@ -1754,31 +1762,36 @@ mod windows_app {
             t.stroke_3,
         );
 
-        // The mark: the logo drawn in the accent, and the wordmark beside it.
-        // The one brand moment, which is what Hermes reserves `BrandMark` for.
-        let (lw, lh) = art::logo_size();
-        let mono = art::logo_mono();
-        let mut px = vec![0u8; lw * lh * 4];
-        let chan = |c: Rgb, s: u32| ((c >> s) & 0xFF) as u8;
-        for y in 0..lh {
-            for x in 0..lw {
+        // The mark, box-filtered from the 256px master and blended in the
+        // theme's own foreground.
+        //
+        // **Not the accent.** Drawing it blue was a mistake: `#0000F2` is the
+        // brand's *ground* -- what Hermes puts behind its wordmark -- and the
+        // logo itself is black art. And not `StretchDIBits` over a 1-bit 56px
+        // bitmap either, which is what made it a blob at 30 pixels.
+        let box_px = 32usize;
+        let cov = art::logo_scaled(box_px);
+        let chan = |c: Rgb, shift: u32| ((c >> shift) & 0xFF) as i32;
+        let mut px = vec![0u8; box_px * box_px * 4];
+        for y in 0..box_px {
+            for x in 0..box_px {
                 // A DIB with a positive height is bottom-up, so the source row
                 // is mirrored here rather than the image being upside down.
-                let on = mono[(lh - 1 - y) * lw + x];
-                let c = if on { t.accent } else { t.chrome };
-                let i = (y * lw + x) * 4;
-                // A DIB is BGRA. `Rgb` is 0x00BBGGRR, so blue is the high byte
-                // of the colour and the low byte of the pixel.
-                px[i] = chan(c, 16);
-                px[i + 1] = chan(c, 8);
-                px[i + 2] = chan(c, 0);
+                let a = i32::from(cov[(box_px - 1 - y) * box_px + x]);
+                let i = (y * box_px + x) * 4;
+                // A DIB is BGRA; `Rgb` is 0x00BBGGRR, so blue is the colour's
+                // high byte and the pixel's low one.
+                for (o, shift) in [(0usize, 16u32), (1, 8), (2, 0)] {
+                    let (fg, bg) = (chan(t.fg, shift), chan(t.chrome, shift));
+                    px[i + o] = (bg + (fg - bg) * a / 255) as u8;
+                }
                 px[i + 3] = 0;
             }
         }
         let bmi = BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: lw as i32,
-            biHeight: lh as i32,
+            biWidth: box_px as i32,
+            biHeight: box_px as i32,
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB,
@@ -1788,7 +1801,8 @@ mod windows_app {
             biClrUsed: 0,
             biClrImportant: 0,
         };
-        let box_px = 30;
+        let box_px = box_px as i32;
+        // Blitted 1:1, because the filtering already happened at the right size.
         StretchDIBits(
             hdc,
             metric::INSET,
@@ -1797,8 +1811,8 @@ mod windows_app {
             box_px,
             0,
             0,
-            lw as i32,
-            lh as i32,
+            box_px,
+            box_px,
             px.as_ptr() as *const std::ffi::c_void,
             &bmi,
             DIB_RGB_COLORS,
