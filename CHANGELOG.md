@@ -29,6 +29,13 @@ on purpose, and a test enforces it — the failure mode is deleting a 155 GB
 download.
 
 Silent mode for scripting and CI: `/S`, `/S --uninstall`, `--prefix <dir>`.
+**Wait for it** — the installer is a window-subsystem binary, so a shell gets
+control back immediately and never sees an exit code:
+
+```powershell
+$p = Start-Process Chaos-0.0.4-Setup.exe -ArgumentList '/S' -Wait -PassThru
+$p.ExitCode
+```
 
 ### Added — Chaos as a window
 
