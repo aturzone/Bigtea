@@ -20,7 +20,7 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **583 tests** (50 binaries, 0 failed, 31 ignored — the V4-Flash set
+**Current**: **616 tests** (56 binaries, 0 failed, 31 ignored — the V4-Flash set
 needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
 clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
@@ -69,7 +69,45 @@ could not have done its job either: a pool collapsed onto one handle measures
 "unlucky". The plausibility bounds stay, the comparative claim lives in the
 research node where it was measured under control.
 
-**Current**: **583 tests**, 0 failed.
+**Current**: **616 tests**, 0 failed.
+
+## An installer, an app, and 13 models to fetch (2026-08-18)
+
+**`chaos-setup.exe` carries the whole project inside one file** -- 23.6 MB, 16
+files embedded at link time by `build.rs` from a staging directory. No archive
+to unpack, no PowerShell, no toolchain, no network, no administrator rights.
+Built without NSIS, WiX, Inno or MSI tooling, because every one of those would
+have to be installed on the build machine before a release could be cut, and a
+Windows install turns out to be a window, a file copy, a PATH entry, a shortcut
+and one registry key.
+
+Verified by running it, not by reading it: install writes 17 files, the
+**installed** `chaos-run` reports `0.0.3`, it registers in Add/Remove Programs,
+and uninstall removes bin, the PATH entry and the registry key. **The models
+directory survives**, because it lives outside the prefix on purpose -- a test
+pins that, since the alternative is deleting someone's 155 GB download.
+
+Silent mode (`/S`, `/S --uninstall`, `--prefix`) exists because a
+windows-subsystem binary has no console and CI has nobody to press a button.
+`release.yml` now stages the binaries, builds the installer, **checks it is not
+smaller than half its own payload** (an installer that embedded nothing still
+builds, still runs, and installs zero files), runs install/run/uninstall, and
+attaches `Chaos-<version>-Setup.exe` as its own asset beside the archive.
+
+**The catalogue went from 2 models to 13.** Every repo, filename stem and byte
+count was read from the Hugging Face tree API and verified to resolve before it
+was added -- a wrong stem is a download button that 404s, and this project's own
+rule is that nothing is citable until it has been run. All the new entries use
+architectures in `VERIFIED_ARCHITECTURES`: Qwen3 4B/8B/14B/32B, Gemma-3
+4B/12B/27B, Llama-3.2 1B/3B, Qwen2.5-Coder-7B, Phi-4.
+
+**Every dense entry sets `always_read_bytes` equal to `bytes`**, and ten tests
+enforce it. That is not padding: a dense container has no routed experts, so
+nothing streams and the whole file must fit. It is what makes the app say
+`qwen3-32b 19.8 GB needs 19.8 GB - too big` honestly on this laptop, while
+`v4flash 155 GB needs 7.92 GB - streams`.
+
+**616 tests** (was 575), clippy 0, fmt clean.
 
 ## 20 tok/s on V4-Flash is closed, with a number (2026-08-16)
 

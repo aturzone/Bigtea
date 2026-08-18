@@ -13,29 +13,36 @@
   <a href="https://github.com/aturzone/Chaos/releases"><img alt="version" src="https://img.shields.io/badge/version-0.0.3-orange"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue"></a>
   <a href="https://github.com/aturzone/Chaos/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aturzone/Chaos/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-583%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-616%20passing-brightgreen">
 </p>
 
 ---
 
 ## Start here
 
-**1. Install.** Download your platform's archive from
-[Releases](https://github.com/aturzone/Chaos/releases) and unpack it.
+**1. Install.**
 
-```powershell
-# Windows
-powershell -ExecutionPolicy Bypass -File .\install.ps1
-```
+**Windows** -- download **`Chaos-Setup.exe`** from
+[Releases](https://github.com/aturzone/Chaos/releases) and run it. One file with
+everything inside it: no archive to unpack, no PowerShell, no administrator
+rights. It installs per-user, puts Chaos on your PATH, and adds a Start Menu
+entry.
+
+**Linux / macOS** -- unpack the archive and copy the binaries:
 
 ```bash
-# Linux / macOS
 sudo install -m 755 chaos-*/chaos-* /usr/local/bin/ && mkdir -p ~/.chaos/models
 ```
 
-**2. Put a `.gguf` file in your models folder.** The installer creates it and
-tells you where; it is `~/.chaos/models` (`%USERPROFILE%\.chaos\models` on
-Windows). Chaos downloads nothing on its own.
+**2. Get a model.** Ask Chaos for one:
+
+```bash
+chaos-pull --list          # 13 models, with the size that actually matters
+chaos-pull qwen3-4b        # ~2.5 GB, a good first one
+```
+
+...or drop any `.gguf` into `~/.chaos/models` (`%USERPROFILE%\.chaos\models` on
+Windows). Nothing is downloaded unless you ask for it.
 
 **3. Run it.**
 
@@ -52,6 +59,19 @@ chaos-run qwen3 "write a haiku" -n 64 --auto   # --auto reads your machine and c
 chaos-probe                                    # what can this machine run, and what should you close?
 chaos-serve qwen3 --port 8080                  # then open http://127.0.0.1:8080
 ```
+
+**Or use the window.** `chaos-app` on Windows is a native application: pick a
+model, load it, chat, download more. Two colours, no dependencies, a real Win32
+window rather than a browser in a frame.
+
+```
+INSTALLED  AVAILABLE      v4flash UD-Q4_K_XL  155 GB [5 files]  needs 7.92 GB - streams
+                          qwen3-32b Q4_K_M    19.8 GB           needs 19.8 GB - too big
+```
+
+**Read the second column, not the first.** A 155 GB model streams on a 16 GB
+machine; a 20 GB dense one does not, because a dense container has no routed
+experts to leave on disk.
 
 **`chaos-serve` gives you a window as well as a socket.** Open its address in a
 browser and you get a chat interface; point a coding agent at
