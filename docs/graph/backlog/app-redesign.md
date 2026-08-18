@@ -1,6 +1,6 @@
 ---
 topic: the app's second design — navigation, per-model pages, monitoring
-status: proposed 2026-08-18, awaiting Atur
+status: built 2026-08-18 (steps 1-4), verified by screenshot
 links:
   - app-to-production.md
   - ../../APP.md
@@ -126,3 +126,31 @@ none of it needs to change.
    log.
 
 Step 1 is the one that changes how the app feels; steps 2-4 are then additive.
+
+## Built
+
+All four, plus a menu bar Atur asked for separately. What landed against what
+was proposed:
+
+- **`theme.rs`** — the palette as tokens, light and dark, from Hermes'
+  `styles.css` with Atur's `#0000F2` for its `#0053FD`. Contrast is asserted:
+  every text-on-ground pair clears WCAG AA 4.5:1, which is why `accent_text`
+  exists at all (the raw accent measures 2.11:1 on the dark ground).
+- **`nav.rs`** — the four destinations and, for every control, the one page it
+  belongs to. A test proves no control has two homes and that every setting in
+  the file has a row.
+- **`main.rs`** — rewritten window layer: menu bar, accelerators, rail, per-page
+  layout and painting, per-model pages, the persistent strip.
+- **`tests/ui_rules.rs`** — 17 checks, including the two rules that are
+  invisible at runtime: no Win32 call under a mutable borrow, and no colour
+  named outside `theme.rs`.
+
+**Not built, and why**: MONITOR still cannot show streamed bytes, expert read
+rate or cache residency. The engine measures all three and prints them to its
+log; nothing carries them over the socket. The page says so on its face rather
+than leaving a gap. That is the remaining work, and it is engine-side.
+
+**Measured negative**: the menu bar cannot be darkened. `SetPreferredAppMode`
+resolves and runs on this Windows build and changes nothing; the code was
+removed rather than shipped as a no-op. `reference/hard-won-facts.md` carries
+the detail.

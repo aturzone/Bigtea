@@ -1,15 +1,21 @@
 //! Chaos, as a window.
 //!
-//! A real Win32 application: `RegisterClassW`, a message loop, native controls,
-//! GDI painting. No browser, no webview, no HTML, and no GUI dependency -- the
-//! whole surface it uses is declared in `win32.rs` against libraries Windows
-//! already ships.
+//! A real Win32 application: `RegisterClassW`, a message loop, a menu bar,
+//! native controls, GDI painting. No browser, no webview, no HTML, and no GUI
+//! dependency -- the whole surface it uses is declared in `win32.rs` against
+//! libraries Windows already ships.
 //!
-//! **Two colours, and only two.** `#000000` and `#FFFFFF`. Every control is
-//! repainted to match, because the defaults are grey and a two-value design
-//! with one grey panel in it is not a two-value design. Emphasis is carried by
-//! inversion and by rules, which is what you do when you have no third value --
-//! and it is what Atur asked for.
+//! **Four pages, one of which owns the screen at a time.** The first version of
+//! this window grew a control at a time into a single 380px column, and Atur's
+//! verdict was exact: *"why is all click in one slot"*. `nav.rs` is the answer
+//! written down as data -- where every control lives -- and `theme.rs` is the
+//! palette, so nothing in this file names a colour. Both are testable without a
+//! window server, which is most of what this file used to get wrong.
+//!
+//! The design follows Hermes' own `apps/desktop/DESIGN.md`, which Atur asked
+//! this to match: flat rather than boxed, one primitive per concern, tokens
+//! rather than literals, durable destinations, and expensive surfaces staying
+//! mounted while hidden.
 //!
 //! The engine runs as a child `chaos-serve` process; `client.rs` says why at
 //! length. The short version is that unloading a model has to actually free
@@ -37,89 +43,100 @@ fn main() {
 
 #[cfg(windows)]
 mod windows_app {
+    use chaos_app::nav::{self, Page};
+    use chaos_app::theme::{self, metric, size, weight, Mode, Rgb, Theme};
     use chaos_app::win32::*;
     use chaos_app::{art, catalog, client, models, settings};
     use std::cell::RefCell;
     use std::process::{Child, Command};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::time::Instant;
 
-    const ID_LIST: i32 = 101;
-    const ID_LOAD: i32 = 102;
-    const ID_UNLOAD: i32 = 103;
-    const ID_SEND: i32 = 104;
-    const ID_OUT: i32 = 105;
-    const ID_IN: i32 = 106;
-    const ID_CACHE: i32 = 107;
-    const ID_THREADS: i32 = 108;
-    const ID_REFRESH: i32 = 109;
-    const ID_INSTALLED: i32 = 110;
-    const ID_AVAILABLE: i32 = 111;
-    const ID_GET: i32 = 112;
-    const ID_PORT: i32 = 113;
-    const ID_DELETE: i32 = 114;
+    /// The clock behind the strip and the monitor page. One second: uptime is
+    /// shown to the second, and free memory moves slowly.
+    const TICK_MS: u32 = 1000;
+    const TIMER_ID: usize = 1;
 
-    /// The sidebar's minimum. The real width scales with the window, because the
-    /// AVAILABLE rows carry a name, a size and a verdict and were being clipped
-    /// mid-word at a fixed 300px -- "gemma3-27b Q4_K_M 16.5 GB nee".
-    const SIDEBAR_MIN: i32 = 380;
+    /// Below this the rail plus a page has nowhere to put anything, so the
+    /// window refuses to get smaller rather than clipping its own controls --
+    /// which is how the old sidebar came to show "gemma3-27b Q4_K_M 16.5 GB nee".
+    const MIN_W: i32 = 940;
+    const MIN_H: i32 = 620;
 
-    /// Never more than this share of the window: a sidebar that keeps growing
-    /// leaves no room for the conversation.
-    const SIDEBAR_MAX_FRACTION: i32 = 40;
-
-    /// The sidebar width for a window of `w` pixels.
-    fn sidebar_for(w: i32) -> i32 {
-        let cap = w * SIDEBAR_MAX_FRACTION / 100;
-        SIDEBAR_MIN.min(cap.max(240))
-    }
-
-    const PAD: i32 = 14;
-    const LOGO_PX: i32 = 96;
+    const RELEASES_URL: &str = "https://github.com/aturzone/Chaos/releases";
+    const MANUAL_URL: &str = "https://github.com/aturzone/Chaos/blob/main/docs/APP.md";
 
     /// State the worker thread and the window both touch.
     #[derive(Default)]
     struct Shared {
         /// Text produced since the UI last drained it.
         pending: String,
-        /// Set when the answer is complete, so the UI can re-enable Send.
+        /// Set when the answer is complete, so the UI can re-enable SEND.
         finished: bool,
         tokens: u32,
-        started: Option<std::time::Instant>,
+        started: Option<Instant>,
         status: String,
     }
 
-    /// Which set of models the sidebar lists.
+    /// Which set of models the MODELS page lists.
     #[derive(PartialEq, Clone, Copy)]
     enum Tab {
         Installed,
         Available,
     }
 
-    struct Ui {
-        main: HWND,
-        list: HWND,
-        out: HWND,
-        input: HWND,
-        load: HWND,
-        unload: HWND,
-        send: HWND,
-        cache: HWND,
-        threads: HWND,
-        font: HFONT,
+    /// The faces, made once. Three sizes and a monospace, per `theme::size`.
+    struct Fonts {
+        display: HFONT,
+        heading: HFONT,
+        body: HFONT,
+        body_bold: HFONT,
+        small: HFONT,
         mono: HFONT,
-        black: HBRUSH,
-        entries: Vec<models::Entry>,
-        server: Option<Child>,
-        port: u16,
-        history: Vec<(String, String)>,
-        answer: String,
+        mark: HFONT,
+    }
+
+    /// The solid brushes the palette needs. Remade when the theme changes,
+    /// because `WM_CTLCOLOR*` has to answer with a brush, not a colour.
+    struct Brushes {
+        bg: HBRUSH,
+    }
+
+    /// Everything the window knows.
+    ///
+    /// **No window handles live here.** They are fetched by id through `ctl()`,
+    /// which reads the main handle out of an atomic and asks Windows -- so no
+    /// caller has to hold a borrow open in order to find a control. That was
+    /// the shape of the bug that made every click fatal.
+    struct Ui {
+        theme: Theme,
+        page: Page,
         tab: Tab,
+        fonts: Fonts,
+        brushes: Brushes,
+        entries: Vec<models::Entry>,
+        /// How many files each installed entry is spread across, counted once
+        /// per rescan. **Not counted while painting**: that is a directory scan,
+        /// and the transcript repaints on every token.
+        entry_files: Vec<usize>,
         offers: Vec<catalog::Offer>,
         free_bytes: u64,
-        /// The label of the model currently served, if any. Drives the running
-        /// marker in the list and the endpoint panel.
+        total_bytes: u64,
+        server: Option<Child>,
+        port: u16,
+        /// The label of the model currently served, if any.
         loaded: Option<String>,
+        /// When it came up, for the uptime on the strip.
+        loaded_at: Option<Instant>,
+        /// Tokens this server has produced since it started.
+        served: u64,
+        /// The last measured generation rate, kept so the strip has something
+        /// to show between answers.
+        last_rate: f64,
+        history: Vec<(String, String)>,
+        answer: String,
+        cfg: settings::Settings,
     }
 
     thread_local! {
@@ -136,70 +153,96 @@ mod windows_app {
         &B
     }
 
+    /// The main window handle, readable from any thread.
+    ///
+    /// `UI` is a `thread_local!`, so a worker thread sees `None` in it -- its
+    /// own copy was never initialised. Every background task here needs the
+    /// window handle to wake the UI, so it lives in an atomic as well.
+    fn main_window() -> &'static std::sync::atomic::AtomicUsize {
+        static H: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        &H
+    }
+
+    fn main_hwnd() -> HWND {
+        main_window().load(Ordering::SeqCst) as HWND
+    }
+
+    /// A control by id, without borrowing anything.
+    ///
+    /// The single most useful line in this file: because handles are found this
+    /// way rather than read out of `UI`, no action function needs a borrow open
+    /// while it talks to Windows.
+    fn ctl(id: i32) -> HWND {
+        let h = main_hwnd();
+        if h.is_null() {
+            return std::ptr::null_mut();
+        }
+        unsafe { GetDlgItem(h, id) }
+    }
+
+    /// Wake the UI thread so it drains what a worker produced.
+    ///
+    /// **This used to read `UI`, from the worker thread**, where the
+    /// thread-local is `None` -- so it posted nothing, `drain` never ran, and
+    /// every generated token was received and silently discarded.
+    fn notify() {
+        let h = main_hwnd();
+        if !h.is_null() {
+            unsafe {
+                PostMessageW(h, WM_APP_TICK, 0, 0);
+            }
+        }
+    }
+
+    fn repaint() {
+        let h = main_hwnd();
+        if !h.is_null() {
+            unsafe {
+                InvalidateRect(h, std::ptr::null(), 0);
+            }
+        }
+    }
+
     /// Make a crash say something.
     ///
-    /// The release profile sets `panic = "abort"`, so a panic is not an
-    /// unwind that can be caught -- the process simply vanishes. With no
-    /// console attached (window subsystem) that means no message, no log and
-    /// nothing to report: the window is there one moment and gone the next.
-    /// That is exactly how the `RefCell` double-borrow in `rescan` presented,
-    /// and it cost far more to find than it should have.
-    ///
-    /// The hook runs *before* the abort, so it still gets to write the file and
-    /// put a box on screen naming it.
+    /// The release profile sets `panic = "abort"`, so a panic is not an unwind
+    /// that can be caught -- the process simply vanishes. With no console
+    /// attached that means no message, no log and nothing to report. The hook
+    /// runs *before* the abort, so it still gets to write the file and put a
+    /// box on screen naming it.
     pub fn install_panic_hook() {
         std::panic::set_hook(Box::new(|info| {
             let where_ = info
                 .location()
                 .map(|l| format!("{}:{}", l.file(), l.line()))
-                .unwrap_or_else(|| "unknown location".into());
+                .unwrap_or_else(|| "unknown".into());
             let what = info
                 .payload()
                 .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
+                .map(|s| s.to_string())
                 .or_else(|| info.payload().downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "panicked".into());
-
-            let nl = char::from(10).to_string();
-            let text = [
-                format!("chaos-app {}", env!("CARGO_PKG_VERSION")),
-                what.clone(),
-                format!("at {where_}"),
-            ]
-            .join(&nl);
-            let log = std::env::temp_dir().join("chaos-app-crash.log");
-            let _ = std::fs::write(&log, &text);
-
-            // Built from parts, not a multi-line literal: a wrapped literal
-            // carries the source indentation into the message box.
-            let msg = [
-                "Chaos hit a bug and has to close.".to_string(),
-                String::new(),
-                what,
-                format!("at {where_}"),
-                String::new(),
-                "Written to:".to_string(),
-                log.display().to_string(),
-                String::new(),
-                "Please send that file -- it says exactly what went wrong.".to_string(),
-            ]
-            .join(&nl);
+                .unwrap_or_else(|| "panic".into());
+            let text = format!("Chaos crashed.\n\n{what}\nat {where_}\n");
+            let path = std::env::temp_dir().join("chaos-app-crash.log");
+            let _ = std::fs::write(&path, &text);
             unsafe {
+                let msg = format!("{text}\nWritten to:\n{}", path.display());
                 MessageBoxW(
                     std::ptr::null_mut(),
                     wide(&msg).as_ptr(),
                     wide("Chaos").as_ptr(),
-                    MB_ICONERROR,
+                    MB_OK | MB_ICONERROR,
                 );
             }
         }));
     }
 
     pub fn run() {
+        let cfg = settings::Settings::load();
+
         unsafe {
             let hinst = GetModuleHandleW(std::ptr::null());
             let class = wide("ChaosAppWindow");
-            let black = CreateSolidBrush(BLACK);
 
             let wc = WNDCLASSW {
                 style: 0,
@@ -209,7 +252,10 @@ mod windows_app {
                 hInstance: hinst,
                 hIcon: std::ptr::null_mut(),
                 hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW as *const u16),
-                hbrBackground: black,
+                // Null: `WM_ERASEBKGND` is answered here instead, so Windows
+                // never paints a ground we are about to paint over. That flash
+                // of the wrong colour on every resize is the whole of it.
+                hbrBackground: std::ptr::null_mut(),
                 lpszMenuName: std::ptr::null(),
                 lpszClassName: class.as_ptr(),
             };
@@ -225,8 +271,8 @@ mod windows_app {
                 WS_OVERLAPPEDWINDOW,
                 120,
                 80,
-                1160,
-                760,
+                1180,
+                780,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 hinst,
@@ -236,45 +282,203 @@ mod windows_app {
                 return;
             }
 
-            // The compositor draws the title bar, so it stays light unless
-            // asked. Ignored on Windows builds that predate the attribute.
-            let on: i32 = 1;
-            DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                &on as *const i32 as *const std::ffi::c_void,
-                std::mem::size_of::<i32>() as u32,
-            );
-
             set_window_icon(hwnd, hinst);
-            // Published for the worker threads, which cannot reach the
-            // thread-local `UI`.
             main_window().store(hwnd as usize, Ordering::SeqCst);
-            build_controls(hwnd, hinst, black);
-            // Restore what was set last time. Done after the controls exist and
-            // before the window is shown, so the first paint is already right.
-            let cfg = settings::Settings::load();
-            let put = |id: i32, v: Option<String>| {
-                if let Some(v) = v {
-                    SetWindowTextW(GetDlgItem(hwnd, id), wide(&v).as_ptr());
-                }
-            };
-            put(ID_CACHE, cfg.cache_gib.map(|v| format!("{v}")));
-            put(ID_THREADS, cfg.threads.map(|v| v.to_string()));
-            put(ID_PORT, Some(cfg.port.to_string()));
+
+            build_controls(hwnd, hinst, cfg);
+            build_menu(hwnd);
+            sync_titlebar();
+            fill_settings_page();
+            show_page(Page::Chat);
+            SetTimer(hwnd, TIMER_ID, TICK_MS, 0);
+
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
 
+            let accel = accelerators();
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                // Accelerators first, or `Ctrl+2` is swallowed by whichever
+                // edit control happens to have focus.
+                if !accel.is_null() && TranslateAcceleratorW(hwnd, accel, &mut msg) != 0 {
+                    continue;
+                }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
     }
 
+    // -- the menu ------------------------------------------------------------
+
+    /// The menu bar.
+    ///
+    /// **Every command in the app is in here**, which is the point: Atur asked
+    /// *"where is the menu, where are the options"*, and a Windows application
+    /// with no menu bar has answered that with "nowhere". The rail and the
+    /// buttons are shortcuts to these, never the only route.
+    unsafe fn build_menu(hwnd: HWND) {
+        let bar = CreateMenu();
+
+        let file = CreatePopupMenu();
+        add(file, nav::IDM_RESCAN, "&Rescan models\tF5");
+        add(file, nav::IDM_OPEN_MODELS_DIR, "Open models &folder");
+        sep(file);
+        add(file, nav::IDM_EXIT, "E&xit");
+        popup(bar, file, "&File");
+
+        let model = CreatePopupMenu();
+        add(model, nav::IDM_LOAD, "&Load selected\tCtrl+L");
+        add(model, nav::IDM_STOP, "&Stop running model");
+        sep(model);
+        add(model, nav::IDM_DOWNLOAD, "&Download selected");
+        add(model, nav::IDM_DELETE, "De&lete selected");
+        sep(model);
+        add(model, nav::IDM_COPY_ENDPOINT, "&Copy endpoint\tCtrl+E");
+        popup(bar, model, "&Model");
+
+        let view = CreatePopupMenu();
+        for p in nav::PAGES {
+            let id = menu_of_page(p);
+            add(
+                view,
+                id,
+                &format!("{}\tCtrl+{}", p.title(), p.accel() as char),
+            );
+        }
+        sep(view);
+        add(view, nav::IDM_THEME_LIGHT, "&Light");
+        add(view, nav::IDM_THEME_DARK, "&Dark");
+        popup(bar, view, "&View");
+
+        let help = CreatePopupMenu();
+        add(help, nav::IDM_MANUAL, "&Manual");
+        add(help, nav::IDM_RELEASES, "&Releases");
+        add(help, nav::IDM_CRASH_LOG, "Open &crash log");
+        sep(help);
+        add(help, nav::IDM_ABOUT, "&About Chaos");
+        popup(bar, help, "&Help");
+
+        SetMenu(hwnd, bar);
+        DrawMenuBar(hwnd);
+    }
+
+    fn menu_of_page(p: Page) -> i32 {
+        match p {
+            Page::Chat => nav::IDM_PAGE_CHAT,
+            Page::Models => nav::IDM_PAGE_MODELS,
+            Page::Monitor => nav::IDM_PAGE_MONITOR,
+            Page::Settings => nav::IDM_PAGE_SETTINGS,
+        }
+    }
+
+    unsafe fn add(menu: HMENU, id: i32, text: &str) {
+        AppendMenuW(menu, MF_STRING, id as usize, wide(text).as_ptr());
+    }
+
+    unsafe fn sep(menu: HMENU) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+    }
+
+    unsafe fn popup(bar: HMENU, menu: HMENU, text: &str) {
+        AppendMenuW(bar, MF_POPUP, menu as usize, wide(text).as_ptr());
+    }
+
+    /// Keyboard routes to the same commands the menu names.
+    ///
+    /// Hermes' rule, and a good one: *"a command may have keyboard, palette,
+    /// and visible affordances, but they invoke the same action"*. These post
+    /// the same `WM_COMMAND` a menu pick does.
+    unsafe fn accelerators() -> HACCEL {
+        let mut a: Vec<ACCEL> = nav::PAGES
+            .iter()
+            .map(|&p| ACCEL {
+                fVirt: FVIRTKEY | FCONTROL,
+                key: p.accel() as u16,
+                cmd: menu_of_page(p) as u16,
+            })
+            .collect();
+        a.push(ACCEL {
+            fVirt: FVIRTKEY,
+            key: VK_F5,
+            cmd: nav::IDM_RESCAN as u16,
+        });
+        a.push(ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: b'L' as u16,
+            cmd: nav::IDM_LOAD as u16,
+        });
+        a.push(ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: b'E' as u16,
+            cmd: nav::IDM_COPY_ENDPOINT as u16,
+        });
+        // Ctrl+Enter sends, from anywhere -- including the composer, which is
+        // multi-line precisely so plain Enter can make a paragraph.
+        a.push(ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: VK_RETURN,
+            cmd: nav::ID_SEND as u16,
+        });
+        CreateAcceleratorTableW(a.as_ptr(), a.len() as i32)
+    }
+
+    /// Grey out what cannot be done, each time a menu opens.
+    ///
+    /// A menu that offers "Stop running model" with nothing running is a menu
+    /// that has to be tried in order to be understood.
+    unsafe fn sync_menu(hwnd: HWND) {
+        let menu = GetMenu(hwnd);
+        if menu.is_null() {
+            return;
+        }
+        let (page, tab, running, mode) = UI.with(|u| {
+            u.borrow()
+                .as_ref()
+                .map(|ui| (ui.page, ui.tab, ui.loaded.is_some(), ui.theme.mode))
+                .unwrap_or((Page::Chat, Tab::Installed, false, Mode::Light))
+        });
+        let installed = tab == Tab::Installed;
+        let on_models = page == Page::Models;
+        let enable = |id: i32, yes: bool| {
+            EnableMenuItem(
+                menu,
+                id as u32,
+                MF_BYCOMMAND | if yes { MF_ENABLED } else { MF_GRAYED },
+            );
+        };
+        enable(nav::IDM_LOAD, on_models && installed && !running);
+        enable(nav::IDM_STOP, running);
+        enable(nav::IDM_DOWNLOAD, on_models && !installed);
+        enable(nav::IDM_DELETE, on_models && installed && !running);
+        enable(nav::IDM_COPY_ENDPOINT, running);
+
+        CheckMenuRadioItem(
+            menu,
+            nav::IDM_PAGE_CHAT as u32,
+            nav::IDM_PAGE_SETTINGS as u32,
+            menu_of_page(page) as u32,
+            MF_BYCOMMAND,
+        );
+        let theme_id = match mode {
+            Mode::Light => nav::IDM_THEME_LIGHT,
+            Mode::Dark => nav::IDM_THEME_DARK,
+        };
+        CheckMenuRadioItem(
+            menu,
+            nav::IDM_THEME_LIGHT as u32,
+            nav::IDM_THEME_DARK as u32,
+            theme_id as u32,
+            MF_BYCOMMAND,
+        );
+    }
+
+    // -- construction --------------------------------------------------------
+
     unsafe fn make_font(px: i32, weight: i32, face: &str) -> HFONT {
         let name = wide(face);
+        // `iQuality = 5` is CLEARTYPE_QUALITY: without it small text on a light
+        // ground is noticeably rougher than every other window on the desktop.
         CreateFontW(px, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, name.as_ptr())
     }
 
@@ -288,11 +492,14 @@ mod windows_app {
     ) -> HWND {
         let c = wide(class);
         let t = wide(text);
+        // Created hidden, with no `WS_VISIBLE`. `show_page` is the only thing
+        // that reveals a control, so one missing from `nav::controls` never
+        // appears at all -- a visible bug rather than a silent overlap.
         CreateWindowExW(
             0,
             c.as_ptr(),
             t.as_ptr(),
-            WS_CHILD | WS_VISIBLE | style,
+            WS_CHILD | style,
             0,
             0,
             10,
@@ -304,292 +511,267 @@ mod windows_app {
         )
     }
 
-    unsafe fn build_controls(hwnd: HWND, hinst: HINSTANCE, black: HBRUSH) {
-        let font = make_font(-15, 400, "Segoe UI");
-        let mono = make_font(-14, 400, "Consolas");
+    unsafe fn button(parent: HWND, text: &str, id: i32, hinst: HINSTANCE) -> HWND {
+        child(parent, "BUTTON", text, BS_OWNERDRAW | WS_TABSTOP, id, hinst)
+    }
 
-        let list = child(
-            hwnd,
-            "LISTBOX",
-            "",
-            LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | WS_VSCROLL | WS_BORDER,
-            ID_LIST,
-            hinst,
-        );
-        let out = child(
+    unsafe fn build_controls(hwnd: HWND, hinst: HINSTANCE, cfg: settings::Settings) {
+        let fonts = Fonts {
+            display: make_font(size::DISPLAY, weight::BOLD, theme::FACE_UI),
+            heading: make_font(size::HEADING, weight::MEDIUM, theme::FACE_UI),
+            body: make_font(size::BODY, weight::REGULAR, theme::FACE_UI),
+            body_bold: make_font(size::BODY, weight::MEDIUM, theme::FACE_UI),
+            small: make_font(size::SMALL, weight::REGULAR, theme::FACE_UI),
+            mono: make_font(size::MONO, weight::REGULAR, theme::FACE_MONO),
+            mark: make_font(size::MARK, weight::BOLD, theme::FACE_UI),
+        };
+
+        // The shell.
+        for p in nav::PAGES {
+            button(hwnd, p.label(), nav::nav_id(p), hinst);
+        }
+        button(hwnd, "STOP", nav::ID_STRIP_STOP, hinst);
+
+        // Chat.
+        child(
             hwnd,
             "EDIT",
             "",
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER,
-            ID_OUT,
+            nav::ID_OUT,
             hinst,
         );
-        let input = child(
+        child(
             hwnd,
             "EDIT",
             "",
-            ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_BORDER | WS_TABSTOP,
-            ID_IN,
+            ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_BORDER | WS_TABSTOP,
+            nav::ID_IN,
             hinst,
         );
-        let load = child(
-            hwnd,
-            "BUTTON",
-            "LOAD",
-            BS_OWNERDRAW | WS_TABSTOP,
-            ID_LOAD,
-            hinst,
-        );
-        let unload = child(
-            hwnd,
-            "BUTTON",
-            "UNLOAD",
-            BS_OWNERDRAW | WS_TABSTOP,
-            ID_UNLOAD,
-            hinst,
-        );
-        let refresh = child(
-            hwnd,
-            "BUTTON",
-            "RESCAN",
-            BS_OWNERDRAW | WS_TABSTOP,
-            ID_REFRESH,
-            hinst,
-        );
-        let send = child(
-            hwnd,
-            "BUTTON",
-            "SEND",
-            BS_OWNERDRAW | WS_TABSTOP,
-            ID_SEND,
-            hinst,
-        );
-        let installed = child(
-            hwnd,
-            "BUTTON",
-            "INSTALLED",
-            BS_OWNERDRAW | WS_TABSTOP,
-            ID_INSTALLED,
-            hinst,
-        );
-        let available = child(
-            hwnd,
-            "BUTTON",
-            "AVAILABLE",
-            BS_OWNERDRAW | WS_TABSTOP,
-            ID_AVAILABLE,
-            hinst,
-        );
-        let get = child(
-            hwnd,
-            "BUTTON",
-            "DOWNLOAD",
-            BS_OWNERDRAW | WS_TABSTOP,
-            ID_GET,
-            hinst,
-        );
-        let del = child(
-            hwnd,
-            "BUTTON",
-            "DELETE",
-            BS_OWNERDRAW | WS_TABSTOP,
-            ID_DELETE,
-            hinst,
-        );
-        let port = child(hwnd, "EDIT", "8231", WS_BORDER | WS_TABSTOP, ID_PORT, hinst);
-        let cache = child(hwnd, "EDIT", "", WS_BORDER | WS_TABSTOP, ID_CACHE, hinst);
-        let threads = child(hwnd, "EDIT", "", WS_BORDER | WS_TABSTOP, ID_THREADS, hinst);
+        button(hwnd, "SEND", nav::ID_SEND, hinst);
+        button(hwnd, "CLEAR", nav::ID_CLEAR, hinst);
 
-        for h in [
-            list, out, input, load, unload, refresh, send, cache, threads, installed, available,
-            get, port, del,
-        ] {
-            SendMessageW(h, WM_SETFONT, font as WPARAM, 1);
+        // Models.
+        button(hwnd, "INSTALLED", nav::ID_TAB_INSTALLED, hinst);
+        button(hwnd, "AVAILABLE", nav::ID_TAB_AVAILABLE, hinst);
+        child(
+            hwnd,
+            "LISTBOX",
+            "",
+            LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | WS_VSCROLL | WS_BORDER,
+            nav::ID_LIST,
+            hinst,
+        );
+        button(hwnd, "LOAD", nav::ID_LOAD, hinst);
+        button(hwnd, "STOP", nav::ID_UNLOAD, hinst);
+        button(hwnd, "DOWNLOAD", nav::ID_GET, hinst);
+        button(hwnd, "DELETE", nav::ID_DELETE, hinst);
+        button(hwnd, "RESCAN", nav::ID_REFRESH, hinst);
+        button(hwnd, "COPY ENDPOINT", nav::ID_COPY_ENDPOINT, hinst);
+
+        // Settings: every field the file holds, which is the point of the page.
+        for f in nav::FIELDS {
+            child(hwnd, "EDIT", "", WS_BORDER | WS_TABSTOP, f.id, hinst);
         }
-        SendMessageW(out, WM_SETFONT, mono as WPARAM, 1);
-        SendMessageW(input, WM_SETFONT, mono as WPARAM, 1);
+        for f in nav::TOGGLES {
+            button(hwnd, f.label, f.id, hinst);
+        }
+        button(hwnd, "SAVE", nav::ID_SAVE, hinst);
+        button(hwnd, "RESET", nav::ID_RESET, hinst);
 
-        // An owner-draw list uses a fixed row height that defaults to
-        // roughly the system font's, which clipped the model name in half.
-        SendMessageW(list, LB_SETITEMHEIGHT, 0, 26);
+        // The transcript, the composer and the list carry measurements, so they
+        // are monospaced; everything else is the UI face.
+        let mono_controls = [nav::ID_OUT, nav::ID_IN, nav::ID_LIST];
+        for p in nav::PAGES {
+            for &id in nav::controls(p) {
+                let f = if mono_controls.contains(&id) {
+                    fonts.mono
+                } else {
+                    fonts.body
+                };
+                SendMessageW(GetDlgItem(hwnd, id), WM_SETFONT, f as WPARAM, 1);
+            }
+        }
+        for id in nav::SHELL_CONTROLS {
+            SendMessageW(GetDlgItem(hwnd, id), WM_SETFONT, fonts.body as WPARAM, 1);
+        }
 
-        EnableWindow(unload, 0);
-        EnableWindow(send, 0);
+        // An owner-draw list uses a fixed row height that defaults to roughly
+        // the system font's, which clipped the model name in half.
+        SendMessageW(GetDlgItem(hwnd, nav::ID_LIST), LB_SETITEMHEIGHT, 0, 28);
 
+        // An EDIT puts its text flush against the border otherwise, which on a
+        // design built out of whitespace is the one control that has none.
+        for id in [nav::ID_OUT, nav::ID_IN] {
+            SendMessageW(
+                GetDlgItem(hwnd, id),
+                EM_SETMARGINS,
+                EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                (10 | (10 << 16)) as LPARAM,
+            );
+        }
+        for f in nav::FIELDS {
+            SendMessageW(
+                GetDlgItem(hwnd, f.id),
+                EM_SETMARGINS,
+                EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                (8 | (8 << 16)) as LPARAM,
+            );
+        }
+
+        let t = theme::theme(cfg.mode);
+        let port = cfg.port;
         UI.with(|u| {
             *u.borrow_mut() = Some(Ui {
-                main: hwnd,
-                list,
-                out,
-                input,
-                load,
-                unload,
-                send,
-                cache,
-                threads,
-                font,
-                mono,
-                black,
-                entries: Vec::new(),
-                server: None,
-                port: 8231,
-                history: Vec::new(),
-                answer: String::new(),
+                theme: t,
+                page: Page::Chat,
                 tab: Tab::Installed,
-                loaded: None,
+                fonts,
+                brushes: Brushes {
+                    bg: CreateSolidBrush(t.bg),
+                },
+                entries: Vec::new(),
+                entry_files: Vec::new(),
                 offers: catalog::offers(),
                 free_bytes: free_memory_bytes(),
+                total_bytes: total_memory_bytes(),
+                server: None,
+                port,
+                loaded: None,
+                loaded_at: None,
+                served: 0,
+                last_rate: 0.0,
+                history: Vec::new(),
+                answer: String::new(),
+                cfg,
             })
         });
         rescan();
     }
 
-    /// Physical memory currently free, for the "would this run here" verdict.
+    /// Match the title bar to the palette.
     ///
-    /// `chaos-probe` reports this properly; the app needs one number and not a
-    /// dependency on the probe crate, so it asks Windows directly.
-    fn free_memory_bytes() -> u64 {
-        #[repr(C)]
-        struct MemStatus {
-            length: u32,
-            memory_load: u32,
-            total_phys: u64,
-            avail_phys: u64,
-            total_page: u64,
-            avail_page: u64,
-            total_virtual: u64,
-            avail_virtual: u64,
-            avail_extended: u64,
-        }
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn GlobalMemoryStatusEx(buffer: *mut MemStatus) -> i32;
-        }
-        unsafe {
-            let mut m: MemStatus = std::mem::zeroed();
-            m.length = std::mem::size_of::<MemStatus>() as u32;
-            if GlobalMemoryStatusEx(&mut m) != 0 {
-                m.avail_phys
-            } else {
-                0
-            }
-        }
-    }
-
-    /// Total physical memory, for the "x of y" the resource line shows.
-    fn total_memory_bytes() -> u64 {
-        #[repr(C)]
-        struct MemStatus {
-            length: u32,
-            memory_load: u32,
-            total_phys: u64,
-            avail_phys: u64,
-            total_page: u64,
-            avail_page: u64,
-            total_virtual: u64,
-            avail_virtual: u64,
-            avail_extended: u64,
-        }
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn GlobalMemoryStatusEx(buffer: *mut MemStatus) -> i32;
-        }
-        unsafe {
-            let mut m: MemStatus = std::mem::zeroed();
-            m.length = std::mem::size_of::<MemStatus>() as u32;
-            if GlobalMemoryStatusEx(&mut m) != 0 {
-                m.total_phys
-            } else {
-                0
-            }
-        }
-    }
-
-    /// Re-read the models directory into the list.
-    /// Refill the list for the current tab.
-    ///
-    /// **No borrow is held across a Win32 call here, and none may be added.**
-    /// `LB_ADDSTRING` on an owner-draw listbox makes the control ask its parent
-    /// for colours *synchronously*, and that handler borrows `UI`. Holding
-    /// `borrow_mut()` across it is a `RefCell` double borrow, which under
-    /// `panic = "abort"` is instant, silent process death -- which is exactly
-    /// what clicking INSTALLED or AVAILABLE used to do.
-    ///
-    /// So: take a short borrow, build the rows, drop it, then talk to Windows.
-    fn rescan() {
-        // Phase 1 -- read state and build the strings. Borrow ends here.
-        let (list, main, load, get, del_btn, rows, installed, can_load) = {
-            let free = free_memory_bytes();
-            UI.with(|u| {
-                let mut b = u.borrow_mut();
-                let ui = b.as_mut()?;
-                ui.free_bytes = free;
-                let rows: Vec<String> = match ui.tab {
-                    Tab::Installed => {
-                        ui.entries = models::list();
-                        if ui.entries.is_empty() {
-                            vec!["nothing installed -- open AVAILABLE to download one".to_string()]
-                        } else {
-                            ui.entries.iter().map(models::row).collect()
-                        }
-                    }
-                    Tab::Available => ui.offers.iter().map(|o| catalog::row(o, free)).collect(),
-                };
-                let installed = ui.tab == Tab::Installed;
-                Some((
-                    ui.list,
-                    ui.main,
-                    ui.load,
-                    ui.dlg(ID_GET),
-                    ui.dlg(ID_DELETE),
-                    rows,
-                    installed,
-                    installed && ui.server.is_none(),
-                ))
-            })
-        }
-        .unwrap_or((
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            Vec::new(),
-            true,
-            false,
-        ));
-        if list.is_null() {
-            return;
-        }
-
-        // Phase 2 -- nothing borrowed. Windows may re-enter freely.
-        unsafe {
-            SendMessageW(list, LB_RESETCONTENT, 0, 0);
-            for r in &rows {
-                let t = wide(r);
-                SendMessageW(list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
-            }
-            SendMessageW(list, LB_SETCURSEL, 0, 0);
-            EnableWindow(load, i32::from(can_load));
-            EnableWindow(get, i32::from(!installed));
-            EnableWindow(del_btn, i32::from(installed));
-            InvalidateRect(main, std::ptr::null(), 1);
-        }
-    }
-
-    /// The window handle, copied out so callers can talk to Windows without
-    /// holding a borrow. See `rescan` for why that matters.
-    fn main_hwnd() -> HWND {
-        UI.with(|u| {
+    /// The compositor draws it, not us, so it stays light however the client
+    /// area is painted. A no-op on Windows builds too old to know the
+    /// attribute, which is why the return value is not checked.
+    fn sync_titlebar() {
+        let dark = UI.with(|u| {
             u.borrow()
                 .as_ref()
-                .map(|ui| ui.main)
-                .unwrap_or(std::ptr::null_mut())
-        })
+                .map(|ui| ui.theme.mode == Mode::Dark)
+                .unwrap_or(false)
+        });
+        let h = main_hwnd();
+        if h.is_null() {
+            return;
+        }
+        let on: i32 = i32::from(dark);
+        unsafe {
+            DwmSetWindowAttribute(
+                h,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &on as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+        // The scrollbars are the system's too, and they came up `#F0F0F0` on a
+        // `#0D0D0E` page until this was here. Naming the control's theme class
+        // is the documented way to move them; measured at `#171717` after.
+        for id in [nav::ID_OUT, nav::ID_IN, nav::ID_LIST] {
+            unsafe {
+                set_control_theme(ctl(id), dark);
+            }
+        }
+        // **The menu bar stays light in dark mode, and there is no fix here.**
+        // It is non-client, so it does not follow the title-bar attribute.
+        // `SetPreferredAppMode` -- uxtheme ordinal 135, what every dark Win32
+        // app calls -- was tried both before window creation and after, with
+        // `FlushMenuThemes`: the ordinals resolve on this build (10.0.26200)
+        // and the bar still measures `#FFFFFF`. Owner-drawing the whole menu is
+        // the only remaining route, and it needs the undocumented
+        // `WM_UAHDRAWMENU` to do the bar's background. Not worth it for a strip
+        // that is light on a theme most people will not switch to; `docs/APP.md`
+        // says so plainly rather than leaving it to be noticed.
     }
 
-    fn set_status(text: &str) {
-        shared().lock().unwrap().status = text.to_string();
+    // -- pages ---------------------------------------------------------------
+
+    /// Reveal one page and hide the rest.
+    ///
+    /// Controls are hidden, never destroyed. Hermes states the reason better
+    /// than a comment here could: *"expensive stateful surfaces stay mounted
+    /// when hidden -- visibility is not lifecycle"*. A transcript rebuilt every
+    /// time you glance at the settings is a transcript you have lost.
+    fn show_page(p: Page) {
+        UI.with(|u| {
+            if let Some(ui) = u.borrow_mut().as_mut() {
+                ui.page = p;
+            }
+        });
+
+        // Borrow is closed. `ShowWindow` repaints, which asks the parent for
+        // colours, which borrows -- doing this inside would abort the process.
+        for q in nav::PAGES {
+            let show = q == p;
+            for &id in nav::controls(q) {
+                unsafe {
+                    ShowWindow(ctl(id), if show { SW_SHOW } else { SW_HIDE });
+                }
+            }
+        }
+        for id in nav::SHELL_CONTROLS {
+            unsafe {
+                ShowWindow(ctl(id), SW_SHOW);
+            }
+        }
+
+        let h = main_hwnd();
+        if !h.is_null() {
+            unsafe {
+                layout(h);
+                InvalidateRect(h, std::ptr::null(), 1);
+            }
+        }
+        sync_enabled();
+        // The page you arrive at gets the caret, so typing works without a
+        // click first. Chat is the home surface, so there it is the composer.
+        let focus = match p {
+            Page::Chat => Some(nav::ID_IN),
+            Page::Models => Some(nav::ID_LIST),
+            Page::Settings => Some(nav::FIELDS[0].id),
+            Page::Monitor => None,
+        };
+        if let Some(id) = focus {
+            unsafe {
+                SetFocus(ctl(id));
+            }
+        }
+    }
+
+    fn set_mode(m: Mode) {
+        let old = UI.with(|u| {
+            let mut b = u.borrow_mut();
+            let ui = b.as_mut()?;
+            if ui.theme.mode == m {
+                return None;
+            }
+            let old = ui.brushes.bg;
+            ui.theme = theme::theme(m);
+            ui.brushes = Brushes {
+                bg: unsafe { CreateSolidBrush(ui.theme.bg) },
+            };
+            ui.cfg.mode = m;
+            let _ = ui.cfg.save();
+            Some(old)
+        });
+        let Some(bg) = old else { return };
+        // The replacement is already in place, so the old one is safe to
+        // release. Leaking a brush per toggle would be invisible and permanent.
+        unsafe {
+            DeleteObject(bg as HGDIOBJ);
+        }
+        sync_titlebar();
         let h = main_hwnd();
         if !h.is_null() {
             unsafe {
@@ -598,46 +780,163 @@ mod windows_app {
         }
     }
 
-    fn append_out(text: &str) {
-        // Handle copied out first: `EM_REPLACESEL` repaints the control, which
-        // asks the parent for colours, which borrows `UI`.
-        let out = UI.with(|u| {
+    /// Which controls are live, given what is running and which tab is showing.
+    ///
+    /// One function, called after anything that could change the answer, rather
+    /// than an `EnableWindow` scattered through every action -- which is how
+    /// the old window ended up with a SEND button that stayed grey after a
+    /// model came up.
+    fn sync_enabled() {
+        let (installed, running, busy_now) = UI.with(|u| {
             u.borrow()
                 .as_ref()
-                .map(|ui| ui.out)
-                .unwrap_or(std::ptr::null_mut())
+                .map(|ui| {
+                    (
+                        ui.tab == Tab::Installed,
+                        ui.loaded.is_some(),
+                        busy().load(Ordering::SeqCst),
+                    )
+                })
+                .unwrap_or((true, false, false))
         });
-        if out.is_null() {
-            return;
-        }
-        {
-            let ui = OutHandle(out);
-            let w = wide(text);
-            unsafe {
-                // **The box is ES_READONLY, and a read-only EDIT ignores
-                // EM_REPLACESEL entirely** -- no error, no text, nothing. Every
-                // token the model produced was being dropped here while the
-                // status line cheerfully said "ready". Drop the flag for the
-                // append and put it straight back, so the transcript still
-                // cannot be typed into.
-                SendMessageW(ui.0, EM_SETREADONLY, 0, 0);
-                // Move the caret to the end, then replace an empty selection:
-                // the only way to append to an EDIT without re-sending the
-                // whole buffer, which for a long answer is quadratic.
-                let len = GetWindowTextLengthW(ui.0);
-                SendMessageW(ui.0, EM_SETSEL, len as WPARAM, len as LPARAM);
-                SendMessageW(ui.0, EM_REPLACESEL, 0, w.as_ptr() as LPARAM);
-                SendMessageW(ui.0, EM_SCROLLCARET, 0, 0);
-                SendMessageW(ui.0, EM_SETREADONLY, 1, 0);
-            }
+        let set = |id: i32, on: bool| unsafe {
+            EnableWindow(ctl(id), i32::from(on));
+        };
+        set(nav::ID_LOAD, installed && !running);
+        set(nav::ID_UNLOAD, running);
+        set(nav::ID_GET, !installed);
+        set(nav::ID_DELETE, installed && !running);
+        set(nav::ID_COPY_ENDPOINT, running);
+        set(nav::ID_SEND, running && !busy_now);
+        set(nav::ID_STRIP_STOP, running);
+    }
+
+    // -- machine facts -------------------------------------------------------
+
+    #[repr(C)]
+    struct MemStatus {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page: u64,
+        avail_page: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemStatus) -> i32;
+    }
+
+    fn mem_status() -> Option<MemStatus> {
+        unsafe {
+            let mut m: MemStatus = std::mem::zeroed();
+            m.length = std::mem::size_of::<MemStatus>() as u32;
+            (GlobalMemoryStatusEx(&mut m) != 0).then_some(m)
         }
     }
 
-    /// A window handle that has already left the borrow, named so the calls
-    /// below read the same as before the fix.
-    struct OutHandle(HWND);
+    /// Physical memory currently free, for the "would this run here" verdict.
+    ///
+    /// `chaos-probe` reports this properly; the app needs one number and not a
+    /// dependency on the probe crate, so it asks Windows directly.
+    fn free_memory_bytes() -> u64 {
+        mem_status().map(|m| m.avail_phys).unwrap_or(0)
+    }
+
+    fn total_memory_bytes() -> u64 {
+        mem_status().map(|m| m.total_phys).unwrap_or(0)
+    }
+
+    // -- actions -------------------------------------------------------------
+
+    fn rescan() {
+        // Phase 1 -- read state and build the strings. Borrow ends here.
+        let rows: Vec<String> = {
+            let free = free_memory_bytes();
+            let total = total_memory_bytes();
+            UI.with(|u| {
+                let mut b = u.borrow_mut();
+                let Some(ui) = b.as_mut() else {
+                    return Vec::new();
+                };
+                ui.free_bytes = free;
+                ui.total_bytes = total;
+                match ui.tab {
+                    Tab::Installed => {
+                        ui.entries = models::list();
+                        // Counted here, once, rather than while painting: this
+                        // is a directory scan per model and the window
+                        // repaints on every generated token.
+                        ui.entry_files = ui
+                            .entries
+                            .iter()
+                            .map(|e| shards_of(&e.path).len())
+                            .collect();
+                        if ui.entries.is_empty() {
+                            vec!["nothing installed -- open AVAILABLE to download one".to_string()]
+                        } else {
+                            ui.entries.iter().map(models::row).collect()
+                        }
+                    }
+                    Tab::Available => ui.offers.iter().map(|o| catalog::row(o, free)).collect(),
+                }
+            })
+        };
+
+        // Phase 2 -- nothing borrowed. Windows may re-enter freely.
+        let list = ctl(nav::ID_LIST);
+        if list.is_null() {
+            return;
+        }
+        unsafe {
+            SendMessageW(list, LB_RESETCONTENT, 0, 0);
+            for r in &rows {
+                let t = wide(r);
+                SendMessageW(list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
+            }
+            SendMessageW(list, LB_SETCURSEL, 0, 0);
+        }
+        sync_enabled();
+        repaint();
+    }
+
+    fn set_status(text: &str) {
+        shared().lock().unwrap().status = text.to_string();
+        repaint();
+    }
+
+    fn append_out(text: &str) {
+        let out = ctl(nav::ID_OUT);
+        if out.is_null() {
+            return;
+        }
+        let w = wide(text);
+        unsafe {
+            // **The box is ES_READONLY, and a read-only EDIT ignores
+            // EM_REPLACESEL entirely** -- no error, no text, nothing. Every
+            // token the model produced was dropped here while the status line
+            // cheerfully said "ready". Drop the flag for the append and put it
+            // straight back, so the transcript still cannot be typed into.
+            SendMessageW(out, EM_SETREADONLY, 0, 0);
+            // Move the caret to the end, then replace an empty selection: the
+            // only way to append to an EDIT without re-sending the whole
+            // buffer, which for a long answer is quadratic.
+            let len = GetWindowTextLengthW(out);
+            SendMessageW(out, EM_SETSEL, len as WPARAM, len as LPARAM);
+            SendMessageW(out, EM_REPLACESEL, 0, w.as_ptr() as LPARAM);
+            SendMessageW(out, EM_SCROLLCARET, 0, 0);
+            SendMessageW(out, EM_SETREADONLY, 1, 0);
+        }
+    }
 
     fn control_text(h: HWND) -> String {
+        if h.is_null() {
+            return String::new();
+        }
         unsafe {
             let n = GetWindowTextLengthW(h);
             if n <= 0 {
@@ -649,33 +948,33 @@ mod windows_app {
         }
     }
 
+    /// The row the list has selected.
+    fn selection() -> Option<usize> {
+        let list = ctl(nav::ID_LIST);
+        if list.is_null() {
+            return None;
+        }
+        let sel = unsafe { SendMessageW(list, LB_GETCURSEL, 0, 0) };
+        (sel >= 0).then_some(sel as usize)
+    }
+
     /// Start `chaos-serve` on the selected model, hidden.
     fn load_model() {
-        // Handles first, borrow dropped, then Windows. Reading a control's text
-        // is a message like any other.
-        let hs = UI.with(|u| {
-            let b = u.borrow();
-            let ui = b.as_ref()?;
-            Some((ui.list, ui.cache, ui.threads, ui.dlg(ID_PORT)))
-        });
-        let Some((list, cache_box, threads_box, port_box)) = hs else {
+        let Some(sel) = selection() else {
+            set_status("select a model first");
             return;
         };
-        let sel = unsafe { SendMessageW(list, LB_GETCURSEL, 0, 0) };
-        let cache = control_text(cache_box);
-        let threads = control_text(threads_box);
-        // The port box is the setting, not a decoration: what it says is what
-        // the server binds and what the endpoint panel shows.
-        let port: u16 = control_text(port_box).trim().parse().unwrap_or(8231);
-
         let picked = UI.with(|u| {
             let b = u.borrow();
             let ui = b.as_ref()?;
-            let e = (sel >= 0).then(|| ui.entries.get(sel as usize)).flatten()?;
-            Some((e.path.clone(), e.label.clone()))
+            if ui.tab != Tab::Installed {
+                return None;
+            }
+            let e = ui.entries.get(sel)?;
+            Some((e.path.clone(), e.label.clone(), ui.cfg.clone()))
         });
-        let Some((path, label)) = picked else {
-            set_status("select a model first");
+        let Some((path, label, cfg)) = picked else {
+            set_status("open INSTALLED and select a model first");
             return;
         };
 
@@ -693,22 +992,12 @@ mod windows_app {
             return;
         }
 
-        // One place builds the arguments -- `Settings::serve_args` -- so the
-        // window and anything else that starts a server cannot disagree about
-        // what a setting means. It is covered by tests; this call site is not
-        // testable at all.
-        let mut cfg = settings::Settings::load();
-        cfg.port = port;
-        cfg.cache_gib = cache.trim().parse::<f64>().ok().filter(|v| *v > 0.0);
-        cfg.threads = threads.trim().parse::<u32>().ok().filter(|v| *v > 0);
-        // Unverified architectures refuse by name. The app is for running what
-        // you have, and the refusal is already explained in the status line.
-        cfg.force = true;
-        // Remember what was typed, so the boxes are filled in next time rather
-        // than empty. A settings page that forgets is a form.
-        if let Err(e) = cfg.save() {
-            set_status(&e);
-        }
+        // **`cfg.force` is whatever SETTINGS says**, and nothing here overrides
+        // it. The previous version set it to `true` unconditionally, which made
+        // the toggle on the settings page a decoration: turning it off changed
+        // nothing, and an unverified architecture ran anyway. If it is off,
+        // `chaos-serve` refuses by name and the refusal reaches the strip.
+        let port = cfg.port;
 
         let mut cmd = Command::new(&exe);
         for a in cfg.serve_args(&path.to_string_lossy()) {
@@ -721,37 +1010,28 @@ mod windows_app {
 
         match cmd.spawn() {
             Ok(c) => {
-                // Same rule as `rescan`: the handles come out of the borrow and
-                // the borrow ends before any of them is touched. `SetWindowTextW`
-                // on the output box repaints it, which asks the parent for
-                // colours, which borrows -- so doing this inside would abort the
-                // process exactly as clicking a tab used to.
-                let handles = UI.with(|u| {
-                    let mut b = u.borrow_mut();
-                    let ui = b.as_mut()?;
-                    ui.server = Some(c);
-                    ui.history.clear();
-                    ui.loaded = Some(label.clone());
-                    // What the box said, so the endpoint line and the chat
-                    // client both use the port the server was given rather
-                    // than the default they were built with.
-                    ui.port = port;
-                    Some((ui.load, ui.unload, ui.out))
-                });
-                if let Some((load, unload, out)) = handles {
-                    unsafe {
-                        EnableWindow(load, 0);
-                        EnableWindow(unload, 1);
-                        SetWindowTextW(out, wide("").as_ptr());
+                UI.with(|u| {
+                    if let Some(ui) = u.borrow_mut().as_mut() {
+                        ui.server = Some(c);
+                        ui.history.clear();
+                        ui.loaded = Some(label.clone());
+                        ui.loaded_at = Some(Instant::now());
+                        ui.served = 0;
+                        ui.last_rate = 0.0;
+                        ui.port = port;
                     }
+                });
+                // Borrow closed before any of this touches Windows.
+                unsafe {
+                    SetWindowTextW(ctl(nav::ID_OUT), wide("").as_ptr());
                 }
+                sync_enabled();
                 set_status("loading -- a large model takes a while");
-                let port2 = port;
                 std::thread::spawn(move || {
                     // Poll rather than parse stdout: readiness is exactly "does
-                    // it answer", and that is the same check a client makes.
+                    // it answer", and that is the check a client makes too.
                     for _ in 0..1200 {
-                        if client::health(port2) {
+                        if client::health(port) {
                             let mut s = shared().lock().unwrap();
                             s.status = "ready".into();
                             s.finished = true;
@@ -773,23 +1053,9 @@ mod windows_app {
     }
 
     fn unload_model() {
-        // `stop_server` takes the child out under a short borrow and waits for
-        // it outside one. The handles come out the same way -- `EnableWindow`
-        // repaints, which asks the parent for colours, which borrows.
         stop_server();
-        let hs = UI.with(|u| {
-            let b = u.borrow();
-            let ui = b.as_ref()?;
-            Some((ui.load, ui.unload, ui.send))
-        });
-        if let Some((load, unload, send)) = hs {
-            unsafe {
-                EnableWindow(load, 1);
-                EnableWindow(unload, 0);
-                EnableWindow(send, 0);
-            }
-        }
-        set_status("unloaded -- the memory is back");
+        sync_enabled();
+        set_status("stopped -- the memory is back");
     }
 
     /// Stop the child engine, if one is running.
@@ -806,6 +1072,7 @@ mod windows_app {
         UI.with(|u| {
             if let Some(ui) = u.borrow_mut().as_mut() {
                 ui.loaded = None;
+                ui.loaded_at = None;
             }
         });
     }
@@ -813,7 +1080,7 @@ mod windows_app {
     /// Every file belonging to a container, including the other shards.
     ///
     /// Deleting only the file the list shows would leave four of five shards --
-    /// 120 GB of unusable data -- on disk and report success.
+    /// 120 GB of unusable data -- on disk, and report success.
     fn shards_of(first: &std::path::Path) -> Vec<std::path::PathBuf> {
         let single = || vec![first.to_path_buf()];
         let Some(name) = first.file_name().and_then(|n| n.to_str()) else {
@@ -846,14 +1113,17 @@ mod windows_app {
 
     /// Delete the selected model's files, after saying exactly what will go.
     fn delete_selected() {
+        let Some(sel) = selection() else {
+            set_status("select an installed model to delete");
+            return;
+        };
         let picked = UI.with(|u| {
             let b = u.borrow();
             let ui = b.as_ref()?;
             if ui.tab != Tab::Installed {
                 return None;
             }
-            let sel = unsafe { SendMessageW(ui.list, LB_GETCURSEL, 0, 0) };
-            let e = (sel >= 0).then(|| ui.entries.get(sel as usize)).flatten()?;
+            let e = ui.entries.get(sel)?;
             Some((
                 e.path.clone(),
                 e.label.clone(),
@@ -868,7 +1138,7 @@ mod windows_app {
         // Deleting the file a running server has open would half-work and leave
         // the engine reading a hole.
         if loaded.as_deref() == Some(label.as_str()) {
-            set_status("that model is loaded -- press UNLOAD first");
+            set_status("that model is running -- press STOP first");
             return;
         }
 
@@ -924,20 +1194,22 @@ mod windows_app {
     /// and a second downloader in the window would be a second thing to get
     /// wrong about a 155 GB file.
     fn download_selected() {
-        let (offer, exe) = UI.with(|u| {
-            let b = u.borrow();
-            let Some(ui) = b.as_ref() else {
-                return (None, None);
-            };
-            let sel = unsafe { SendMessageW(ui.list, LB_GETCURSEL, 0, 0) };
-            let o = (sel >= 0)
-                .then(|| ui.offers.get(sel as usize))
-                .flatten()
-                .map(|o| (o.name.clone(), o.quant.clone(), o.bytes));
-            (o, std::env::current_exe().ok())
-        });
-        let (Some((name, quant, bytes)), Some(exe)) = (offer, exe) else {
+        let Some(sel) = selection() else {
             set_status("select something to download");
+            return;
+        };
+        let offer = UI.with(|u| {
+            let b = u.borrow();
+            let ui = b.as_ref()?;
+            if ui.tab != Tab::Available {
+                return None;
+            }
+            ui.offers
+                .get(sel)
+                .map(|o| (o.name.clone(), o.quant.clone(), o.bytes))
+        });
+        let (Some((name, quant, bytes)), Some(exe)) = (offer, std::env::current_exe().ok()) else {
+            set_status("open AVAILABLE and select something to download");
             return;
         };
         let pull = exe.with_file_name("chaos-pull.exe");
@@ -978,28 +1250,30 @@ mod windows_app {
         });
     }
 
-    /// The main window handle, readable from any thread.
-    ///
-    /// `UI` is a `thread_local!`, so a worker thread sees `None` in it -- its
-    /// own copy was never initialised. Every background task here needs the
-    /// window handle to wake the UI, so it lives in an atomic as well.
-    fn main_window() -> &'static std::sync::atomic::AtomicUsize {
-        static H: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        &H
+    fn endpoint() -> Option<String> {
+        UI.with(|u| {
+            let b = u.borrow();
+            let ui = b.as_ref()?;
+            ui.loaded
+                .as_ref()
+                .map(|_| format!("http://127.0.0.1:{}/v1", ui.port))
+        })
     }
 
-    /// Wake the UI thread so it drains what a worker produced.
+    /// Put the endpoint on the clipboard.
     ///
-    /// **This used to read `UI`, from the worker thread**, where the
-    /// thread-local is `None` -- so it posted nothing, `drain` never ran, and
-    /// every generated token was received and silently discarded. The window
-    /// said "ready" and showed an empty answer.
-    fn notify() {
-        let h = main_window().load(Ordering::SeqCst);
-        if h != 0 {
-            unsafe {
-                PostMessageW(h as HWND, WM_APP_TICK, 0, 0);
+    /// This is the string you paste into a coding agent, and retyping it off
+    /// the screen is exactly the friction that makes a window feel like a demo.
+    fn copy_endpoint() {
+        match endpoint() {
+            Some(url) => {
+                if unsafe { set_clipboard_text(main_hwnd(), &url) } {
+                    set_status(&format!("copied {url}"));
+                } else {
+                    set_status("the clipboard is held by another program");
+                }
             }
+            None => set_status("nothing is running, so there is no endpoint yet"),
         }
     }
 
@@ -1007,31 +1281,34 @@ mod windows_app {
         if busy().load(Ordering::SeqCst) {
             return;
         }
-        let (prompt, port, history) = UI.with(|u| {
-            let b = u.borrow();
-            let Some(ui) = b.as_ref() else {
-                return (String::new(), 0u16, Vec::new());
-            };
-            // `ui.port` is set when the model is loaded, from the port box, so
-            // this is the port the server was actually told to bind.
-            (control_text(ui.input), ui.port, ui.history.clone())
-        });
-        let prompt = prompt.trim().to_string();
+        let running = UI.with(|u| u.borrow().as_ref().is_some_and(|ui| ui.loaded.is_some()));
+        if !running {
+            // Say what to do, and go there. A SEND that silently does nothing
+            // is how "why can I not send a message" starts.
+            set_status("nothing is running -- pick a model and press LOAD");
+            show_page(Page::Models);
+            return;
+        }
+        let prompt = control_text(ctl(nav::ID_IN)).trim().to_string();
         if prompt.is_empty() {
             return;
         }
-
-        let hs = UI.with(|u| {
-            let mut b = u.borrow_mut();
-            let ui = b.as_mut()?;
-            ui.answer.clear();
-            Some((ui.input, ui.send))
+        let (port, history) = UI.with(|u| {
+            let b = u.borrow();
+            b.as_ref()
+                .map(|ui| (ui.port, ui.history.clone()))
+                .unwrap_or((0, Vec::new()))
         });
-        if let Some((input, send)) = hs {
-            unsafe {
-                SetWindowTextW(input, wide("").as_ptr());
-                EnableWindow(send, 0);
+
+        UI.with(|u| {
+            if let Some(ui) = u.borrow_mut().as_mut() {
+                ui.answer.clear();
+                ui.history.push(("user".into(), prompt.clone()));
             }
+        });
+        unsafe {
+            SetWindowTextW(ctl(nav::ID_IN), wide("").as_ptr());
+            EnableWindow(ctl(nav::ID_SEND), 0);
         }
         append_out(&format!("\r\n> {}\r\n\r\n", prompt.replace('\n', "\r\n")));
 
@@ -1040,21 +1317,13 @@ mod windows_app {
             s.pending.clear();
             s.finished = false;
             s.tokens = 0;
-            s.started = Some(std::time::Instant::now());
+            s.started = Some(Instant::now());
             s.status = "thinking".into();
         }
         busy().store(true, Ordering::SeqCst);
 
-        let p2 = prompt.clone();
-        UI.with(|u| {
-            if let Some(ui) = u.borrow_mut().as_mut() {
-                ui.history.push(("user".into(), p2));
-            }
-        });
-
         std::thread::spawn(move || {
-            let hist: Vec<(String, String)> = history;
-            client::chat(port, &hist, &prompt, 512, &mut |ev| match ev {
+            client::chat(port, &history, &prompt, 512, &mut |ev| match ev {
                 client::Event::Token(t) => {
                     let mut s = shared().lock().unwrap();
                     s.pending.push_str(&t);
@@ -1081,6 +1350,20 @@ mod windows_app {
         });
     }
 
+    /// Empty the transcript and the history behind it.
+    fn clear_chat() {
+        UI.with(|u| {
+            if let Some(ui) = u.borrow_mut().as_mut() {
+                ui.history.clear();
+                ui.answer.clear();
+            }
+        });
+        unsafe {
+            SetWindowTextW(ctl(nav::ID_OUT), wide("").as_ptr());
+        }
+        set_status("conversation cleared");
+    }
+
     /// Drain what the worker produced. Runs on the UI thread only.
     fn drain() {
         let (text, finished, tokens, elapsed) = {
@@ -1101,384 +1384,1434 @@ mod windows_app {
         if tokens > 0 && elapsed > 0.0 {
             let rate = tokens as f64 / elapsed;
             shared().lock().unwrap().status = format!("{tokens} tokens, {rate:.2} tok/s");
+            UI.with(|u| {
+                if let Some(ui) = u.borrow_mut().as_mut() {
+                    ui.last_rate = rate;
+                }
+            });
         }
         if finished && busy().swap(false, Ordering::SeqCst) {
-            let send = UI.with(|u| {
-                let mut b = u.borrow_mut();
-                let ui = b.as_mut()?;
-                let a = std::mem::take(&mut ui.answer);
-                if !a.is_empty() {
-                    ui.history.push(("assistant".into(), a));
-                }
-                Some(ui.send)
-            });
-            if let Some(send) = send {
-                unsafe {
-                    EnableWindow(send, 1);
-                }
-            }
-        }
-        if finished {
             UI.with(|u| {
-                if let Some(ui) = u.borrow().as_ref() {
-                    if ui.server.is_some() {
-                        unsafe {
-                            EnableWindow(ui.send, 1);
-                        }
+                if let Some(ui) = u.borrow_mut().as_mut() {
+                    let a = std::mem::take(&mut ui.answer);
+                    if !a.is_empty() {
+                        ui.history.push(("assistant".into(), a));
                     }
+                    ui.served += u64::from(tokens);
                 }
             });
+            sync_enabled();
         }
+        repaint();
+    }
+
+    // -- settings ------------------------------------------------------------
+
+    /// Put the stored settings into the boxes.
+    fn fill_settings_page() {
+        let cfg = UI.with(|u| u.borrow().as_ref().map(|ui| ui.cfg.clone()));
+        let Some(cfg) = cfg else { return };
+        let put = |id: i32, v: Option<String>| unsafe {
+            SetWindowTextW(ctl(id), wide(&v.unwrap_or_default()).as_ptr());
+        };
+        put(nav::ID_CACHE, cfg.cache_gib.map(|v| format!("{v}")));
+        put(nav::ID_THREADS, cfg.threads.map(|v| v.to_string()));
+        put(
+            nav::ID_THREADS_BATCH,
+            cfg.threads_batch.map(|v| v.to_string()),
+        );
+        put(nav::ID_PORT, Some(cfg.port.to_string()));
+        put(nav::ID_CONTEXT, cfg.context.map(|v| v.to_string()));
+        put(nav::ID_NGL, cfg.ngl.map(|v| v.to_string()));
+        put(nav::ID_MODELS_DIR, cfg.models_dir.clone());
+    }
+
+    /// Read every box back and write the file.
+    fn save_settings() {
+        let read = |id: i32| control_text(ctl(id)).trim().to_string();
+        let cache = read(nav::ID_CACHE);
+        let threads = read(nav::ID_THREADS);
+        let tb = read(nav::ID_THREADS_BATCH);
+        let port_text = read(nav::ID_PORT);
+        let context = read(nav::ID_CONTEXT);
+        let ngl = read(nav::ID_NGL);
+        let dir = read(nav::ID_MODELS_DIR);
+
+        // A port that will not parse must not silently become something else:
+        // the endpoint the window advertises has to be the port the server
+        // binds, or every client is sent to nothing.
+        let Some(port) = port_text.parse::<u16>().ok().filter(|p| *p > 0) else {
+            set_status(&format!("{port_text:?} is not a port -- nothing saved"));
+            return;
+        };
+
+        let result = UI.with(|u| {
+            let mut b = u.borrow_mut();
+            let ui = b.as_mut()?;
+            ui.cfg.cache_gib = cache.parse::<f64>().ok().filter(|v| *v > 0.0);
+            ui.cfg.threads = threads.parse::<u32>().ok().filter(|v| *v > 0);
+            ui.cfg.threads_batch = tb.parse::<u32>().ok().filter(|v| *v > 0);
+            ui.cfg.port = port;
+            ui.cfg.context = context.parse::<u32>().ok().filter(|v| *v > 0);
+            ui.cfg.ngl = ngl.parse::<u32>().ok();
+            ui.cfg.models_dir = (!dir.is_empty()).then(|| dir.clone());
+            Some((ui.cfg.save(), ui.loaded.is_some()))
+        });
+        let Some((saved, running)) = result else {
+            return;
+        };
+        match saved {
+            // The port only reaches a running server on the next load; saying
+            // so beats letting someone wonder why the endpoint did not move.
+            Ok(()) if running => set_status("saved -- the port takes effect next time you load"),
+            Ok(()) => set_status(&format!("saved to {}", settings::path().display())),
+            Err(e) => set_status(&e),
+        }
+        // What was stored is what is shown: re-filling normalises "8231 " and
+        // reveals anything dropped for being unparseable.
+        fill_settings_page();
+        repaint();
+    }
+
+    /// Back to measured everything, which is what an empty file means.
+    fn reset_settings() {
         UI.with(|u| {
-            if let Some(ui) = u.borrow().as_ref() {
-                unsafe {
-                    InvalidateRect(ui.main, std::ptr::null(), 0);
-                }
+            if let Some(ui) = u.borrow_mut().as_mut() {
+                // The theme is a view preference, not an engine setting, and
+                // resetting the engine must not flip the lights.
+                ui.cfg.reset_engine();
+                let _ = ui.cfg.save();
             }
         });
+        fill_settings_page();
+        set_status("reset -- every setting is measured from this machine again");
+        repaint();
     }
 
-    unsafe fn layout(hwnd: HWND) {
-        let mut r = RECT::default();
-        GetClientRect(hwnd, &mut r);
-        let w = r.right - r.left;
-        let h = r.bottom - r.top;
-        let sidebar = sidebar_for(w);
-
+    fn toggle(id: i32) {
         UI.with(|u| {
-            let b = u.borrow();
-            let Some(ui) = b.as_ref() else { return };
-            let btn_h = 28;
-            let bw = (sidebar - PAD * 3) / 2;
-            // The two tabs sit directly above the list they switch between.
-            let tab_y = PAD * 2 + LOGO_PX + 24;
-            MoveWindow(ui.dlg(ID_INSTALLED), PAD, tab_y, bw, btn_h, 1);
-            MoveWindow(ui.dlg(ID_AVAILABLE), PAD * 2 + bw, tab_y, bw, btn_h, 1);
-
-            let top = tab_y + btn_h + 8;
-            // Three rows of controls plus two labelled setting rows below the
-            // list; the list takes whatever is left.
-            let list_h = h - top - PAD * 3 - btn_h * 4 - 68;
-            MoveWindow(ui.list, PAD, top, sidebar - PAD * 2, list_h.max(60), 1);
-
-            let by = top + list_h.max(60) + PAD;
-            MoveWindow(ui.load, PAD, by, bw, btn_h, 1);
-            MoveWindow(ui.unload, PAD * 2 + bw, by, bw, btn_h, 1);
-            let r2 = by + btn_h + 6;
-            MoveWindow(ui.dlg(ID_GET), PAD, r2, bw, btn_h, 1);
-            MoveWindow(ui.dlg(ID_DELETE), PAD * 2 + bw, r2, bw, btn_h, 1);
-            let r2b = r2 + btn_h + 6;
-            MoveWindow(ui.refresh_handle(), PAD, r2b, bw, btn_h, 1);
-
-            // Settings row: each box sits under a label painted in WM_PAINT.
-            let r3 = r2b + btn_h + 24;
-            let sw = (sidebar - PAD * 4) / 3;
-            MoveWindow(ui.cache, PAD, r3, sw, btn_h, 1);
-            MoveWindow(ui.threads, PAD * 2 + sw, r3, sw, btn_h, 1);
-            MoveWindow(ui.dlg(ID_PORT), PAD * 3 + sw * 2, r3, sw, btn_h, 1);
-
-            let rx = sidebar;
-            let rw = w - rx - PAD;
-            let in_h = 92;
-            // 62px: three status lines plus breathing room. It was 34, which
-            // is one line, and the other two were drawn over the input box.
-            let out_h = h - PAD * 3 - in_h - 62;
-            MoveWindow(ui.out, rx, PAD, rw, out_h.max(80), 1);
-            MoveWindow(ui.input, rx, PAD * 2 + out_h.max(80), rw - 110, in_h, 1);
-            MoveWindow(
-                ui.send,
-                rx + rw - 100,
-                PAD * 2 + out_h.max(80),
-                100,
-                in_h,
-                1,
-            );
+            if let Some(ui) = u.borrow_mut().as_mut() {
+                if id == nav::ID_AUTO {
+                    ui.cfg.auto = !ui.cfg.auto;
+                } else {
+                    ui.cfg.force = !ui.cfg.force;
+                }
+                let _ = ui.cfg.save();
+            }
         });
+        repaint();
     }
 
-    impl Ui {
-        /// A control by id. The ones created after the struct was written are
-        /// reached this way rather than growing the struct a field at a time.
-        fn dlg(&self, id: i32) -> HWND {
-            unsafe { GetDlgItem(self.main, id) }
-        }
-        fn refresh_handle(&self) -> HWND {
-            self.dlg(ID_REFRESH)
+    // -- painting primitives -------------------------------------------------
+
+    /// One place that draws text, so no page invents its own alignment.
+    unsafe fn text(hdc: HDC, r: RECT, s: &str, font: HFONT, colour: Rgb, flags: u32) {
+        let old = SelectObject(hdc, font as HGDIOBJ);
+        SetTextColor(hdc, colour);
+        SetBkMode(hdc, TRANSPARENT);
+        let mut rc = r;
+        let w: Vec<u16> = s.encode_utf16().collect();
+        DrawTextW(
+            hdc,
+            w.as_ptr(),
+            w.len() as i32,
+            &mut rc,
+            flags | DT_NOPREFIX,
+        );
+        SelectObject(hdc, old);
+    }
+
+    /// Left-aligned single line, which is nearly every string in the app.
+    unsafe fn label(hdc: HDC, x: i32, y: i32, w: i32, s: &str, font: HFONT, colour: Rgb) {
+        text(
+            hdc,
+            RECT {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + 40,
+            },
+            s,
+            font,
+            colour,
+            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+    }
+
+    unsafe fn fill(hdc: HDC, r: RECT, colour: Rgb) {
+        let b = CreateSolidBrush(colour);
+        FillRect(hdc, &r, b);
+        DeleteObject(b as HGDIOBJ);
+    }
+
+    /// A hairline. The only divider this design has -- Hermes: *"group with
+    /// whitespace and a single hairline, never nested rounded boxes"*.
+    unsafe fn rule(hdc: HDC, x1: i32, x2: i32, y: i32, colour: Rgb) {
+        fill(
+            hdc,
+            RECT {
+                left: x1,
+                top: y,
+                right: x2,
+                bottom: y + 1,
+            },
+            colour,
+        );
+    }
+
+    /// A one-pixel rectangle with nothing inside it.
+    unsafe fn frame(hdc: HDC, r: RECT, colour: Rgb) {
+        for q in [
+            RECT {
+                bottom: r.top + 1,
+                ..r
+            },
+            RECT {
+                top: r.bottom - 1,
+                ..r
+            },
+            RECT {
+                right: r.left + 1,
+                ..r
+            },
+            RECT {
+                left: r.right - 1,
+                ..r
+            },
+        ] {
+            fill(hdc, q, colour);
         }
     }
+
+    fn inset(r: RECT, by: i32) -> RECT {
+        RECT {
+            left: r.left + by,
+            top: r.top + by,
+            right: r.right - by,
+            bottom: r.bottom - by,
+        }
+    }
+
+    unsafe fn measure(hdc: HDC, s: &str, font: HFONT) -> i32 {
+        let old = SelectObject(hdc, font as HGDIOBJ);
+        let w: Vec<u16> = s.encode_utf16().collect();
+        let mut sz = SIZE::default();
+        GetTextExtentPoint32W(hdc, w.as_ptr(), w.len() as i32, &mut sz);
+        SelectObject(hdc, old);
+        sz.cx
+    }
+
+    /// `a` with `pct` percent of `b` mixed in, channel by channel.
+    fn mix(a: Rgb, b: Rgb, pct: u32) -> Rgb {
+        let ch = |shift: u32| {
+            let (x, y) = ((a >> shift) & 0xFF, (b >> shift) & 0xFF);
+            ((x * (100 - pct) + y * pct) / 100) & 0xFF
+        };
+        ch(0) | (ch(8) << 8) | (ch(16) << 16)
+    }
+
+    fn human_duration(secs: u64) -> String {
+        match secs {
+            0..=59 => format!("{secs}s"),
+            60..=3599 => format!("{}m {}s", secs / 60, secs % 60),
+            _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+        }
+    }
+
+    // -- geometry, shared by layout and paint --------------------------------
+
+    /// The area a page owns: everything but the rail and the strip.
+    fn page_rect(client: RECT) -> RECT {
+        RECT {
+            left: metric::RAIL,
+            top: 0,
+            right: client.right,
+            bottom: client.bottom - metric::STRIP,
+        }
+    }
+
+    /// Where a navigation button sits.
+    fn nav_rect(i: usize) -> RECT {
+        let y = 112 + i as i32 * (metric::NAV_ROW + 2);
+        RECT {
+            left: 10,
+            top: y,
+            right: metric::RAIL - 10,
+            bottom: y + metric::NAV_ROW,
+        }
+    }
+
+    /// Where the model list ends and the model's own page begins.
+    fn models_split(page: RECT) -> i32 {
+        let usable = page.right - page.left - metric::INSET * 2;
+        page.left + metric::INSET + (usable * 44 / 100)
+    }
+
+    /// The first line of a page's content, under the title block.
+    fn content_top(page: RECT) -> i32 {
+        page.top + 104
+    }
+
+    fn settings_columns(page: RECT) -> (i32, i32, i32) {
+        let x = page.left + metric::INSET;
+        let w = page.right - x - metric::INSET;
+        let col = (w - 44) / 2;
+        (x, x + col + 44, col)
+    }
+
+    /// One entry per settings control: its id, where it goes, and whether it is
+    /// a toggle rather than a box.
+    ///
+    /// **Computed in one place** because `layout` positions the controls and
+    /// `paint` draws the labels and hints beside them. Two independent walks of
+    /// the same list is exactly how a label ends up over the wrong box.
+    fn settings_rows(page: RECT) -> Vec<(i32, i32, i32, bool)> {
+        let (left, right, _) = settings_columns(page);
+        let mut out = Vec::new();
+        let mut y = [content_top(page), content_top(page)];
+        for (gi, group) in nav::GROUPS.iter().enumerate() {
+            // Groups alternate between the columns, each kept whole.
+            let c = usize::from(gi % 2 == 1);
+            let x = if c == 0 { left } else { right };
+            y[c] += 26;
+            for f in nav::FIELDS.iter().filter(|f| f.group == *group) {
+                out.push((f.id, x, y[c] + 18, false));
+                y[c] += 18 + metric::CONTROL + 34;
+            }
+            for f in nav::TOGGLES.iter().filter(|f| f.group == *group) {
+                out.push((f.id, x, y[c], true));
+                y[c] += 24 + 30;
+            }
+            y[c] += 16;
+        }
+        out
+    }
+
+    // -- painting ------------------------------------------------------------
 
     unsafe fn paint(hwnd: HWND) {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
         let hdc = BeginPaint(hwnd, &mut ps);
         let mut r = RECT::default();
         GetClientRect(hwnd, &mut r);
-        let sidebar = sidebar_for(r.right - r.left);
+
+        // The selection is read *before* the borrow: `LB_GETCURSEL` is a
+        // `SendMessageW`, and this file's rule is that Windows is never called
+        // with `UI` held open.
+        let sel = selection();
+
+        // Double-buffered. Painting a rail, a page and a strip straight to the
+        // window flickers, and the transcript repaints on every token.
+        let mem = CreateCompatibleDC(hdc);
+        let bmp = CreateCompatibleBitmap(hdc, r.right.max(1), r.bottom.max(1));
+        let old_bmp = SelectObject(mem, bmp);
 
         UI.with(|u| {
             let b = u.borrow();
             let Some(ui) = b.as_ref() else { return };
-            FillRect(hdc, &r, ui.black);
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, WHITE);
+            fill(mem, r, ui.theme.bg);
+            paint_rail(mem, ui, r);
+            paint_strip(mem, ui, r);
 
-            // The logo, thresholded to two values and blitted as a DIB. Drawn
-            // rather than shipped as a second asset: it is the same array the
-            // terminal banner prints, from the same SVG.
-            let (lw, lh) = art::logo_size();
-            let mono = art::logo_mono();
-            let mut px = vec![0u8; lw * lh * 4];
-            for y in 0..lh {
-                for x in 0..lw {
-                    // A DIB with a positive height is bottom-up, so the source
-                    // row is mirrored here rather than the image being upside
-                    // down on screen.
-                    let v = if mono[(lh - 1 - y) * lw + x] {
-                        255u8
-                    } else {
-                        0u8
-                    };
-                    let i = (y * lw + x) * 4;
-                    px[i] = v;
-                    px[i + 1] = v;
-                    px[i + 2] = v;
-                    px[i + 3] = 0;
-                }
+            let page = page_rect(r);
+            match ui.page {
+                Page::Chat => paint_chat(mem, ui, page),
+                Page::Models => paint_models(mem, ui, page, sel),
+                Page::Monitor => paint_monitor(mem, ui, page),
+                Page::Settings => paint_settings(mem, ui, page),
             }
-            let bmi = BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: lw as i32,
-                biHeight: lh as i32,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB,
-                biSizeImage: 0,
-                biXPelsPerMeter: 0,
-                biYPelsPerMeter: 0,
-                biClrUsed: 0,
-                biClrImportant: 0,
-            };
-            StretchDIBits(
-                hdc,
-                PAD + (sidebar - PAD * 2 - LOGO_PX) / 2,
-                PAD,
-                LOGO_PX,
-                LOGO_PX,
-                0,
-                0,
-                lw as i32,
-                lh as i32,
-                px.as_ptr() as *const _,
-                &bmi,
-                DIB_RGB_COLORS,
-                SRCCOPY,
-            );
-
-            SelectObject(hdc, ui.font as HGDIOBJ);
-            let name = wide("C H A O S");
-            TextOutW(hdc, PAD + 4, PAD + LOGO_PX + 6, name.as_ptr(), 9);
-
-            // The rule between the sidebar and the conversation. A line, not a
-            // panel, because a filled panel would need a third value.
-            let pen = CreatePen(0, 1, WHITE);
-            let old = SelectObject(hdc, pen);
-                        Rectangle(hdc, sidebar - PAD, -2, sidebar - PAD + 1, r.bottom + 2);
-            SelectObject(hdc, old);
-            DeleteObject(pen);
-
-            SelectObject(hdc, ui.mono as HGDIOBJ);
-            let s = shared().lock().unwrap();
-            let status = if s.status.is_empty() {
-                "idle".to_string()
-            } else {
-                s.status.clone()
-            };
-            drop(s);
-            let put = |x: i32, y: i32, txt: &str| {
-                let w = wide(txt);
-                TextOutW(hdc, x, y, w.as_ptr(), txt.encode_utf16().count() as i32);
-            };
-
-            // The bottom strip carries three things a model runner has to show
-            // and this one was not showing at all: what is loaded, where a
-            // client can reach it, and what the machine has left.
-            // Three lines above the bottom edge. The endpoint used to sit at
-            // base - 38, which is inside the input box's rectangle, so the one
-            // line telling you where to point a client was painted underneath a
-            // control and never seen.
-            let base = r.bottom - 22;
-            put(sidebar, base, &status);
-
-            match &ui.loaded {
-                Some(name) => {
-                    // C5: the endpoint, spelled out. Without this the server is
-                    // running and there is no way to point anything at it.
-                    put(
-                        sidebar,
-                        base - 40,
-                        &format!(
-                            "running  {name}   ->   http://127.0.0.1:{}/v1   (no API key needed, localhost only)",
-                            ui.port
-                        ),
-                    );
-                }
-                None => put(sidebar, base - 40, "no model loaded"),
-            }
-
-            // C3: what the machine has, refreshed every time this repaints.
-            let total = total_memory_bytes();
-            let free = ui.free_bytes;
-            let used = total.saturating_sub(free);
-            put(
-                sidebar,
-                base - 21,
-                &format!(
-                    "memory  {} free of {}   ({}% in use)",
-                    models::human_size(free),
-                    models::human_size(total),
-                    used.checked_mul(100).and_then(|v| v.checked_div(total)).unwrap_or(0)
-                ),
-            );
-            // Labels for the three setting boxes. Painted rather than made
-            // into STATIC controls: three more windows to colour, position and
-            // keep in step, for text that never changes.
-            let mut lr = RECT::default();
-            GetWindowRect(ui.cache, &mut lr);
-            let mut here = POINT {
-                x: lr.left,
-                y: lr.top,
-            };
-            ScreenToClient(hwnd, &mut here);
-            let sw = (sidebar - PAD * 4) / 3;
-            for (i, label) in ["cache GiB", "threads", "port"].iter().enumerate() {
-                let w = wide(label);
-                TextOutW(
-                    hdc,
-                    PAD + (PAD + sw) * i as i32,
-                    here.y - 18,
-                    w.as_ptr(),
-                    label.len() as i32,
-                );
-            }
-
-            // Which tab is showing, marked by a rule under it rather than a
-            // fill -- the same trick the buttons use for availability.
-            let tab_y = PAD * 2 + LOGO_PX + 24 + 28;
-            let bw = (sidebar - PAD * 3) / 2;
-            let (ux, uw) = if ui.tab == Tab::Installed {
-                (PAD, bw)
-            } else {
-                (PAD * 2 + bw, bw)
-            };
-            let upen = CreatePen(0, 2, WHITE);
-            let uold = SelectObject(hdc, upen);
-            Rectangle(hdc, ux, tab_y + 1, ux + uw, tab_y + 3);
-            SelectObject(hdc, uold);
-            DeleteObject(upen);
         });
 
+        BitBlt(hdc, 0, 0, r.right, r.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old_bmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
         EndPaint(hwnd, &ps);
     }
 
-    /// Paint one owner-drawn control in the two-value palette.
+    /// The navigation rail: the mark, the destinations, and nothing else.
+    unsafe fn paint_rail(hdc: HDC, ui: &Ui, client: RECT) {
+        let t = &ui.theme;
+        fill(
+            hdc,
+            RECT {
+                left: 0,
+                top: 0,
+                right: metric::RAIL,
+                bottom: client.bottom,
+            },
+            t.chrome,
+        );
+        // One hairline separates the rail from the page. Not a border.
+        fill(
+            hdc,
+            RECT {
+                left: metric::RAIL - 1,
+                top: 0,
+                right: metric::RAIL,
+                bottom: client.bottom,
+            },
+            t.stroke_3,
+        );
+
+        // The mark: the logo drawn in the accent, and the wordmark beside it.
+        // The one brand moment, which is what Hermes reserves `BrandMark` for.
+        let (lw, lh) = art::logo_size();
+        let mono = art::logo_mono();
+        let mut px = vec![0u8; lw * lh * 4];
+        let chan = |c: Rgb, s: u32| ((c >> s) & 0xFF) as u8;
+        for y in 0..lh {
+            for x in 0..lw {
+                // A DIB with a positive height is bottom-up, so the source row
+                // is mirrored here rather than the image being upside down.
+                let on = mono[(lh - 1 - y) * lw + x];
+                let c = if on { t.accent } else { t.chrome };
+                let i = (y * lw + x) * 4;
+                // A DIB is BGRA. `Rgb` is 0x00BBGGRR, so blue is the high byte
+                // of the colour and the low byte of the pixel.
+                px[i] = chan(c, 16);
+                px[i + 1] = chan(c, 8);
+                px[i + 2] = chan(c, 0);
+                px[i + 3] = 0;
+            }
+        }
+        let bmi = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: lw as i32,
+            biHeight: lh as i32,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+        let box_px = 30;
+        StretchDIBits(
+            hdc,
+            metric::INSET,
+            28,
+            box_px,
+            box_px,
+            0,
+            0,
+            lw as i32,
+            lh as i32,
+            px.as_ptr() as *const std::ffi::c_void,
+            &bmi,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+        label(
+            hdc,
+            metric::INSET + box_px + 10,
+            32,
+            metric::RAIL,
+            "CHAOS",
+            ui.fonts.mark,
+            t.fg,
+        );
+        // The version, quietly, so a bug report can name it.
+        label(
+            hdc,
+            metric::INSET,
+            70,
+            metric::RAIL - metric::INSET,
+            &format!("v{}", env!("CARGO_PKG_VERSION")),
+            ui.fonts.small,
+            t.fg_tertiary,
+        );
+    }
+
+    /// The strip along the bottom: what is running, where, and how fast.
+    ///
+    /// **The only thing on every page.** Whatever you are looking at, this says
+    /// whether a model is up and gives you the URL to paste.
+    unsafe fn paint_strip(hdc: HDC, ui: &Ui, client: RECT) {
+        let t = &ui.theme;
+        let top = client.bottom - metric::STRIP;
+        fill(
+            hdc,
+            RECT {
+                left: 0,
+                top,
+                right: client.right,
+                bottom: client.bottom,
+            },
+            t.chrome,
+        );
+        rule(hdc, 0, client.right, top, t.stroke_3);
+
+        let y = top + 8;
+        let x = metric::RAIL + metric::INSET;
+        // The status line is the app's running commentary, right-aligned above
+        // the STOP button so it never collides with the endpoint.
+        let status = {
+            let s = shared().lock().unwrap();
+            s.status.clone()
+        };
+
+        match &ui.loaded {
+            Some(name) => {
+                fill(
+                    hdc,
+                    RECT {
+                        left: x,
+                        top: y + 8,
+                        right: x + 8,
+                        bottom: y + 16,
+                    },
+                    t.green,
+                );
+                let nx = x + 16;
+                label(hdc, nx, y + 1, 320, name, ui.fonts.body_bold, t.fg);
+                let url = format!("http://127.0.0.1:{}/v1", ui.port);
+                let uw = measure(hdc, &url, ui.fonts.mono) + 8;
+                label(hdc, nx, y + 21, uw, &url, ui.fonts.mono, t.accent_text);
+
+                let right = client.right - metric::INSET - 96;
+                let left = (nx + 340).min(right - 40);
+                let rate = if ui.last_rate > 0.0 {
+                    format!("{:.2} tok/s", ui.last_rate)
+                } else {
+                    "-- tok/s".to_string()
+                };
+                text(
+                    hdc,
+                    RECT {
+                        left,
+                        top: y + 1,
+                        right,
+                        bottom: y + 19,
+                    },
+                    &rate,
+                    ui.fonts.mono,
+                    t.fg,
+                    DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+                let up = ui
+                    .loaded_at
+                    .map(|i| human_duration(i.elapsed().as_secs()))
+                    .unwrap_or_default();
+                text(
+                    hdc,
+                    RECT {
+                        left,
+                        top: y + 21,
+                        right,
+                        bottom: y + 39,
+                    },
+                    &format!("up {up} · {} tokens · {status}", ui.served),
+                    ui.fonts.small,
+                    t.fg_tertiary,
+                    DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+            }
+            None => {
+                // A hollow dot, and the strip says what to do about it rather
+                // than leaving it to be discovered.
+                frame(
+                    hdc,
+                    RECT {
+                        left: x,
+                        top: y + 8,
+                        right: x + 8,
+                        bottom: y + 16,
+                    },
+                    t.stroke_1,
+                );
+                label(
+                    hdc,
+                    x + 16,
+                    y + 1,
+                    420,
+                    "no model running",
+                    ui.fonts.body_bold,
+                    t.fg_secondary,
+                );
+                label(
+                    hdc,
+                    x + 16,
+                    y + 21,
+                    520,
+                    "Open MODELS, pick one, and press LOAD.",
+                    ui.fonts.small,
+                    t.fg_tertiary,
+                );
+                if !status.is_empty() {
+                    text(
+                        hdc,
+                        RECT {
+                            left: x + 560,
+                            top: y + 12,
+                            right: client.right - metric::INSET - 96,
+                            bottom: y + 32,
+                        },
+                        &status,
+                        ui.fonts.small,
+                        t.fg_secondary,
+                        DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS,
+                    );
+                }
+            }
+        }
+    }
+
+    /// A page's title block: one display-size line, and one sentence.
+    unsafe fn paint_header(hdc: HDC, ui: &Ui, page: RECT, p: Page) {
+        let t = &ui.theme;
+        let x = page.left + metric::INSET;
+        let w = page.right - x - metric::INSET;
+        label(hdc, x, page.top + 24, w, p.title(), ui.fonts.display, t.fg);
+        label(
+            hdc,
+            x,
+            page.top + 66,
+            w,
+            p.subtitle(),
+            ui.fonts.body,
+            t.fg_secondary,
+        );
+    }
+
+    unsafe fn paint_chat(hdc: HDC, ui: &Ui, page: RECT) {
+        paint_header(hdc, ui, page, Page::Chat);
+        let x = page.left + metric::INSET;
+        label(
+            hdc,
+            x,
+            page.bottom - 24,
+            page.right - x - metric::INSET,
+            "Ctrl+Enter sends. The conversation is kept until you press CLEAR.",
+            ui.fonts.small,
+            ui.theme.fg_tertiary,
+        );
+    }
+
+    /// A model's page: its name, its state, whether it is running, and the
+    /// label/value rows underneath.
+    type Detail = (String, String, bool, Vec<(String, String)>);
+
+    /// The selected model's own page, as label/value rows.
+    fn model_detail(ui: &Ui, sel: Option<usize>) -> Option<Detail> {
+        let i = sel?;
+        match ui.tab {
+            Tab::Installed => {
+                let e = ui.entries.get(i)?;
+                let running = ui.loaded.as_deref() == Some(e.label.as_str());
+                let files = ui.entry_files.get(i).copied().unwrap_or(1);
+                let mut rows = vec![
+                    (
+                        "on disk".into(),
+                        format!(
+                            "{}{}",
+                            models::human_size(e.bytes.unwrap_or(0)),
+                            if files > 1 {
+                                format!(" across {files} files")
+                            } else {
+                                String::new()
+                            }
+                        ),
+                    ),
+                    (
+                        "folder".into(),
+                        e.path
+                            .parent()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                    ),
+                ];
+                if running {
+                    rows.push((
+                        "endpoint".into(),
+                        format!("http://127.0.0.1:{}/v1", ui.port),
+                    ));
+                    rows.push((
+                        "context".into(),
+                        ui.cfg
+                            .context
+                            .map(|c| format!("{c} tokens"))
+                            .unwrap_or_else(|| "the model's own limit".into()),
+                    ));
+                    rows.push((
+                        "threads".into(),
+                        ui.cfg
+                            .threads
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "measured".into()),
+                    ));
+                    rows.push((
+                        "expert cache".into(),
+                        ui.cfg
+                            .cache_gib
+                            .map(|c| format!("{c} GiB"))
+                            .unwrap_or_else(|| "measured".into()),
+                    ));
+                    rows.push((
+                        "uptime".into(),
+                        ui.loaded_at
+                            .map(|t| human_duration(t.elapsed().as_secs()))
+                            .unwrap_or_default(),
+                    ));
+                    rows.push(("served".into(), format!("{} tokens", ui.served)));
+                }
+                Some((
+                    e.label.clone(),
+                    if running {
+                        "RUNNING".into()
+                    } else {
+                        "installed, not running".into()
+                    },
+                    running,
+                    rows,
+                ))
+            }
+            Tab::Available => {
+                let o = ui.offers.get(i)?;
+                let state = match catalog::verdict(o, ui.free_bytes) {
+                    catalog::Verdict::Resident => "fits entirely in memory",
+                    catalog::Verdict::Streams => "streams from disk on this machine",
+                    catalog::Verdict::TooBig => "too big for this machine",
+                };
+                let rows = vec![
+                    ("download".into(), models::human_size(o.bytes)),
+                    (
+                        "stays resident".into(),
+                        format!(
+                            "{} -- this is the number that decides",
+                            models::human_size(o.always_read)
+                        ),
+                    ),
+                    ("architecture".into(), o.arch.clone()),
+                    ("quantisation".into(), o.quant.clone()),
+                    (
+                        "files".into(),
+                        if o.shards > 1 {
+                            format!("{} shards", o.shards)
+                        } else {
+                            "1".into()
+                        },
+                    ),
+                    ("free right now".into(), models::human_size(ui.free_bytes)),
+                ];
+                Some((o.name.clone(), state.into(), false, rows))
+            }
+        }
+    }
+
+    unsafe fn paint_models(hdc: HDC, ui: &Ui, page: RECT, sel: Option<usize>) {
+        paint_header(hdc, ui, page, Page::Models);
+        let t = &ui.theme;
+        let top = content_top(page);
+        let split = models_split(page);
+
+        // A rule under the active tab. A fill would be a second emphasis
+        // mechanism for something the eye already reads as a heading.
+        let tab_y = top + metric::BUTTON;
+        let tx = if ui.tab == Tab::Installed {
+            page.left + metric::INSET
+        } else {
+            page.left + metric::INSET + 104
+        };
+        fill(
+            hdc,
+            RECT {
+                left: tx,
+                top: tab_y,
+                right: tx + 96,
+                bottom: tab_y + 2,
+            },
+            t.accent,
+        );
+
+        let dx = split + 28;
+        let dw = page.right - metric::INSET - dx;
+        let mut y = top + 2;
+
+        let Some((name, state, running, rows)) = model_detail(ui, sel) else {
+            label(
+                hdc,
+                dx,
+                y + 8,
+                dw,
+                "Select a model on the left.",
+                ui.fonts.body,
+                t.fg_tertiary,
+            );
+            return;
+        };
+
+        label(hdc, dx, y, dw, &name, ui.fonts.heading, t.fg);
+        y += 28;
+        if running {
+            fill(
+                hdc,
+                RECT {
+                    left: dx,
+                    top: y + 5,
+                    right: dx + 7,
+                    bottom: y + 12,
+                },
+                t.green,
+            );
+            label(hdc, dx + 13, y, dw - 13, &state, ui.fonts.small, t.green);
+        } else {
+            label(hdc, dx, y, dw, &state, ui.fonts.small, t.fg_tertiary);
+        }
+        // Below this the buttons sit, positioned by `layout` at the same y.
+        y += 24;
+        rule(hdc, dx, dx + dw, y, t.stroke_3);
+        y += 16 + metric::BUTTON * 2 + 10 + 20;
+
+        // **Every number carries its unit and its meaning**: two aligned
+        // columns, no boxes, nothing to click to discover.
+        for (k, v) in rows {
+            label(hdc, dx, y + 1, 150, &k, ui.fonts.small, t.fg_tertiary);
+            label(hdc, dx + 156, y, dw - 156, &v, ui.fonts.mono, t.fg);
+            y += 24;
+        }
+    }
+
+    unsafe fn paint_monitor(hdc: HDC, ui: &Ui, page: RECT) {
+        paint_header(hdc, ui, page, Page::Monitor);
+        let t = &ui.theme;
+        let x = page.left + metric::INSET;
+        let w = page.right - x - metric::INSET;
+        let mut y = content_top(page);
+
+        let total = ui.total_bytes.max(1);
+        let free = ui.free_bytes;
+        let used = total.saturating_sub(free);
+        let pct = (used.saturating_mul(100) / total) as i32;
+
+        label(hdc, x, y, w, "MEMORY", ui.fonts.small, t.fg_tertiary);
+        y += 22;
+        label(
+            hdc,
+            x,
+            y,
+            w,
+            &format!(
+                "{} free of {}",
+                models::human_size(free),
+                models::human_size(total)
+            ),
+            ui.fonts.heading,
+            t.fg,
+        );
+        y += 32;
+        // The only chart in the app, and it earns its place: whether a model
+        // fits is the question this page exists to answer.
+        let bar_w = w.min(560);
+        fill(
+            hdc,
+            RECT {
+                left: x,
+                top: y,
+                right: x + bar_w,
+                bottom: y + 8,
+            },
+            t.soft,
+        );
+        fill(
+            hdc,
+            RECT {
+                left: x,
+                top: y,
+                right: x + bar_w * pct / 100,
+                bottom: y + 8,
+            },
+            if pct > 90 { t.red } else { t.accent },
+        );
+        y += 16;
+        label(
+            hdc,
+            x,
+            y,
+            w,
+            &format!("{pct}% in use across every process on this machine"),
+            ui.fonts.small,
+            t.fg_tertiary,
+        );
+        y += 32;
+        rule(hdc, x, x + w, y, t.stroke_3);
+        y += 20;
+
+        label(hdc, x, y, w, "GENERATION", ui.fonts.small, t.fg_tertiary);
+        y += 24;
+        let rows: Vec<(String, String)> = match &ui.loaded {
+            Some(name) => vec![
+                ("model".into(), name.clone()),
+                (
+                    "endpoint".into(),
+                    format!("http://127.0.0.1:{}/v1", ui.port),
+                ),
+                (
+                    "uptime".into(),
+                    ui.loaded_at
+                        .map(|i| human_duration(i.elapsed().as_secs()))
+                        .unwrap_or_default(),
+                ),
+                (
+                    "last rate".into(),
+                    if ui.last_rate > 0.0 {
+                        format!("{:.2} tok/s", ui.last_rate)
+                    } else {
+                        "nothing generated yet".into()
+                    },
+                ),
+                ("tokens served".into(), ui.served.to_string()),
+            ],
+            None => vec![(
+                "model".into(),
+                "nothing running -- load one on MODELS".into(),
+            )],
+        };
+        for (k, v) in rows {
+            label(hdc, x, y + 1, 160, &k, ui.fonts.small, t.fg_tertiary);
+            label(hdc, x + 166, y, w - 166, &v, ui.fonts.mono, t.fg);
+            y += 24;
+        }
+        y += 10;
+        rule(hdc, x, x + w, y, t.stroke_3);
+        y += 20;
+
+        label(hdc, x, y, w, "ON DISK", ui.fonts.small, t.fg_tertiary);
+        y += 24;
+        let bytes: u64 = ui.entries.iter().filter_map(|e| e.bytes).sum();
+        for (k, v) in [
+            (
+                "models installed",
+                format!(
+                    "{}, {} in total",
+                    ui.entries.len(),
+                    models::human_size(bytes)
+                ),
+            ),
+            ("folder", models::default_dir().display().to_string()),
+        ] {
+            label(hdc, x, y + 1, 160, k, ui.fonts.small, t.fg_tertiary);
+            label(hdc, x + 166, y, w - 166, &v, ui.fonts.mono, t.fg);
+            y += 24;
+        }
+
+        // **What this page does not know**, said plainly rather than left as an
+        // absence. Streamed bytes, expert read rate and cache residency are all
+        // measured inside the engine and printed to its log; nothing carries
+        // them over the socket yet, so they are not here and are not invented.
+        y += 20;
+        text(
+            hdc,
+            RECT {
+                left: x,
+                top: y,
+                right: x + w.min(640),
+                bottom: y + 64,
+            },
+            "Streamed bytes, expert read rate and cache residency are measured inside the \
+             engine and printed to its log. They are not on this page because nothing \
+             reports them over the socket yet.",
+            ui.fonts.small,
+            t.fg_tertiary,
+            DT_LEFT | DT_WORDBREAK,
+        );
+    }
+
+    unsafe fn paint_settings(hdc: HDC, ui: &Ui, page: RECT) {
+        paint_header(hdc, ui, page, Page::Settings);
+        let t = &ui.theme;
+        let (left, right, col) = settings_columns(page);
+
+        // Walked exactly as `settings_rows` walks it, so a heading cannot drift
+        // away from the boxes underneath it.
+        let mut y = [content_top(page), content_top(page)];
+        for (gi, group) in nav::GROUPS.iter().enumerate() {
+            let c = usize::from(gi % 2 == 1);
+            let x = if c == 0 { left } else { right };
+            label(hdc, x, y[c] - 2, col, group, ui.fonts.small, t.fg_tertiary);
+            rule(hdc, x, x + col, y[c] + 17, t.stroke_3);
+            y[c] += 26;
+            for f in nav::FIELDS.iter().filter(|f| f.group == *group) {
+                label(hdc, x, y[c] - 1, col, f.label, ui.fonts.body_bold, t.fg);
+                text(
+                    hdc,
+                    RECT {
+                        left: x,
+                        top: y[c] + 18 + metric::CONTROL + 4,
+                        right: x + col,
+                        bottom: y[c] + 18 + metric::CONTROL + 32,
+                    },
+                    f.hint,
+                    ui.fonts.small,
+                    t.fg_tertiary,
+                    DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS,
+                );
+                y[c] += 18 + metric::CONTROL + 34;
+            }
+            for f in nav::TOGGLES.iter().filter(|f| f.group == *group) {
+                text(
+                    hdc,
+                    RECT {
+                        left: x + 26,
+                        top: y[c] + 24,
+                        right: x + col,
+                        bottom: y[c] + 24 + 28,
+                    },
+                    f.hint,
+                    ui.fonts.small,
+                    t.fg_tertiary,
+                    DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS,
+                );
+                y[c] += 24 + 30;
+            }
+            y[c] += 16;
+        }
+
+        // Where the file is, because a settings page whose file you cannot find
+        // is a settings page you cannot back up or hand to anyone.
+        label(
+            hdc,
+            left,
+            page.bottom - 26,
+            page.right - left - metric::INSET,
+            &format!("Stored in {}", settings::path().display()),
+            ui.fonts.small,
+            t.fg_tertiary,
+        );
+    }
+
+    // -- layout --------------------------------------------------------------
+
+    /// Position every control for the current page.
+    ///
+    /// **Builds the whole move list under the borrow, then applies it with
+    /// nothing borrowed.** `MoveWindow` repaints, which asks the parent for
+    /// colours, which borrows -- and a `RefCell` double borrow under
+    /// `panic = "abort"` is instant, silent process death.
+    unsafe fn layout(hwnd: HWND) {
+        let mut r = RECT::default();
+        GetClientRect(hwnd, &mut r);
+        let page = page_rect(r);
+
+        let moves: Vec<(i32, i32, i32, i32, i32)> = UI.with(|u| {
+            let b = u.borrow();
+            let Some(ui) = b.as_ref() else {
+                return Vec::new();
+            };
+            let mut m = Vec::new();
+
+            for (i, p) in nav::PAGES.iter().enumerate() {
+                let q = nav_rect(i);
+                m.push((
+                    nav::nav_id(*p),
+                    q.left,
+                    q.top,
+                    q.right - q.left,
+                    q.bottom - q.top,
+                ));
+            }
+            m.push((
+                nav::ID_STRIP_STOP,
+                r.right - metric::INSET - 84,
+                r.bottom - metric::STRIP + 10,
+                84,
+                metric::BUTTON,
+            ));
+
+            let x = page.left + metric::INSET;
+            let w = page.right - x - metric::INSET;
+            let top = content_top(page);
+
+            match ui.page {
+                Page::Chat => {
+                    let composer_h = 88;
+                    let out_h = (page.bottom - top - composer_h - 44).max(120);
+                    m.push((nav::ID_OUT, x, top, w, out_h));
+                    let cy = top + out_h + 14;
+                    m.push((nav::ID_IN, x, cy, w - 200, composer_h));
+                    m.push((nav::ID_SEND, x + w - 188, cy, 110, metric::BUTTON));
+                    m.push((nav::ID_CLEAR, x + w - 70, cy, 70, metric::BUTTON));
+                }
+                Page::Models => {
+                    let split = models_split(page);
+                    m.push((nav::ID_TAB_INSTALLED, x, top, 96, metric::BUTTON));
+                    m.push((nav::ID_TAB_AVAILABLE, x + 104, top, 96, metric::BUTTON));
+                    // RESCAN belongs with the list it refreshes.
+                    m.push((nav::ID_REFRESH, split - 84, top, 84, metric::BUTTON));
+                    let list_top = top + metric::BUTTON + 14;
+                    m.push((
+                        nav::ID_LIST,
+                        x,
+                        list_top,
+                        split - x,
+                        (page.bottom - list_top - 18).max(80),
+                    ));
+
+                    // The model's own actions, under its name and status.
+                    let dx = split + 28;
+                    let dw = page.right - metric::INSET - dx;
+                    let by = top + 2 + 28 + 24 + 16;
+                    let bw = ((dw - 20) / 3).clamp(70, 150);
+                    m.push((nav::ID_LOAD, dx, by, bw, metric::BUTTON));
+                    m.push((nav::ID_UNLOAD, dx + bw + 10, by, bw, metric::BUTTON));
+                    m.push((
+                        nav::ID_COPY_ENDPOINT,
+                        dx + (bw + 10) * 2,
+                        by,
+                        bw,
+                        metric::BUTTON,
+                    ));
+                    let by2 = by + metric::BUTTON + 10;
+                    m.push((nav::ID_GET, dx, by2, bw, metric::BUTTON));
+                    m.push((nav::ID_DELETE, dx + bw + 10, by2, bw, metric::BUTTON));
+                }
+                Page::Monitor => {}
+                Page::Settings => {
+                    let (_, _, col) = settings_columns(page);
+                    let bw = col.min(300);
+                    for (id, cx, cy, is_toggle) in settings_rows(page) {
+                        let h = if is_toggle { 24 } else { metric::CONTROL };
+                        m.push((id, cx, cy, bw, h));
+                    }
+                    let by = page.bottom - 26 - metric::BUTTON - 16;
+                    m.push((nav::ID_SAVE, x, by, 110, metric::BUTTON));
+                    m.push((nav::ID_RESET, x + 120, by, 110, metric::BUTTON));
+                }
+            }
+            m
+        });
+
+        for (id, x, y, w, h) in moves {
+            let c = ctl(id);
+            if !c.is_null() {
+                MoveWindow(c, x, y, w.max(1), h.max(1), 1);
+            }
+        }
+    }
+
+    // -- owner-drawn controls ------------------------------------------------
+
+    /// How a button is weighted.
+    ///
+    /// Hermes: *"one primary action per page, visually heavier than the rest"*.
+    /// The old window had six buttons of identical weight, so the eye had no
+    /// idea which one to press.
+    #[derive(PartialEq, Clone, Copy)]
+    enum Weight {
+        /// Filled with the accent. Exactly one per page.
+        Primary,
+        /// A hairline and a label.
+        Secondary,
+        /// A hairline and a label, in the destructive colour.
+        Destructive,
+        /// No box at all -- Hermes' `text` variant, for "Cancel" and "Clear".
+        Quiet,
+        /// A navigation destination in the rail.
+        Nav,
+        /// A tab above the model list.
+        Tab,
+        /// A checkbox and a label.
+        Toggle,
+    }
+
+    /// **The primary action follows the page**, and on MODELS the tab: loading
+    /// what you have, or fetching what you do not.
+    fn weight_of(id: i32, page: Page, tab: Tab) -> Weight {
+        match id {
+            nav::ID_NAV_CHAT | nav::ID_NAV_MODELS | nav::ID_NAV_MONITOR | nav::ID_NAV_SETTINGS => {
+                Weight::Nav
+            }
+            nav::ID_TAB_INSTALLED | nav::ID_TAB_AVAILABLE => Weight::Tab,
+            nav::ID_AUTO | nav::ID_FORCE => Weight::Toggle,
+            nav::ID_DELETE => Weight::Destructive,
+            nav::ID_CLEAR | nav::ID_RESET | nav::ID_REFRESH => Weight::Quiet,
+            nav::ID_SEND if page == Page::Chat => Weight::Primary,
+            nav::ID_SAVE if page == Page::Settings => Weight::Primary,
+            nav::ID_LOAD if page == Page::Models && tab == Tab::Installed => Weight::Primary,
+            nav::ID_GET if page == Page::Models && tab == Tab::Available => Weight::Primary,
+            _ => Weight::Secondary,
+        }
+    }
+
+    /// Paint one owner-drawn control.
     ///
     /// Buttons and the list selection are the two places Windows insists on its
-    /// own colours -- a themed push button ignores `WM_CTLCOLORBTN`, and the
-    /// selection bar is the system highlight, which is blue. Both are drawn
-    /// here instead. Emphasis is inversion, since there is no third value to
-    /// reach for: selected and pressed are white-on-black turned inside out.
+    /// own colours -- a themed push button ignores `WM_CTLCOLORBTN` entirely,
+    /// and the selection bar is the system highlight. Both are drawn here.
     unsafe fn draw_item(di: &DRAWITEMSTRUCT) {
         let selected = di.itemState & ODS_SELECTED != 0;
         let disabled = di.itemState & ODS_DISABLED != 0;
-        let (bg, fg) = if selected {
-            (WHITE, BLACK)
-        } else {
-            (BLACK, WHITE)
+        let focused = di.itemState & ODS_FOCUS != 0;
+
+        // Everything needed comes out of the borrow first; the reads from
+        // Windows below are all outside it.
+        let snapshot = UI.with(|u| {
+            let b = u.borrow();
+            b.as_ref().map(|ui| {
+                (
+                    ui.theme,
+                    ui.page,
+                    ui.tab,
+                    ui.fonts.body,
+                    ui.fonts.body_bold,
+                    ui.cfg.auto,
+                    ui.cfg.force,
+                    ui.loaded.clone(),
+                )
+            })
+        });
+        let Some((t, page, tab, font, font_bold, auto, force, loaded)) = snapshot else {
+            return;
         };
 
-        let brush = CreateSolidBrush(bg);
-        FillRect(di.hDC, &di.rcItem, brush);
-        DeleteObject(brush as HGDIOBJ);
-
-        // A one-pixel rule around a button, so it reads as a control without a
-        // fill that would need a third value.
-        // The frame is how a button says it can be pressed. Omitted when
-        // disabled: with only two values, *removing* the rule is the quiet
-        // signal and inverting the whole control is the loud one, and the loud
-        // one was landing on precisely the controls that do nothing.
-        if di.CtlType != ODT_LISTBOX && !disabled {
-            let pen = CreatePen(0, 1, fg);
-            let old_pen = SelectObject(di.hDC, pen);
-            let hollow = CreateSolidBrush(bg);
-            let old_brush = SelectObject(di.hDC, hollow as HGDIOBJ);
-            Rectangle(
-                di.hDC,
-                di.rcItem.left,
-                di.rcItem.top,
-                di.rcItem.right,
-                di.rcItem.bottom,
-            );
-            SelectObject(di.hDC, old_brush);
-            SelectObject(di.hDC, old_pen);
-            DeleteObject(hollow as HGDIOBJ);
-            DeleteObject(pen as HGDIOBJ);
+        if di.CtlType == ODT_LISTBOX {
+            draw_list_row(di, &t, font, font_bold, selected, loaded.as_deref());
+            return;
         }
 
-        let text = if di.CtlType == ODT_LISTBOX {
-            if di.itemID == u32::MAX {
-                return;
+        let id = di.CtlID as i32;
+        let text_s = control_text(di.hwndItem);
+        let r = di.rcItem;
+
+        match weight_of(id, page, tab) {
+            Weight::Nav => {
+                let active = nav::page_of_nav(id) == Some(page);
+                let bg = if active {
+                    t.accent_soft
+                } else if selected {
+                    t.soft
+                } else {
+                    t.chrome
+                };
+                fill(di.hDC, r, bg);
+                if active {
+                    // A rule down the left edge as well as the wash: the marker
+                    // has to survive on a ground that is already tinted.
+                    fill(
+                        di.hDC,
+                        RECT {
+                            left: r.left,
+                            top: r.top + 4,
+                            right: r.left + 3,
+                            bottom: r.bottom - 4,
+                        },
+                        t.accent,
+                    );
+                }
+                text(
+                    di.hDC,
+                    RECT {
+                        left: r.left + 16,
+                        ..r
+                    },
+                    &text_s,
+                    if active { font_bold } else { font },
+                    if active {
+                        t.accent_text
+                    } else {
+                        t.fg_secondary
+                    },
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+                );
             }
-            let n = SendMessageW(di.hwndItem, LB_GETTEXTLEN, di.itemID as WPARAM, 0);
-            if n <= 0 {
-                return;
+            Weight::Tab => {
+                let active = (id == nav::ID_TAB_INSTALLED) == (tab == Tab::Installed);
+                fill(di.hDC, r, t.bg);
+                text(
+                    di.hDC,
+                    r,
+                    &text_s,
+                    if active { font_bold } else { font },
+                    if active { t.fg } else { t.fg_tertiary },
+                    DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                );
             }
-            let mut buf = vec![0u16; n as usize + 1];
-            SendMessageW(
-                di.hwndItem,
-                LB_GETTEXT,
-                di.itemID as WPARAM,
-                buf.as_mut_ptr() as LPARAM,
+            Weight::Toggle => {
+                fill(di.hDC, r, t.bg);
+                let on = if id == nav::ID_AUTO { auto } else { force };
+                let b = RECT {
+                    left: r.left,
+                    top: r.top + 3,
+                    right: r.left + 16,
+                    bottom: r.top + 19,
+                };
+                if on {
+                    fill(di.hDC, b, t.accent);
+                    // A tick drawn as two strokes: a glyph would depend on a
+                    // font having one at this size, and Segoe UI's is centred
+                    // for a much larger box.
+                    let pen = CreatePen(0, 2, t.on_accent);
+                    let old = SelectObject(di.hDC, pen);
+                    MoveToEx(di.hDC, b.left + 4, b.top + 8, std::ptr::null_mut());
+                    LineTo(di.hDC, b.left + 7, b.top + 11);
+                    LineTo(di.hDC, b.left + 12, b.top + 5);
+                    SelectObject(di.hDC, old);
+                    DeleteObject(pen);
+                } else {
+                    frame(di.hDC, b, t.stroke_1);
+                }
+                text(
+                    di.hDC,
+                    RECT {
+                        left: r.left + 26,
+                        ..r
+                    },
+                    &text_s,
+                    font,
+                    t.fg,
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+                );
+                if focused {
+                    frame(di.hDC, inset(b, -3), t.stroke_1);
+                }
+            }
+            Weight::Primary => {
+                let bg = if disabled {
+                    t.soft
+                } else if selected {
+                    // Pressed: the same blue, taken down. There is no second
+                    // accent to reach for, and inverting would read as disabled.
+                    mix(t.accent, t.fg, 22)
+                } else {
+                    t.accent
+                };
+                fill(di.hDC, r, bg);
+                text(
+                    di.hDC,
+                    r,
+                    &text_s,
+                    font_bold,
+                    if disabled { t.fg_tertiary } else { t.on_accent },
+                    DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                );
+                if focused && !disabled {
+                    frame(di.hDC, inset(r, 3), t.on_accent);
+                }
+            }
+            w @ (Weight::Secondary | Weight::Destructive) => {
+                let danger = w == Weight::Destructive;
+                fill(di.hDC, r, if selected { t.soft_active } else { t.bg });
+                // The hairline is how a button says it can be pressed. Omitted
+                // when disabled: removing the rule is the quiet signal, and
+                // inverting the whole control was the loud one -- which used to
+                // land on precisely the controls that do nothing.
+                if !disabled {
+                    frame(di.hDC, r, if danger { t.red } else { t.stroke_1 });
+                }
+                text(
+                    di.hDC,
+                    r,
+                    &text_s,
+                    font,
+                    if disabled {
+                        t.fg_tertiary
+                    } else if danger {
+                        t.red
+                    } else {
+                        t.fg
+                    },
+                    DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                );
+                if focused && !disabled {
+                    frame(di.hDC, inset(r, 3), t.stroke_2);
+                }
+            }
+            Weight::Quiet => {
+                fill(di.hDC, r, if selected { t.soft } else { t.bg });
+                text(
+                    di.hDC,
+                    r,
+                    &text_s,
+                    font,
+                    if disabled {
+                        t.fg_tertiary
+                    } else {
+                        t.fg_secondary
+                    },
+                    DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                );
+            }
+        }
+    }
+
+    /// One row of the model list.
+    unsafe fn draw_list_row(
+        di: &DRAWITEMSTRUCT,
+        t: &Theme,
+        font: HFONT,
+        font_bold: HFONT,
+        selected: bool,
+        loaded: Option<&str>,
+    ) {
+        if di.itemID == u32::MAX {
+            return;
+        }
+        let n = SendMessageW(di.hwndItem, LB_GETTEXTLEN, di.itemID as WPARAM, 0);
+        if n <= 0 {
+            return;
+        }
+        let mut buf = vec![0u16; n as usize + 1];
+        SendMessageW(
+            di.hwndItem,
+            LB_GETTEXT,
+            di.itemID as WPARAM,
+            buf.as_mut_ptr() as LPARAM,
+        );
+        let s = String::from_utf16_lossy(&buf[..n as usize]);
+
+        fill(
+            di.hDC,
+            di.rcItem,
+            if selected { t.soft_active } else { t.bg },
+        );
+        if selected {
+            fill(
+                di.hDC,
+                RECT {
+                    right: di.rcItem.left + 3,
+                    ..di.rcItem
+                },
+                t.accent,
             );
-            String::from_utf16_lossy(&buf[..n as usize])
-        } else {
-            let n = GetWindowTextLengthW(di.hwndItem);
-            if n <= 0 {
-                return;
-            }
-            let mut buf = vec![0u16; n as usize + 1];
-            let got = GetWindowTextW(di.hwndItem, buf.as_mut_ptr(), n + 1);
-            String::from_utf16_lossy(&buf[..got.max(0) as usize])
-        };
-
-        SetBkMode(di.hDC, TRANSPARENT);
-        SetTextColor(di.hDC, fg);
-
-        let w: Vec<u16> = text.encode_utf16().collect();
-        let (x, y) = if di.CtlType == ODT_LISTBOX {
-            (di.rcItem.left + 6, di.rcItem.top + 3)
-        } else {
-            // Centred by measurement would need GetTextExtentPoint32; the
-            // buttons carry short fixed labels, so a fraction of the width is
-            // close enough and cannot be wrong by more than a few pixels.
-            let cw = (di.rcItem.right - di.rcItem.left) / 2;
-            let approx = (text.len() as i32 * 7) / 2;
-            (
-                di.rcItem.left + (cw - approx).max(6),
-                di.rcItem.top + (di.rcItem.bottom - di.rcItem.top) / 2 - 9,
-            )
-        };
-        TextOutW(di.hDC, x, y, w.as_ptr(), w.len() as i32);
+        }
+        // A running model is marked in the list as well as on the strip, so
+        // "which one is up" is answered wherever you happen to be looking.
+        let running = loaded.is_some_and(|l| s.starts_with(l));
+        let mut x = di.rcItem.left + 12;
+        if running {
+            fill(
+                di.hDC,
+                RECT {
+                    left: x,
+                    top: di.rcItem.top + 10,
+                    right: x + 7,
+                    bottom: di.rcItem.top + 17,
+                },
+                t.green,
+            );
+            x += 13;
+        }
+        text(
+            di.hDC,
+            RECT {
+                left: x,
+                right: di.rcItem.right - 8,
+                ..di.rcItem
+            },
+            &s,
+            if running { font_bold } else { font },
+            t.fg,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
     }
 
     /// Put the embedded icon on the window itself.
     ///
     /// The resource compiled into the executable is what Explorer shows for the
     /// *file*. The title bar, the taskbar button and the Alt-Tab strip read the
-    /// *window's* icon, which is unset until something sends `WM_SETICON` --
-    /// which is why an executable can have a perfectly good icon in Explorer and
-    /// still show a blank page while it is running.
-    ///
-    /// Both sizes: small is the title bar, big is the taskbar. Resource id 1,
-    /// matching what `build.rs` writes into the `.rc`.
+    /// *window's* icon, which is unset until something sends `WM_SETICON`.
     unsafe fn set_window_icon(hwnd: HWND, hinst: HINSTANCE) {
         let id = 1u16 as *const u16;
         let big = LoadImageW(hinst, id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
@@ -1491,6 +2824,41 @@ mod windows_app {
         }
     }
 
+    fn about() {
+        let msg = format!(
+            "Chaos v{}\n\nA runner for models larger than memory: the always-read \
+             weights stay resident, routed experts stream from disk per token.\n\n\
+             {RELEASES_URL}",
+            env!("CARGO_PKG_VERSION")
+        );
+        unsafe {
+            MessageBoxW(
+                main_hwnd(),
+                wide(&msg).as_ptr(),
+                wide("About Chaos").as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+    }
+
+    fn open_crash_log() {
+        let p = std::env::temp_dir().join("chaos-app-crash.log");
+        if p.exists() {
+            shell_open(&p.display().to_string());
+        } else {
+            set_status("no crash log -- Chaos has not crashed on this machine");
+        }
+    }
+
+    fn set_tab(tab: Tab) {
+        UI.with(|u| {
+            if let Some(ui) = u.borrow_mut().as_mut() {
+                ui.tab = tab;
+            }
+        });
+        rescan();
+    }
+
     unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         match msg {
             WM_SIZE => {
@@ -1498,21 +2866,45 @@ mod windows_app {
                 InvalidateRect(hwnd, std::ptr::null(), 1);
                 0
             }
+            // Below this the rail plus a page has nowhere to put anything.
+            WM_GETMINMAXINFO => {
+                let mm = &mut *(lp as *mut MINMAXINFO);
+                mm.ptMinTrackSize.x = MIN_W;
+                mm.ptMinTrackSize.y = MIN_H;
+                0
+            }
+            // Answered here so Windows never paints a ground we are about to
+            // paint over: that flash of the wrong colour is the whole of it.
+            WM_ERASEBKGND => 1,
             WM_PAINT => {
                 paint(hwnd);
                 0
             }
-            // Every control repainted to the two-value palette. Without these
-            // the list and the boxes come up in the system's greys, which is
-            // the whole design gone.
-            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-                SetTextColor(wp as HDC, WHITE);
-                SetBkColor(wp as HDC, BLACK);
+            WM_TIMER => {
+                // Uptime and free memory move on their own; nothing else here
+                // would ever ask for them to be redrawn.
+                let free = free_memory_bytes();
                 UI.with(|u| {
-                    u.borrow()
-                        .as_ref()
-                        .map(|ui| ui.black as LRESULT)
-                        .unwrap_or(0)
+                    if let Some(ui) = u.borrow_mut().as_mut() {
+                        ui.free_bytes = free;
+                    }
+                });
+                repaint();
+                0
+            }
+            WM_INITMENUPOPUP => {
+                sync_menu(hwnd);
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            // Every control repainted to the palette. Without these the boxes
+            // come up in the system's greys, which is the whole design gone.
+            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                UI.with(|u| {
+                    let b = u.borrow();
+                    let Some(ui) = b.as_ref() else { return 0 };
+                    SetTextColor(wp as HDC, ui.theme.fg);
+                    SetBkColor(wp as HDC, ui.theme.bg);
+                    ui.brushes.bg as LRESULT
                 })
             }
             WM_APP_TICK => {
@@ -1527,39 +2919,101 @@ mod windows_app {
             WM_COMMAND => {
                 let id = (wp & 0xFFFF) as i32;
                 let code = ((wp >> 16) & 0xFFFF) as u16;
+                // A menu pick and a rail button end in the same call, which is
+                // the rule about one action having exactly one home.
+                if let Some(p) = nav::page_of_menu(id).or_else(|| nav::page_of_nav(id)) {
+                    show_page(p);
+                    return 0;
+                }
+                match id {
+                    nav::IDM_EXIT => {
+                        DestroyWindow(hwnd);
+                        return 0;
+                    }
+                    nav::IDM_THEME_LIGHT => {
+                        set_mode(Mode::Light);
+                        return 0;
+                    }
+                    nav::IDM_THEME_DARK => {
+                        set_mode(Mode::Dark);
+                        return 0;
+                    }
+                    nav::IDM_RESCAN => {
+                        rescan();
+                        return 0;
+                    }
+                    nav::IDM_OPEN_MODELS_DIR => {
+                        let d = models::default_dir();
+                        let _ = std::fs::create_dir_all(&d);
+                        shell_open(&d.display().to_string());
+                        return 0;
+                    }
+                    nav::IDM_LOAD => {
+                        load_model();
+                        return 0;
+                    }
+                    nav::IDM_STOP => {
+                        unload_model();
+                        return 0;
+                    }
+                    nav::IDM_DOWNLOAD => {
+                        download_selected();
+                        return 0;
+                    }
+                    nav::IDM_DELETE => {
+                        delete_selected();
+                        return 0;
+                    }
+                    nav::IDM_COPY_ENDPOINT => {
+                        copy_endpoint();
+                        return 0;
+                    }
+                    nav::IDM_MANUAL => {
+                        shell_open(MANUAL_URL);
+                        return 0;
+                    }
+                    nav::IDM_RELEASES => {
+                        shell_open(RELEASES_URL);
+                        return 0;
+                    }
+                    nav::IDM_CRASH_LOG => {
+                        open_crash_log();
+                        return 0;
+                    }
+                    nav::IDM_ABOUT => {
+                        about();
+                        return 0;
+                    }
+                    _ => {}
+                }
                 match (id, code) {
-                    (ID_LOAD, BN_CLICKED) => load_model(),
-                    (ID_UNLOAD, BN_CLICKED) => unload_model(),
-                    (ID_SEND, BN_CLICKED) => send_prompt(),
-                    (ID_REFRESH, BN_CLICKED) => rescan(),
-                    (ID_GET, BN_CLICKED) => download_selected(),
-                    (ID_DELETE, BN_CLICKED) => delete_selected(),
-                    (ID_INSTALLED, BN_CLICKED) => {
-                        UI.with(|u| {
-                            if let Some(ui) = u.borrow_mut().as_mut() {
-                                ui.tab = Tab::Installed;
-                            }
-                        });
-                        rescan();
+                    (nav::ID_LOAD, BN_CLICKED) => load_model(),
+                    (nav::ID_UNLOAD, BN_CLICKED) | (nav::ID_STRIP_STOP, BN_CLICKED) => {
+                        unload_model()
                     }
-                    (ID_AVAILABLE, BN_CLICKED) => {
-                        UI.with(|u| {
-                            if let Some(ui) = u.borrow_mut().as_mut() {
-                                ui.tab = Tab::Available;
-                            }
-                        });
-                        rescan();
-                    }
-                    (ID_LIST, LBN_SELCHANGE) => {}
+                    // `BN_CLICKED` is zero, which is also the code an
+                    // accelerator arrives with -- so Ctrl+Enter and the button
+                    // land on this one arm rather than needing two.
+                    (nav::ID_SEND, BN_CLICKED) => send_prompt(),
+                    (nav::ID_CLEAR, BN_CLICKED) => clear_chat(),
+                    (nav::ID_REFRESH, BN_CLICKED) => rescan(),
+                    (nav::ID_GET, BN_CLICKED) => download_selected(),
+                    (nav::ID_DELETE, BN_CLICKED) => delete_selected(),
+                    (nav::ID_COPY_ENDPOINT, BN_CLICKED) => copy_endpoint(),
+                    (nav::ID_TAB_INSTALLED, BN_CLICKED) => set_tab(Tab::Installed),
+                    (nav::ID_TAB_AVAILABLE, BN_CLICKED) => set_tab(Tab::Available),
+                    (nav::ID_SAVE, BN_CLICKED) => save_settings(),
+                    (nav::ID_RESET, BN_CLICKED) => reset_settings(),
+                    (nav::ID_AUTO, BN_CLICKED) | (nav::ID_FORCE, BN_CLICKED) => toggle(id),
+                    // Selecting a different model redraws its page beside the
+                    // list, which is the whole point of a page per model.
+                    (nav::ID_LIST, LBN_SELCHANGE) => repaint(),
                     _ => {}
                 }
                 0
             }
             WM_CLOSE => {
-                // Kill the child before the window goes: an orphaned server
-                // holding 7 GiB is exactly the failure this project has a rule
-                // about, and it would outlive the app that started it.
-                unload_model();
+                stop_server();
                 DestroyWindow(hwnd);
                 0
             }
@@ -1570,6 +3024,7 @@ mod windows_app {
                 // 7 GiB for V4-Flash -- with no window to stop it from. The
                 // taskbar close became a memory leak you had to find in Task
                 // Manager.
+                KillTimer(hwnd, TIMER_ID);
                 stop_server();
                 PostQuitMessage(0);
                 0

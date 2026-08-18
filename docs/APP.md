@@ -1,8 +1,9 @@
 # Chaos, the Windows app
 
 `chaos-app` is a native window: pick a model, run it, talk to it, point a coding
-agent at it. Everything it does is also possible from the command line — the app
-is the shorter route, not a different engine.
+agent at it, and watch what the machine is doing while it works. Everything it
+does is also possible from the command line — the app is the shorter route, not
+a different engine.
 
 ## Installing
 
@@ -25,73 +26,136 @@ and pressing UNINSTALL.
 ## The window
 
 ```
-+---------------------------+--------------------------------------+
-|  logo                     |                                      |
-|  CHAOS                    |  the conversation                    |
-|  [INSTALLED] [AVAILABLE]  |                                      |
-|                           |                                      |
-|  model list               |                                      |
-|                           +--------------------------------------+
-|  [LOAD]    [UNLOAD]       |  what you type              [SEND]   |
-|  [DOWNLOAD][DELETE]       +--------------------------------------+
-|  [RESCAN]                 |  running <model> -> http://...       |
-|  cache  threads  port     |  memory  6.4 GB free of 16.9 GB      |
-+---------------------------+--------------------------------------+
++----------------+----------------------------------------------+
+| ✳ CHAOS        |  Chat                                        |
+|   v0.0.6       |  Talk to the running model, or point a       |
+|                |  coding agent at its endpoint.               |
+| ▎CHAT          |                                              |
+|  MODELS        |  +----------------------------------------+  |
+|  MONITOR       |  |  the conversation                      |  |
+|  SETTINGS      |  +----------------------------------------+  |
+|                |  [ what you type      ]  [ SEND ]  CLEAR     |
++----------------+----------------------------------------------+
+| ● qwen3-4b                        15.4 tok/s        [ STOP ]   |
+|   http://127.0.0.1:8231/v1        up 3m · 812 tokens           |
++----------------------------------------------------------------+
 ```
+
+**Four pages, and one owns the screen at a time.** Reach them from the rail, from
+**View** in the menu, or with `Ctrl+1` … `Ctrl+4`.
+
+**The strip along the bottom is on every page.** Whatever you are looking at, it
+says whether a model is up, where to reach it, and how fast it is going.
+
+### CHAT
+
+The conversation, full width. `Ctrl+Enter` sends — plain Enter makes a
+paragraph, because a prompt is often more than one line. **CLEAR** empties the
+transcript and the history behind it; until then the model sees the whole
+conversation.
+
+### MODELS
 
 **INSTALLED** lists what is on this machine. **AVAILABLE** lists what Chaos can
-fetch, with two numbers per row:
+fetch. Selecting a model opens **that model's own page** beside the list:
 
 ```
-v4flash UD-Q4_K_XL   155 GB [5 files]   needs 7.92 GB - streams
-qwen3-32b Q4_K_M     19.8 GB            needs 19.8 GB - too big
+Llama-3.2-1B-Instruct-Q4_K_M                            ● RUNNING
+
+  [ LOAD ]   [ STOP ]   [ COPY ENDPOINT ]
+  [ DOWNLOAD ]   [ DELETE ]
+
+  on disk        808 MB
+  endpoint       http://127.0.0.1:8231/v1
+  context        the model's own limit
+  threads        measured
+  expert cache   measured
+  uptime         1m 18s
+  served         20 tokens
 ```
 
-**Read the second number.** The first is the download; the second is what has to
+For a model you have not downloaded yet, the same page shows the two numbers
+that decide whether it will run here:
+
+```
+  download            155 GB
+  stays resident      7.92 GB -- this is the number that decides
+```
+
+**Read the second one.** The first is the download; the second is what has to
 stay in memory. A 155 GB Mixture-of-Experts model *streams* on a 16 GB machine
 because only the always-read weights are resident. A 20 GB dense model does not,
 because a dense container has no routed experts to leave on disk. Sorting by
 download size gets this exactly backwards.
 
-## Using it
-
-**LOAD** starts the engine on the selected model. Large models take a while; the
-status line says `loading` until the server answers, then `ready`.
-
-**The endpoint appears at the bottom** once a model is up:
-
-```
-running qwen3-4b -> http://127.0.0.1:8231/v1   (no API key needed, localhost only)
-```
-
-That is an OpenAI-compatible endpoint. Point `aider`, `Cline`, `Continue` or
-anything else that takes a base URL at it. **There is no API key** — the server
-binds `127.0.0.1` only and never listens on the network, so there is nothing to
-authenticate. If a client demands a key, give it any string.
-
-**UNLOAD** stops the engine and frees the memory. So does closing the window:
+**LOAD** starts the engine. Large models take a while; the strip says so until
+the server answers. **STOP** frees the memory, and so does closing the window —
 the model runs as a child process and Chaos stops it on the way out.
 
-**DOWNLOAD** fetches the selected AVAILABLE model with `chaos-pull`, in the
-background. **DELETE** removes an installed model and *every shard* of it, after
-telling you how many files and how many bytes. It refuses while that model is
-loaded.
+**COPY ENDPOINT** puts `http://127.0.0.1:8231/v1` on the clipboard, which is the
+string you paste into `aider`, `Cline`, `Continue`, or anything else that takes
+a base URL. **There is no API key**: the server binds `127.0.0.1` only and never
+listens on the network, so there is nothing to authenticate. If a client demands
+a key, give it any string.
 
-## Settings
+**DELETE** removes an installed model and *every shard* of it, after telling you
+how many files and how many bytes. It refuses while that model is running.
 
-The three boxes are the settings that matter most, and they persist to
-`%USERPROFILE%\.chaos\settings.txt`:
+### MONITOR
+
+What the machine is doing: memory free and in use with a bar, the running
+model's endpoint, uptime, last measured rate and tokens served, and what is on
+disk.
+
+Streamed bytes, expert read rate and cache residency are measured inside the
+engine and printed to its log. **They are not on this page**, because nothing
+carries them over the socket yet — and the page says so rather than leaving a
+gap to be noticed.
+
+### SETTINGS
+
+Every setting the file holds — nine of them — grouped, each saying what it does
+and what leaving it empty will do:
 
 | | |
 |---|---|
-| `cache GiB` | expert cache budget. Empty means the engine measures your machine |
-| `threads` | generation threads. Empty means measured — generation wants 2-4, not all of them |
-| `port` | where the server listens, and what the endpoint line shows |
+| **Model defaults** | `context`, `GPU layers`, `measure this machine`, `allow unverified architectures` |
+| **Performance** | `expert cache`, `generation threads`, `prefill threads` |
+| **Server** | `port` |
+| **Paths** | `models folder` |
 
-The file holds more than the window exposes — `threads_batch`, `context`, `ngl`,
-`models_dir`, `auto`, `force` — and it is plain text, safe to edit by hand.
-Unknown keys are preserved, so an older build will not silently discard a newer
-one's preferences.
+**Empty means measured.** Chaos reads the machine and picks a value; typing one
+overrides it. **SAVE** writes the file and reports where. **RESET** returns every
+engine setting to measured, and leaves the theme alone.
+
+> **`allow unverified architectures`** runs a model that has never been diffed
+> against llama.cpp. Such a model can produce fluent nonsense rather than an
+> error. The setting is honest about that, and it is honoured — turning it off
+> makes `chaos-serve` refuse by name.
+
+### The menu
+
+**File** — rescan (`F5`), open the models folder, exit.
+**Model** — load (`Ctrl+L`), stop, download, delete, copy endpoint (`Ctrl+E`).
+**View** — the four pages, and light or dark.
+**Help** — manual, releases, crash log, about.
+
+Commands that cannot be run right now are greyed rather than left to be tried.
+
+## Light and dark
+
+Chaos opens light, which is what Hermes' desktop does and what this design was
+drawn against. **View → Dark** switches, and the choice persists.
+
+> **The menu bar stays light in dark mode.** It is drawn by Windows outside the
+> client area and does not follow the dark title-bar attribute.
+> `SetPreferredAppMode` — the undocumented `uxtheme` ordinal every dark Win32
+> app calls — was tried both before and after window creation, with
+> `FlushMenuThemes`. The ordinals resolve on Windows 10.0.26200 and the bar
+> still measures `#FFFFFF`. Owner-drawing the entire menu is the only route
+> left, and it needs another undocumented message to paint the bar's own
+> background. The scrollbars *are* fixed, by naming the control's dark theme
+> class — measured going from `#F0F0F0` to `#171717`.
 
 ## Where things live
 
@@ -105,26 +169,30 @@ one's preferences.
 **Models are never inside the install.** Uninstalling cannot delete them, and an
 upgrade never touches them.
 
+The settings file is plain text and safe to edit by hand. Keys it does not
+recognise are preserved, so running an older build once will not silently
+discard a newer one's preferences.
+
 ## When something goes wrong
 
 If the app closes unexpectedly it writes `%TEMP%\chaos-app-crash.log` and shows
-a message box naming it. That file says what failed and where — please send it.
+a message box naming it. **Help → Open crash log** finds it. That file says what
+failed and where — please send it.
 
 A model that will not load is nearly always one of three things: the always-read
-set does not fit (the AVAILABLE row says `too big`), the port is already taken
-(change it), or the architecture has never been diffed against llama.cpp. The
-app passes `--force` for the last case, because refusing to run what you have is
-not useful in a window — but be aware that an unverified architecture can produce
-fluent nonsense rather than an error.
+set does not fit (the model's page says `too big for this machine`), the port is
+already taken (change it in SETTINGS), or the architecture has never been diffed
+against llama.cpp and `allow unverified architectures` is off.
 
 ## What the app does not do yet
 
 Named plainly rather than left to be discovered:
 
-- No per-model window; one model runs at a time.
+- One model runs at a time.
 - Download progress shows start and finish, not a percentage.
 - No tray icon — closing the window is the way to quit.
-- The GPU settings (`ngl`, device) are in the settings file but not in the
-  window.
+- MONITOR cannot show streamed bytes or cache residency; the engine measures
+  them but does not report them over the socket.
+- The menu bar does not follow dark mode. See above for what was tried.
 
 `docs/graph/backlog/app-to-production.md` tracks these.
