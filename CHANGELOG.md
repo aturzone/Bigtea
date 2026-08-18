@@ -10,6 +10,95 @@ While the major version is `0`, anything may change in a minor release.
 
 Nothing yet.
 
+## [0.0.7] — 2026-08-19
+
+The window redesigned around four pages, an installer that looks like one, and
+a mark drawn from vectors. Every resident figure in the catalogue is now
+measured rather than estimated — including the one this project's headline
+claim rests on.
+
+### The app is four pages, not one panel
+
+Atur's verdict on 0.0.6 was exact: *"why is all click in one slot"*. Everything
+had been on one screen because the window grew a control at a time.
+
+- **CHAT · MODELS · MONITOR · SETTINGS**, reachable from a navigation rail, a
+  real **menu bar**, or `Ctrl+1`..`Ctrl+4`. One page owns the screen.
+- A **strip on every page** carries what is running, its endpoint, its
+  throughput and STOP.
+- **A page per model** rather than a row: status, endpoint, context, threads,
+  cache, uptime, tokens served.
+- **SETTINGS exposes all nine fields** the file holds; the old window showed
+  three. The five that need knowledge are **dropdowns generated from your
+  machine** — core count, free memory, whether a GPU exists — each option
+  carrying one line on what it costs, and "Measured" always first.
+- Light and dark, following Hermes' desktop palette with Atur's `#0000F2`.
+
+### The installer looks like an installer
+
+Navy `#0d2f86`, cream `#ffe6cb`, a tracked display-serif wordmark and one
+bordered action — Hermes' own installer values, read from its source. The
+install is **twenty named steps on a worker thread** with a progress bar, ticks
+and per-step timings, instead of a frozen window that returned a paragraph when
+it was over. It also has a panic hook and writes `%TEMP%\chaos-setup.log`.
+
+### The mark is geometry
+
+`assets/logo.svg` ships as **44 polygons, 11,094 points**, filled by a scanline
+rasteriser at whatever size is wanted. No bitmap anywhere. The app icon is a
+real rounded square with an alpha channel — it was RGB before, so a rounded
+corner had to be filled with something and any fill read as a square.
+
+### Added
+
+- **An API key that is actually checked.** `chaos-serve --api-key` requires
+  `Authorization: Bearer` on `/v1/*` and answers 401 in the shape an OpenAI
+  client expects. Off by default; `/health` is never gated. Generated from the
+  system CSPRNG, not the clock.
+- **Model → Test the connection** makes the three requests an agent makes and
+  reports each. `docs/AGENTS.md` carries recipes for Hermes, aider and the
+  OpenAI-compatible provider every editor extension has.
+- **Download progress**: percent, bytes, rate and time left, measured from the
+  files on disk so a resumed fetch reports correctly.
+- **Linux packages**: a `.deb` and an AppImage, built from coreutils alone and
+  verified in CI by installing the deb, running `chaos-run` off PATH, and
+  executing `chaos-probe` out of the AppImage.
+- **`tools/gguf-always-read.py`** reads a container's tensor table over HTTP and
+  computes its resident set exactly, without downloading the model.
+
+### Fixed
+
+- **A model the engine cannot run was started anyway.** Qwen3.6 showed a green
+  dot while the server had already exited, so the next message failed with
+  "connection actively refused". The architecture is read from the container's
+  header before a server is started, and the refusal says why.
+- **A dead engine went on being reported as running.**
+- **The window flickered once a second** — the timer repaint covered the child
+  controls. `WS_CLIPCHILDREN`, on both windows.
+- **`DrawTextW` with an empty string killed the installer.** `Vec::as_ptr` on an
+  empty vector is dangling and Windows dereferences it; the report has blank
+  lines in it.
+- A worker thread cannot show a message box owned by the UI thread — it did
+  nothing at all.
+
+### Corrected
+
+- **V4-Flash's resident set was `7_925_000_000`, a round guess.** Measured
+  across all five shards: **7,920,157,020**. The estimate was lucky to 0.06%,
+  and it is the number the project's headline rests on.
+- Qwen3-30B-A3B was `1_000_000_000`; measured **997,554,176**. A test now
+  rejects any Mixture-of-Experts resident figure that looks rounded.
+
+### Known limits
+
+- **Qwen 3.5/3.6 (`qwen35`, `qwen35moe`) cannot run.** They are hybrid
+  architectures — recurrent state plus multi-token prediction — not plain
+  transformers. They are listed in the catalogue and refuse with the reason.
+- The menu bar stays light in dark mode; Windows draws it and
+  `SetPreferredAppMode` measurably does nothing on 10.0.26200.
+- MONITOR cannot show streamed bytes or cache residency; the engine measures
+  them but does not report them over the socket.
+
 ## [0.0.6] — 2026-08-18
 
 The app in 0.0.5 could not be used. This release is that, fixed, plus what a
