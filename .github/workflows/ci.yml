@@ -186,7 +186,14 @@ jobs:
         run: |
           cargo build --release --workspace
           cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --release --workspace
+          cargo test --release --workspace | tee /tmp/test.log
+
+      # The test count is quoted in STATUS.md, the README badge and CLAUDE.md,
+      # and it has gone stale three times -- 566, 570, 575 -- each caught only
+      # by someone noticing. Noticing is not a mechanism.
+      - name: The documented test count is the real one
+        shell: bash
+        run: bash scripts/check-test-count.sh /tmp/test.log
 
       # The container-backed tests skip themselves when no model is on disk.
       # This proves the skip path works, not that the tests pass.

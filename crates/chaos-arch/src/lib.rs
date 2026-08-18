@@ -24,6 +24,7 @@ mod qwen3;
 pub mod sample;
 pub mod spectrum;
 mod stream;
+pub mod ui;
 
 pub use deepseek4::{AttentionKind, Deepseek4Config, Deepseek4Model};
 pub use deepseek4_forward::{

@@ -147,13 +147,45 @@ jobs:
           fi
           echo '```' >> $GITHUB_STEP_SUMMARY
 
+      # The installer is built LAST and separately, because it embeds the other
+      # binaries: `build.rs` reads CHAOS_STAGE_DIR and links every file in that
+      # directory into the .exe. Building it in the same pass as its own payload
+      # would embed whatever the previous run happened to leave behind.
+      - name: Build the installer (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          GGML_LIB_DIR: ${{ github.workspace }}/ggml-libs
+        run: |
+          mkdir -p stage
+          for b in chaos-app chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench chaos-iobench chaos-gpubench; do
+            test -f "target/release/$b.exe" || { echo "::error::$b.exe missing"; exit 1; }
+            cp "target/release/$b.exe" stage/
+          done
+          cp README.md LICENSE NOTICE CHANGELOG.md STATUS.md stage/
+          CHAOS_STAGE_DIR="$(pwd)/stage" cargo build --release -p chaos-setup
+          test -f target/release/chaos-setup.exe || { echo "::error::chaos-setup.exe was not built"; exit 1; }
+          # An installer much smaller than its payload embedded nothing, which
+          # still builds, still runs, and installs zero files. Check the size
+          # rather than trusting that build.rs found the directory.
+          payload=$(du -bs stage | cut -f1)
+          setup=$(stat -c%s target/release/chaos-setup.exe)
+          echo "payload ${payload} bytes, installer ${setup} bytes"
+          if [ "$setup" -lt $((payload / 2)) ]; then
+            echo "::error::chaos-setup.exe is $setup bytes against a $payload byte payload -- it embedded nothing"
+            exit 1
+          fi
+
       - name: Package
         shell: bash
         run: |
           VER="${GITHUB_REF_NAME:-dev}"
           DIR="chaos-${VER}-${{ matrix.name }}"
           mkdir -p "$DIR"
-          for b in chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench chaos-iobench chaos-gpubench; do
+          # chaos-app ships but is deliberately absent from the smoke test
+          # above: with no arguments it opens a window, and CI would wait
+          # for someone to close it.
+          for b in chaos-app chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench chaos-iobench chaos-gpubench; do
             cp "target/release/$b${{ matrix.ext }}" "$DIR/"
           done
           cp README.md LICENSE NOTICE CHANGELOG.md STATUS.md "$DIR/"
@@ -162,6 +194,13 @@ jobs:
           # anyone on those platforms would rather have than a script.
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp scripts/install.ps1 "$DIR/"
+            # The double-click path: starts the server and opens the browser.
+            cp "scripts/Chat with Chaos.cmd" "$DIR/"
+            cp target/release/chaos-setup.exe "$DIR/"
+            # And beside the archive, under a name that says what it is: someone
+            # who wants an installer should not have to find and unpack a zip to
+            # reach it. One file, download and run.
+            cp target/release/chaos-setup.exe "Chaos-${VER}-Setup.exe"
           fi
           if [ "${{ matrix.archive }}" = "zip" ]; then
             7z a "$DIR.zip" "$DIR" >/dev/null
@@ -173,6 +212,35 @@ jobs:
       # An installer that fails on the archive it ships with is worse than no
       # installer, and it is the one thing here that cannot be checked locally
       # in the shape a user meets it: unpacked archive, no toolchain, no repo.
+      # The setup .exe is what most people will download, and the one artefact
+      # that cannot be verified by building it. Silent mode exists so this can
+      # run at all: a windows-subsystem binary has no console, and CI has nobody
+      # to press a button.
+      - name: The setup .exe installs, runs and uninstalls (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = Join-Path $PWD 'target/release/chaos-setup.exe'
+          $prefix = Join-Path $env:RUNNER_TEMP 'chaos-setup-test'
+          & $setup /S --prefix $prefix
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content (Join-Path $prefix 'setup.log') -ErrorAction SilentlyContinue
+            throw "chaos-setup /S exited $LASTEXITCODE"
+          }
+          $exe = Join-Path $prefix 'bin/chaos-run.exe'
+          if (-not (Test-Path $exe)) { throw "chaos-run.exe missing after install" }
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "the installed chaos-run does not start" }
+          if (-not (Test-Path (Join-Path $prefix 'bin/chaos-app.exe'))) { throw "chaos-app.exe missing after install" }
+          # Models live outside the prefix on purpose, and uninstall must not
+          # reach them. A wrong answer here deletes someone's 155 GB download.
+          $models = Join-Path $env:USERPROFILE '.chaos/models'
+          if (-not (Test-Path $models)) { throw "the models directory was not created" }
+          & $setup /S --uninstall --prefix $prefix
+          if (Test-Path (Join-Path $prefix 'bin')) { throw "uninstall left bin behind" }
+          if (-not (Test-Path $models)) { throw "UNINSTALL DELETED THE MODELS DIRECTORY" }
+          Write-Host 'setup: install / run / uninstall clean, models untouched'
+
       - name: The installer installs (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -200,7 +268,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: chaos-${{ matrix.name }}
-          path: chaos-*.${{ matrix.archive }}
+          path: |
+            chaos-*.${{ matrix.archive }}
+            Chaos-*-Setup.exe
           if-no-files-found: error
 
   publish:

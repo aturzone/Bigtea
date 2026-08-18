@@ -20,11 +20,94 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **575 tests** (50 binaries, 0 failed, 31 ignored — the V4-Flash set
+**Current**: **616 tests** (56 binaries, 0 failed, 31 ignored — the V4-Flash set
 needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
 clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
 reading, which is the only way that number has ever been right.
+
+## A browser interface, and what a browser found (2026-08-17)
+
+`chaos-serve` now serves a chat UI at `GET /`, compiled into the binary: no CDN,
+no fonts, no build step, works with the network cable out. The transport is the
+`/v1/chat/completions` SSE endpoint agents already use, so the page exercises the
+same path a real client does rather than a second one written for it. **8 tests**
+cover the ways a page breaks while still returning 200 — an outside fetch, an
+unbalanced tag, an element the script reaches for that does not exist, non-ASCII
+making `Content-Length` disagree with the body, `innerHTML` letting model output
+inject markup.
+
+**Pointing a browser at it found two bugs no agent would ever have hit.**
+
+1. **An idle connection wedged the server, permanently.** Browsers open
+   speculative TCP connections and leave them idle; the accept loop is
+   single-threaded and blocked in `read_request` on a socket that would never
+   send anything. No error, no log line, just a server that never answered
+   again. Every client until now was an agent, and an agent connects in order to
+   send immediately. A 3-second read deadline bounds it — at the 20 s first tried,
+   a page behind one dead socket took **17.9 s** to load, which is a hang as far
+   as anyone watching is concerned. Measured after: **1 ms clean, 1.9 s behind an
+   idle connection**, against never.
+2. **The headers went out with the source's indentation on them.** `send_html`
+   was written with a wrapped string literal, so `Content-Type` carried nine
+   leading spaces, curl folded it into the previous line, and the declared length
+   (7658) disagreed with what a client actually read (7802). The SSE path
+   directly below already carries a comment saying not to do this. Built by
+   concatenation now, and declared length matches the body exactly.
+
+Also: **`chaos-serve` with no argument serves the only model on the machine**,
+which is what makes a double-click launcher possible — a shortcut cannot know the
+name of a file the user has not put there yet. Two or more and it still lists
+them and stops.
+
+**A flaky test from #93 was removed.** `the_spill_rate_beats_the_load_rate_it_replaced`
+asserted a strict inequality between two measured I/O rates; three consecutive
+runs on an idle machine gave fail / pass / pass, and the failing pair was **1.44
+against 1.49 GiB/s** — a 3% difference standing in for an effect of ~1.6x. It
+could not have done its job either: a pool collapsed onto one handle measures
+0.76x, inside the same noise, so no threshold separates "regressed" from
+"unlucky". The plausibility bounds stay, the comparative claim lives in the
+research node where it was measured under control.
+
+**Current**: **616 tests**, 0 failed.
+
+## An installer, an app, and 13 models to fetch (2026-08-18)
+
+**`chaos-setup.exe` carries the whole project inside one file** -- 23.6 MB, 16
+files embedded at link time by `build.rs` from a staging directory. No archive
+to unpack, no PowerShell, no toolchain, no network, no administrator rights.
+Built without NSIS, WiX, Inno or MSI tooling, because every one of those would
+have to be installed on the build machine before a release could be cut, and a
+Windows install turns out to be a window, a file copy, a PATH entry, a shortcut
+and one registry key.
+
+Verified by running it, not by reading it: install writes 17 files, the
+**installed** `chaos-run` reports `0.0.3`, it registers in Add/Remove Programs,
+and uninstall removes bin, the PATH entry and the registry key. **The models
+directory survives**, because it lives outside the prefix on purpose -- a test
+pins that, since the alternative is deleting someone's 155 GB download.
+
+Silent mode (`/S`, `/S --uninstall`, `--prefix`) exists because a
+windows-subsystem binary has no console and CI has nobody to press a button.
+`release.yml` now stages the binaries, builds the installer, **checks it is not
+smaller than half its own payload** (an installer that embedded nothing still
+builds, still runs, and installs zero files), runs install/run/uninstall, and
+attaches `Chaos-<version>-Setup.exe` as its own asset beside the archive.
+
+**The catalogue went from 2 models to 13.** Every repo, filename stem and byte
+count was read from the Hugging Face tree API and verified to resolve before it
+was added -- a wrong stem is a download button that 404s, and this project's own
+rule is that nothing is citable until it has been run. All the new entries use
+architectures in `VERIFIED_ARCHITECTURES`: Qwen3 4B/8B/14B/32B, Gemma-3
+4B/12B/27B, Llama-3.2 1B/3B, Qwen2.5-Coder-7B, Phi-4.
+
+**Every dense entry sets `always_read_bytes` equal to `bytes`**, and ten tests
+enforce it. That is not padding: a dense container has no routed experts, so
+nothing streams and the whole file must fit. It is what makes the app say
+`qwen3-32b 19.8 GB needs 19.8 GB - too big` honestly on this laptop, while
+`v4flash 155 GB needs 7.92 GB - streams`.
+
+**616 tests** (was 575), clippy 0, fmt clean.
 
 ## 20 tok/s on V4-Flash is closed, with a number (2026-08-16)
 

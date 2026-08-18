@@ -105,6 +105,159 @@ pub const CATALOGUE: &[Entry] = &[
             always_read_bytes: 1_000_000_000,
         }],
     },
+    // -- dense models -------------------------------------------------------
+    //
+    // **Every byte of a dense model is always-read**, so `always_read_bytes`
+    // equals `bytes` for all of these. That is not laziness: a dense container
+    // has no routed experts to stream, so the streaming trick this project is
+    // built on does nothing for it and the whole file has to fit. Writing the
+    // real number here is what makes the app say "too big" honestly instead of
+    // promising a 20 GB model will stream on a 16 GB machine.
+    //
+    // Sizes were read from the Hugging Face tree API rather than estimated, and
+    // every repo, filename and byte count below was verified to resolve before
+    // it was added -- a wrong stem here is a download button that 404s.
+    // Architectures are all in `VERIFIED_ARCHITECTURES`.
+    Entry {
+        name: "qwen3-32b",
+        repo: "unsloth/Qwen3-32B-GGUF",
+        stem: "Qwen3-32B-{quant}",
+        arch: "qwen3",
+        quants: &[
+            Quant {
+                name: "Q4_K_M",
+                bytes: 19_762_150_048,
+                shards: 1,
+                always_read_bytes: 19_762_150_048,
+            },
+            Quant {
+                name: "Q5_K_M",
+                bytes: 23_214_832_288,
+                shards: 1,
+                always_read_bytes: 23_214_832_288,
+            },
+        ],
+    },
+    Entry {
+        name: "qwen3-14b",
+        repo: "unsloth/Qwen3-14B-GGUF",
+        stem: "Qwen3-14B-{quant}",
+        arch: "qwen3",
+        quants: &[Quant {
+            name: "Q4_K_M",
+            bytes: 9_001_753_984,
+            shards: 1,
+            always_read_bytes: 9_001_753_984,
+        }],
+    },
+    Entry {
+        name: "qwen3-8b",
+        repo: "unsloth/Qwen3-8B-GGUF",
+        stem: "Qwen3-8B-{quant}",
+        arch: "qwen3",
+        quants: &[Quant {
+            name: "Q4_K_M",
+            bytes: 5_027_784_512,
+            shards: 1,
+            always_read_bytes: 5_027_784_512,
+        }],
+    },
+    Entry {
+        name: "qwen3-4b",
+        repo: "unsloth/Qwen3-4B-GGUF",
+        stem: "Qwen3-4B-{quant}",
+        arch: "qwen3",
+        quants: &[Quant {
+            name: "Q4_K_M",
+            bytes: 2_497_281_312,
+            shards: 1,
+            always_read_bytes: 2_497_281_312,
+        }],
+    },
+    Entry {
+        name: "gemma3-27b",
+        repo: "unsloth/gemma-3-27b-it-GGUF",
+        stem: "gemma-3-27b-it-{quant}",
+        arch: "gemma3",
+        quants: &[Quant {
+            name: "Q4_K_M",
+            bytes: 16_546_688_736,
+            shards: 1,
+            always_read_bytes: 16_546_688_736,
+        }],
+    },
+    Entry {
+        name: "gemma3-12b",
+        repo: "unsloth/gemma-3-12b-it-GGUF",
+        stem: "gemma-3-12b-it-{quant}",
+        arch: "gemma3",
+        quants: &[Quant {
+            name: "Q4_K_M",
+            bytes: 7_300_778_336,
+            shards: 1,
+            always_read_bytes: 7_300_778_336,
+        }],
+    },
+    Entry {
+        name: "gemma3-4b",
+        repo: "unsloth/gemma-3-4b-it-GGUF",
+        stem: "gemma-3-4b-it-{quant}",
+        arch: "gemma3",
+        quants: &[Quant {
+            name: "Q4_K_M",
+            bytes: 2_489_894_016,
+            shards: 1,
+            always_read_bytes: 2_489_894_016,
+        }],
+    },
+    Entry {
+        name: "llama3.2-3b",
+        repo: "unsloth/Llama-3.2-3B-Instruct-GGUF",
+        stem: "Llama-3.2-3B-Instruct-{quant}",
+        arch: "llama",
+        quants: &[Quant {
+            name: "Q4_K_M",
+            bytes: 2_019_377_600,
+            shards: 1,
+            always_read_bytes: 2_019_377_600,
+        }],
+    },
+    Entry {
+        name: "llama3.2-1b",
+        repo: "unsloth/Llama-3.2-1B-Instruct-GGUF",
+        stem: "Llama-3.2-1B-Instruct-{quant}",
+        arch: "llama",
+        quants: &[Quant {
+            name: "Q4_K_M",
+            bytes: 807_694_368,
+            shards: 1,
+            always_read_bytes: 807_694_368,
+        }],
+    },
+    Entry {
+        name: "qwen2.5-coder-7b",
+        repo: "unsloth/Qwen2.5-Coder-7B-Instruct-GGUF",
+        stem: "Qwen2.5-Coder-7B-Instruct-{quant}",
+        arch: "qwen2",
+        quants: &[Quant {
+            name: "Q4_K_M",
+            bytes: 4_683_073_504,
+            shards: 1,
+            always_read_bytes: 4_683_073_504,
+        }],
+    },
+    Entry {
+        name: "phi4",
+        repo: "unsloth/phi-4-GGUF",
+        stem: "phi-4-{quant}",
+        arch: "phi3",
+        quants: &[Quant {
+            name: "Q4_K_M",
+            bytes: 8_890_306_112,
+            shards: 1,
+            always_read_bytes: 8_890_306_112,
+        }],
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static Entry> {
