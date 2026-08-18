@@ -201,6 +201,10 @@ pub const IMAGE_ICON: u32 = 1;
 pub const LR_DEFAULTSIZE: u32 = 0x0000_0040;
 pub const LR_SHARED: u32 = 0x0000_8000;
 
+pub const MB_YESNO: u32 = 0x0000_0004;
+pub const MB_ICONWARNING: u32 = 0x0000_0030;
+pub const IDYES: i32 = 6;
+
 pub const MB_ICONERROR: u32 = 0x0000_0010;
 pub const MB_OK: u32 = 0x0000_0000;
 pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
