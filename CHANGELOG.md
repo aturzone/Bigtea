@@ -10,6 +10,86 @@ While the major version is `0`, anything may change in a minor release.
 
 Nothing yet.
 
+## [0.0.6] — 2026-08-18
+
+The app in 0.0.5 could not be used. This release is that, fixed, plus what a
+model runner has to show.
+
+### Fixed — the app died on the first click
+
+**Clicking INSTALLED or AVAILABLE killed the process instantly**, with no
+window, no message and no log.
+
+`WM_CTLCOLORLISTBOX` borrows the window's state, and the code that filled the
+list held a mutable borrow while calling `SendMessageW` — which dispatches that
+message *synchronously*. A `RefCell` double borrow, and `panic = "abort"` turns
+a double borrow into immediate process death. It could never have worked.
+
+Six places had that shape. Three were found by a test written afterwards rather
+than by clicking, and one of them was **UNLOAD** — the button that frees the
+model's memory.
+
+Two more, in the same family:
+
+- **The GUI uninstall removed nothing.** It launched the helper and stayed open,
+  so the helper could not delete the folder the window was running from and gave
+  up. The window now exits after reporting.
+- **Closing the window left the engine running**, holding every resident byte —
+  7 GiB for V4-Flash — with nothing left to stop it from. Closing Chaos now
+  stops the model.
+
+**A crash now says something.** Under `abort` with no console there was nothing
+at all; the app writes `%TEMP%\chaos-app-crash.log` and shows a message box
+naming it.
+
+### Added — icons
+
+`chaos-setup.exe`, `chaos-app.exe` and the window itself carry the logo, at
+**nine sizes from 16 to 256**, each rendered from `assets/logo.svg` at its own
+resolution. Windows downsamples one large icon badly and this mark is thin
+radiating lines.
+
+### Added — what the app was missing
+
+- **The endpoint.** `running <model> -> http://127.0.0.1:8231/v1`, so a coding
+  agent can be pointed at it. There is no API key: the server binds localhost
+  only.
+- **DELETE**, which removes *every shard*. Deleting one file of a five-shard
+  container would leave 120 GB of unusable data and report success.
+- **Live memory**, free of total.
+- **Settings that persist**, in `%USERPROFILE%\.chaos\settings.txt` — outside
+  the install, so upgrading or uninstalling never takes them. Unknown keys are
+  preserved, so an older build cannot discard a newer one's preferences.
+- **A sidebar that scales with the window.** At a fixed width the model rows
+  were clipped mid-word and the fit verdict — the number that decides whether a
+  model runs — could not be read.
+
+### Added — the installer says what it did
+
+Install and uninstall end with a report rather than the window closing: what was
+written, where, what was removed, and what was deliberately kept. Running a newer
+setup over an older install names the upgrade.
+
+### Added — `docs/APP.md`
+
+A manual for the window, including a section on what it does not do yet.
+
+### Changed
+
+- CI starts `chaos-app`, waits, and fails if it exited or left a crash log —
+  and checks no `chaos-serve` survives it. An app that only *builds* is what
+  shipped 0.0.5.
+- The documented test count is checked against the suite that actually ran.
+
+### Known
+
+**Windows SmartScreen will warn** that the publisher is unknown. That is what
+Windows says about every unsigned application; choose *More info → Run anyway*.
+Signing needs a certificate, which is a purchase, not a patch.
+
+One model runs at a time; there is no per-model window yet.
+
+
 ## [0.0.5] — 2026-08-18
 
 ### Fixed — uninstalling actually uninstalled
