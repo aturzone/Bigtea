@@ -62,4 +62,60 @@ fn main() {
 
     std::fs::write(&out, src).expect("cannot write payload.rs");
     println!("cargo:warning=chaos-setup embeds {} file(s)", files.len());
+
+    embed_icon();
+}
+
+/// Give the installer an icon, the same way the app does.
+///
+/// The setup .exe is the very first thing anyone sees, and a blank default icon
+/// on a 23 MB download from an unknown publisher is precisely the shape of
+/// something you would not run.
+fn embed_icon() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let ico = root.join("assets").join("chaos.ico");
+    println!("cargo:rerun-if-changed={}", ico.display());
+    if !ico.exists() {
+        return;
+    }
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let rc = out.join("icon.rc");
+    // Forward slashes: windres reads a backslash as an escape.
+    let path = ico.to_string_lossy().replace(char::from(92), "/");
+    let rc_text = format!(
+        "1 ICON \"{path}\"
+"
+    );
+    if std::fs::write(&rc, rc_text).is_err() {
+        return;
+    }
+    let res = out.join("icon.o");
+    let ok = ["windres", "x86_64-w64-mingw32-windres"]
+        .iter()
+        .any(|tool| {
+            std::process::Command::new(tool)
+                .args([
+                    "-i",
+                    &rc.to_string_lossy(),
+                    "-o",
+                    &res.to_string_lossy(),
+                    "-O",
+                    "coff",
+                ])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
+    if ok && res.exists() {
+        println!("cargo:rustc-link-arg-bins={}", res.display());
+    } else {
+        println!("cargo:warning=windres unavailable; the installer will have no icon");
+    }
 }

@@ -31,13 +31,14 @@ fn main() {
 
 #[cfg(windows)]
 fn main() {
+    windows_app::install_panic_hook();
     windows_app::run();
 }
 
 #[cfg(windows)]
 mod windows_app {
     use chaos_app::win32::*;
-    use chaos_app::{art, catalog, client, models};
+    use chaos_app::{art, catalog, client, models, settings};
     use std::cell::RefCell;
     use std::process::{Child, Command};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,8 +57,23 @@ mod windows_app {
     const ID_AVAILABLE: i32 = 111;
     const ID_GET: i32 = 112;
     const ID_PORT: i32 = 113;
+    const ID_DELETE: i32 = 114;
 
-    const SIDEBAR: i32 = 300;
+    /// The sidebar's minimum. The real width scales with the window, because the
+    /// AVAILABLE rows carry a name, a size and a verdict and were being clipped
+    /// mid-word at a fixed 300px -- "gemma3-27b Q4_K_M 16.5 GB nee".
+    const SIDEBAR_MIN: i32 = 380;
+
+    /// Never more than this share of the window: a sidebar that keeps growing
+    /// leaves no room for the conversation.
+    const SIDEBAR_MAX_FRACTION: i32 = 40;
+
+    /// The sidebar width for a window of `w` pixels.
+    fn sidebar_for(w: i32) -> i32 {
+        let cap = w * SIDEBAR_MAX_FRACTION / 100;
+        SIDEBAR_MIN.min(cap.max(240))
+    }
+
     const PAD: i32 = 14;
     const LOGO_PX: i32 = 96;
 
@@ -101,6 +117,9 @@ mod windows_app {
         tab: Tab,
         offers: Vec<catalog::Offer>,
         free_bytes: u64,
+        /// The label of the model currently served, if any. Drives the running
+        /// marker in the list and the endpoint panel.
+        loaded: Option<String>,
     }
 
     thread_local! {
@@ -115,6 +134,65 @@ mod windows_app {
     fn busy() -> &'static AtomicBool {
         static B: AtomicBool = AtomicBool::new(false);
         &B
+    }
+
+    /// Make a crash say something.
+    ///
+    /// The release profile sets `panic = "abort"`, so a panic is not an
+    /// unwind that can be caught -- the process simply vanishes. With no
+    /// console attached (window subsystem) that means no message, no log and
+    /// nothing to report: the window is there one moment and gone the next.
+    /// That is exactly how the `RefCell` double-borrow in `rescan` presented,
+    /// and it cost far more to find than it should have.
+    ///
+    /// The hook runs *before* the abort, so it still gets to write the file and
+    /// put a box on screen naming it.
+    pub fn install_panic_hook() {
+        std::panic::set_hook(Box::new(|info| {
+            let where_ = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "unknown location".into());
+            let what = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panicked".into());
+
+            let nl = char::from(10).to_string();
+            let text = [
+                format!("chaos-app {}", env!("CARGO_PKG_VERSION")),
+                what.clone(),
+                format!("at {where_}"),
+            ]
+            .join(&nl);
+            let log = std::env::temp_dir().join("chaos-app-crash.log");
+            let _ = std::fs::write(&log, &text);
+
+            // Built from parts, not a multi-line literal: a wrapped literal
+            // carries the source indentation into the message box.
+            let msg = [
+                "Chaos hit a bug and has to close.".to_string(),
+                String::new(),
+                what,
+                format!("at {where_}"),
+                String::new(),
+                "Written to:".to_string(),
+                log.display().to_string(),
+                String::new(),
+                "Please send that file -- it says exactly what went wrong.".to_string(),
+            ]
+            .join(&nl);
+            unsafe {
+                MessageBoxW(
+                    std::ptr::null_mut(),
+                    wide(&msg).as_ptr(),
+                    wide("Chaos").as_ptr(),
+                    MB_ICONERROR,
+                );
+            }
+        }));
     }
 
     pub fn run() {
@@ -168,7 +246,19 @@ mod windows_app {
                 std::mem::size_of::<i32>() as u32,
             );
 
+            set_window_icon(hwnd, hinst);
             build_controls(hwnd, hinst, black);
+            // Restore what was set last time. Done after the controls exist and
+            // before the window is shown, so the first paint is already right.
+            let cfg = settings::Settings::load();
+            let put = |id: i32, v: Option<String>| {
+                if let Some(v) = v {
+                    SetWindowTextW(GetDlgItem(hwnd, id), wide(&v).as_ptr());
+                }
+            };
+            put(ID_CACHE, cfg.cache_gib.map(|v| format!("{v}")));
+            put(ID_THREADS, cfg.threads.map(|v| v.to_string()));
+            put(ID_PORT, Some(cfg.port.to_string()));
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
 
@@ -295,13 +385,21 @@ mod windows_app {
             ID_GET,
             hinst,
         );
+        let del = child(
+            hwnd,
+            "BUTTON",
+            "DELETE",
+            BS_OWNERDRAW | WS_TABSTOP,
+            ID_DELETE,
+            hinst,
+        );
         let port = child(hwnd, "EDIT", "8231", WS_BORDER | WS_TABSTOP, ID_PORT, hinst);
         let cache = child(hwnd, "EDIT", "", WS_BORDER | WS_TABSTOP, ID_CACHE, hinst);
         let threads = child(hwnd, "EDIT", "", WS_BORDER | WS_TABSTOP, ID_THREADS, hinst);
 
         for h in [
             list, out, input, load, unload, refresh, send, cache, threads, installed, available,
-            get, port,
+            get, port, del,
         ] {
             SendMessageW(h, WM_SETFONT, font as WPARAM, 1);
         }
@@ -335,6 +433,7 @@ mod windows_app {
                 history: Vec::new(),
                 answer: String::new(),
                 tab: Tab::Installed,
+                loaded: None,
                 offers: catalog::offers(),
                 free_bytes: free_memory_bytes(),
             })
@@ -374,86 +473,158 @@ mod windows_app {
         }
     }
 
+    /// Total physical memory, for the "x of y" the resource line shows.
+    fn total_memory_bytes() -> u64 {
+        #[repr(C)]
+        struct MemStatus {
+            length: u32,
+            memory_load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page: u64,
+            avail_page: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_extended: u64,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GlobalMemoryStatusEx(buffer: *mut MemStatus) -> i32;
+        }
+        unsafe {
+            let mut m: MemStatus = std::mem::zeroed();
+            m.length = std::mem::size_of::<MemStatus>() as u32;
+            if GlobalMemoryStatusEx(&mut m) != 0 {
+                m.total_phys
+            } else {
+                0
+            }
+        }
+    }
+
     /// Re-read the models directory into the list.
+    /// Refill the list for the current tab.
+    ///
+    /// **No borrow is held across a Win32 call here, and none may be added.**
+    /// `LB_ADDSTRING` on an owner-draw listbox makes the control ask its parent
+    /// for colours *synchronously*, and that handler borrows `UI`. Holding
+    /// `borrow_mut()` across it is a `RefCell` double borrow, which under
+    /// `panic = "abort"` is instant, silent process death -- which is exactly
+    /// what clicking INSTALLED or AVAILABLE used to do.
+    ///
+    /// So: take a short borrow, build the rows, drop it, then talk to Windows.
     fn rescan() {
-        UI.with(|u| {
-            let mut b = u.borrow_mut();
-            let Some(ui) = b.as_mut() else { return };
-            unsafe {
-                SendMessageW(ui.list, LB_RESETCONTENT, 0, 0);
-            }
-            ui.free_bytes = free_memory_bytes();
-            match ui.tab {
-                Tab::Installed => {
-                    ui.entries = models::list();
-                    if ui.entries.is_empty() {
-                        let t = wide("nothing installed -- try AVAILABLE");
-                        unsafe {
-                            SendMessageW(ui.list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
-                        }
-                    } else {
-                        for e in &ui.entries {
-                            let t = wide(&models::row(e));
-                            unsafe {
-                                SendMessageW(ui.list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
-                            }
+        // Phase 1 -- read state and build the strings. Borrow ends here.
+        let (list, main, load, get, del_btn, rows, installed, can_load) = {
+            let free = free_memory_bytes();
+            UI.with(|u| {
+                let mut b = u.borrow_mut();
+                let ui = b.as_mut()?;
+                ui.free_bytes = free;
+                let rows: Vec<String> = match ui.tab {
+                    Tab::Installed => {
+                        ui.entries = models::list();
+                        if ui.entries.is_empty() {
+                            vec!["nothing installed -- open AVAILABLE to download one".to_string()]
+                        } else {
+                            ui.entries.iter().map(models::row).collect()
                         }
                     }
-                }
-                Tab::Available => {
-                    for o in &ui.offers {
-                        let t = wide(&catalog::row(o, ui.free_bytes));
-                        unsafe {
-                            SendMessageW(ui.list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
-                        }
-                    }
-                }
-            }
-            unsafe {
-                SendMessageW(ui.list, LB_SETCURSEL, 0, 0);
-                // Only the buttons that mean something in this tab.
+                    Tab::Available => ui.offers.iter().map(|o| catalog::row(o, free)).collect(),
+                };
                 let installed = ui.tab == Tab::Installed;
-                EnableWindow(
+                Some((
+                    ui.list,
+                    ui.main,
                     ui.load,
-                    if installed && ui.server.is_none() {
-                        1
-                    } else {
-                        0
-                    },
-                );
-                EnableWindow(GetDlgItem(ui.main, ID_GET), if installed { 0 } else { 1 });
-                InvalidateRect(ui.main, std::ptr::null(), 1);
+                    ui.dlg(ID_GET),
+                    ui.dlg(ID_DELETE),
+                    rows,
+                    installed,
+                    installed && ui.server.is_none(),
+                ))
+            })
+        }
+        .unwrap_or((
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            Vec::new(),
+            true,
+            false,
+        ));
+        if list.is_null() {
+            return;
+        }
+
+        // Phase 2 -- nothing borrowed. Windows may re-enter freely.
+        unsafe {
+            SendMessageW(list, LB_RESETCONTENT, 0, 0);
+            for r in &rows {
+                let t = wide(r);
+                SendMessageW(list, LB_ADDSTRING, 0, t.as_ptr() as LPARAM);
             }
-        });
+            SendMessageW(list, LB_SETCURSEL, 0, 0);
+            EnableWindow(load, i32::from(can_load));
+            EnableWindow(get, i32::from(!installed));
+            EnableWindow(del_btn, i32::from(installed));
+            InvalidateRect(main, std::ptr::null(), 1);
+        }
+    }
+
+    /// The window handle, copied out so callers can talk to Windows without
+    /// holding a borrow. See `rescan` for why that matters.
+    fn main_hwnd() -> HWND {
+        UI.with(|u| {
+            u.borrow()
+                .as_ref()
+                .map(|ui| ui.main)
+                .unwrap_or(std::ptr::null_mut())
+        })
     }
 
     fn set_status(text: &str) {
         shared().lock().unwrap().status = text.to_string();
-        UI.with(|u| {
-            if let Some(ui) = u.borrow().as_ref() {
-                unsafe {
-                    InvalidateRect(ui.main, std::ptr::null(), 1);
-                }
+        let h = main_hwnd();
+        if !h.is_null() {
+            unsafe {
+                InvalidateRect(h, std::ptr::null(), 1);
             }
-        });
+        }
     }
 
     fn append_out(text: &str) {
-        UI.with(|u| {
-            let b = u.borrow();
-            let Some(ui) = b.as_ref() else { return };
+        // Handle copied out first: `EM_REPLACESEL` repaints the control, which
+        // asks the parent for colours, which borrows `UI`.
+        let out = UI.with(|u| {
+            u.borrow()
+                .as_ref()
+                .map(|ui| ui.out)
+                .unwrap_or(std::ptr::null_mut())
+        });
+        if out.is_null() {
+            return;
+        }
+        {
+            let ui = OutHandle(out);
             let w = wide(text);
             unsafe {
                 // Move the caret to the end, then replace an empty selection:
                 // the only way to append to an EDIT without re-sending the
                 // whole buffer, which for a long answer is quadratic.
-                let len = GetWindowTextLengthW(ui.out);
-                SendMessageW(ui.out, EM_SETSEL, len as WPARAM, len as LPARAM);
-                SendMessageW(ui.out, EM_REPLACESEL, 0, w.as_ptr() as LPARAM);
-                SendMessageW(ui.out, EM_SCROLLCARET, 0, 0);
+                let len = GetWindowTextLengthW(ui.0);
+                SendMessageW(ui.0, EM_SETSEL, len as WPARAM, len as LPARAM);
+                SendMessageW(ui.0, EM_REPLACESEL, 0, w.as_ptr() as LPARAM);
+                SendMessageW(ui.0, EM_SCROLLCARET, 0, 0);
             }
-        });
+        }
     }
+
+    /// A window handle that has already left the borrow, named so the calls
+    /// below read the same as before the fix.
+    struct OutHandle(HWND);
 
     fn control_text(h: HWND) -> String {
         unsafe {
@@ -469,24 +640,30 @@ mod windows_app {
 
     /// Start `chaos-serve` on the selected model, hidden.
     fn load_model() {
-        let (path, cache, threads, port) = UI.with(|u| {
+        // Handles first, borrow dropped, then Windows. Reading a control's text
+        // is a message like any other.
+        let hs = UI.with(|u| {
             let b = u.borrow();
-            let Some(ui) = b.as_ref() else {
-                return (None, String::new(), String::new(), 0u16);
-            };
-            let sel = unsafe { SendMessageW(ui.list, LB_GETCURSEL, 0, 0) };
-            let path = (sel >= 0)
-                .then(|| ui.entries.get(sel as usize))
-                .flatten()
-                .map(|e| e.path.clone());
-            (
-                path,
-                control_text(ui.cache),
-                control_text(ui.threads),
-                ui.port,
-            )
+            let ui = b.as_ref()?;
+            Some((ui.list, ui.cache, ui.threads, ui.dlg(ID_PORT)))
         });
-        let Some(path) = path else {
+        let Some((list, cache_box, threads_box, port_box)) = hs else {
+            return;
+        };
+        let sel = unsafe { SendMessageW(list, LB_GETCURSEL, 0, 0) };
+        let cache = control_text(cache_box);
+        let threads = control_text(threads_box);
+        // The port box is the setting, not a decoration: what it says is what
+        // the server binds and what the endpoint panel shows.
+        let port: u16 = control_text(port_box).trim().parse().unwrap_or(8231);
+
+        let picked = UI.with(|u| {
+            let b = u.borrow();
+            let ui = b.as_ref()?;
+            let e = (sel >= 0).then(|| ui.entries.get(sel as usize)).flatten()?;
+            Some((e.path.clone(), e.label.clone()))
+        });
+        let Some((path, label)) = picked else {
             set_status("select a model first");
             return;
         };
@@ -505,21 +682,27 @@ mod windows_app {
             return;
         }
 
-        let mut cmd = Command::new(&exe);
-        cmd.arg(&path).arg("--port").arg(port.to_string());
-        if let Ok(v) = cache.trim().parse::<f64>() {
-            if v > 0.0 {
-                cmd.arg("--cache").arg(format!("{v}"));
-            }
-        }
-        if let Ok(v) = threads.trim().parse::<u32>() {
-            if v > 0 {
-                cmd.arg("-t").arg(v.to_string());
-            }
-        }
+        // One place builds the arguments -- `Settings::serve_args` -- so the
+        // window and anything else that starts a server cannot disagree about
+        // what a setting means. It is covered by tests; this call site is not
+        // testable at all.
+        let mut cfg = settings::Settings::load();
+        cfg.port = port;
+        cfg.cache_gib = cache.trim().parse::<f64>().ok().filter(|v| *v > 0.0);
+        cfg.threads = threads.trim().parse::<u32>().ok().filter(|v| *v > 0);
         // Unverified architectures refuse by name. The app is for running what
         // you have, and the refusal is already explained in the status line.
-        cmd.arg("--force");
+        cfg.force = true;
+        // Remember what was typed, so the boxes are filled in next time rather
+        // than empty. A settings page that forgets is a form.
+        if let Err(e) = cfg.save() {
+            set_status(&e);
+        }
+
+        let mut cmd = Command::new(&exe);
+        for a in cfg.serve_args(&path.to_string_lossy()) {
+            cmd.arg(a);
+        }
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(CREATE_NO_WINDOW);
@@ -527,17 +710,26 @@ mod windows_app {
 
         match cmd.spawn() {
             Ok(c) => {
-                UI.with(|u| {
-                    if let Some(ui) = u.borrow_mut().as_mut() {
-                        ui.server = Some(c);
-                        ui.history.clear();
-                        unsafe {
-                            EnableWindow(ui.load, 0);
-                            EnableWindow(ui.unload, 1);
-                            SetWindowTextW(ui.out, wide("").as_ptr());
-                        }
-                    }
+                // Same rule as `rescan`: the handles come out of the borrow and
+                // the borrow ends before any of them is touched. `SetWindowTextW`
+                // on the output box repaints it, which asks the parent for
+                // colours, which borrows -- so doing this inside would abort the
+                // process exactly as clicking a tab used to.
+                let handles = UI.with(|u| {
+                    let mut b = u.borrow_mut();
+                    let ui = b.as_mut()?;
+                    ui.server = Some(c);
+                    ui.history.clear();
+                    ui.loaded = Some(label.clone());
+                    Some((ui.load, ui.unload, ui.out))
                 });
+                if let Some((load, unload, out)) = handles {
+                    unsafe {
+                        EnableWindow(load, 0);
+                        EnableWindow(unload, 1);
+                        SetWindowTextW(out, wide("").as_ptr());
+                    }
+                }
                 set_status("loading -- a large model takes a while");
                 let port2 = port;
                 std::thread::spawn(move || {
@@ -566,20 +758,148 @@ mod windows_app {
     }
 
     fn unload_model() {
-        UI.with(|u| {
-            let mut b = u.borrow_mut();
-            let Some(ui) = b.as_mut() else { return };
-            if let Some(mut c) = ui.server.take() {
-                let _ = c.kill();
-                let _ = c.wait();
-            }
+        // `stop_server` takes the child out under a short borrow and waits for
+        // it outside one. The handles come out the same way -- `EnableWindow`
+        // repaints, which asks the parent for colours, which borrows.
+        stop_server();
+        let hs = UI.with(|u| {
+            let b = u.borrow();
+            let ui = b.as_ref()?;
+            Some((ui.load, ui.unload, ui.send))
+        });
+        if let Some((load, unload, send)) = hs {
             unsafe {
-                EnableWindow(ui.load, 1);
-                EnableWindow(ui.unload, 0);
-                EnableWindow(ui.send, 0);
+                EnableWindow(load, 1);
+                EnableWindow(unload, 0);
+                EnableWindow(send, 0);
+            }
+        }
+        set_status("unloaded -- the memory is back");
+    }
+
+    /// Stop the child engine, if one is running.
+    ///
+    /// Kill rather than ask: `chaos-serve` has no shutdown endpoint, it holds
+    /// no state worth flushing, and a model mid-token would otherwise keep the
+    /// process alive for minutes.
+    fn stop_server() {
+        let child = UI.with(|u| u.borrow_mut().as_mut().and_then(|ui| ui.server.take()));
+        if let Some(mut c) = child {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        UI.with(|u| {
+            if let Some(ui) = u.borrow_mut().as_mut() {
+                ui.loaded = None;
             }
         });
-        set_status("unloaded -- the memory is back");
+    }
+
+    /// Every file belonging to a container, including the other shards.
+    ///
+    /// Deleting only the file the list shows would leave four of five shards --
+    /// 120 GB of unusable data -- on disk and report success.
+    fn shards_of(first: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let single = || vec![first.to_path_buf()];
+        let Some(name) = first.file_name().and_then(|n| n.to_str()) else {
+            return single();
+        };
+        let Some(dir) = first.parent() else {
+            return single();
+        };
+        let Some(idx) = name.rfind("-00001-of-") else {
+            return single();
+        };
+        let stem = &name[..idx];
+        let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(stem) && n.ends_with(".gguf"))
+            })
+            .collect();
+        out.sort();
+        if out.is_empty() {
+            out = single();
+        }
+        out
+    }
+
+    /// Delete the selected model's files, after saying exactly what will go.
+    fn delete_selected() {
+        let picked = UI.with(|u| {
+            let b = u.borrow();
+            let ui = b.as_ref()?;
+            if ui.tab != Tab::Installed {
+                return None;
+            }
+            let sel = unsafe { SendMessageW(ui.list, LB_GETCURSEL, 0, 0) };
+            let e = (sel >= 0).then(|| ui.entries.get(sel as usize)).flatten()?;
+            Some((
+                e.path.clone(),
+                e.label.clone(),
+                e.bytes.unwrap_or(0),
+                ui.loaded.clone(),
+            ))
+        });
+        let Some((path, label, bytes, loaded)) = picked else {
+            set_status("select an installed model to delete");
+            return;
+        };
+        // Deleting the file a running server has open would half-work and leave
+        // the engine reading a hole.
+        if loaded.as_deref() == Some(label.as_str()) {
+            set_status("that model is loaded -- press UNLOAD first");
+            return;
+        }
+
+        let files = shards_of(&path);
+        let msg = format!(
+            "Delete {label}?\n\n{} file(s), {} freed from\n{}\n\nThis cannot be undone.",
+            files.len(),
+            models::human_size(bytes),
+            path.parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+        let answer = unsafe {
+            MessageBoxW(
+                main_hwnd(),
+                wide(&msg).as_ptr(),
+                wide("Chaos").as_ptr(),
+                MB_YESNO | MB_ICONWARNING,
+            )
+        };
+        if answer != IDYES {
+            set_status("nothing deleted");
+            return;
+        }
+
+        let mut gone = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        for f in &files {
+            match std::fs::remove_file(f) {
+                Ok(()) => gone += 1,
+                Err(e) => failed.push(format!("{}: {e}", f.display())),
+            }
+        }
+        if failed.is_empty() {
+            set_status(&format!(
+                "deleted {label} -- {gone} file(s), {} freed",
+                models::human_size(bytes)
+            ));
+        } else {
+            set_status(&format!(
+                "deleted {gone}, {} failed: {}",
+                failed.len(),
+                failed[0]
+            ));
+        }
+        rescan();
     }
 
     /// Fetch the selected catalogue entry with `chaos-pull`.
@@ -669,15 +989,18 @@ mod windows_app {
             return;
         }
 
-        UI.with(|u| {
-            if let Some(ui) = u.borrow_mut().as_mut() {
-                ui.answer.clear();
-                unsafe {
-                    SetWindowTextW(ui.input, wide("").as_ptr());
-                    EnableWindow(ui.send, 0);
-                }
-            }
+        let hs = UI.with(|u| {
+            let mut b = u.borrow_mut();
+            let ui = b.as_mut()?;
+            ui.answer.clear();
+            Some((ui.input, ui.send))
         });
+        if let Some((input, send)) = hs {
+            unsafe {
+                SetWindowTextW(input, wide("").as_ptr());
+                EnableWindow(send, 0);
+            }
+        }
         append_out(&format!("\r\n> {}\r\n\r\n", prompt.replace('\n', "\r\n")));
 
         {
@@ -748,17 +1071,20 @@ mod windows_app {
             shared().lock().unwrap().status = format!("{tokens} tokens, {rate:.2} tok/s");
         }
         if finished && busy().swap(false, Ordering::SeqCst) {
-            UI.with(|u| {
-                if let Some(ui) = u.borrow_mut().as_mut() {
-                    let a = std::mem::take(&mut ui.answer);
-                    if !a.is_empty() {
-                        ui.history.push(("assistant".into(), a));
-                    }
-                    unsafe {
-                        EnableWindow(ui.send, 1);
-                    }
+            let send = UI.with(|u| {
+                let mut b = u.borrow_mut();
+                let ui = b.as_mut()?;
+                let a = std::mem::take(&mut ui.answer);
+                if !a.is_empty() {
+                    ui.history.push(("assistant".into(), a));
                 }
+                Some(ui.send)
             });
+            if let Some(send) = send {
+                unsafe {
+                    EnableWindow(send, 1);
+                }
+            }
         }
         if finished {
             UI.with(|u| {
@@ -785,12 +1111,13 @@ mod windows_app {
         GetClientRect(hwnd, &mut r);
         let w = r.right - r.left;
         let h = r.bottom - r.top;
+        let sidebar = sidebar_for(w);
 
         UI.with(|u| {
             let b = u.borrow();
             let Some(ui) = b.as_ref() else { return };
             let btn_h = 28;
-            let bw = (SIDEBAR - PAD * 3) / 2;
+            let bw = (sidebar - PAD * 3) / 2;
             // The two tabs sit directly above the list they switch between.
             let tab_y = PAD * 2 + LOGO_PX + 24;
             MoveWindow(ui.dlg(ID_INSTALLED), PAD, tab_y, bw, btn_h, 1);
@@ -799,24 +1126,26 @@ mod windows_app {
             let top = tab_y + btn_h + 8;
             // Three rows of controls plus two labelled setting rows below the
             // list; the list takes whatever is left.
-            let list_h = h - top - PAD * 3 - btn_h * 3 - 62;
-            MoveWindow(ui.list, PAD, top, SIDEBAR - PAD * 2, list_h.max(60), 1);
+            let list_h = h - top - PAD * 3 - btn_h * 4 - 68;
+            MoveWindow(ui.list, PAD, top, sidebar - PAD * 2, list_h.max(60), 1);
 
             let by = top + list_h.max(60) + PAD;
             MoveWindow(ui.load, PAD, by, bw, btn_h, 1);
             MoveWindow(ui.unload, PAD * 2 + bw, by, bw, btn_h, 1);
             let r2 = by + btn_h + 6;
             MoveWindow(ui.dlg(ID_GET), PAD, r2, bw, btn_h, 1);
-            MoveWindow(ui.refresh_handle(), PAD * 2 + bw, r2, bw, btn_h, 1);
+            MoveWindow(ui.dlg(ID_DELETE), PAD * 2 + bw, r2, bw, btn_h, 1);
+            let r2b = r2 + btn_h + 6;
+            MoveWindow(ui.refresh_handle(), PAD, r2b, bw, btn_h, 1);
 
             // Settings row: each box sits under a label painted in WM_PAINT.
-            let r3 = r2 + btn_h + 24;
-            let sw = (SIDEBAR - PAD * 4) / 3;
+            let r3 = r2b + btn_h + 24;
+            let sw = (sidebar - PAD * 4) / 3;
             MoveWindow(ui.cache, PAD, r3, sw, btn_h, 1);
             MoveWindow(ui.threads, PAD * 2 + sw, r3, sw, btn_h, 1);
             MoveWindow(ui.dlg(ID_PORT), PAD * 3 + sw * 2, r3, sw, btn_h, 1);
 
-            let rx = SIDEBAR;
+            let rx = sidebar;
             let rw = w - rx - PAD;
             let in_h = 92;
             let out_h = h - PAD * 3 - in_h - 34;
@@ -849,6 +1178,7 @@ mod windows_app {
         let hdc = BeginPaint(hwnd, &mut ps);
         let mut r = RECT::default();
         GetClientRect(hwnd, &mut r);
+        let sidebar = sidebar_for(r.right - r.left);
 
         UI.with(|u| {
             let b = u.borrow();
@@ -895,7 +1225,7 @@ mod windows_app {
             };
             StretchDIBits(
                 hdc,
-                PAD + (SIDEBAR - PAD * 2 - LOGO_PX) / 2,
+                PAD + (sidebar - PAD * 2 - LOGO_PX) / 2,
                 PAD,
                 LOGO_PX,
                 LOGO_PX,
@@ -917,7 +1247,7 @@ mod windows_app {
             // panel, because a filled panel would need a third value.
             let pen = CreatePen(0, 1, WHITE);
             let old = SelectObject(hdc, pen);
-            Rectangle(hdc, SIDEBAR - PAD, -2, SIDEBAR - PAD + 1, r.bottom + 2);
+                        Rectangle(hdc, sidebar - PAD, -2, sidebar - PAD + 1, r.bottom + 2);
             SelectObject(hdc, old);
             DeleteObject(pen);
 
@@ -929,13 +1259,46 @@ mod windows_app {
                 s.status.clone()
             };
             drop(s);
-            let line = wide(&status);
-            TextOutW(
-                hdc,
-                SIDEBAR,
-                r.bottom - 24,
-                line.as_ptr(),
-                status.encode_utf16().count() as i32,
+            let put = |x: i32, y: i32, txt: &str| {
+                let w = wide(txt);
+                TextOutW(hdc, x, y, w.as_ptr(), txt.encode_utf16().count() as i32);
+            };
+
+            // The bottom strip carries three things a model runner has to show
+            // and this one was not showing at all: what is loaded, where a
+            // client can reach it, and what the machine has left.
+            let base = r.bottom - 26;
+            put(sidebar, base, &status);
+
+            match &ui.loaded {
+                Some(name) => {
+                    // C5: the endpoint, spelled out. Without this the server is
+                    // running and there is no way to point anything at it.
+                    put(
+                        sidebar,
+                        base - 38,
+                        &format!(
+                            "running  {name}   ->   http://127.0.0.1:{}/v1   (no API key needed, localhost only)",
+                            ui.port
+                        ),
+                    );
+                }
+                None => put(sidebar, base - 38, "no model loaded"),
+            }
+
+            // C3: what the machine has, refreshed every time this repaints.
+            let total = total_memory_bytes();
+            let free = ui.free_bytes;
+            let used = total.saturating_sub(free);
+            put(
+                sidebar,
+                base - 19,
+                &format!(
+                    "memory  {} free of {}   ({}% in use)",
+                    models::human_size(free),
+                    models::human_size(total),
+                    used.checked_mul(100).and_then(|v| v.checked_div(total)).unwrap_or(0)
+                ),
             );
             // Labels for the three setting boxes. Painted rather than made
             // into STATIC controls: three more windows to colour, position and
@@ -947,7 +1310,7 @@ mod windows_app {
                 y: lr.top,
             };
             ScreenToClient(hwnd, &mut here);
-            let sw = (SIDEBAR - PAD * 4) / 3;
+            let sw = (sidebar - PAD * 4) / 3;
             for (i, label) in ["cache GiB", "threads", "port"].iter().enumerate() {
                 let w = wide(label);
                 TextOutW(
@@ -962,7 +1325,7 @@ mod windows_app {
             // Which tab is showing, marked by a rule under it rather than a
             // fill -- the same trick the buttons use for availability.
             let tab_y = PAD * 2 + LOGO_PX + 24 + 28;
-            let bw = (SIDEBAR - PAD * 3) / 2;
+            let bw = (sidebar - PAD * 3) / 2;
             let (ux, uw) = if ui.tab == Tab::Installed {
                 (PAD, bw)
             } else {
@@ -1068,6 +1431,28 @@ mod windows_app {
         TextOutW(di.hDC, x, y, w.as_ptr(), w.len() as i32);
     }
 
+    /// Put the embedded icon on the window itself.
+    ///
+    /// The resource compiled into the executable is what Explorer shows for the
+    /// *file*. The title bar, the taskbar button and the Alt-Tab strip read the
+    /// *window's* icon, which is unset until something sends `WM_SETICON` --
+    /// which is why an executable can have a perfectly good icon in Explorer and
+    /// still show a blank page while it is running.
+    ///
+    /// Both sizes: small is the title bar, big is the taskbar. Resource id 1,
+    /// matching what `build.rs` writes into the `.rc`.
+    unsafe fn set_window_icon(hwnd: HWND, hinst: HINSTANCE) {
+        let id = 1u16 as *const u16;
+        let big = LoadImageW(hinst, id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+        if !big.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, big as LPARAM);
+        }
+        let small = LoadImageW(hinst, id, IMAGE_ICON, 16, 16, LR_SHARED);
+        if !small.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small as LPARAM);
+        }
+    }
+
     unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         match msg {
             WM_SIZE => {
@@ -1110,6 +1495,7 @@ mod windows_app {
                     (ID_SEND, BN_CLICKED) => send_prompt(),
                     (ID_REFRESH, BN_CLICKED) => rescan(),
                     (ID_GET, BN_CLICKED) => download_selected(),
+                    (ID_DELETE, BN_CLICKED) => delete_selected(),
                     (ID_INSTALLED, BN_CLICKED) => {
                         UI.with(|u| {
                             if let Some(ui) = u.borrow_mut().as_mut() {
@@ -1140,6 +1526,13 @@ mod windows_app {
                 0
             }
             WM_DESTROY => {
+                // **Closing the window must stop the engine.** The model runs
+                // in a child `chaos-serve`, and until this was here, closing
+                // Chaos left that child alive holding every resident byte --
+                // 7 GiB for V4-Flash -- with no window to stop it from. The
+                // taskbar close became a memory leak you had to find in Task
+                // Manager.
+                stop_server();
                 PostQuitMessage(0);
                 0
             }
