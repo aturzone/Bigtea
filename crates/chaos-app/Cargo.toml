@@ -28,6 +28,9 @@ chaos-model = { path = "../chaos-model" }
 # options offered are the ones that make sense on *this* machine. Zero external
 # dependencies of its own, like everything else here.
 chaos-probe = { path = "../chaos-probe" }
+# To read `general.architecture` out of a container before starting a server
+# for it. The filename says "Qwen3.6"; only the header says `qwen35`.
+chaos-gguf = { path = "../chaos-gguf" }
 
 [[bin]]
 name = "chaos-app"

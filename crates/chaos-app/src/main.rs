@@ -296,7 +296,11 @@ mod windows_app {
                 0,
                 class.as_ptr(),
                 title.as_ptr(),
-                WS_OVERLAPPEDWINDOW,
+                // `WS_CLIPCHILDREN`: the timer repaints this window every
+                // second for the uptime and the download bar, and without it
+                // every child control repaints too -- a visible flash across
+                // the whole window, once a second, forever.
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                 120,
                 80,
                 1180,
@@ -1082,6 +1086,35 @@ mod windows_app {
             return;
         }
 
+        // **Refuse an architecture the engine cannot run, here, before a server
+        // is started.** Without this the app spawned `chaos-serve`, the server
+        // refused the container and exited, and the window went on showing the
+        // model as RUNNING with a green dot -- so the next message came back
+        // "connection actively refused", which reads as a networking fault
+        // rather than as "this model does not work". That is exactly what
+        // happened to Atur with Qwen3.6-27B.
+        let arch = architecture_of(&path);
+        if let Some(why) = arch
+            .as_deref()
+            .and_then(chaos_model::catalogue::why_not_runnable)
+        {
+            set_status(&format!("{label} cannot run: {why}"));
+            unsafe {
+                MessageBoxW(
+                    main_hwnd(),
+                    wide(&format!(
+                        "{label} cannot run in Chaos yet.\n\n{why}.\n\nThe file is fine and \
+                         nothing is wrong with the download -- the engine does not implement \
+                         this architecture. Deleting and fetching it again will not change that."
+                    ))
+                    .as_ptr(),
+                    wide("Chaos").as_ptr(),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+            return;
+        }
+
         // **`cfg.force` is whatever SETTINGS says**, and nothing here overrides
         // it. The previous version set it to `true` unconditionally, which made
         // the toggle on the settings page a decoration: turning it off changed
@@ -1140,6 +1173,26 @@ mod windows_app {
             }
             Err(e) => set_status(&format!("could not start: {e}")),
         }
+    }
+
+    /// The architecture string in a container's header.
+    ///
+    /// Read straight from the GGUF rather than guessed from the filename: the
+    /// name says "Qwen3.6" and the header says `qwen35`, and only one of those
+    /// decides whether the engine can run it.
+    fn architecture_of(path: &std::path::Path) -> Option<String> {
+        use std::io::Read;
+        // Only the head: a GGUF's metadata and tensor table live at the front,
+        // and mapping 16 GB to read one string would stall the window. If the
+        // table is longer than this the parse fails, `None` comes back, and the
+        // load proceeds exactly as it did before -- the server then refuses it,
+        // which is the old behaviour rather than a new failure.
+        const HEAD: usize = 32 << 20;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut buf = Vec::with_capacity(HEAD);
+        f.by_ref().take(HEAD as u64).read_to_end(&mut buf).ok()?;
+        let g = chaos_gguf::Gguf::parse(&buf).ok()?;
+        g.get_str("general.architecture").map(str::to_string)
     }
 
     fn unload_model() {
@@ -3374,6 +3427,32 @@ Any value a client sends is accepted.                      The server still list
                 // Uptime and free memory move on their own; nothing else here
                 // would ever ask for them to be redrawn.
                 let free = free_memory_bytes();
+                // **A child that has exited is not a running model.** The
+                // window used to keep the green dot and the endpoint up after
+                // `chaos-serve` died, so the next message failed with a
+                // connection error and no explanation.
+                let died = UI.with(|u| {
+                    let mut b = u.borrow_mut();
+                    let ui = b.as_mut()?;
+                    let gone = match ui.server.as_mut() {
+                        Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+                        None => false,
+                    };
+                    if !gone {
+                        return None;
+                    }
+                    let name = ui.loaded.clone();
+                    ui.server = None;
+                    ui.loaded = None;
+                    ui.loaded_at = None;
+                    Some(name.unwrap_or_default())
+                });
+                if let Some(name) = died {
+                    sync_enabled();
+                    set_status(&format!(
+                        "{name} stopped on its own -- the engine could not keep it running"
+                    ));
+                }
                 // A download is another process writing files, so the only way
                 // to know how far along it is, is to look at them.
                 let ended = {

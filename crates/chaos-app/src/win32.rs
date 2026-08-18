@@ -119,6 +119,14 @@ pub const WS_CHILD: u32 = 0x4000_0000;
 pub const WS_VISIBLE: u32 = 0x1000_0000;
 pub const WS_VSCROLL: u32 = 0x0020_0000;
 pub const WS_BORDER: u32 = 0x0080_0000;
+/// **The cure for a window that flickers once a second.**
+///
+/// Without it, the parent's `WM_PAINT` paints the whole client area *including*
+/// the rectangles its child controls occupy, and the children then repaint on
+/// top. The transcript, the list and every box flashed on every tick, which is
+/// exactly the "non-stop glitch" Atur reported -- and double-buffering the
+/// parent cannot fix it, because the flicker is the children, not the parent.
+pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
 pub const WS_TABSTOP: u32 = 0x0001_0000;
 
 pub const ES_MULTILINE: u32 = 0x0004;

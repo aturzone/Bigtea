@@ -250,7 +250,10 @@ mod setup {
             let title = wide("Chaos Setup");
             // No WS_THICKFRAME or maximise: the layout is fixed, and a resizable
             // window that does not reflow is worse than one that cannot resize.
-            let style = 0x00CA_0000u32; // WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+            // WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, plus
+            // WS_CLIPCHILDREN so the step list's repaints do not flash the
+            // buttons and the path box underneath them.
+            let style = 0x00CA_0000u32 | WS_CLIPCHILDREN;
             let hwnd = CreateWindowExW(
                 0,
                 class.as_ptr(),
