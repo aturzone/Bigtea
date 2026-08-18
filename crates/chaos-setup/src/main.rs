@@ -61,8 +61,17 @@ fn main() {
         };
         // A silent installer must still say what happened somewhere, and a
         // windows-subsystem binary has no console -- so the message goes to the
-        // exit code and to a log beside the prefix.
-        let _ = std::fs::write(prefix.join("setup.log"), &msg);
+        // exit code and to a log.
+        //
+        // **Not into the prefix when uninstalling.** Writing it there recreates
+        // the directory that was just removed, so a "clean" uninstall left an
+        // empty `Chaos` folder holding one log file saying it had uninstalled.
+        let log = if uninstall {
+            std::env::temp_dir().join("chaos-uninstall.log")
+        } else {
+            prefix.join("setup.log")
+        };
+        let _ = std::fs::write(log, &msg);
         std::process::exit(if ok { 0 } else { 1 });
     }
     setup::run();
@@ -75,6 +84,7 @@ mod setup {
     use chaos_setup::*;
     use std::cell::RefCell;
     use std::path::PathBuf;
+    use std::process::Command;
 
     const ID_PREFIX: i32 = 201;
     const ID_INSTALL: i32 = 202;
@@ -355,16 +365,120 @@ mod setup {
         )
     }
 
+    /// Is this executable inside the directory being uninstalled?
+    fn running_inside(prefix: &std::path::Path) -> bool {
+        let Ok(me) = std::env::current_exe() else {
+            return false;
+        };
+        // Canonicalise both: `%LOCALAPPDATA%\Chaos` and the resolved path can
+        // differ by case or by a junction, and a false negative here brings the
+        // whole bug back.
+        let me = me.canonicalize().unwrap_or(me);
+        let prefix = prefix
+            .canonicalize()
+            .unwrap_or_else(|_| prefix.to_path_buf());
+        me.starts_with(&prefix)
+    }
+
+    /// Copy this executable to the temp directory and let that copy uninstall.
+    ///
+    /// **Spawned detached, and deliberately not waited for.** Waiting is what
+    /// made the first attempt at this fail: `cmd.status()` keeps the parent --
+    /// which lives inside the directory being deleted -- alive for the whole of
+    /// the child's run, so Windows still held the file open and the child could
+    /// not remove it either. The parent has to be gone. So it starts the child
+    /// and returns immediately, and the child retries until the lock clears.
+    ///
+    /// This is how NSIS uninstallers behave too, for exactly this reason.
+    fn relaunch_from_temp(prefix: &std::path::Path) -> Result<String, String> {
+        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        // A fixed name rather than a random one: this workspace has no random
+        // number generator, a stale copy is simply overwritten, and it sits in
+        // a directory Windows cleans up.
+        let tmp = std::env::temp_dir().join("chaos-uninstall.exe");
+        std::fs::copy(&me, &tmp).map_err(|e| format!("cannot stage the uninstaller: {e}"))?;
+
+        let mut cmd = Command::new(&tmp);
+        cmd.arg("/S").arg("--uninstall").arg("--prefix").arg(prefix);
+        {
+            use std::os::windows::process::CommandExt;
+            // DETACHED_PROCESS too: the child must outlive this one.
+            cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        }
+        cmd.spawn()
+            .map_err(|e| format!("cannot start the staged uninstaller: {e}"))?;
+        Ok("uninstalling -- the files are removed a moment after this closes.".into())
+    }
+
+    /// Delete a directory, waiting out a lock rather than giving up on it.
+    ///
+    /// The process that asked for the uninstall may still be exiting, and
+    /// Windows keeps a running executable's file open until it has. A single
+    /// attempt fails in that window; a few seconds of retries does not.
+    fn remove_dir_all_retrying(dir: &std::path::Path) -> bool {
+        for _ in 0..40 {
+            if !dir.exists() {
+                return true;
+            }
+            if std::fs::remove_dir_all(dir).is_ok() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        !dir.exists()
+    }
+
     /// Remove an install from `prefix`.
     pub fn uninstall_to(prefix: &std::path::Path) -> (bool, String) {
         let prefix = prefix.to_path_buf();
         let bin = bin_dir(&prefix);
-        let _ = std::fs::remove_dir_all(&bin);
+
+        // **A running executable cannot delete the directory it lives in.**
+        // The installer copies itself into `bin` so Add/Remove Programs has
+        // something to launch -- which means the normal uninstall runs from
+        // inside the very folder it is trying to remove, Windows holds the file
+        // open, `remove_dir_all` fails, and the old code reported success
+        // anyway. Uninstalling left every binary on disk and said "uninstalled".
+        //
+        // So: if this copy is inside the prefix, re-run from a copy in the temp
+        // directory and let that one do the work. The relaunched process is
+        // holding a file nothing is about to delete.
+        if running_inside(&prefix) {
+            match relaunch_from_temp(&prefix) {
+                Ok(msg) => return (true, msg),
+                // Falling through is still better than stopping: everything
+                // except this one executable can be removed from here.
+                Err(e) => {
+                    let _ =
+                        std::fs::write(prefix.join("setup.log"), format!("relaunch failed: {e}"));
+                }
+            }
+        }
+
+        remove_dir_all_retrying(&bin);
         let _ = std::fs::remove_file(manifest_path(&prefix));
+        let _ = std::fs::remove_file(prefix.join("setup.log"));
+        // Only if empty: the prefix may be a directory the user chose and
+        // already had things of their own in.
         let _ = std::fs::remove_dir(&prefix);
         remove_from_path(&bin.to_string_lossy());
         let _ = std::fs::remove_file(start_menu_lnk());
         unregister_uninstall();
+
+        // Report what is actually true. `remove_dir_all` is best-effort here --
+        // a binary still running keeps its own file alive -- so check rather
+        // than assume, because "uninstalled" over a full directory is the lie
+        // this function used to tell.
+        if bin.exists() {
+            let left = std::fs::read_dir(&bin).map(|d| d.count()).unwrap_or(0);
+            return (
+                false,
+                format!(
+                    "removed the PATH entry, shortcut and registry entry, but {left} file(s)                      are still in {} because something has them open. Close anything                      running from there and uninstall again.",
+                    bin.display()
+                ),
+            );
+        }
         (
             true,
             "uninstalled. Your models were left where they are.".into(),

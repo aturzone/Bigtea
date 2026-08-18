@@ -10,6 +10,36 @@ While the major version is `0`, anything may change in a minor release.
 
 Nothing yet.
 
+## [0.0.5] — 2026-08-18
+
+### Fixed — uninstalling actually uninstalled
+
+**In 0.0.4, uninstalling from Add/Remove Programs removed nothing and reported
+success.** A running executable cannot delete the directory it lives in, and the
+installer copies itself into `bin` so Windows has something to launch — so the
+uninstaller ran from inside the very folder it was trying to remove, the delete
+failed, and the code said "uninstalled" anyway.
+
+Three things were wrong and all three are fixed:
+
+- The uninstaller now **re-runs from a copy in the temp directory**, spawned
+  **detached** so the original can exit. Waiting for it was the first attempt and
+  it failed the same way: the parent stayed alive holding the file open for the
+  whole of the child's run.
+- The staged copy **retries for ten seconds** rather than trying once, because
+  the process that asked for the uninstall may still be exiting.
+- It **checks before reporting.** If files remain it says how many and where,
+  instead of claiming success over a full directory.
+
+Also: the silent log no longer recreates the folder it just deleted. A clean
+uninstall used to leave an empty `Chaos` directory containing one file that said
+it had uninstalled.
+
+Verified from the default prefix, the path that was broken: install 17 files,
+uninstall from the installed copy, everything gone in one second, PATH and
+registry clean.
+
+
 ## [0.0.4] — 2026-08-18
 
 ### Added — one file to install everything
