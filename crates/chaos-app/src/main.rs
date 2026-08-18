@@ -3669,8 +3669,16 @@ Any value a client sends is accepted.                      The server still list
                     (nav::ID_RESET, BN_CLICKED) => reset_settings(),
                     (nav::ID_AUTO, BN_CLICKED) | (nav::ID_FORCE, BN_CLICKED) => toggle(id),
                     // Selecting a different model redraws its page beside the
-                    // list, which is the whole point of a page per model.
-                    (nav::ID_LIST, LBN_SELCHANGE) => repaint(),
+                    // list, which is the whole point of a page per model --
+                    // **and re-decides which buttons are live**, because what
+                    // can be done to a model now depends on the model. An
+                    // unfinished download offers DOWNLOAD and refuses LOAD; a
+                    // whole one is the other way round. Repainting alone left
+                    // whichever answer the *first* row happened to give.
+                    (nav::ID_LIST, LBN_SELCHANGE) => {
+                        sync_enabled();
+                        repaint();
+                    }
                     // A settings dropdown changed: the sentence under it
                     // describes the *selected* option, so it has to be redrawn.
                     (_, CBN_SELCHANGE) => repaint(),
