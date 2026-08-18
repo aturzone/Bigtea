@@ -5,7 +5,7 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-17 · **Version**: **v0.0.3, released** · **Branch**:
+**Last updated**: 2026-08-17 · **Version**: **v0.0.6, released** · **Branch**:
 `main` · **Open PRs**: none. #83-#92 merged, every branch deleted.
 
 **The release is out**: <https://github.com/aturzone/Chaos/releases/tag/v0.0.3>
@@ -70,6 +70,37 @@ could not have done its job either: a pool collapsed onto one handle measures
 research node where it was measured under control.
 
 **Current**: **641 tests**, 0 failed.
+
+## v0.0.6 — the app actually works now (2026-08-18)
+
+**0.0.5's app could not be used.** Clicking INSTALLED or AVAILABLE killed the
+process instantly: `WM_CTLCOLORLISTBOX` borrows the window state, and the list
+fill held a mutable borrow across `SendMessageW`, which dispatches that message
+synchronously. A `RefCell` double borrow, and `panic = "abort"` makes that
+immediate process death with no window, no message and no log.
+
+**Six sites had that shape. Three were found by a test, not by clicking** — one
+of them `unload_model`, the button that frees the model's memory. The test is a
+*source* check (`crates/chaos-app/tests/ui_rules.rs`), because the failure is an
+abort that no harness can observe at runtime.
+
+Also fixed: the GUI uninstall removed nothing (it stayed open, so the staged
+helper could not delete the directory the window ran from), and closing the
+window left `chaos-serve` alive holding every resident byte.
+
+**Shipped alongside**: nine icon sizes rendered from the SVG and compiled in
+with `windres`; the endpoint URL shown so an agent can be pointed at it; DELETE
+that removes every shard; live memory; settings persisted outside the install
+with unknown keys preserved; a sidebar that scales so the fit verdict is
+readable; install and uninstall reports; `docs/APP.md`.
+
+**CI now starts the app**, waits, and fails if it exited or wrote a crash log —
+and checks no `chaos-serve` survives it. An app that only *builds* is exactly
+what shipped 0.0.5.
+
+**Still open**: SmartScreen (a certificate, not a patch), uninstall verified via
+`/S` rather than the Settings UI, and no per-model window — one model at a time.
+`docs/graph/backlog/app-to-production.md` tracks them.
 
 ## An installer, an app, and 13 models to fetch (2026-08-18)
 
