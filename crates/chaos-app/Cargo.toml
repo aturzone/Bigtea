@@ -24,6 +24,10 @@ description = "Native Windows app for Chaos: pick a model, run it, watch it work
 
 [dependencies]
 chaos-model = { path = "../chaos-model" }
+# For the settings page: core count, memory and whether a GPU exists, so the
+# options offered are the ones that make sense on *this* machine. Zero external
+# dependencies of its own, like everything else here.
+chaos-probe = { path = "../chaos-probe" }
 
 [[bin]]
 name = "chaos-app"

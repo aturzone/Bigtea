@@ -566,6 +566,9 @@ extern "system" {
     pub fn DrawMenuBar(hWnd: HWND) -> BOOL;
     pub fn CheckMenuRadioItem(hmenu: HMENU, first: u32, last: u32, check: u32, flags: u32) -> BOOL;
     pub fn EnableMenuItem(hMenu: HMENU, uIDEnableItem: u32, uEnable: u32) -> BOOL;
+    /// A tick beside one item, for a setting that is on or off. Distinct from
+    /// `CheckMenuRadioItem`, which is one-of-many.
+    pub fn CheckMenuItem(hMenu: HMENU, uIDCheckItem: u32, uCheck: u32) -> u32;
     pub fn GetMenu(hWnd: HWND) -> HMENU;
     pub fn CreateAcceleratorTableW(paccel: *const ACCEL, cAccel: i32) -> HACCEL;
     pub fn TranslateAcceleratorW(hWnd: HWND, hAccTable: HACCEL, lpMsg: *mut MSG) -> i32;
@@ -841,4 +844,71 @@ pub unsafe fn first_available_face(hdc: HDC, wanted: &[&str]) -> Option<String> 
         }
     }
     None
+}
+
+// -- combo boxes -------------------------------------------------------------
+//
+// A settings page made of empty text boxes asks a question most people cannot
+// answer. These are the dropdowns that replace them, owner-drawn for the same
+// reason the buttons are: a themed combo ignores `WM_CTLCOLOR*`.
+
+/// A list that cannot be typed into: the choices are the choices.
+pub const CBS_DROPDOWNLIST: u32 = 0x0003;
+pub const CBS_OWNERDRAWFIXED: u32 = 0x0010;
+pub const CBS_HASSTRINGS: u32 = 0x0200;
+
+pub const CB_ADDSTRING: u32 = 0x0143;
+pub const CB_RESETCONTENT: u32 = 0x014B;
+pub const CB_SETCURSEL: u32 = 0x014E;
+pub const CB_GETCURSEL: u32 = 0x0147;
+pub const CB_SETITEMHEIGHT: u32 = 0x0153;
+pub const CBN_SELCHANGE: u16 = 1;
+
+pub const ODT_COMBOBOX: u32 = 3;
+pub const ODS_COMBOBOXEDIT: u32 = 0x1000;
+
+/// Windows asks for a row height before it draws one.
+pub const WM_MEASUREITEM: u32 = 0x002C;
+
+#[repr(C)]
+pub struct MEASUREITEMSTRUCT {
+    pub CtlType: u32,
+    pub CtlID: u32,
+    pub itemID: u32,
+    pub itemWidth: u32,
+    pub itemHeight: u32,
+    pub itemData: usize,
+}
+
+// -- randomness --------------------------------------------------------------
+
+#[link(name = "bcrypt")]
+extern "system" {
+    fn BCryptGenRandom(alg: *mut c_void, buf: *mut u8, len: u32, flags: u32) -> i32;
+}
+
+/// `BCRYPT_USE_SYSTEM_PREFERRED_RNG`: no algorithm handle to open or close.
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+
+/// `n` random bytes as lowercase hex, from the system generator.
+///
+/// **Not `SystemTime` mixed with a process id.** An API key derived from the
+/// clock is guessable by anyone who knows roughly when it was made, and the
+/// whole point of the key is that it cannot be guessed. Windows ships a CSPRNG;
+/// this is the two-line way to ask it.
+///
+/// Returns `None` rather than falling back to something weaker: a key that
+/// silently is not random is worse than no key, because it is trusted.
+pub fn random_hex(n: usize) -> Option<String> {
+    let mut buf = vec![0u8; n];
+    let ok = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            n as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    // STATUS_SUCCESS is 0; anything else is a failure worth surfacing.
+    (ok == 0).then(|| buf.iter().map(|b| format!("{b:02x}")).collect())
 }

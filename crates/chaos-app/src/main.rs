@@ -43,6 +43,7 @@ fn main() {
 
 #[cfg(windows)]
 mod windows_app {
+    use chaos_app::choices::{self, Choice};
     use chaos_app::nav::{self, Page};
     use chaos_app::theme::{self, metric, size, weight, Mode, Rgb, Theme};
     use chaos_app::win32::*;
@@ -137,6 +138,13 @@ mod windows_app {
         history: Vec<(String, String)>,
         answer: String,
         cfg: settings::Settings,
+        /// What this machine is, so the settings page can offer values that
+        /// make sense on it rather than an empty box.
+        machine: choices::Machine,
+        /// The options each dropdown currently holds, by control id. Kept so
+        /// the note under a box follows the *selection* rather than repeating a
+        /// static sentence, and so saving reads the value rather than the label.
+        lists: std::collections::HashMap<i32, Vec<Choice>>,
     }
 
     thread_local! {
@@ -165,6 +173,13 @@ mod windows_app {
 
     fn main_hwnd() -> HWND {
         main_window().load(Ordering::SeqCst) as HWND
+    }
+
+    /// A settings control's handle, for the paint path. Named separately so the
+    /// call inside `paint_settings` reads as what it is: a handle lookup, which
+    /// `GetDlgItem` performs without dispatching a message.
+    fn sel_of(id: i32) -> HWND {
+        ctl(id)
     }
 
     /// A control by id, without borrowing anything.
@@ -335,6 +350,7 @@ mod windows_app {
         add(model, nav::IDM_DELETE, "De&lete selected");
         sep(model);
         add(model, nav::IDM_COPY_ENDPOINT, "&Copy endpoint\tCtrl+E");
+        add(model, nav::IDM_API_KEY, "Require an &API key");
         popup(bar, model, "&Model");
 
         let view = CreatePopupMenu();
@@ -452,6 +468,19 @@ mod windows_app {
         enable(nav::IDM_DOWNLOAD, on_models && !installed);
         enable(nav::IDM_DELETE, on_models && installed && !running);
         enable(nav::IDM_COPY_ENDPOINT, running);
+        // Ticked when a key is required, so the menu answers "is one set?"
+        // without anybody having to open the settings file.
+        let keyed = UI.with(|u| {
+            u.borrow()
+                .as_ref()
+                .map(|ui| ui.cfg.api_key.is_some())
+                .unwrap_or(false)
+        });
+        CheckMenuItem(
+            menu,
+            nav::IDM_API_KEY as u32,
+            MF_BYCOMMAND | if keyed { MF_CHECKED } else { MF_UNCHECKED },
+        );
 
         CheckMenuRadioItem(
             menu,
@@ -571,8 +600,26 @@ mod windows_app {
         button(hwnd, "COPY ENDPOINT", nav::ID_COPY_ENDPOINT, hinst);
 
         // Settings: every field the file holds, which is the point of the page.
+        //
+        // **A field with a sensible short list is a dropdown, not a box.** An
+        // empty text box asks "how many threads?", which most people cannot
+        // answer and which has a different right answer on every machine.
+        // `choices::for_field` decides which is which, so the window does not
+        // carry a second copy of that judgement.
+        let probe = probe_machine();
         for f in nav::FIELDS {
-            child(hwnd, "EDIT", "", WS_BORDER | WS_TABSTOP, f.id, hinst);
+            if choices::for_field(f.id, probe).is_some() {
+                child(
+                    hwnd,
+                    "COMBOBOX",
+                    "",
+                    CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
+                    f.id,
+                    hinst,
+                );
+            } else {
+                child(hwnd, "EDIT", "", WS_BORDER | WS_TABSTOP, f.id, hinst);
+            }
         }
         for f in nav::TOGGLES {
             button(hwnd, f.label, f.id, hinst);
@@ -612,16 +659,24 @@ mod windows_app {
             );
         }
         for f in nav::FIELDS {
-            SendMessageW(
-                GetDlgItem(hwnd, f.id),
-                EM_SETMARGINS,
-                EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                (8 | (8 << 16)) as LPARAM,
-            );
+            let h = GetDlgItem(hwnd, f.id);
+            if choices::for_field(f.id, probe).is_some() {
+                // Combo rows, tall enough for the label at body size.
+                SendMessageW(h, CB_SETITEMHEIGHT, 0, 24);
+                SendMessageW(h, CB_SETITEMHEIGHT, usize::MAX, 26);
+            } else {
+                SendMessageW(
+                    h,
+                    EM_SETMARGINS,
+                    EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                    (8 | (8 << 16)) as LPARAM,
+                );
+            }
         }
 
         let t = theme::theme(cfg.mode);
         let port = cfg.port;
+        let machine = probe_machine();
         UI.with(|u| {
             *u.borrow_mut() = Some(Ui {
                 theme: t,
@@ -645,9 +700,28 @@ mod windows_app {
                 history: Vec::new(),
                 answer: String::new(),
                 cfg,
+                machine,
+                lists: std::collections::HashMap::new(),
             })
         });
         rescan();
+    }
+
+    /// What the machine is, for the settings page.
+    ///
+    /// `chaos-probe` already answers this properly and has no dependencies of
+    /// its own, so the app asks it rather than growing a second, worse copy.
+    /// `measure_bandwidth: false` skips the only slow step -- the disk timing --
+    /// because nothing on this page needs it and the window must not stall on
+    /// startup.
+    fn probe_machine() -> choices::Machine {
+        let m = chaos_probe::Machine::probe(models::default_dir(), false);
+        choices::Machine {
+            cores: m.cpu_threads.max(1) as u32,
+            total_ram: m.ram_total_bytes.unwrap_or(0),
+            free_ram: m.ram_available_bytes.unwrap_or(0),
+            gpu: !m.gpus.is_empty(),
+        }
     }
 
     /// Match the title bar to the palette.
@@ -1265,16 +1339,87 @@ mod windows_app {
     /// This is the string you paste into a coding agent, and retyping it off
     /// the screen is exactly the friction that makes a window feel like a demo.
     fn copy_endpoint() {
-        match endpoint() {
-            Some(url) => {
-                if unsafe { set_clipboard_text(main_hwnd(), &url) } {
-                    set_status(&format!("copied {url}"));
-                } else {
-                    set_status("the clipboard is held by another program");
-                }
+        let Some(url) = endpoint() else {
+            set_status("nothing is running, so there is no endpoint yet");
+            return;
+        };
+        let key = UI.with(|u| u.borrow().as_ref().and_then(|ui| ui.cfg.api_key.clone()));
+        // With a key set, both go on the clipboard. Pasting a URL into a client
+        // that then rejects every request for want of a key is the kind of
+        // half-answer that costs an afternoon.
+        let text = match &key {
+            Some(k) => format!(
+                "{url}
+API key: {k}"
+            ),
+            None => url.clone(),
+        };
+        if unsafe { set_clipboard_text(main_hwnd(), &text) } {
+            match key {
+                Some(_) => set_status(&format!("copied {url} and its API key")),
+                None => set_status(&format!("copied {url}")),
             }
-            None => set_status("nothing is running, so there is no endpoint yet"),
+        } else {
+            set_status("the clipboard is held by another program");
         }
+    }
+
+    /// Turn the API key on or off, generating one when turning it on.
+    ///
+    /// **Off by default, and never switched on quietly.** Enabling it would
+    /// start refusing every agent already pointed at this endpoint, so it is a
+    /// deliberate act that shows the key, copies it, and says when it takes
+    /// effect -- a server that is already running was started without it.
+    fn toggle_api_key() {
+        let key = UI.with(|u| {
+            let mut b = u.borrow_mut();
+            let ui = b.as_mut()?;
+            ui.cfg.api_key = match ui.cfg.api_key {
+                Some(_) => None,
+                // 24 bytes from the system generator, hex. **Not derived from
+                // the clock**: a key anyone can guess from roughly when it was
+                // made is worse than no key, because it is trusted.
+                None => random_hex(24),
+            };
+            let _ = ui.cfg.save();
+            Some(ui.cfg.api_key.clone())
+        });
+        let Some(key) = key else { return };
+        let running = UI.with(|u| u.borrow().as_ref().is_some_and(|ui| ui.loaded.is_some()));
+        let msg = match &key {
+            Some(k) => {
+                unsafe {
+                    set_clipboard_text(main_hwnd(), k);
+                }
+                format!(
+                    "An API key is now required.
+
+{k}
+
+It is on your clipboard.                      Paste it into any client that asks for one.
+
+{}",
+                    if running {
+                        "The running model was started without it -- press STOP and LOAD again."
+                    } else {
+                        "It takes effect the next time you load a model."
+                    }
+                )
+            }
+            None => "No API key is required now.
+
+Any value a client sends is accepted.                      The server still listens on 127.0.0.1 only."
+                .to_string(),
+        };
+        unsafe {
+            MessageBoxW(
+                main_hwnd(),
+                wide(&msg).as_ptr(),
+                wide("Chaos").as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        repaint();
     }
 
     fn send_prompt() {
@@ -1293,11 +1438,11 @@ mod windows_app {
         if prompt.is_empty() {
             return;
         }
-        let (port, history) = UI.with(|u| {
+        let (port, history, key) = UI.with(|u| {
             let b = u.borrow();
             b.as_ref()
-                .map(|ui| (ui.port, ui.history.clone()))
-                .unwrap_or((0, Vec::new()))
+                .map(|ui| (ui.port, ui.history.clone(), ui.cfg.api_key.clone()))
+                .unwrap_or((0, Vec::new(), None))
         });
 
         UI.with(|u| {
@@ -1323,30 +1468,37 @@ mod windows_app {
         busy().store(true, Ordering::SeqCst);
 
         std::thread::spawn(move || {
-            client::chat(port, &history, &prompt, 512, &mut |ev| match ev {
-                client::Event::Token(t) => {
-                    let mut s = shared().lock().unwrap();
-                    s.pending.push_str(&t);
-                    s.tokens += 1;
-                    drop(s);
-                    notify();
-                }
-                client::Event::Done => {
-                    let mut s = shared().lock().unwrap();
-                    s.finished = true;
-                    s.status = "ready".into();
-                    drop(s);
-                    notify();
-                }
-                client::Event::Failed(m) => {
-                    let mut s = shared().lock().unwrap();
-                    s.pending.push_str(&format!("\n[{m}]\n"));
-                    s.finished = true;
-                    s.status = m;
-                    drop(s);
-                    notify();
-                }
-            });
+            client::chat(
+                port,
+                &history,
+                &prompt,
+                512,
+                key.as_deref(),
+                &mut |ev| match ev {
+                    client::Event::Token(t) => {
+                        let mut s = shared().lock().unwrap();
+                        s.pending.push_str(&t);
+                        s.tokens += 1;
+                        drop(s);
+                        notify();
+                    }
+                    client::Event::Done => {
+                        let mut s = shared().lock().unwrap();
+                        s.finished = true;
+                        s.status = "ready".into();
+                        drop(s);
+                        notify();
+                    }
+                    client::Event::Failed(m) => {
+                        let mut s = shared().lock().unwrap();
+                        s.pending.push_str(&format!("\n[{m}]\n"));
+                        s.finished = true;
+                        s.status = m;
+                        drop(s);
+                        notify();
+                    }
+                },
+            );
         });
     }
 
@@ -1407,28 +1559,107 @@ mod windows_app {
 
     // -- settings ------------------------------------------------------------
 
-    /// Put the stored settings into the boxes.
+    /// The list a field offers on this machine, or `None` if it is typed.
+    fn field_choices(id: i32) -> Option<Vec<Choice>> {
+        let m = UI.with(|u| u.borrow().as_ref().map(|ui| ui.machine))?;
+        choices::for_field(id, m)
+    }
+
+    /// Put the stored settings into the boxes and the dropdowns.
     fn fill_settings_page() {
         let cfg = UI.with(|u| u.borrow().as_ref().map(|ui| ui.cfg.clone()));
         let Some(cfg) = cfg else { return };
-        let put = |id: i32, v: Option<String>| unsafe {
-            SetWindowTextW(ctl(id), wide(&v.unwrap_or_default()).as_ptr());
+
+        let stored = |id: i32| -> String {
+            match id {
+                nav::ID_CACHE => cfg.cache_gib.map(|v| format!("{v}")).unwrap_or_default(),
+                nav::ID_THREADS => cfg.threads.map(|v| v.to_string()).unwrap_or_default(),
+                nav::ID_THREADS_BATCH => {
+                    cfg.threads_batch.map(|v| v.to_string()).unwrap_or_default()
+                }
+                nav::ID_CONTEXT => cfg.context.map(|v| v.to_string()).unwrap_or_default(),
+                nav::ID_NGL => cfg.ngl.map(|v| v.to_string()).unwrap_or_default(),
+                nav::ID_PORT => cfg.port.to_string(),
+                nav::ID_MODELS_DIR => cfg.models_dir.clone().unwrap_or_default(),
+                _ => String::new(),
+            }
         };
-        put(nav::ID_CACHE, cfg.cache_gib.map(|v| format!("{v}")));
-        put(nav::ID_THREADS, cfg.threads.map(|v| v.to_string()));
-        put(
-            nav::ID_THREADS_BATCH,
-            cfg.threads_batch.map(|v| v.to_string()),
-        );
-        put(nav::ID_PORT, Some(cfg.port.to_string()));
-        put(nav::ID_CONTEXT, cfg.context.map(|v| v.to_string()));
-        put(nav::ID_NGL, cfg.ngl.map(|v| v.to_string()));
-        put(nav::ID_MODELS_DIR, cfg.models_dir.clone());
+
+        for f in nav::FIELDS {
+            let h = ctl(f.id);
+            if h.is_null() {
+                continue;
+            }
+            let want = stored(f.id);
+            match field_choices(f.id) {
+                Some(list) => {
+                    // A value the file holds that is not in the list still has
+                    // to be selectable, or saving would silently change it.
+                    let mut list = list;
+                    if !want.is_empty() && !list.iter().any(|c| c.value == want) {
+                        list.push(Choice {
+                            value: want.clone(),
+                            label: format!("{want} (from your settings file)"),
+                            note: "Typed by hand rather than chosen here. Kept as it is.".into(),
+                        });
+                    }
+                    let selected = list.iter().position(|c| c.value == want).unwrap_or(0);
+                    unsafe {
+                        SendMessageW(h, CB_RESETCONTENT, 0, 0);
+                        for c in &list {
+                            let t = wide(&c.label);
+                            SendMessageW(h, CB_ADDSTRING, 0, t.as_ptr() as LPARAM);
+                        }
+                        SendMessageW(h, CB_SETCURSEL, selected, 0);
+                    }
+                    // Cached so paint and save do not rebuild the list, and so
+                    // the note under the box follows the selection.
+                    UI.with(|u| {
+                        if let Some(ui) = u.borrow_mut().as_mut() {
+                            ui.lists.insert(f.id, list);
+                        }
+                    });
+                }
+                None => unsafe {
+                    SetWindowTextW(h, wide(&want).as_ptr());
+                },
+            }
+        }
+    }
+
+    /// The value a settings control currently holds, whichever kind it is.
+    fn field_value(id: i32) -> String {
+        let h = ctl(id);
+        if h.is_null() {
+            return String::new();
+        }
+        let listed = UI.with(|u| {
+            let b = u.borrow();
+            b.as_ref()
+                .map(|ui| ui.lists.contains_key(&id))
+                .unwrap_or(false)
+        });
+        if !listed {
+            return control_text(h).trim().to_string();
+        }
+        let sel = unsafe { SendMessageW(h, CB_GETCURSEL, 0, 0) };
+        if sel < 0 {
+            return String::new();
+        }
+        UI.with(|u| {
+            let b = u.borrow();
+            b.as_ref()
+                .and_then(|ui| ui.lists.get(&id))
+                .and_then(|l| l.get(sel as usize))
+                .map(|c| c.value.clone())
+                .unwrap_or_default()
+        })
     }
 
     /// Read every box back and write the file.
     fn save_settings() {
-        let read = |id: i32| control_text(ctl(id)).trim().to_string();
+        // Reads a dropdown's selected *value* or a box's text, as appropriate.
+        let read = field_value;
         let cache = read(nav::ID_CACHE);
         let threads = read(nav::ID_THREADS);
         let tb = read(nav::ID_THREADS_BATCH);
@@ -2043,6 +2274,13 @@ mod windows_app {
                         format!("http://127.0.0.1:{}/v1", ui.port),
                     ));
                     rows.push((
+                        "API key".into(),
+                        match &ui.cfg.api_key {
+                            Some(k) => k.clone(),
+                            None => "not required -- any value works".into(),
+                        },
+                    ));
+                    rows.push((
                         "context".into(),
                         ui.cfg
                             .context
@@ -2269,6 +2507,13 @@ mod windows_app {
                     format!("http://127.0.0.1:{}/v1", ui.port),
                 ),
                 (
+                    "API key".into(),
+                    match &ui.cfg.api_key {
+                        Some(k) => k.clone(),
+                        None => "not required -- any value works".into(),
+                    },
+                ),
+                (
                     "uptime".into(),
                     ui.loaded_at
                         .map(|i| human_duration(i.elapsed().as_secs()))
@@ -2355,15 +2600,27 @@ mod windows_app {
             y[c] += 26;
             for f in nav::FIELDS.iter().filter(|f| f.group == *group) {
                 label(hdc, x, y[c] - 1, col, f.label, ui.fonts.body_bold, t.fg);
+                // **The note describes the current selection, not the field.**
+                // A dropdown whose explanation never changes is a dropdown you
+                // have to try in order to understand.
+                let note = ui
+                    .lists
+                    .get(&f.id)
+                    .and_then(|l| {
+                        let sel = unsafe { SendMessageW(sel_of(f.id), CB_GETCURSEL, 0, 0) };
+                        (sel >= 0).then(|| l.get(sel as usize)).flatten()
+                    })
+                    .map(|c| c.note.clone())
+                    .unwrap_or_else(|| f.hint.to_string());
                 text(
                     hdc,
                     RECT {
                         left: x,
                         top: y[c] + 18 + metric::CONTROL + 4,
                         right: x + col,
-                        bottom: y[c] + 18 + metric::CONTROL + 32,
+                        bottom: y[c] + 18 + metric::CONTROL + 34,
                     },
-                    f.hint,
+                    &note,
                     ui.fonts.small,
                     t.fg_tertiary,
                     DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS,
@@ -2590,6 +2847,10 @@ mod windows_app {
             draw_list_row(di, &t, font, font_bold, selected, loaded.as_deref());
             return;
         }
+        if di.CtlType == ODT_COMBOBOX {
+            draw_combo(di, &t, font, font_bold, selected);
+            return;
+        }
 
         let id = di.CtlID as i32;
         let text_s = control_text(di.hwndItem);
@@ -2754,6 +3015,76 @@ mod windows_app {
                 );
             }
         }
+    }
+
+    /// A dropdown: its closed face, and its rows when open.
+    ///
+    /// Owner-drawn for the same reason the buttons are -- a themed combo ignores
+    /// `WM_CTLCOLOR*` and comes up in the system's greys. `ODS_COMBOBOXEDIT`
+    /// distinguishes the closed control from a row in the open list, which are
+    /// drawn differently: the face carries a chevron, the rows do not.
+    unsafe fn draw_combo(
+        di: &DRAWITEMSTRUCT,
+        t: &Theme,
+        font: HFONT,
+        font_bold: HFONT,
+        selected: bool,
+    ) {
+        let face = di.itemState & ODS_COMBOBOXEDIT != 0;
+        let r = di.rcItem;
+        // The open list sits on the elevated fill so it reads as floating; the
+        // closed face sits on the page.
+        let ground = if face {
+            t.bg
+        } else if selected {
+            t.accent_soft
+        } else {
+            t.soft
+        };
+        fill(di.hDC, r, ground);
+
+        if face {
+            frame(di.hDC, r, t.stroke_1);
+            // **No chevron is drawn here.** `CBS_OWNERDRAWFIXED` hands over the
+            // *items*, not the drop-down button, which Windows keeps painting
+            // itself -- so drawing one produced two, side by side.
+        } else if selected {
+            fill(
+                di.hDC,
+                RECT {
+                    right: r.left + 3,
+                    ..r
+                },
+                t.accent,
+            );
+        }
+
+        if di.itemID == u32::MAX {
+            return;
+        }
+        // The text comes from our own cached list rather than `CB_GETLBTEXT`:
+        // the label is already in hand, and asking the control for it during
+        // its own paint is a message round trip for nothing.
+        let label = UI.with(|u| {
+            let b = u.borrow();
+            b.as_ref()
+                .and_then(|ui| ui.lists.get(&(di.CtlID as i32)))
+                .and_then(|l| l.get(di.itemID as usize))
+                .map(|c| c.label.clone())
+        });
+        let Some(label) = label else { return };
+        text(
+            di.hDC,
+            RECT {
+                left: r.left + 10,
+                right: r.right - if face { 26 } else { 8 },
+                ..r
+            },
+            &label,
+            if face { font_bold } else { font },
+            t.fg,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
     }
 
     /// One row of the model list.
@@ -2936,6 +3267,13 @@ mod windows_app {
                 draw_item(di);
                 1
             }
+            // Windows asks how tall a row is before it draws one, and the
+            // default is the system font's height -- which clips a 15px label.
+            WM_MEASUREITEM => {
+                let mi = &mut *(lp as *mut MEASUREITEMSTRUCT);
+                mi.itemHeight = 26;
+                1
+            }
             WM_COMMAND => {
                 let id = (wp & 0xFFFF) as i32;
                 let code = ((wp >> 16) & 0xFFFF) as u16;
@@ -2988,6 +3326,10 @@ mod windows_app {
                         copy_endpoint();
                         return 0;
                     }
+                    nav::IDM_API_KEY => {
+                        toggle_api_key();
+                        return 0;
+                    }
                     nav::IDM_MANUAL => {
                         shell_open(MANUAL_URL);
                         return 0;
@@ -3028,6 +3370,9 @@ mod windows_app {
                     // Selecting a different model redraws its page beside the
                     // list, which is the whole point of a page per model.
                     (nav::ID_LIST, LBN_SELCHANGE) => repaint(),
+                    // A settings dropdown changed: the sentence under it
+                    // describes the *selected* option, so it has to be redrawn.
+                    (_, CBN_SELCHANGE) => repaint(),
                     _ => {}
                 }
                 0

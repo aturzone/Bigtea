@@ -110,6 +110,8 @@ pub fn chat(
     history: &[(String, String)],
     prompt: &str,
     max_tokens: u32,
+    // The key the server was started with, if any.
+    api_key: Option<&str>,
     on: &mut dyn FnMut(Event),
 ) {
     let mut msgs = String::new();
@@ -149,8 +151,15 @@ pub fn chat(
             return;
         }
     };
+    // **The window's own chat sends the key too.** A key the app displays but
+    // does not use would make its own transcript the one client that cannot
+    // talk to the model it just started.
+    let auth = match api_key {
+        Some(k) if !k.is_empty() => format!("Authorization: Bearer {k}\r\n"),
+        _ => String::new(),
+    };
     let head = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     if w.write_all(head.as_bytes()).is_err() || w.write_all(body.as_bytes()).is_err() {

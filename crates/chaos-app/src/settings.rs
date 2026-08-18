@@ -38,6 +38,15 @@ pub struct Settings {
     /// Light or dark. Persisted because a window that forgets which way round
     /// it is every launch is not a preference, it is a flicker.
     pub mode: Mode,
+    /// The key `/v1/*` requires, or `None` for no key at all.
+    ///
+    /// **Off by default, deliberately.** The server binds `127.0.0.1` only, so
+    /// a key is not what keeps a stranger out -- what keeps them out is that
+    /// there is no route in. Turning it on by default would also break every
+    /// agent already pointed at an existing install. It exists because many
+    /// OpenAI-compatible clients insist on sending a key, and because a shared
+    /// machine is a real thing.
+    pub api_key: Option<String>,
     /// Keys read but not understood, preserved on write.
     unknown: BTreeMap<String, String>,
 }
@@ -58,6 +67,7 @@ impl Default for Settings {
             force: false,
             // Hermes' desktop defaults to light, and so does this.
             mode: Mode::Light,
+            api_key: None,
             unknown: BTreeMap::new(),
         }
     }
@@ -98,6 +108,7 @@ impl Settings {
                 "auto" => s.auto = truthy(v),
                 "force" => s.force = truthy(v),
                 "mode" => s.mode = Mode::parse(v).unwrap_or(s.mode),
+                "api_key" => s.api_key = (!v.is_empty()).then(|| v.to_string()),
                 _ => {
                     s.unknown.insert(k.to_string(), v.to_string());
                 }
@@ -128,6 +139,7 @@ impl Settings {
         out.push_str(&format!("auto = {}\n", self.auto));
         out.push_str(&format!("force = {}\n", self.force));
         out.push_str(&format!("mode = {}\n", self.mode.as_str()));
+        out.push_str(&opt("api_key", self.api_key.clone()));
         for (k, v) in &self.unknown {
             out.push_str(&format!("{k} = {v}\n"));
         }
@@ -201,7 +213,21 @@ impl Settings {
         if self.force {
             a.push("--force".into());
         }
+        if let Some(k) = &self.api_key {
+            a.push("--api-key".into());
+            a.push(k.clone());
+        }
         a
+    }
+
+    /// The endpoint, and what to send with it.
+    ///
+    /// One place, so the line the window shows, the string COPY ENDPOINT puts
+    /// on the clipboard, and what the chat client actually sends cannot
+    /// disagree -- which is precisely how an endpoint panel comes to advertise
+    /// something that does not work.
+    pub fn endpoint(&self) -> String {
+        format!("http://127.0.0.1:{}/v1", self.port)
     }
 }
 
@@ -226,6 +252,7 @@ mod tests {
             auto: true,
             force: true,
             mode: Mode::Dark,
+            api_key: Some("deadbeef".into()),
             ..Settings::default()
         };
         assert_eq!(Settings::parse(&s.render()), s);
@@ -308,6 +335,30 @@ mod tests {
     #[test]
     fn the_model_is_the_first_argument() {
         assert_eq!(Settings::default().serve_args("mymodel")[0], "mymodel");
+    }
+
+    /// A key reaches the server, or it is a decoration on a page.
+    #[test]
+    fn a_key_is_passed_to_the_server() {
+        let mut s = Settings::default();
+        assert!(
+            !s.serve_args("m").iter().any(|a| a == "--api-key"),
+            "no key is set, so none must be passed"
+        );
+        s.api_key = Some("abc123".into());
+        let a = s.serve_args("m");
+        let i = a
+            .iter()
+            .position(|x| x == "--api-key")
+            .expect("no --api-key");
+        assert_eq!(a[i + 1], "abc123");
+    }
+
+    /// The endpoint is built in one place and follows the port.
+    #[test]
+    fn the_endpoint_follows_the_port() {
+        let s = Settings::parse("port = 9313");
+        assert_eq!(s.endpoint(), "http://127.0.0.1:9313/v1");
     }
 
     /// A reset returns every engine setting to measured, and touches neither
