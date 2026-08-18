@@ -10,6 +10,75 @@ While the major version is `0`, anything may change in a minor release.
 
 Nothing yet.
 
+## [0.0.4] — 2026-08-18
+
+### Added — one file to install everything
+
+**`Chaos-0.0.4-Setup.exe`.** Download it, run it, press INSTALL. 23 MB with every
+binary inside: no archive to unpack, no PowerShell, no toolchain, no network, no
+administrator rights. It installs per-user, puts Chaos on your PATH, creates the
+models folder, adds a Start Menu entry and registers in Add/Remove Programs.
+
+Built without NSIS, WiX, Inno or MSI tooling, because every one of them would
+have to be installed on the build machine before a release could be cut, and this
+project has no dependencies. A Windows install turns out to be a window, a file
+copy, a PATH entry, a shortcut and one registry key.
+
+**Uninstalling never touches your models.** They live outside the install folder
+on purpose, and a test enforces it — the failure mode is deleting a 155 GB
+download.
+
+Silent mode for scripting and CI: `/S`, `/S --uninstall`, `--prefix <dir>`.
+
+### Added — Chaos as a window
+
+**`chaos-app`**, a native Win32 application. Not a browser in a frame: a real
+window, drawn with GDI, in two colours and nothing between them. Pick a model,
+LOAD it, chat with it, UNLOAD it — and unloading genuinely frees the memory,
+because the engine runs as a child process rather than inside the window.
+
+INSTALLED and AVAILABLE tabs, a DOWNLOAD button, and settings for cache, threads
+and port.
+
+### Added — a browser interface for `chaos-serve`
+
+`GET /` now serves a chat page, self-contained in the binary: no CDN, no font, no
+script fetched from anywhere. An offline machine gets the whole interface.
+
+### Added — 13 models to fetch, up from 2
+
+Qwen3 4B/8B/14B/32B, Gemma-3 4B/12B/27B, Llama-3.2 1B/3B, Qwen2.5-Coder-7B and
+Phi-4, alongside DeepSeek-V4-Flash and Qwen3-30B-A3B. Every repository, filename
+and byte count was read from the Hugging Face API and verified to resolve before
+being added.
+
+**Each entry states what must stay resident, not just what it downloads**, and
+that is the number the fit verdict uses:
+
+```
+v4flash    155.1 GB    7.38 GiB resident   -> streams on a 16 GB machine
+qwen3-32b   19.8 GB   18.40 GiB resident   -> does not
+```
+
+A dense model has no routed experts, so nothing streams and the whole file has to
+fit. Sorting by download size would have called the 155 GB model impossible and
+the 20 GB one easy, which is backwards.
+
+### Changed
+
+- `chaos-iobench` and `chaos-gpubench` now ship in the release, so the
+  measurements this project publishes can be reproduced by anyone who downloads
+  it.
+- The release workflow builds and tests the installer, and fails if it embedded
+  nothing.
+
+### Fixed
+
+- The documented test count is now checked by CI against the suite that actually
+  ran. It had gone stale three times — 566, 570, 575 — each caught only by
+  someone noticing.
+
+
 ## [0.0.3] — 2026-08-16
 
 ### Changed — the project is now called `chaos`
