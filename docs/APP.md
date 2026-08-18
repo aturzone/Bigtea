@@ -206,7 +206,9 @@ against llama.cpp and `allow unverified architectures` is off.
 Named plainly rather than left to be discovered:
 
 - One model runs at a time.
-- Download progress shows start and finish, not a percentage.
+- Download progress is measured from the bytes on disk, so a paused or
+  restarted fetch is still tracked; it cannot show which *shard* of a
+  five-part container is in flight.
 - No tray icon — closing the window is the way to quit.
 - MONITOR cannot show streamed bytes or cache residency; the engine measures
   them but does not report them over the socket.

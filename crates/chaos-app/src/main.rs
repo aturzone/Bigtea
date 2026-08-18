@@ -44,6 +44,7 @@ fn main() {
 #[cfg(windows)]
 mod windows_app {
     use chaos_app::choices::{self, Choice};
+    use chaos_app::download::Download;
     use chaos_app::nav::{self, Page};
     use chaos_app::theme::{self, metric, size, weight, Mode, Rgb, Theme};
     use chaos_app::win32::*;
@@ -78,6 +79,8 @@ mod windows_app {
         tokens: u32,
         started: Option<Instant>,
         status: String,
+        /// Set when `chaos-pull` exits, so the UI stops watching the files.
+        download_done: bool,
         /// A message box the UI thread must put up: its text, and whether it is
         /// good news.
         ///
@@ -149,6 +152,8 @@ mod windows_app {
         /// What this machine is, so the settings page can offer values that
         /// make sense on it rather than an empty box.
         machine: choices::Machine,
+        /// A download in flight, watched by the bytes it puts on disk.
+        download: Option<Download>,
         /// The options each dropdown currently holds, by control id. Kept so
         /// the note under a box follows the *selection* rather than repeating a
         /// static sentence, and so saving reads the value rather than the label.
@@ -711,6 +716,7 @@ mod windows_app {
                 answer: String::new(),
                 cfg,
                 machine,
+                download: None,
                 lists: std::collections::HashMap::new(),
             })
         });
@@ -1304,8 +1310,19 @@ mod windows_app {
         let dir = models::default_dir();
         let _ = std::fs::create_dir_all(&dir);
 
+        // Everything the watcher needs, worked out before the fetch starts:
+        // which files will appear, and what they will weigh in total.
+        let files: Vec<std::path::PathBuf> = chaos_model::catalogue::find(&name)
+            .and_then(|e| e.quant(&quant).map(|q| (e, q)))
+            .map(|(e, q)| e.files(q).into_iter().map(|f| dir.join(f)).collect())
+            .unwrap_or_default();
+        UI.with(|u| {
+            if let Some(ui) = u.borrow_mut().as_mut() {
+                ui.download = Some(Download::new(format!("{name} {quant}"), files, bytes));
+            }
+        });
         set_status(&format!(
-            "downloading {name} {quant}, {} -- this runs in the background",
+            "downloading {name} {quant}, {}",
             models::human_size(bytes)
         ));
 
@@ -1329,6 +1346,7 @@ mod windows_app {
             let mut sh = shared().lock().unwrap();
             sh.status = msg;
             sh.finished = true;
+            sh.download_done = true;
             drop(sh);
             notify();
         });
@@ -2181,6 +2199,37 @@ Any value a client sends is accepted.                      The server still list
 
         let y = top + 8;
         let x = metric::RAIL + metric::INSET;
+
+        // **A download outranks the running model on the strip.** It is the
+        // thing that is happening, it can take an hour, and a window that says
+        // only "downloading" for that hour looks broken -- which is what it did.
+        if let Some(d) = ui.download.as_ref().filter(|d| !d.finished) {
+            let bar_w = client.right - x - metric::INSET - 96;
+            label(hdc, x, y + 1, bar_w, &d.line(), ui.fonts.body_bold, t.fg);
+            let by = y + 26;
+            fill(
+                hdc,
+                RECT {
+                    left: x,
+                    top: by,
+                    right: x + bar_w,
+                    bottom: by + 6,
+                },
+                t.soft,
+            );
+            fill(
+                hdc,
+                RECT {
+                    left: x,
+                    top: by,
+                    right: x + bar_w * d.percent() as i32 / 100,
+                    bottom: by + 6,
+                },
+                t.accent,
+            );
+            return;
+        }
+
         // The status line is the app's running commentary, right-aligned above
         // the STOP button so it never collides with the endpoint.
         let status = {
@@ -3325,11 +3374,30 @@ Any value a client sends is accepted.                      The server still list
                 // Uptime and free memory move on their own; nothing else here
                 // would ever ask for them to be redrawn.
                 let free = free_memory_bytes();
+                // A download is another process writing files, so the only way
+                // to know how far along it is, is to look at them.
+                let ended = {
+                    let mut sh = shared().lock().unwrap();
+                    std::mem::take(&mut sh.download_done)
+                };
+                let mut rescan_after = false;
                 UI.with(|u| {
                     if let Some(ui) = u.borrow_mut().as_mut() {
                         ui.free_bytes = free;
+                        if let Some(d) = ui.download.as_mut() {
+                            d.done_bytes = chaos_app::download::bytes_on_disk(&d.files);
+                            d.elapsed += f64::from(TICK_MS) / 1000.0;
+                            if ended {
+                                d.finished = true;
+                                rescan_after = true;
+                            }
+                        }
                     }
                 });
+                if rescan_after {
+                    // The finished container is now an installed model.
+                    rescan();
+                }
                 repaint();
                 0
             }
