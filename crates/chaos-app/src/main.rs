@@ -38,7 +38,7 @@ fn main() {
 #[cfg(windows)]
 mod windows_app {
     use chaos_app::win32::*;
-    use chaos_app::{art, catalog, client, models};
+    use chaos_app::{art, catalog, client, models, settings};
     use std::cell::RefCell;
     use std::process::{Child, Command};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -160,28 +160,30 @@ mod windows_app {
                 .or_else(|| info.payload().downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "panicked".into());
 
+            let nl = char::from(10).to_string();
+            let text = [
+                format!("chaos-app {}", env!("CARGO_PKG_VERSION")),
+                what.clone(),
+                format!("at {where_}"),
+            ]
+            .join(&nl);
             let log = std::env::temp_dir().join("chaos-app-crash.log");
-            let text = format!(
-                "chaos-app {}
-{what}
-at {where_}
-",
-                env!("CARGO_PKG_VERSION")
-            );
             let _ = std::fs::write(&log, &text);
 
-            let msg = format!(
-                "Chaos hit a bug and has to close.
-
-{what}
-at {where_}
-
-                 Written to:
-{}
-
-Please send that file -- it says exactly what went wrong.",
-                log.display()
-            );
+            // Built from parts, not a multi-line literal: a wrapped literal
+            // carries the source indentation into the message box.
+            let msg = [
+                "Chaos hit a bug and has to close.".to_string(),
+                String::new(),
+                what,
+                format!("at {where_}"),
+                String::new(),
+                "Written to:".to_string(),
+                log.display().to_string(),
+                String::new(),
+                "Please send that file -- it says exactly what went wrong.".to_string(),
+            ]
+            .join(&nl);
             unsafe {
                 MessageBoxW(
                     std::ptr::null_mut(),
@@ -246,6 +248,17 @@ Please send that file -- it says exactly what went wrong.",
 
             set_window_icon(hwnd, hinst);
             build_controls(hwnd, hinst, black);
+            // Restore what was set last time. Done after the controls exist and
+            // before the window is shown, so the first paint is already right.
+            let cfg = settings::Settings::load();
+            let put = |id: i32, v: Option<String>| {
+                if let Some(v) = v {
+                    SetWindowTextW(GetDlgItem(hwnd, id), wide(&v).as_ptr());
+                }
+            };
+            put(ID_CACHE, cfg.cache_gib.map(|v| format!("{v}")));
+            put(ID_THREADS, cfg.threads.map(|v| v.to_string()));
+            put(ID_PORT, Some(cfg.port.to_string()));
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
 
@@ -669,21 +682,27 @@ Please send that file -- it says exactly what went wrong.",
             return;
         }
 
-        let mut cmd = Command::new(&exe);
-        cmd.arg(&path).arg("--port").arg(port.to_string());
-        if let Ok(v) = cache.trim().parse::<f64>() {
-            if v > 0.0 {
-                cmd.arg("--cache").arg(format!("{v}"));
-            }
-        }
-        if let Ok(v) = threads.trim().parse::<u32>() {
-            if v > 0 {
-                cmd.arg("-t").arg(v.to_string());
-            }
-        }
+        // One place builds the arguments -- `Settings::serve_args` -- so the
+        // window and anything else that starts a server cannot disagree about
+        // what a setting means. It is covered by tests; this call site is not
+        // testable at all.
+        let mut cfg = settings::Settings::load();
+        cfg.port = port;
+        cfg.cache_gib = cache.trim().parse::<f64>().ok().filter(|v| *v > 0.0);
+        cfg.threads = threads.trim().parse::<u32>().ok().filter(|v| *v > 0);
         // Unverified architectures refuse by name. The app is for running what
         // you have, and the refusal is already explained in the status line.
-        cmd.arg("--force");
+        cfg.force = true;
+        // Remember what was typed, so the boxes are filled in next time rather
+        // than empty. A settings page that forgets is a form.
+        if let Err(e) = cfg.save() {
+            set_status(&e);
+        }
+
+        let mut cmd = Command::new(&exe);
+        for a in cfg.serve_args(&path.to_string_lossy()) {
+            cmd.arg(a);
+        }
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(CREATE_NO_WINDOW);
@@ -739,19 +758,22 @@ Please send that file -- it says exactly what went wrong.",
     }
 
     fn unload_model() {
-        UI.with(|u| {
-            let mut b = u.borrow_mut();
-            let Some(ui) = b.as_mut() else { return };
-            if let Some(mut c) = ui.server.take() {
-                let _ = c.kill();
-                let _ = c.wait();
-            }
-            unsafe {
-                EnableWindow(ui.load, 1);
-                EnableWindow(ui.unload, 0);
-                EnableWindow(ui.send, 0);
-            }
+        // `stop_server` takes the child out under a short borrow and waits for
+        // it outside one. The handles come out the same way -- `EnableWindow`
+        // repaints, which asks the parent for colours, which borrows.
+        stop_server();
+        let hs = UI.with(|u| {
+            let b = u.borrow();
+            let ui = b.as_ref()?;
+            Some((ui.load, ui.unload, ui.send))
         });
+        if let Some((load, unload, send)) = hs {
+            unsafe {
+                EnableWindow(load, 1);
+                EnableWindow(unload, 0);
+                EnableWindow(send, 0);
+            }
+        }
         set_status("unloaded -- the memory is back");
     }
 
@@ -967,15 +989,18 @@ Please send that file -- it says exactly what went wrong.",
             return;
         }
 
-        UI.with(|u| {
-            if let Some(ui) = u.borrow_mut().as_mut() {
-                ui.answer.clear();
-                unsafe {
-                    SetWindowTextW(ui.input, wide("").as_ptr());
-                    EnableWindow(ui.send, 0);
-                }
-            }
+        let hs = UI.with(|u| {
+            let mut b = u.borrow_mut();
+            let ui = b.as_mut()?;
+            ui.answer.clear();
+            Some((ui.input, ui.send))
         });
+        if let Some((input, send)) = hs {
+            unsafe {
+                SetWindowTextW(input, wide("").as_ptr());
+                EnableWindow(send, 0);
+            }
+        }
         append_out(&format!("\r\n> {}\r\n\r\n", prompt.replace('\n', "\r\n")));
 
         {
@@ -1046,17 +1071,20 @@ Please send that file -- it says exactly what went wrong.",
             shared().lock().unwrap().status = format!("{tokens} tokens, {rate:.2} tok/s");
         }
         if finished && busy().swap(false, Ordering::SeqCst) {
-            UI.with(|u| {
-                if let Some(ui) = u.borrow_mut().as_mut() {
-                    let a = std::mem::take(&mut ui.answer);
-                    if !a.is_empty() {
-                        ui.history.push(("assistant".into(), a));
-                    }
-                    unsafe {
-                        EnableWindow(ui.send, 1);
-                    }
+            let send = UI.with(|u| {
+                let mut b = u.borrow_mut();
+                let ui = b.as_mut()?;
+                let a = std::mem::take(&mut ui.answer);
+                if !a.is_empty() {
+                    ui.history.push(("assistant".into(), a));
                 }
+                Some(ui.send)
             });
+            if let Some(send) = send {
+                unsafe {
+                    EnableWindow(send, 1);
+                }
+            }
         }
         if finished {
             UI.with(|u| {

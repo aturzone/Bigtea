@@ -228,6 +228,36 @@ jobs:
       # way while the installer itself was fine -- it had simply not been given
       # time to start. Every scripted call needs `Start-Process -Wait`, which is
       # how NSIS and every other GUI installer behaves too.
+      # D4. `chaos-app` cannot be in the "binaries actually start" check --
+      # with no arguments it opens a window and CI would wait forever. But an
+      # app that only builds is what shipped a version that aborted on the
+      # first click, so it is started, given a moment, and required to still
+      # be alive. That is the smallest check that would have caught it.
+      - name: The app starts and stays up (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $app = Join-Path $PWD 'target/release/chaos-app.exe'
+          $log = Join-Path $env:TEMP 'chaos-app-crash.log'
+          Remove-Item -Force $log -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath $app -PassThru
+          Start-Sleep -Seconds 8
+          $p.Refresh()
+          if ($p.HasExited) {
+            if (Test-Path $log) { Get-Content $log }
+            throw "chaos-app exited on its own with code $($p.ExitCode)"
+          }
+          $p | Stop-Process -Force
+          Start-Sleep -Seconds 2
+          if (Test-Path $log) {
+            Get-Content $log
+            throw "chaos-app wrote a crash log"
+          }
+          # Closing the app must not leave the engine running (C4).
+          $left = @(Get-Process chaos-serve -ErrorAction SilentlyContinue).Count
+          if ($left -ne 0) { throw "$left chaos-serve process(es) left running after the app closed" }
+          Write-Host 'chaos-app started, stayed up, closed clean'
+
       - name: The setup .exe installs, runs and uninstalls (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

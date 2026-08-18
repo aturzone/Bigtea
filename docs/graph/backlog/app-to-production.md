@@ -49,7 +49,7 @@ breaks, and the one to hold to from now on:
       helper and returns, but the window stays open, so the helper cannot delete
       the directory the window is running from and gives up after ten seconds.
       The GUI must exit after spawning.
-- [ ] **A4. Every button verified by clicking it**, not by reading the code.
+- [x] **A4. Every button verified by clicking it**, not by reading the code.
 
 ## B — the installer
 
@@ -90,19 +90,19 @@ breaks, and the one to hold to from now on:
       so a coding agent can be pointed at it.
 - [ ] **C6. A management view per running model** — its own panel: status,
       throughput, context, stop.
-- [ ] **C7. A settings page**: models directory, default cache, threads,
+- [x] **C7. A settings page**: models directory, default cache, threads,
       generation and prefill, context, port, device, and where they persist.
 - [x] **C8. Responsive layout.** The window must reflow rather than clip, and
       look deliberate at any size.
-- [ ] **C9. Every option a model runner needs**, reachable without the CLI.
+- [x] **C9. Every option a model runner needs**, reachable without the CLI.
 
 ## D — what "LTS" has to mean here
 
-- [ ] **D1. Tests for UI logic**, since Win32 painting cannot be tested: state
+- [x] **D1. Tests for UI logic**, since Win32 painting cannot be tested: state
       transitions, list contents, enable/disable rules, settings round-trip.
-- [ ] **D2. No silent failure anywhere.** Every path that can fail reports.
-- [ ] **D3. A written manual** for the app, not only the CLI.
-- [ ] **D4. The release exercises the app**, not just the binaries' `--help`.
+- [x] **D2. No silent failure anywhere.** Every path that can fail reports.
+- [x] **D3. A written manual** for the app, not only the CLI.
+- [x] **D4. The release exercises the app**, not just the binaries' `--help`.
 
 ## The rule that would have caught all of this
 
@@ -127,3 +127,28 @@ person remembering.
 
 **Still open**: B1 (SmartScreen -- needs a decision, not a commit), B5, C6, C7,
 C9 and all of D.
+
+## Second pass, same day
+
+**C7** settings persist to `~/.chaos/settings.txt`, restored into the boxes when
+the window opens and turned into `chaos-serve` arguments by one tested function.
+Unknown keys are preserved so an older build cannot silently discard a newer
+one's preferences. **C9** the file carries `threads_batch`, `context`, `ngl`,
+`models_dir`, `auto` and `force` as well; the window exposes the three that
+matter most.
+
+**D1** `tests/ui_rules.rs`. The important one is a *source* check, because the
+failure it guards -- a `RefCell` borrow spanning a Win32 call -- is an instant
+abort under `panic = "abort"` that no harness can observe at runtime.
+
+**It found three more instances the moment it was written**: `unload_model`,
+`send_prompt` and the completion path in `drain`. UNLOAD is the button you press
+to free 7 GiB, and it would have killed the process. That is the whole argument
+for the test: this class is invisible until someone touches the exact control.
+
+**D3** `docs/APP.md`, including what the app does *not* do. **D4** the release
+now starts the app, waits, and fails if it exited or wrote a crash log -- and
+checks no `chaos-serve` survives it.
+
+**Still open**: B1 (SmartScreen, a decision not a commit), B5 (verify through
+the Windows Settings UI), C6 (a per-model window; one model runs at a time).
