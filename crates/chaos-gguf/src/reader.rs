@@ -296,6 +296,27 @@ impl Gguf {
         self.tensors.iter().filter_map(TensorInfo::size_bytes).sum()
     }
 
+    /// How long this file must be, according to its own index.
+    ///
+    /// **A container states its own size, so a half-finished download can be
+    /// recognised without knowing what it was meant to be.** The index gives
+    /// every tensor an offset and a size, and the file cannot end before the
+    /// last of them does. It may be *longer* -- ggml pads the data section up
+    /// to the alignment -- so this is a floor, and a file below it is provably
+    /// truncated rather than merely suspicious.
+    ///
+    /// Offsets are not required to be in index order, hence the max rather than
+    /// the last entry.
+    pub fn expected_file_bytes(&self) -> u64 {
+        let end = self
+            .tensors
+            .iter()
+            .filter_map(|t| Some(t.offset + t.size_bytes()?))
+            .max()
+            .unwrap_or(0);
+        self.data_offset + end
+    }
+
     /// Split total bytes into `(routed_expert, everything_else)`.
     ///
     /// This is *the* number for streaming inference: the second element is read

@@ -38,6 +38,17 @@ pub enum PreTokenizer {
     LlamaBpe,
     /// `qwen2`. As above but **one digit at a time**.
     Qwen2,
+    /// `dbrx`. **The same regex as `llama3`, and none of its
+    /// other behaviour** -- which is the whole reason it is a separate variant
+    /// rather than another name in the `LlamaBpe` arm.
+    ///
+    /// llama.cpp's `llama3` arm sets `ignore_merges = true` and `add_bos =
+    /// true` beside the pre-type; its `dbrx` arm sets neither. Phi-4 declares
+    /// no `tokenizer.ggml.add_bos_token`, so folding `dbrx` into `LlamaBpe`
+    /// here would have switched BOS on for it from the *default* — one extra
+    /// token in front of every prompt, and a disagreement from the first token
+    /// generated. Verified against `llama-tokenize` on Phi-4.
+    Dbrx,
     /// `joyai-llm`, DeepSeek-V4-Flash. Adds a CJK rule and has no contraction
     /// rule; verified against llama.cpp on that model.
     JoyaiLlm,
@@ -67,8 +78,8 @@ impl fmt::Display for UnknownPreTokenizer {
         write!(
             f,
             "tokenizer.ggml.pre = {:?} is not implemented (verified here: \
-             \"llama-bpe\"/\"llama3\", \"qwen2\", \"joyai-llm\", \"default\", \
-             \"gpt-2\"/\"mpt\"/\"olmo\"/\"jais\"). \
+             \"llama-bpe\"/\"llama3\", \"qwen2\", \"dbrx\", \"joyai-llm\", \
+             \"default\", \"gpt-2\"/\"mpt\"/\"olmo\"/\"jais\"). \
              The pre-tokenizer decides where BPE may merge, so guessing one \
              shifts every token boundary and the model answers fluently and \
              wrongly rather than failing — which is why this refuses instead. \
@@ -91,6 +102,16 @@ impl PreTokenizer {
             // Falcon3-1B-Instruct. `llama-v3` is the third alias in that arm.
             "llama-bpe" | "llama3" | "llama-v3" | "falcon3" => Ok(PreTokenizer::LlamaBpe),
             "qwen2" => Ok(PreTokenizer::Qwen2),
+            // Same expression as `llama3`, byte for byte, and llama.cpp says so
+            // in a comment above it. What differs is everything *around* the
+            // pre-type: no `ignore_merges`, no `add_bos`. Checked against Phi-4,
+            // whose container asks for this one.
+            //
+            // **`smaug-bpe` shares llama.cpp's arm and is still refused here.**
+            // Identical in the source is not the same as checked, and there is
+            // no Smaug container on this machine to check it against. That rule
+            // is the reason the two variants above were caught disagreeing.
+            "dbrx" => Ok(PreTokenizer::Dbrx),
             "joyai-llm" => Ok(PreTokenizer::JoyaiLlm),
             // **Also the absent case.** `Tokenizer::from_metadata` passes
             // "default" when the container declares no `tokenizer.ggml.pre`,
@@ -108,6 +129,7 @@ impl PreTokenizer {
         match self {
             PreTokenizer::Qwen2 => 1,
             PreTokenizer::LlamaBpe
+            | PreTokenizer::Dbrx
             | PreTokenizer::JoyaiLlm
             | PreTokenizer::Default
             | PreTokenizer::Gpt2 => 3,
@@ -123,7 +145,9 @@ pub fn pre_tokenize(text: &str, pre: PreTokenizer) -> Vec<String> {
         PreTokenizer::JoyaiLlm => joyai(text),
         PreTokenizer::Default => default_gpt2(text),
         PreTokenizer::Gpt2 => gpt2_rule(text),
-        PreTokenizer::LlamaBpe | PreTokenizer::Qwen2 => gpt4_style(text, pre.max_digits()),
+        PreTokenizer::LlamaBpe | PreTokenizer::Dbrx | PreTokenizer::Qwen2 => {
+            gpt4_style(text, pre.max_digits())
+        }
     }
 }
 
@@ -825,5 +849,50 @@ mod tests {
                 "the message must say so: {text}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dbrx_tests {
+    use super::*;
+
+    #[test]
+    fn dbrx_resolves_and_smaug_is_still_refused() {
+        assert_eq!(PreTokenizer::from_name("dbrx"), Ok(PreTokenizer::Dbrx));
+        // llama.cpp puts `smaug-bpe` in the same arm, and that is *not* the
+        // standard here: no container on this machine declares it, so it stays
+        // refused by name rather than implemented by inference.
+        assert!(PreTokenizer::from_name("smaug-bpe").is_err());
+    }
+
+    /// The expression is `llama3`'s, so the *splitting* must be identical.
+    /// What differs is `add_bos` and `ignore_merges`, which live elsewhere.
+    #[test]
+    fn dbrx_splits_exactly_as_llama_bpe_does() {
+        for text in [
+            "4567",
+            "12345678",
+            "don't",
+            "DON'T",
+            "def fibonacci(n):",
+            "hello, world!",
+            "a\n\nb",
+            "What is the capital of France? One short sentence.",
+            "",
+            "   ",
+            "CJK 漢字 mixed 123456",
+        ] {
+            assert_eq!(
+                pre_tokenize(text, PreTokenizer::Dbrx),
+                pre_tokenize(text, PreTokenizer::LlamaBpe),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// Three digits at a time, like `llama3` and unlike `qwen2`.
+    #[test]
+    fn dbrx_groups_three_digits() {
+        assert_eq!(pre_tokenize("4567", PreTokenizer::Dbrx), ["456", "7"]);
     }
 }

@@ -128,6 +128,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // The same refusal the runner makes: a truncated download is recognised
+    // from the container's own index before anything is bound.
+    if let Some(why) = chaos_model::complete::why_incomplete(std::path::Path::new(&path)) {
+        eprintln!("chaos-serve: {why}");
+        eprintln!("             run `chaos-pull` again -- it resumes.");
+        return ExitCode::from(2);
+    }
     match serve(&path, port, cache_gib, api_key) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

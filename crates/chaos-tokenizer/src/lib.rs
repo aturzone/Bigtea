@@ -157,6 +157,24 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
+    /// Which splitting rule this container asked for.
+    ///
+    /// Exposed so a parity test can state *which* rule it is checking rather
+    /// than only that the ids came out right — two rules agreeing on one string
+    /// says nothing about the next one.
+    pub fn pre_tokenizer(&self) -> PreTokenizer {
+        self.pre
+    }
+
+    /// Whether a beginning-of-sequence token is prepended.
+    ///
+    /// Half of what `tokenizer.ggml.pre` decides when the container leaves
+    /// `add_bos_token` unset, and invisible in any comparison of splitting
+    /// rules: an extra leading token shifts every position after it.
+    pub fn adds_bos(&self) -> bool {
+        self.add_bos
+    }
+
     /// Build from a container's metadata map.
     pub fn from_metadata(
         meta: &std::collections::BTreeMap<String, Value>,

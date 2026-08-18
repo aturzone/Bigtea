@@ -16,6 +16,54 @@
 
 use std::path::{Path, PathBuf};
 
+/// The user's home, whatever this platform calls it.
+fn home() -> Option<PathBuf> {
+    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var(key).ok().map(PathBuf::from)
+}
+
+/// `models_dir` from `~/.chaos/settings.txt`, which the app writes.
+///
+/// **Read here rather than in the app** so that setting it moves `chaos-run`
+/// and `chaos-serve` too. It was written to the file and consulted by nothing,
+/// which is the worst of the three possible behaviours: the setting looked like
+/// it worked. The file is `key = value` lines; anything else is skipped.
+fn dirs_from_settings() -> Vec<PathBuf> {
+    let Some(file) = home().map(|h| h.join(".chaos").join("settings.txt")) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() == "models_dir" {
+            return split_dirs(v.trim());
+        }
+    }
+    Vec::new()
+}
+
+/// One setting, several folders.
+///
+/// **A machine with a big model on a second drive is the normal case, not an
+/// exotic one** -- a 144 GB container does not live beside a 2 GB one. So both
+/// `CHAOS_MODELS` and the `models_dir` setting take a list in the platform's
+/// own separator (`;` on Windows, `:` elsewhere), which is what `split_paths`
+/// implements and what a `PATH` has always meant. A single folder still reads
+/// as a single folder, so nothing that already worked changes.
+fn split_dirs(value: &str) -> Vec<PathBuf> {
+    std::env::split_paths(value)
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect()
+}
+
 /// Where models are looked for, in order.
 ///
 /// Two of these exist for real reasons rather than by accident: `install.ps1`
@@ -25,20 +73,19 @@ use std::path::{Path, PathBuf};
 /// from.
 pub fn model_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Ok(dir) = std::env::var("CHAOS_MODELS") {
-        dirs.push(PathBuf::from(dir));
+    if let Ok(value) = std::env::var("CHAOS_MODELS") {
+        dirs.extend(split_dirs(&value));
     }
-    let home = if cfg!(windows) {
-        std::env::var("USERPROFILE").ok()
-    } else {
-        std::env::var("HOME").ok()
-    };
-    if let Some(home) = home {
-        dirs.push(PathBuf::from(home).join(".chaos").join("models"));
+    dirs.extend(dirs_from_settings());
+    if let Some(home) = home() {
+        dirs.push(home.join(".chaos").join("models"));
     }
     dirs.push(crate::download::cache_dir());
     dirs.push(PathBuf::from("models"));
-    dirs.dedup();
+    // `Vec::dedup` only removes *adjacent* duplicates, so the cache directory
+    // appearing both in the setting and by default survived it twice.
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
     dirs
 }
 
@@ -59,29 +106,54 @@ pub struct Found {
 pub fn list() -> Vec<Found> {
     let mut out: Vec<Found> = Vec::new();
     for dir in model_dirs() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let (label, shard) = split_shard(stem);
-            if shard.is_some_and(|n| n != 1) {
-                continue; // a later shard of a container already listed
-            }
-            if out.iter().any(|f| f.label == label) {
-                continue; // the same model in two search directories
-            }
-            out.push(Found { path, label });
-        }
+        scan_into(&dir, true, &mut out);
     }
     out.sort_by_key(|f| f.label.to_lowercase());
     out
+}
+
+/// Every `.gguf` directly in `dir`, and -- once -- in each of its children.
+///
+/// **A big sharded model lives in its own folder.** Five files that together
+/// weigh 144 GB are not dropped beside a 2 GB one; they are put in
+/// `models/v4flash/`, which is where `chaos-pull` puts a multi-shard fetch and
+/// where a user who moved one by hand puts it too. A scan that stopped at the
+/// top level reported "no models installed" with the model plainly there.
+///
+/// One level, not a walk: a models folder pointed at a whole drive would
+/// otherwise read every directory on it.
+fn scan_into(dir: &Path, descend: bool, out: &mut Vec<Found>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut children = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if descend {
+                children.push(path);
+            }
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let (label, shard) = split_shard(stem);
+        if shard.is_some_and(|n| n != 1) {
+            continue; // a later shard of a container already listed
+        }
+        if out.iter().any(|f| f.label == label) {
+            continue; // the same model in two search directories
+        }
+        out.push(Found { path, label });
+    }
+    children.sort();
+    for c in children {
+        scan_into(&c, false, out);
+    }
 }
 
 /// `("Model-00002-of-00005")` becomes `("Model", Some(2))`.
@@ -115,6 +187,21 @@ pub enum FindError {
     Ambiguous { matches: Vec<Found> },
 }
 
+/// The labels a catalogue name's own downloads would appear under, lowercased.
+///
+/// One per quantisation, most-preferred first, taken from the filenames the
+/// entry itself generates rather than from any second rule about naming.
+fn catalogue_labels(name: &str) -> Vec<String> {
+    let Some(e) = crate::catalogue::find(name) else {
+        return Vec::new();
+    };
+    e.quants
+        .iter()
+        .filter_map(|q| e.files(q).into_iter().next())
+        .map(|f| split_shard(f.trim_end_matches(".gguf")).0.to_lowercase())
+        .collect()
+}
+
 /// Turn a user's argument into a path to open.
 ///
 /// An existing path is returned unchanged — including a relative one, and
@@ -135,6 +222,20 @@ pub fn resolve(arg: &str) -> Result<PathBuf, FindError> {
     if let Some(f) = available.iter().find(|f| f.label.to_lowercase() == wanted) {
         return Ok(f.path.clone());
     }
+
+    // **The catalogue name is a name too.** `chaos-pull v4flash` fetches
+    // `DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf`, and then `chaos-run
+    // v4flash` said "no model called v4flash" while listing the file it had
+    // just downloaded. The name a user is told to type must be the name that
+    // works, so a catalogue entry is resolved to the labels its own filenames
+    // produce. Tried after the exact label match, so a file actually called
+    // `v4flash.gguf` still wins.
+    for label in catalogue_labels(&wanted) {
+        if let Some(f) = available.iter().find(|f| f.label.to_lowercase() == label) {
+            return Ok(f.path.clone());
+        }
+    }
+
     let matches: Vec<Found> = available
         .iter()
         .filter(|f| f.label.to_lowercase().contains(&wanted))
@@ -189,6 +290,128 @@ pub fn explain(arg: &str, err: &FindError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **One setting, several folders.** A 144 GB container does not live
+    /// beside a 2 GB one, so the folder list has to be a list -- and the
+    /// separator is the platform's own, the one a `PATH` has always used.
+    #[test]
+    fn a_folder_setting_may_name_several() {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let joined = format!("{}{sep}{}", "one", "two");
+        let dirs = split_dirs(&joined);
+        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        assert_eq!(dirs[0], PathBuf::from("one"));
+        assert_eq!(dirs[1], PathBuf::from("two"));
+    }
+
+    /// A single folder still reads as a single folder, so nothing that already
+    /// worked changes. On Windows this also means a drive letter survives:
+    /// splitting on `:` would have cut `C:\\models` in half.
+    #[test]
+    fn one_folder_stays_one_folder() {
+        let one = if cfg!(windows) {
+            "C:\\models"
+        } else {
+            "/models"
+        };
+        assert_eq!(split_dirs(one), vec![PathBuf::from(one)]);
+    }
+
+    #[test]
+    fn an_empty_setting_names_no_folder() {
+        assert!(split_dirs("").is_empty());
+    }
+
+    /// `Vec::dedup` only removes *adjacent* duplicates, so the same directory
+    /// named by the setting and again by default survived it and every model
+    /// in it was skipped the second time by label -- which worked, but only by
+    /// accident. The search order must hold each directory exactly once.
+    #[test]
+    fn a_directory_is_searched_once() {
+        let dirs = model_dirs();
+        let mut seen = std::collections::HashSet::new();
+        for d in &dirs {
+            assert!(seen.insert(d.clone()), "{d:?} is in the search order twice");
+        }
+    }
+
+    /// **The name a user is told to type must be the name that works.**
+    /// `chaos-pull v4flash` writes `DeepSeek-V4-Flash-UD-...gguf`, and then
+    /// `chaos-run v4flash` answered "no model called v4flash" while listing
+    /// that very file. The catalogue name has to resolve to what it fetched.
+    #[test]
+    fn a_catalogue_name_maps_to_the_label_it_downloads_as() {
+        assert_eq!(
+            catalogue_labels("v4flash"),
+            vec!["deepseek-v4-flash-ud-q4_k_xl".to_string()]
+        );
+        assert_eq!(
+            catalogue_labels("qwen3-8b"),
+            vec!["qwen3-8b-q4_k_m".to_string()]
+        );
+        // One per quantisation, so either download resolves.
+        assert_eq!(catalogue_labels("qwen3-32b").len(), 2);
+        assert!(catalogue_labels("not-in-the-catalogue").is_empty());
+    }
+
+    /// Every catalogue name must produce at least one label, or `chaos-run
+    /// <name>` silently falls through to substring matching for that entry.
+    #[test]
+    fn every_catalogue_name_produces_a_label() {
+        for e in crate::catalogue::CATALOGUE {
+            let labels = catalogue_labels(e.name);
+            assert!(!labels.is_empty(), "{} produces no label", e.name);
+            for l in labels {
+                assert!(!l.contains("-of-"), "{} kept a shard suffix: {l}", e.name);
+            }
+        }
+    }
+
+    /// A model in its own folder is found, one level down and no further.
+    ///
+    /// This is how a five-shard container is stored, and a scan that stopped at
+    /// the top level reported "no models installed" with 145 GB plainly there.
+    #[test]
+    fn a_model_in_its_own_folder_is_found() {
+        let root = std::env::temp_dir().join("chaos-find-nested-9c2");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("big")).unwrap();
+        std::fs::create_dir_all(root.join("big").join("deeper")).unwrap();
+        std::fs::write(root.join("top.gguf"), b"x").unwrap();
+        std::fs::write(root.join("big").join("nested.gguf"), b"x").unwrap();
+        std::fs::write(root.join("big").join("deeper").join("far.gguf"), b"x").unwrap();
+
+        let mut out = Vec::new();
+        scan_into(&root, true, &mut out);
+        let labels: Vec<&str> = out.iter().map(|f| f.label.as_str()).collect();
+        assert!(labels.contains(&"top"), "{labels:?}");
+        assert!(labels.contains(&"nested"), "{labels:?}");
+        // Two levels down is not searched: a models folder pointed at a whole
+        // drive would otherwise read every directory on it.
+        assert!(!labels.contains(&"far"), "{labels:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A sharded container in a subfolder still appears once, as shard one.
+    #[test]
+    fn a_sharded_container_in_a_subfolder_is_one_entry() {
+        let root = std::env::temp_dir().join("chaos-find-nested-shards-9c2");
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("v4flash");
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 1..=5 {
+            std::fs::write(sub.join(format!("Big-{i:05}-of-00005.gguf")), b"x").unwrap();
+        }
+
+        let mut out = Vec::new();
+        scan_into(&root, true, &mut out);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].label, "Big");
+        assert!(out[0].path.ends_with("Big-00001-of-00005.gguf"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn a_shard_suffix_is_stripped_and_numbered() {

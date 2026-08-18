@@ -295,6 +295,16 @@ pub mod metric {
     pub const ROW: i32 = 40;
     /// A navigation destination.
     pub const NAV_ROW: i32 = 34;
+    /// One row of a dropdown's list.
+    pub const COMBO_ROW: i32 = 26;
+    /// How many rows of a dropdown are visible before it scrolls.
+    ///
+    /// **This is not decoration -- it is the reason a dropdown opens at all.**
+    /// A combo box is sized by its *dropped* height, and Windows gives the
+    /// closed box only what its item height needs. Size one to a single row and
+    /// the list gets nothing, which is indistinguishable from a control that
+    /// ignores the mouse. The longest list on the settings page offers seven.
+    pub const COMBO_VISIBLE: i32 = 8;
 }
 
 #[cfg(test)]

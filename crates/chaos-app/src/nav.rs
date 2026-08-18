@@ -272,7 +272,7 @@ pub const FIELDS: &[Field] = &[
     Field {
         id: ID_MODELS_DIR,
         label: "models folder",
-        hint: "Empty: %USERPROFILE%\\.chaos\\models",
+        hint: "Empty: %USERPROFILE%\\.chaos\\models. Several, separated by ; are all searched.",
         group: "Paths",
     },
 ];
@@ -441,11 +441,7 @@ mod tests {
     fn field_hints_are_sentences() {
         for f in FIELDS.iter().chain(TOGGLES) {
             let h = f.hint;
-            assert!(
-                h.ends_with('.') || h.ends_with("models"),
-                "{:?} does not end its hint",
-                f.label
-            );
+            assert!(h.ends_with('.'), "{:?} does not end its hint", f.label);
             assert!(
                 h.chars()
                     .next()

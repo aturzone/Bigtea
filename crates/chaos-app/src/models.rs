@@ -13,6 +13,13 @@ pub struct Entry {
     pub path: PathBuf,
     /// Total bytes across every shard, or `None` if it could not be measured.
     pub bytes: Option<u64>,
+    /// Why this container cannot be loaded, if it cannot.
+    ///
+    /// **A half-downloaded model looks exactly like a finished one in a list**
+    /// -- right name, right extension, valid header -- and the only way a user
+    /// found out was to press LOAD and read whatever the engine said three
+    /// seconds later. Two of the models on this machine were in that state.
+    pub incomplete: Option<String>,
 }
 
 /// Human-readable size, at the precision the number deserves.
@@ -47,15 +54,14 @@ pub fn human_size(bytes: u64) -> String {
 /// configuration. Getting this wrong once already cost a release: the installer
 /// made one directory and the downloader wrote to another.
 pub fn default_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("CHAOS_MODELS") {
-        if !d.is_empty() {
-            return PathBuf::from(d);
-        }
-    }
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        return PathBuf::from(home).join(".chaos").join("models");
-    }
-    PathBuf::from("models")
+    // The *first* place `chaos_model::find` looks, so a download lands where
+    // the list will show it. Asking `find` rather than re-deriving the order is
+    // the point: the two disagreeing is the bug this doc comment describes, and
+    // a second copy of the rule is how it came back.
+    chaos_model::find::model_dirs()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from("models"))
 }
 
 /// Every shard of a split container, so the size is the model's and not
@@ -87,6 +93,7 @@ pub fn list() -> Vec<Entry> {
         .into_iter()
         .map(|f| Entry {
             bytes: total_bytes(&f.path),
+            incomplete: chaos_model::complete::why_incomplete(&f.path),
             label: f.label,
             path: f.path,
         })
@@ -95,9 +102,15 @@ pub fn list() -> Vec<Entry> {
 
 /// One line for the list box: name on the left, size on the right.
 pub fn row(e: &Entry) -> String {
-    match e.bytes {
+    let size = match e.bytes {
         Some(b) => format!("{}   {}", e.label, human_size(b)),
         None => e.label.clone(),
+    };
+    // Said in the list, not only on the model's own page: the list is where the
+    // choice is made, and "9.00 GB" beside a file holding 911 MB is a lie.
+    match &e.incomplete {
+        Some(_) => format!("{size}   (unfinished)"),
+        None => size,
     }
 }
 
@@ -129,7 +142,20 @@ mod tests {
             label: "qwen3".into(),
             path: "x".into(),
             bytes: None,
+            incomplete: None,
         };
         assert_eq!(row(&e), "qwen3");
+    }
+
+    /// The list must say so, because the list is where the choice is made.
+    #[test]
+    fn an_unfinished_download_says_so_in_the_row() {
+        let e = Entry {
+            label: "qwen3-14b".into(),
+            path: "x".into(),
+            bytes: Some(911_499_264),
+            incomplete: Some("the download did not finish".into()),
+        };
+        assert!(row(&e).contains("unfinished"));
     }
 }

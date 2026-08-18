@@ -680,9 +680,16 @@ mod windows_app {
         for f in nav::FIELDS {
             let h = GetDlgItem(hwnd, f.id);
             if choices::for_field(f.id, probe).is_some() {
-                // Combo rows, tall enough for the label at body size.
-                SendMessageW(h, CB_SETITEMHEIGHT, 0, 24);
-                SendMessageW(h, CB_SETITEMHEIGHT, usize::MAX, 26);
+                // Every row of the list, then -- `usize::MAX` is `-1` -- the
+                // closed box itself. The closed height is what Windows keeps
+                // when it shrinks the control; `layout` sizes the rest.
+                SendMessageW(h, CB_SETITEMHEIGHT, 0, metric::COMBO_ROW as LPARAM);
+                SendMessageW(
+                    h,
+                    CB_SETITEMHEIGHT,
+                    usize::MAX,
+                    (metric::CONTROL - 6) as LPARAM,
+                );
             } else {
                 SendMessageW(
                     h,
@@ -881,7 +888,10 @@ mod windows_app {
     /// the old window ended up with a SEND button that stayed grey after a
     /// model came up.
     fn sync_enabled() {
-        let (installed, running, busy_now) = UI.with(|u| {
+        // The selection is read first: `LB_GETCURSEL` is a `SendMessageW`, and
+        // this file's rule is that Windows is never called with `UI` open.
+        let sel = selection();
+        let (installed, running, busy_now, unfinished) = UI.with(|u| {
             u.borrow()
                 .as_ref()
                 .map(|ui| {
@@ -889,16 +899,21 @@ mod windows_app {
                         ui.tab == Tab::Installed,
                         ui.loaded.is_some(),
                         busy().load(Ordering::SeqCst),
+                        sel.and_then(|s| ui.entries.get(s))
+                            .is_some_and(|e| e.incomplete.is_some()),
                     )
                 })
-                .unwrap_or((true, false, false))
+                .unwrap_or((true, false, false, false))
         });
         let set = |id: i32, on: bool| unsafe {
             EnableWindow(ctl(id), i32::from(on));
         };
-        set(nav::ID_LOAD, installed && !running);
+        // **An unfinished model cannot be loaded and can be finished.** Leaving
+        // DOWNLOAD grey on the INSTALLED tab meant the one action that fixes
+        // the problem was the one action not offered.
+        set(nav::ID_LOAD, installed && !running && !unfinished);
         set(nav::ID_UNLOAD, running);
-        set(nav::ID_GET, !installed);
+        set(nav::ID_GET, !installed || (unfinished && !running));
         set(nav::ID_DELETE, installed && !running);
         set(nav::ID_COPY_ENDPOINT, running);
         set(nav::ID_SEND, running && !busy_now);
@@ -1083,6 +1098,28 @@ mod windows_app {
         };
         if !exe.exists() {
             set_status("chaos-serve.exe is missing from this folder");
+            return;
+        }
+
+        // **Refuse a half-written container before anything is started.** An
+        // interrupted download leaves a valid header and no weights, so the
+        // list shows it beside models that work and the failure arrives later,
+        // from the engine, in the engine's words.
+        if let Some(why) = chaos_model::complete::why_incomplete(&path) {
+            set_status(&format!("{label}: {why}"));
+            unsafe {
+                MessageBoxW(
+                    main_hwnd(),
+                    wide(&format!(
+                        "{label} is not fully downloaded.\n\n{why}.\n\nPress DOWNLOAD, which \
+                         is live for this model -- the fetch resumes from what is already on \
+                         disk rather than starting again."
+                    ))
+                    .as_ptr(),
+                    wide("Chaos").as_ptr(),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
             return;
         }
 
@@ -1344,12 +1381,21 @@ mod windows_app {
         let offer = UI.with(|u| {
             let b = u.borrow();
             let ui = b.as_ref()?;
-            if ui.tab != Tab::Available {
-                return None;
+            if ui.tab == Tab::Available {
+                return ui
+                    .offers
+                    .get(sel)
+                    .map(|o| (o.name.clone(), o.quant.clone(), o.bytes));
             }
-            ui.offers
-                .get(sel)
-                .map(|o| (o.name.clone(), o.quant.clone(), o.bytes))
+            // **On INSTALLED this is the resume button.** A model already on
+            // disk is known by its file rather than by the name it was fetched
+            // under, so the catalogue is asked which entry produces that
+            // filename. `chaos-pull` then resumes from the bytes already there.
+            let e = ui.entries.get(sel)?;
+            e.incomplete.as_ref()?;
+            let file = e.path.file_name()?.to_str()?;
+            let (entry, quant) = chaos_model::catalogue::find_by_file(file)?;
+            Some((entry.name.to_string(), quant.name.to_string(), quant.bytes))
         });
         let (Some((name, quant, bytes)), Some(exe)) = (offer, std::env::current_exe().ok()) else {
             set_status("open AVAILABLE and select something to download");
@@ -2941,7 +2987,21 @@ Any value a client sends is accepted.                      The server still list
                     let (_, _, col) = settings_columns(page);
                     let bw = col.min(300);
                     for (id, cx, cy, is_toggle) in settings_rows(page) {
-                        let h = if is_toggle { 24 } else { metric::CONTROL };
+                        // **A combo box's height is the height of its dropped
+                        // list, not of the closed box.** Windows sizes the
+                        // closed control from its own item height and gives
+                        // every remaining pixel to the list, so passing the row
+                        // height here left the list nothing to open into:
+                        // clicking a dropdown opened a list zero pixels tall,
+                        // which looks exactly like a control that does nothing.
+                        // That was the whole of "the options never show up".
+                        let h = if is_toggle {
+                            24
+                        } else if choices::for_field(id, ui.machine).is_some() {
+                            metric::CONTROL + metric::COMBO_ROW * metric::COMBO_VISIBLE
+                        } else {
+                            metric::CONTROL
+                        };
                         m.push((id, cx, cy, bw, h));
                     }
                     let by = page.bottom - 26 - metric::BUTTON - 16;
