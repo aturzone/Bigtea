@@ -21,6 +21,7 @@ mod kv;
 pub mod log;
 mod logo_bitmap;
 mod qwen3;
+mod qwen35;
 pub mod sample;
 pub mod spectrum;
 mod stream;

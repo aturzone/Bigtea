@@ -38,6 +38,13 @@ const ROPE_TYPE_NORM: i32 = 0;
 /// an architecture this list has never seen is more likely to be one of them.
 /// It is still a guess, which is why [`Qwen3Config::rope_type_is_known`] exists
 /// and the runner says so out loud.
+/// `GGML_ROPE_TYPE_IMROPE`, the interleaved multimodal rotation Qwen3.5 uses.
+///
+/// 40, not 8: `MROPE` is 8 and `IMROPE` sets an extra bit on top of it. The two
+/// differ in which dimension pairs the four sections address, and both run
+/// without error on the other's layout.
+pub const ROPE_TYPE_IMROPE: i32 = 40;
+
 fn rope_type_for(arch: &str) -> (i32, bool) {
     match arch {
         // `olmo` and `internlm2` were read straight out of llama.cpp's
@@ -50,21 +57,18 @@ fn rope_type_for(arch: &str) -> (i32, bool) {
         }
         "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "phi3" | "gemma" | "gemma2" | "gemma3"
         | "stablelm" | "starcoder2" | "falcon" | "phi2" | "gptneox" => (ROPE_TYPE_NEOX, true),
-        // **`qwen35` / `qwen35moe` are deliberately absent — Qwen3.8's
-        // architecture string.** llama.cpp returns `LLAMA_ROPE_TYPE_IMROPE` for
-        // both: interleaved multimodal RoPE, which is neither of the two modes
-        // this engine implements. It also branches on those arches in five
-        // other places in `llama-model.cpp`, so the rope mode is the visible
-        // part of a larger difference.
+        // **`qwen35` is Qwen3.5, Qwen3.6 and Qwen3.8** — all three report the
+        // same architecture string, read from their own containers. llama.cpp
+        // returns `LLAMA_ROPE_TYPE_IMROPE` for it: interleaved multimodal RoPE,
+        // four sections wide, applied through `ggml_rope_multi` rather than
+        // `ggml_rope_ext`. Its 16 attention layers use this; its 48 recurrent
+        // layers have no rotation at all.
         //
         // Read from the container's header without downloading it: a 1 MB
         // range request over `Qwen3.8-27B-...IQ4_XS.gguf` gives
         // `general.architecture = qwen35` in under a second, which is how a new
         // model should be triaged before 16 GB moves.
-        //
-        // Falling through to the unknown arm makes the runner warn and demand
-        // `--force`, which is correct. Naming it NEOX here would rotate the
-        // wrong way and produce fluent, wrong text.
+        "qwen35" => (ROPE_TYPE_IMROPE, true),
         //
         // **`mpt` and `bloom` are deliberately absent.** llama.cpp returns
         // `LLAMA_ROPE_TYPE_NONE` for both: they position with ALiBi instead of
@@ -158,6 +162,16 @@ pub const VERIFIED_ARCHITECTURES: &[&str] = &[
     "phi3",
     "qwen2",
     "qwen3",
+    // **Qwen3.5, Qwen3.6 and Qwen3.8 all report `qwen35`.** Verified against
+    // llama.cpp on Qwen3.5-0.8B-Q8_0 three ways, with the debug dump OFF:
+    // all 24 layers by value and by sum, and byte-identical greedy output at
+    // 1-, 5- and 22-token prompts -- which is what covers both regimes of the
+    // fused delta rule, since it takes a different path at one token.
+    //
+    // `qwen35moe` is deliberately NOT here: no MoE container of this family has
+    // been run, and its routed path is untested. Sharing an implementation in
+    // llama.cpp is not the same as having been checked.
+    "qwen35",
     // `qwen3moe` WAS HERE AND HAS BEEN REMOVED — but what still keeps it out is
     // the *harness*, not the engine.
     //
@@ -213,6 +227,77 @@ pub fn architecture_is_verified(arch: &str) -> bool {
     VERIFIED_ARCHITECTURES.contains(&arch)
 }
 
+/// The gated delta net's shape, for the `qwen35` family.
+///
+/// **Three quarters of a Qwen3.5/3.6/3.8 layer stack is not attention.** Those
+/// layers are a *gated delta net*: a linear-attention recurrence carrying a
+/// state matrix from token to token, with a depthwise causal convolution over
+/// its own q/k/v before the recurrence runs. Everything here is read from the
+/// container's `qwen35.ssm.*` keys, and the derived widths below are what make
+/// the fused tensors decomposable.
+///
+/// For Qwen3.5-0.8B: `group_count 16`, `state_size 128`, `time_step_rank 16`,
+/// `inner_size 2048`, so `key_dim = 2048`, `value_dim = 2048`, `head_v_dim =
+/// 128`, and `conv_dim = 6144` — which is exactly the width of `attn_qkv` and
+/// the second dimension of `ssm_conv1d` in that file. The 27B is the same
+/// arithmetic at `time_step_rank 48`, giving 10240.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsmConfig {
+    /// `ssm.conv_kernel` — the convolution window, 4. The rolling state keeps
+    /// `conv_kernel - 1` past values per channel.
+    pub conv_kernel: u32,
+    /// `ssm.inner_size` — the value path's total width, and `ssm_out`'s input.
+    pub inner_size: u32,
+    /// `ssm.state_size` — the head dimension shared by keys and values, 128.
+    /// **Also the side of the carried state matrix**, which is
+    /// `[state_size, state_size]` per value head.
+    pub state_size: u32,
+    /// `ssm.group_count` — how many *key* heads. Fewer than the value heads,
+    /// so q and k are broadcast up before the recurrence.
+    pub group_count: u32,
+    /// `ssm.time_step_rank` — how many *value* heads, and the width of
+    /// `ssm_a`, `ssm_dt.bias`, `ssm_alpha` and `ssm_beta`.
+    pub time_step_rank: u32,
+    /// `full_attention_interval` — every `n`th layer is real attention.
+    pub full_attention_interval: u32,
+}
+
+impl SsmConfig {
+    /// `group_count * state_size`: the width of q, and of k, in `attn_qkv`.
+    pub fn key_dim(&self) -> u32 {
+        self.group_count * self.state_size
+    }
+
+    /// `inner_size`: the width of v, and of the output gate `attn_gate`.
+    pub fn value_dim(&self) -> u32 {
+        self.inner_size
+    }
+
+    /// `inner_size / time_step_rank`. Equal to `state_size` in every published
+    /// Qwen3.5 size, and computed rather than assumed because the fused op
+    /// requires `S_k == S_v` and would **abort** if they ever diverged.
+    pub fn head_v_dim(&self) -> u32 {
+        self.inner_size / self.time_step_rank.max(1)
+    }
+
+    /// `2 * key_dim + value_dim`: the width of `attn_qkv` and the channel count
+    /// of `ssm_conv1d`.
+    pub fn conv_dim(&self) -> u32 {
+        2 * self.key_dim() + self.value_dim()
+    }
+
+    /// Floats of rolling convolution window per sequence, per layer.
+    pub fn conv_state_len(&self) -> usize {
+        ((self.conv_kernel - 1) * self.conv_dim()) as usize
+    }
+
+    /// Floats of carried recurrent state per sequence, per layer:
+    /// `head_v_dim * head_v_dim * time_step_rank`.
+    pub fn recurrent_state_len(&self) -> usize {
+        (self.head_v_dim() * self.head_v_dim() * self.time_step_rank) as usize
+    }
+}
+
 /// Shape and hyper-parameters, read from the container rather than assumed.
 #[derive(Debug, Clone)]
 pub struct Qwen3Config {
@@ -243,6 +328,29 @@ pub struct Qwen3Config {
     pub n_expert: u32,
     pub n_expert_used: u32,
     pub n_ff_expert: u32,
+    /// Present only for the `qwen35` family; `None` means every layer is
+    /// attention, which is every other architecture here.
+    pub ssm: Option<SsmConfig>,
+    /// mRoPE section widths, four of them, from `rope.dimension_sections`.
+    ///
+    /// **Not decoration.** The sections decide which dimension pairs rotate
+    /// together, so a text-only prompt still goes through `rope_multi` rather
+    /// than `rope_ext` — and substituting the plain rotation is silent.
+    pub rope_sections: Option<[i32; 4]>,
+    /// What the norm in front of the feed-forward is *called* in the container.
+    ///
+    /// `ffn_norm` everywhere except `qwen35`, which names the same slot
+    /// `post_attention_norm`. It sits between the attention residual and the
+    /// FFN, which is the ordinary pre-norm position — the name is the only
+    /// thing unusual about it, and looking for the usual name refuses the
+    /// container outright.
+    pub ffn_norm_name: &'static str,
+    /// `attn_q` holds the query **and** a gate, each `head_dim * n_head` wide.
+    ///
+    /// Qwen3.5 projects both in one matmul and multiplies the attention output
+    /// by `sigmoid(gate)`. Reading the tensor as a plain query takes the first
+    /// half of an interleaved pair and produces fluent nonsense.
+    pub fused_q_gate: bool,
     /// Whether each block carries `attn_q_norm` / `attn_k_norm`.
     ///
     /// Qwen3 normalises every attention head separately, with a weight of
@@ -437,6 +545,29 @@ impl Qwen3Config {
         };
 
         let n_embd = need("embedding_length")? as u32;
+        // The gated delta net's shape. Its presence is what makes a layer stack
+        // hybrid, and it is read from the container rather than from the arch
+        // name so a variant that drops it is handled without a new name.
+        let ssm = model
+            .arch_u64("ssm.conv_kernel")
+            .map(|conv_kernel| SsmConfig {
+                conv_kernel: conv_kernel as u32,
+                inner_size: model.arch_u64("ssm.inner_size").unwrap_or(0) as u32,
+                state_size: model.arch_u64("ssm.state_size").unwrap_or(0) as u32,
+                group_count: model.arch_u64("ssm.group_count").unwrap_or(1) as u32,
+                time_step_rank: model.arch_u64("ssm.time_step_rank").unwrap_or(1) as u32,
+                // Absent means "all attention"; llama.cpp defaults it to 4 and so
+                // does this, because a container that carries the ssm tensors and
+                // omits the interval is asking for the family default.
+                full_attention_interval: model.arch_u64("full_attention_interval").unwrap_or(4)
+                    as u32,
+            });
+        let rope_sections = model
+            .arch_i64_array("rope.dimension_sections")
+            .and_then(|v| {
+                // Four, or it is not the mRoPE this understands.
+                (v.len() >= 4).then(|| [v[0] as i32, v[1] as i32, v[2] as i32, v[3] as i32])
+            });
         let n_head = need("attention.head_count")? as u32;
         // Qwen3 declares head dimension explicitly; older models imply it.
         let head_dim = model
@@ -524,7 +655,34 @@ impl Qwen3Config {
             n_expert_used: model.arch_u64("expert_used_count").unwrap_or(0) as u32,
             n_ff_expert: model.arch_u64("expert_feed_forward_length").unwrap_or(0) as u32,
             // Asked of the container, not of the architecture name.
-            qk_norm: model.location("blk.0.attn_q_norm.weight").is_some(),
+            // Asked of the *first attention layer*, not of block 0: on a hybrid
+            // stack block 0 is a delta net and carries no `attn_q_norm` at all,
+            // so testing block 0 reported "no QK norm" for a model that has it
+            // on every attention layer it does have.
+            qk_norm: (0..need("block_count")? as u32)
+                .find(|il| ssm.is_none_or(|s| (il + 1) % s.full_attention_interval.max(1) == 0))
+                .is_some_and(|il| {
+                    model
+                        .location(&format!("blk.{il}.attn_q_norm.weight"))
+                        .is_some()
+                }),
+            ssm,
+            rope_sections,
+            // `qwen35` names the FFN's norm after the thing before it rather
+            // than after the thing it feeds.
+            ffn_norm_name: if ssm.is_some() {
+                "post_attention_norm"
+            } else {
+                "ffn_norm"
+            },
+            // Detected from the shape, not the arch name: a query projection
+            // twice as wide as `head_dim * n_head` is carrying a gate beside it.
+            fused_q_gate: (0..need("block_count")? as u32)
+                .filter_map(|il| model.location(&format!("blk.{il}.attn_q.weight")))
+                .next()
+                .is_some_and(|l| {
+                    l.dims.last().copied() == Some(u64::from(head_dim) * u64::from(n_head) * 2)
+                }),
             rope_type: rope_type_for(&arch).0,
             rope_type_is_known: rope_type_for(&arch).1,
             // Asked of the container, like `qk_norm`: a fusion is a fact about
@@ -547,8 +705,18 @@ impl Qwen3Config {
             // works without being listed anywhere. The guard on `attn_norm`
             // matters: OLMo has neither norm tensor, and calling that "parallel"
             // would restructure a block that is perfectly serial.
+            // **"One norm" is what makes a block parallel, and the test for it
+            // is the absence of a second norm -- by whatever name.** `qwen35`
+            // has two: `attn_norm` in front of attention and
+            // `post_attention_norm` in front of the feed-forward, which is an
+            // ordinary serial block that simply does not use the usual name.
+            // Testing for `ffn_norm` alone read it as parallel, and the FFN then
+            // consumed `attn_norm(x)` -- the value attention had already seen.
+            // The symptom was `attn_post_norm-0` coming out **identical to
+            // llama.cpp's `attn_norm-0`**, which is what named the bug.
             parallel_residual: model.location("blk.0.attn_norm.weight").is_some()
-                && model.location("blk.0.ffn_norm.weight").is_none(),
+                && model.location("blk.0.ffn_norm.weight").is_none()
+                && model.location("blk.0.post_attention_norm.weight").is_none(),
             clamp_kqv: model.arch_f32("attention.clamp_kqv").unwrap_or(0.0),
             uses_alibi: arch == "baichuan" && need("block_count")? == 40,
             rope_freqs: model.location("rope_freqs.weight").is_some(),
@@ -560,14 +728,30 @@ impl Qwen3Config {
                 .arch_u64("rope.dimension_count")
                 .map(|v| v as u32)
                 .unwrap_or(head_dim),
-            fused_qkv: model.location("blk.0.attn_qkv.weight").is_some(),
+            // **Not on a hybrid model, whatever the tensor is called.**
+            // `qwen35` carries `blk.0.attn_qkv.weight` and it is not attention's
+            // fused QKV -- it is the delta net's input projection, `2 * key_dim
+            // + value_dim` wide, convolved before it is split. Reading that as
+            // Phi-3's fused QKV asked the *attention* layers for a tensor they
+            // do not have, and had they had one it would have been the wrong
+            // shape and silent.
+            fused_qkv: ssm.is_none() && model.location("blk.0.attn_qkv.weight").is_some(),
             // A missing `ffn_gate` means one of two very different things, and
             // the **shape** is what separates them: Phi-3 fuses gate and up
             // into one tensor twice `n_ff` wide, while StarCoder2 simply has no
             // gate and its `ffn_up` is `n_ff` wide. Treating the second as the
             // first splits a tensor in half and computes SwiGLU over nonsense.
             fused_gate_up,
-            post_norms: model.location("blk.0.post_attention_norm.weight").is_some(),
+            // **Both, not either.** Gemma's post-norms come in a pair --
+            // `post_attention_norm` *and* `post_ffw_norm` -- and it is the pair
+            // that means "normalise each sub-block's output before it rejoins
+            // the residual". `qwen35` carries the first name for a different
+            // job: it is the norm in *front of* its feed-forward, in the
+            // ordinary pre-norm position. Testing one name alone read that as
+            // Gemma and then demanded a `post_ffw_norm` the container does not
+            // have, refusing a loadable model.
+            post_norms: model.location("blk.0.post_attention_norm.weight").is_some()
+                && model.location("blk.0.post_ffw_norm.weight").is_some(),
             // Gemma scales by sqrt(n_embd) on the way in. Keyed on the
             // architecture because nothing in the weights reveals it.
             scale_embeddings: arch.starts_with("gemma"),
@@ -610,6 +794,26 @@ impl Qwen3Config {
                 },
             ),
         })
+    }
+
+    /// Whether layer `il` is a gated delta net rather than attention.
+    ///
+    /// llama.cpp's rule, verbatim: `(il + 1) % full_attention_interval != 0`.
+    /// With an interval of 4 over 24 blocks that makes **18 recurrent layers
+    /// and 6 attention layers** — 3, 7, 11, 15, 19, 23 — which is exactly the
+    /// set of blocks in Qwen3.5-0.8B that carry `attn_q.weight`. Checking the
+    /// rule against the container's own tensor names is how it was confirmed
+    /// rather than assumed.
+    pub fn is_recurrent(&self, il: u32) -> bool {
+        match self.ssm {
+            Some(s) => (il + 1) % s.full_attention_interval.max(1) != 0,
+            None => false,
+        }
+    }
+
+    /// The container's name for the norm in front of the feed-forward.
+    pub fn ffn_norm(&self, il: u32) -> String {
+        format!("blk.{il}.{}", self.ffn_norm_name)
     }
 
     pub fn is_moe(&self) -> bool {
@@ -773,13 +977,16 @@ impl Qwen3Model {
             names.push("rope_freqs.weight".to_string());
         }
         for il in 0..c.n_layer {
-            names.push(format!("blk.{il}.attn_output.weight"));
+            // A recurrent layer's output projection is `ssm_out`, listed below.
+            if !c.is_recurrent(il) {
+                names.push(format!("blk.{il}.attn_output.weight"));
+            }
             if c.norm_affine {
                 names.push(format!("blk.{il}.attn_norm.weight"));
                 // A parallel block has ONE norm, so asking for `ffn_norm` is
                 // asking for a tensor that does not exist.
                 if !c.parallel_residual {
-                    names.push(format!("blk.{il}.ffn_norm.weight"));
+                    names.push(format!("{}.weight", c.ffn_norm(il)));
                 }
             }
             // **A bias that is not listed here is never loaded**, and the graph
@@ -806,7 +1013,25 @@ impl Qwen3Model {
                     names.push(format!("blk.{il}.{suffix}"));
                 }
             }
-            if c.fused_qkv {
+            // **A recurrent layer has no attention tensors at all**, and an
+            // attention layer on this architecture has no `ssm_*`. Listing
+            // either set for the wrong layer refuses the container up front --
+            // which is the good failure, but it refuses a loadable model.
+            if c.is_recurrent(il) {
+                for suffix in [
+                    "attn_qkv.weight",
+                    "attn_gate.weight",
+                    "ssm_conv1d.weight",
+                    "ssm_dt.bias",
+                    "ssm_a",
+                    "ssm_alpha.weight",
+                    "ssm_beta.weight",
+                    "ssm_norm.weight",
+                    "ssm_out.weight",
+                ] {
+                    names.push(format!("blk.{il}.{suffix}"));
+                }
+            } else if c.fused_qkv {
                 names.push(format!("blk.{il}.attn_qkv.weight"));
             } else {
                 for suffix in ["attn_q.weight", "attn_k.weight", "attn_v.weight"] {
@@ -820,7 +1045,7 @@ impl Qwen3Model {
             }
             // Only Qwen3 carries these. Listing them unconditionally is what
             // refused every Llama-family container up front.
-            if c.qk_norm {
+            if c.qk_norm && !c.is_recurrent(il) {
                 for suffix in ["attn_q_norm.weight", "attn_k_norm.weight"] {
                     names.push(format!("blk.{il}.{suffix}"));
                 }
@@ -1120,6 +1345,10 @@ mod tests {
             fused_gate_up: false,
             parallel_residual: false,
             post_norms: false,
+            ssm: None,
+            rope_sections: None,
+            ffn_norm_name: "ffn_norm",
+            fused_q_gate: false,
             scale_embeddings: false,
             attn_scale_dim: 16,
             prescale_q: false,
@@ -1286,8 +1515,14 @@ mod tests {
         // ALiBi models: llama.cpp says ROPE_TYPE_NONE, so they must stay
         // UNKNOWN here rather than be given a rotation they do not use.
         assert!(!rope_type_for("mpt").1);
-        // Qwen3.8: IMROPE, which this engine does not implement.
-        assert!(!rope_type_for("qwen35").1);
+        // **`qwen35` is implemented now** -- Qwen3.5, 3.6 and 3.8 all report it,
+        // and its 16 attention layers rotate through `ggml_rope_multi` with the
+        // container's four `rope.dimension_sections`. Diffed against llama.cpp
+        // layer by layer on Qwen3.5-0.8B, so this is a checked fact.
+        assert_eq!(rope_type_for("qwen35"), (ROPE_TYPE_IMROPE, true));
+        // `qwen35moe` still is not: no MoE container of this family has been
+        // run here, and its routed path is untested. Identical in llama.cpp's
+        // source is not the same as checked.
         assert!(!rope_type_for("qwen35moe").1);
         assert!(!rope_type_for("bloom").1);
         assert_eq!(rope_type_for("internlm2"), (ROPE_TYPE_NORM, true));

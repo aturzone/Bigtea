@@ -20,7 +20,7 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **733 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
+**Current**: **738 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
 needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
 clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
@@ -57,12 +57,17 @@ its arguments and returns confident numbers rather than failing to build.
 sums its rolling window to 10 then 14; `gated_delta_net` returns
 `S*H*T*N + S*S*H*N` finite values with the carried state moved off zero.
 
-**Qwen3.8 does not run yet.** What is left is the layer wiring: the recurrent
-state cache, the delta-net layer graph, the config fields, mRoPE on the 16
-attention layers, and tolerating the MTP block — and then the diff against
-llama.cpp, which is the half that decides whether it ships. The integration
-point is the per-layer loop at `stream.rs:2107`, where every layer already
-crosses the ggml boundary as plain vectors. Full plan and shapes:
+**Qwen3.5, Qwen3.6 and Qwen3.8 run.** `qwen35` is in
+`VERIFIED_ARCHITECTURES`: all 24 layers of Qwen3.5-0.8B match
+`llama-eval-callback` by value and by sum, and greedy output is byte-identical to
+llama.cpp at 1-, 5- and 22-token prompts — both regimes of the fused delta rule,
+with the debug dump **off**.
+
+The bug that took the longest was a tensor read back that was never computed: the
+attention gate is a *sibling* view of the `attn_q` matmul, so a graph rooted at
+q, k and v never evaluated it and it returned scratch-arena leftovers. Turning
+the debug dump on changed the leftovers and appeared to fix the model.
+`qwen35moe` stays out — its routed path is untested. Detail:
 [`backlog/qwen35-gated-delta-net.md`](docs/graph/backlog/qwen35-gated-delta-net.md).
 
 **Image generation is untouched.** Ideogram 4 is listed and refused; nothing in
@@ -174,7 +179,7 @@ could not have done its job either: a pool collapsed onto one handle measures
 "unlucky". The plausibility bounds stay, the comparative claim lives in the
 research node where it was measured under control.
 
-**Current**: **733 tests**, 0 failed.
+**Current**: **738 tests**, 0 failed.
 
 ## The app has four pages and a menu (2026-08-18)
 
@@ -216,7 +221,7 @@ no-op. Scrollbars *are* fixable and were — `#F0F0F0` to `#171717`.
 residency. The engine measures all three and prints them to its log; nothing
 carries them over the socket. The page says so on its face.
 
-**Current**: **733 tests**, 0 failed.
+**Current**: **738 tests**, 0 failed.
 
 ## v0.0.6 — the app actually works now (2026-08-18)
 
@@ -285,7 +290,7 @@ nothing streams and the whole file must fit. It is what makes the app say
 `qwen3-32b 19.8 GB needs 19.8 GB - too big` honestly on this laptop, while
 `v4flash 155 GB needs 7.92 GB - streams`.
 
-**733 tests** (was 706), clippy 0, fmt clean.
+**738 tests** (was 706), clippy 0, fmt clean.
 
 ## 20 tok/s on V4-Flash is closed, with a number (2026-08-16)
 

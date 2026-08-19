@@ -126,17 +126,29 @@ mod tests {
     }
 
     /// Every entry the real catalogue offers carries a verdict one way or the
-    /// other, and the new Qwen containers are present rather than hidden.
+    /// other, and the newest Qwen containers are present rather than hidden.
+    ///
+    /// **The dense ones are offered as runnable now**, verified against
+    /// llama.cpp on Qwen3.5-0.8B — the same `qwen35` architecture at 24 layers.
+    /// The MoE variant is still marked, because its routed path is untested.
     #[test]
     fn the_catalogue_lists_the_new_qwen_and_marks_it() {
         let all = offers();
-        let q = all
+        let dense = all
             .iter()
-            .find(|o| o.name.starts_with("qwen3.6"))
-            .expect("the new Qwen models are not offered at all");
+            .find(|o| o.name == "qwen3.8-27b")
+            .expect("the newest Qwen is not offered at all");
         assert!(
-            q.unsupported.is_some(),
-            "qwen3.6 is offered as runnable; the engine does not implement its rope mode"
+            dense.unsupported.is_none(),
+            "qwen3.8 is `qwen35`, which is implemented and verified"
+        );
+        let moe = all
+            .iter()
+            .find(|o| o.name == "qwen3.6-35b-a3b")
+            .expect("the MoE variant is not offered at all");
+        assert!(
+            moe.unsupported.is_some(),
+            "qwen35moe's routed path has never been run here"
         );
         assert!(
             all.iter()

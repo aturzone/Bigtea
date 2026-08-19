@@ -8,6 +8,133 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
+### The Qwen3.5 forward pass is implemented and diffed against llama.cpp
+
+`qwen35` — Qwen3.5, Qwen3.6 **and Qwen3.8**, all one architecture — now runs
+end to end. Developed against `Qwen3.5-0.8B-Q8_0` because it is the same
+architecture at 24 layers instead of 64, so a wrong step shows up in a second
+rather than a minute.
+
+**Verified, not asserted.** Every layer's output compared against
+`llama-eval-callback` on the same container and prompt, by value *and* by sum
+over all five prompt tokens:
+
+```
+l_out-0   llama -0.3452   chaos -0.345155    sum -4.384898 / -4.384897
+l_out-3   llama -0.2049   chaos -0.204932    (the first attention layer)
+l_out-23  llama  0.3155   chaos  0.315493    sum 26.697807 / 26.697754
+```
+
+**All 24 layers agree**, and the sampled token ids are llama.cpp's exactly:
+`" Paris"`, `"."`, `"
+"`, `"The"`, `" capital"`, `" of"`.
+
+The sums matter as much as the values: the delta net is recurrent, so a state
+carried wrongly leaves token 0 perfect and every token after it wrong. Comparing
+first rows alone said the port was correct while the answer was still garbage.
+
+What it took:
+
+- **The gated delta net** (`crates/chaos-arch/src/qwen35.rs`) — 18 of the 0.8B's
+  24 layers, 48 of the 27B's 64. Projections, a rolling depthwise convolution,
+  `l2_norm` on q and k, `ggml_gated_delta_net`, a gated norm, an output
+  projection. The state is host-side like the KV cache, so no in-graph cache
+  writes.
+- **mRoPE** for the attention layers, and **four position values per token** —
+  ggml asserts `ne[2] * 4 == b->ne[0]` and aborts otherwise.
+- **The fused query/gate projection**, interleaved *per head*: head 0's query,
+  head 0's gate, head 1's query. Two contiguous halves would take the queries of
+  the first heads and the gates of the last, silently.
+- **The `qwen35` pre-tokenizer** — one digit at a time, and combining marks
+  belonging to the word rather than the punctuation beside it. Checked against
+  `llama-tokenize`.
+
+### Three detections that read a familiar name and got the wrong architecture
+
+All three found by the layer diff, all three now testing for what they mean
+rather than for one tensor name:
+
+| flag | what went wrong |
+|---|---|
+| `parallel_residual` | absence of `ffn_norm` meant "one norm, parallel block". `qwen35` has two norms and calls the second `post_attention_norm`, so the FFN consumed `attn_norm(x)` — the value attention had already seen. The symptom was `attn_post_norm-0` coming out **identical to llama.cpp's `attn_norm-0`**, which is what named the bug. |
+| `post_norms` | presence of `post_attention_norm` meant Gemma. Gemma's post-norms are a *pair*; demanding the missing `post_ffw_norm` refused a loadable model. |
+| `fused_qkv` | presence of `attn_qkv` meant Phi-3. On `qwen35` that tensor is the delta net's input projection, and attention layers have no such tensor at all. |
+
+### The bug is found: a tensor read back that was never computed
+
+The attention layers' **output gate** is a *sibling* view of the `attn_q` matmul,
+not an ancestor of q, k or v — so a graph rooted at those three never computed
+it, and `to_vec_f32` returned whatever the reused scratch arena held. The
+previous layer's leftovers.
+
+That explains every symptom:
+
+- Layers 0–2 are recurrent and have no gate, so they matched llama.cpp exactly;
+  layer 3, the first attention layer, was wrong.
+- Any extra compute anywhere changed the leftovers and so changed the answer —
+  which is why `CHAOS_DUMP_LAYERS=1` looked like it *fixed* the model.
+- Bisecting the debug computes pointed at the dense-FFN pass, three phases away
+  from the actual fault. The trigger and the bug were in different places.
+
+The fix is one line of intent: **the gate joins q, k and v as a root of both
+`realize_graph` and `run`.** `qwen35.rs` carries a textual regression test for
+it, because the failure is structural — it lives in which tensors `stream.rs`
+hands to the compute.
+
+### Verified, with the instrumentation off
+
+| check | result |
+|---|---|
+| all 24 layers, by value and by sum | match `llama-eval-callback` |
+| 1-token prompt `"Paris"` | `", France.\nThe first time I"` — identical |
+| 5-token prompt | `" Paris.\nThe capital of France is"` — identical |
+| 22-token prompt | `"</think>\n\n The sky appears"` — identical |
+| debug dump on vs off | **same output** |
+
+The three prompt lengths are not decoration: the fused delta rule takes a
+different path at one token than at many, so both regimes are covered.
+
+**`qwen35` is in `VERIFIED_ARCHITECTURES` and `RUNNABLE_ARCHS`** — Qwen3.5,
+Qwen3.6 and Qwen3.8 all report it, and `chaos-run` and `chaos-serve` take them
+without `--force`. `qwen35moe` stays out: no MoE container of the family has been
+run, and its refusal now names what is *untested* rather than what is
+unimplemented.
+
+### Three detections that read a familiar name and got the wrong architecture
+
+All three found by the layer diff, all three now testing for what they mean
+rather than for one tensor name:
+
+| flag | what went wrong |
+|---|---|
+| `parallel_residual` | absence of `ffn_norm` meant "one norm, parallel block". `qwen35` has two norms and calls the second `post_attention_norm`, so the FFN consumed `attn_norm(x)` — the value attention had already seen. The symptom was `attn_post_norm-0` coming out **identical to llama.cpp's `attn_norm-0`**, which is what named the bug. |
+| `post_norms` | presence of `post_attention_norm` meant Gemma. Gemma's post-norms are a *pair*; demanding the missing `post_ffw_norm` refused a loadable model. |
+| `fused_qkv` | presence of `attn_qkv` meant Phi-3. On `qwen35` that tensor is the delta net's input projection, and attention layers have no such tensor at all. |
+
+### Not finished, and the reason is worth reading
+
+**`CHAOS_DUMP_LAYERS=1` changes the answer.** With it set the sampled ids are
+llama.cpp's; without it they are wrong. Same binary, same prompt, `--temp 0`.
+
+So the layer diff above is real *and* insufficient: the debug pass computes extra
+tensors in the same arenas, which changes when a buffer is written, and the plain
+path reads one at the wrong moment. **A model whose output depends on whether it
+is being observed is not verified**, so `qwen35` is out of
+`VERIFIED_ARCHITECTURES` and `RUNNABLE_ARCHS` — it was briefly added during this
+work and has been taken back out.
+
+Ruled out by measurement: thread count (1, 2 and 4 all identically wrong),
+`--force`, computing the layer twice, `scores` as an explicit graph root, `cont`
+copies of both carried states, and a `cont` copy of the convolution's input. The
+delta net's *own* debug pass makes no difference either — so the trigger is one
+of the three extra computes in the **attention** and dense-FFN phases, and the
+first suspect is the strided fused query/gate views. The bisect and the next step
+are written down in `docs/graph/backlog/qwen35-gated-delta-net.md`.
+
+`CHAOS_DUMP_LAYERS=1` prints the residual stream per layer in
+`llama-eval-callback`'s own format and names, which is how all of the above was
+found.
+
 ### Qwen3.8-27B is in the catalogue, and it is Qwen3.6's architecture
 
 Read from the container, not inferred: `general.architecture qwen35`, 866

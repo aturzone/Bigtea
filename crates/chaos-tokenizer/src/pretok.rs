@@ -49,6 +49,22 @@ pub enum PreTokenizer {
     /// token in front of every prompt, and a disagreement from the first token
     /// generated. Verified against `llama-tokenize` on Phi-4.
     Dbrx,
+    /// `qwen35` — Qwen3.5, Qwen3.6 and Qwen3.8.
+    ///
+    /// `llama3`'s shape with **two** changes, both from llama.cpp's
+    /// `LLAMA_VOCAB_PRE_TYPE_QWEN35`:
+    ///
+    /// * `\p{N}` rather than `\p{N}{1,3}` — **one digit at a time**, like
+    ///   `qwen2` and unlike `llama3`. Every number in a prompt splits
+    ///   differently and every boundary after it moves.
+    /// * `[\p{L}\p{M}]+` rather than `\p{L}+`, and `[^\s\p{L}\p{M}\p{N}]+`
+    ///   rather than `[^\s\p{L}\p{N}]+` — **a combining mark belongs to the
+    ///   word it sits on**, not to the punctuation run beside it. Without this a
+    ///   vowelled Arabic or Persian word is cut at every diacritic.
+    ///
+    /// It also sets `clean_spaces = false`, which is a decoding concern rather
+    /// than a splitting one.
+    Qwen35,
     /// `joyai-llm`, DeepSeek-V4-Flash. Adds a CJK rule and has no contraction
     /// rule; verified against llama.cpp on that model.
     JoyaiLlm,
@@ -78,8 +94,8 @@ impl fmt::Display for UnknownPreTokenizer {
         write!(
             f,
             "tokenizer.ggml.pre = {:?} is not implemented (verified here: \
-             \"llama-bpe\"/\"llama3\", \"qwen2\", \"dbrx\", \"joyai-llm\", \
-             \"default\", \"gpt-2\"/\"mpt\"/\"olmo\"/\"jais\"). \
+             \"llama-bpe\"/\"llama3\", \"qwen2\", \"qwen35\", \"dbrx\", \
+             \"joyai-llm\", \"default\", \"gpt-2\"/\"mpt\"/\"olmo\"/\"jais\"). \
              The pre-tokenizer decides where BPE may merge, so guessing one \
              shifts every token boundary and the model answers fluently and \
              wrongly rather than failing — which is why this refuses instead. \
@@ -112,6 +128,8 @@ impl PreTokenizer {
             // no Smaug container on this machine to check it against. That rule
             // is the reason the two variants above were caught disagreeing.
             "dbrx" => Ok(PreTokenizer::Dbrx),
+            // Checked against `llama-tokenize` on Qwen3.5-0.8B.
+            "qwen35" => Ok(PreTokenizer::Qwen35),
             "joyai-llm" => Ok(PreTokenizer::JoyaiLlm),
             // **Also the absent case.** `Tokenizer::from_metadata` passes
             // "default" when the container declares no `tokenizer.ggml.pre`,
@@ -127,7 +145,7 @@ impl PreTokenizer {
     /// How many digits may group into one piece.
     fn max_digits(self) -> usize {
         match self {
-            PreTokenizer::Qwen2 => 1,
+            PreTokenizer::Qwen2 | PreTokenizer::Qwen35 => 1,
             PreTokenizer::LlamaBpe
             | PreTokenizer::Dbrx
             | PreTokenizer::JoyaiLlm
@@ -145,6 +163,7 @@ pub fn pre_tokenize(text: &str, pre: PreTokenizer) -> Vec<String> {
         PreTokenizer::JoyaiLlm => joyai(text),
         PreTokenizer::Default => default_gpt2(text),
         PreTokenizer::Gpt2 => gpt2_rule(text),
+        PreTokenizer::Qwen35 => gpt4_style_marks(text, 1),
         PreTokenizer::LlamaBpe | PreTokenizer::Dbrx | PreTokenizer::Qwen2 => {
             gpt4_style(text, pre.max_digits())
         }
@@ -369,6 +388,95 @@ fn chunk_digits(piece: &str) -> Vec<String> {
 
 /// The contractions both GPT-4-style variants match, case-insensitively.
 const CONTRACTIONS: [&str; 7] = ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d"];
+
+/// `gpt4_style`, with combining marks counted as part of a word.
+///
+/// A separate function rather than a flag on the other one: the mark test
+/// changes **two** classes at once — what a letter run may contain, and what the
+/// punctuation run must exclude — and threading a bool through both was the
+/// version that got one of them wrong.
+fn gpt4_style_marks(text: &str, max_digits: usize) -> Vec<String> {
+    let letter = |c: char| c.is_alphabetic() || is_mark(c);
+    let other = |c: char| !c.is_whitespace() && !letter(c) && !is_digit(c);
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if let Some(len) = contraction_at(&chars, i) {
+            out.push(chars[i..i + len].iter().collect());
+            i += len;
+            continue;
+        }
+        // `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` -- note the *lead* class still
+        // excludes only letters and digits, exactly as llama.cpp writes it, so a
+        // mark can be the optional lead character.
+        let lead =
+            usize::from(!is_newline(chars[i]) && !chars[i].is_alphabetic() && !is_digit(chars[i]));
+        if i + lead < chars.len() && letter(chars[i + lead]) {
+            let mut j = i + lead;
+            while j < chars.len() && letter(chars[j]) {
+                j += 1;
+            }
+            out.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+        if is_digit(chars[i]) {
+            let mut j = i;
+            while j < chars.len() && is_digit(chars[j]) && j - i < max_digits {
+                j += 1;
+            }
+            out.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+        let lead = usize::from(chars[i] == ' ' && i + 1 < chars.len() && other(chars[i + 1]));
+        if i + lead < chars.len() && other(chars[i + lead]) {
+            let mut j = i + lead;
+            while j < chars.len() && other(chars[j]) {
+                j += 1;
+            }
+            while j < chars.len() && is_newline(chars[j]) {
+                j += 1;
+            }
+            out.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+        if chars[i].is_whitespace() {
+            let mut j = i;
+            while j < chars.len() && chars[j].is_whitespace() && !is_newline(chars[j]) {
+                j += 1;
+            }
+            if j < chars.len() && is_newline(chars[j]) {
+                while j < chars.len() && is_newline(chars[j]) {
+                    j += 1;
+                }
+                out.push(chars[i..j].iter().collect());
+                i = j;
+                continue;
+            }
+            // `\s+(?!\S)` then `\s+`: hold back the last space of a run when
+            // something follows it, so it joins the next word.
+            let mut j = i;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            let end = if j < chars.len() && j > i + 1 {
+                j - 1
+            } else {
+                j
+            };
+            out.push(chars[i..end].iter().collect());
+            i = end;
+            continue;
+        }
+        out.push(chars[i].to_string());
+        i += 1;
+    }
+    out
+}
 
 /// `(?i:'s|'t|…)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,n}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
 ///
@@ -623,12 +731,30 @@ fn is_letter(c: char) -> bool {
 }
 
 /// Approximates `\p{M}` (combining marks).
+///
+/// **Widened for `qwen35`**, whose word rule is `[\p{L}\p{M}]+` — a combining
+/// mark belongs to the word it sits on, and without these ranges a vowelled
+/// Arabic or Persian word is cut at every diacritic. Written out because this
+/// workspace has no dependencies and `char` offers no `is_mark`.
+///
+/// A subset of `\p{M}` rather than all of it, so the honest statement is:
+/// checked against `llama-tokenize` for Latin, Arabic and Persian text, and a
+/// script outside these ranges has its marks treated as punctuation — which is
+/// what every other pre-tokenizer here does with them anyway.
 fn is_mark(c: char) -> bool {
-    matches!(c,
-        '\u{0300}'..='\u{036F}'
-        | '\u{1AB0}'..='\u{1AFF}'
-        | '\u{20D0}'..='\u{20FF}'
-        | '\u{FE20}'..='\u{FE2F}'
+    matches!(c as u32,
+        0x0300..=0x036F   // combining diacritical marks
+        | 0x0483..=0x0489 // Cyrillic
+        | 0x0591..=0x05BD | 0x05BF | 0x05C1..=0x05C2 | 0x05C4..=0x05C5 | 0x05C7 // Hebrew
+        | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670   // Arabic and Persian vowelling
+        | 0x06D6..=0x06DC | 0x06DF..=0x06E4 | 0x06E7..=0x06E8 | 0x06EA..=0x06ED
+        | 0x0711 | 0x0730..=0x074A                     // Syriac
+        | 0x07A6..=0x07B0                              // Thaana
+        | 0x0900..=0x0903 | 0x093A..=0x094F | 0x0951..=0x0957 | 0x0962..=0x0963 // Devanagari
+        | 0x0981..=0x0983 | 0x09BC..=0x09CD            // Bengali
+        | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E   // Thai
+        | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF            // combining, extended
+        | 0x20D0..=0x20FF | 0xFE20..=0xFE2F            // symbols, half marks
     )
 }
 

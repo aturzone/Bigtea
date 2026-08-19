@@ -4,7 +4,54 @@
 > architecture. Atur has asked for this three times, so it is written down
 > properly rather than answered again with "not supported".
 
-**Status: the arithmetic is bound and tested; the layer wiring is not written.**
+**Status: the forward pass is implemented and diffed against llama.cpp on
+Qwen3.5-0.8B — all 24 layers, by value and by sum. One thing is left, and it is
+not in the model: `chaos-run`'s incremental printer drops most pieces on this
+vocabulary, so `qwen35` is still out of `RUNNABLE_ARCHS`.**
+
+The evidence, `CHAOS_DUMP_LAYERS=1` against `llama-eval-callback`:
+
+```
+l_out-0   llama -0.3452  chaos -0.345155   sums -4.384898 / -4.384897
+l_out-3   llama -0.2049  chaos -0.204932   the first attention layer
+l_out-23  llama  0.3155  chaos  0.315493   sums 26.697807 / 26.697754
+sampled ids: " Paris" "." "
+" "The" " capital" " of"  -- llama.cpp's exactly
+```
+
+**The sums are the check that matters.** The delta net is recurrent, so a state
+carried wrongly leaves token 0 perfect and every later token wrong; comparing
+first rows alone said the port was correct while the answer was garbage.
+
+Three config detections had to be narrowed, all found by the layer diff:
+`parallel_residual` (absence of `ffn_norm` is not "one norm" — `qwen35` calls its
+second norm `post_attention_norm`), `post_norms` (Gemma's are a *pair*), and
+`fused_qkv` (on `qwen35` `attn_qkv` is the delta net's input projection).
+
+## Closed (2026-08-19)
+
+**The bug was a tensor read back that was never computed.** The attention
+layers' output gate is a sibling view of the `attn_q` matmul, not an ancestor of
+q, k or v, so a graph rooted at those three never evaluated it and `to_vec_f32`
+returned the reused scratch arena's leftovers.
+
+Every symptom followed from that: layers 0-2 are recurrent and gateless so they
+matched exactly, layer 3 was wrong, and *any* extra compute anywhere changed the
+leftovers — so `CHAOS_DUMP_LAYERS=1` appeared to fix the model. Bisecting the
+debug computes pointed at the dense-FFN pass, three phases from the fault.
+
+Fix: the gate joins q, k and v as a root of `realize_graph` and `run`. A textual
+regression test in `qwen35.rs` enforces it.
+
+Verified with the dump **off**: all 24 layers by value and sum, and
+byte-identical greedy output at 1-, 5- and 22-token prompts, which covers both
+regimes of the fused delta rule. `qwen35` is now in `VERIFIED_ARCHITECTURES` and
+`RUNNABLE_ARCHS`; `qwen35moe` is not, because no MoE container of the family has
+been run.
+
+---
+
+**Original status: the arithmetic is bound and tested; the layer wiring is not written.**
 Everything below was measured from the containers Atur has (`Qwen3.6-27B-Q4_K_M`,
 16.8 GB) and from llama.cpp's own implementation, which exists and is the oracle.
 

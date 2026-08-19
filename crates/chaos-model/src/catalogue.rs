@@ -427,6 +427,7 @@ pub const RUNNABLE_ARCHS: &[&str] = &[
     "phi3",
     "qwen2",
     "qwen3",
+    "qwen35",
     "stablelm",
     "starcoder2",
 ];
@@ -443,9 +444,12 @@ pub fn why_not_runnable(arch: &str) -> Option<&'static str> {
         return None;
     }
     Some(match arch {
-        "qwen35" | "qwen35moe" => {
-            "three of its four layers are a gated delta net with recurrent \
-             state, not attention, and Chaos has no recurrent memory yet"
+        // `qwen35` itself is in `RUNNABLE_ARCHS` now, verified against
+        // llama.cpp on Qwen3.5-0.8B. Only the MoE variant is left, and it is
+        // left for a reason: no MoE container of this family has been run
+        // here, so its routed expert path is untested.
+        "qwen35moe" => {
+            "its routed expert path has never been run here -- only the \n             dense variant of this architecture has"
         }
         "ideogram4" => {
             "it is an image model -- a diffusion transformer needing a sampler, \
@@ -635,15 +639,20 @@ mod runnable_tests {
     /// move them -- it fails once they become runnable.
     #[test]
     fn the_new_qwen_models_are_listed_and_refused() {
-        for name in ["qwen3.6-27b", "qwen3.6-35b-a3b", "qwen3.8-27b"] {
+        // **The dense ones run now** -- verified against llama.cpp on
+        // Qwen3.5-0.8B, which is this architecture at 24 layers instead of 64.
+        for name in ["qwen3.6-27b", "qwen3.8-27b"] {
             let e = find(name).unwrap_or_else(|| panic!("{name} is not listed"));
-            let why = why_not_runnable(e.arch)
-                .unwrap_or_else(|| panic!("{name} now claims to run; move it and update this"));
-            // Names the *blocker*, not a symptom: 48 of the 64 layers are a
-            // gated delta net with recurrent state. The mRoPE the older message
-            // pointed at is real but is the smaller half of the work.
-            assert!(why.contains("recurrent"), "{name}: {why}");
+            assert!(
+                why_not_runnable(e.arch).is_none(),
+                "{name} is `qwen35`, which is implemented and verified"
+            );
         }
+        // The MoE variant is still refused, and its reason names what is
+        // *untested* rather than what is unimplemented.
+        let e = find("qwen3.6-35b-a3b").expect("listed");
+        let why = why_not_runnable(e.arch).expect("qwen35moe is still refused");
+        assert!(why.contains("routed"), "{why}");
     }
 
     /// A file on disk resolves back to the entry that would have fetched it.
