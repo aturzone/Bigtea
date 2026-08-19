@@ -82,14 +82,19 @@ pub fn logo_coverage(n: usize) -> Vec<u8> {
 /// look correct on most of these paths and wrong on the ones that overlap.
 fn fill_polygon(grid: &mut [u8], w: usize, poly: &Poly, value: u8) {
     let scale = w as f32;
-    let pts = poly.pts;
-    if pts.len() < 3 {
+    // **Every subpath of this path, in one scanline pass.** SVG fills a path as
+    // a single region, and with no `fill-rule` the default is nonzero -- so a
+    // subpath winding against the first cuts a *hole*. Filling the subpaths one
+    // at a time fills those holes, and this mark's eyes are a hole in a white
+    // shape: they vanished. Collecting crossings from all contours before
+    // resolving the winding is what makes a hole a hole.
+    if poly.contours.iter().all(|c| c.len() < 3) {
         return;
     }
-    // Row range this polygon can touch, so a small path does not walk the
-    // whole bitmap.
+    // Row range this path can touch, so a small one does not walk the whole
+    // bitmap.
     let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-    for &(_, y) in pts {
+    for &(_, y) in poly.contours.iter().flat_map(|c| c.iter()) {
         lo = lo.min(y);
         hi = hi.max(y);
     }
@@ -100,16 +105,21 @@ fn fill_polygon(grid: &mut [u8], w: usize, poly: &Poly, value: u8) {
     for row in y0..y1.min(w) {
         let yc = row as f32 + 0.5;
         xs.clear();
-        for i in 0..pts.len() {
-            let (x0, ay) = pts[i];
-            let (x1, by) = pts[(i + 1) % pts.len()];
-            let (ay, by) = (ay * scale, by * scale);
-            // Half-open in y, so a vertex shared by two edges is counted once
-            // and horizontal edges drop out entirely.
-            if (ay <= yc && by > yc) || (by <= yc && ay > yc) {
-                let t = (yc - ay) / (by - ay);
-                let x = (x0 + t * (x1 - x0)) * scale;
-                xs.push((x, if by > ay { 1 } else { -1 }));
+        for pts in poly.contours {
+            if pts.len() < 3 {
+                continue;
+            }
+            for i in 0..pts.len() {
+                let (x0, ay) = pts[i];
+                let (x1, by) = pts[(i + 1) % pts.len()];
+                let (ay, by) = (ay * scale, by * scale);
+                // Half-open in y, so a vertex shared by two edges is counted
+                // once and horizontal edges drop out entirely.
+                if (ay <= yc && by > yc) || (by <= yc && ay > yc) {
+                    let t = (yc - ay) / (by - ay);
+                    let x = (x0 + t * (x1 - x0)) * scale;
+                    xs.push((x, if by > ay { 1 } else { -1 }));
+                }
             }
         }
         if xs.len() < 2 {
@@ -219,16 +229,30 @@ mod tests {
     #[test]
     fn the_outlines_are_present_and_have_both_fills() {
         assert!(POLYS.len() > 20, "only {} polygons", POLYS.len());
-        let pts: usize = POLYS.iter().map(|p| p.pts.len()).sum();
+        let pts: usize = POLYS
+            .iter()
+            .flat_map(|p| p.contours.iter())
+            .map(|c| c.len())
+            .sum();
         assert!(pts > 2000, "only {pts} points; the flattener has drifted");
         assert!(POLYS.iter().any(|p| p.ink), "nothing is inked");
         assert!(
             POLYS.iter().any(|p| !p.ink),
             "nothing is paper -- the holes in the mark would fill in"
         );
+        // **At least one path has more than one contour, or the hole logic is
+        // untested by the art itself.** Path 12 of this mark is a white shape
+        // with a hole, and that hole is the eyes: filling its subpaths
+        // separately erased them.
+        assert!(
+            POLYS.iter().any(|p| p.contours.len() > 1),
+            "no path has a second contour; the nonzero-winding hole is untested"
+        );
         for p in POLYS {
-            assert!(p.pts.len() >= 3, "a polygon with {} points", p.pts.len());
-            for &(x, y) in p.pts {
+            for c in p.contours {
+                assert!(c.len() >= 3, "a contour with {} points", c.len());
+            }
+            for &(x, y) in p.contours.iter().flat_map(|c| c.iter()) {
                 // The unit square is the *ink* box, and the art's white backing
                 // plate is deliberately larger than it -- so geometry outside
                 // is normal and the rasteriser clips it. What would not be
@@ -242,7 +266,7 @@ mod tests {
         }
         // The inked geometry itself has to sit inside, or the mark is off-centre.
         for p in POLYS.iter().filter(|p| p.ink) {
-            for &(x, y) in p.pts {
+            for &(x, y) in p.contours.iter().flat_map(|c| c.iter()) {
                 assert!(
                     (-0.02..=1.02).contains(&x) && (-0.02..=1.02).contains(&y),
                     "an inked point at ({x}, {y}) falls outside the mark's own box"

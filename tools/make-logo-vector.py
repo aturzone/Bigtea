@@ -46,10 +46,17 @@ def main():
     before = after = 0
     for polys, rgb in paths:
         # The art is black on a white plate. A light fill is *paper*: it paints
-        # over earlier ink, which is how the eye and the gaps between the rays
+        # over earlier ink, which is how the eyes and the gaps between the rays
         # are cut out. Painting order therefore matters and is preserved.
         lum = (rgb[0] * 299 + rgb[1] * 587 + rgb[2] * 114) // 1000
         ink = lum < 128
+        # **One SVG path is one region, however many subpaths it has.** With no
+        # `fill-rule` the default is nonzero, so a second subpath winding the
+        # other way is a *hole*. Emitting each subpath as its own shape filled
+        # them all solid -- and path 12 here is a white shape with a hole, so
+        # the hole was painted white too and the eyes underneath disappeared.
+        # That was the bug: the mark rendered without its eyes.
+        contours = []
         for poly in polys:
             before += len(poly)
             simple = []
@@ -61,19 +68,23 @@ def main():
                     if abs(nx - px) < MIN_STEP and abs(ny - py) < MIN_STEP:
                         continue
                 simple.append((nx, ny))
-            # A polygon needs three distinct points to enclose anything.
+            # A contour needs three distinct points to enclose anything.
             if len(simple) < 3:
                 continue
             after += len(simple)
-            out_paths.append((simple, ink))
+            contours.append(simple)
+        if contours:
+            out_paths.append((contours, ink))
 
     if not out_paths:
         sys.exit("no polygons survived; the SVG or the ink box is wrong")
 
     lines = []
-    for poly, ink in out_paths:
-        pts = ", ".join(f"({x:.5},{y:.5})" for x, y in poly)
-        lines.append(f"    Poly {{ ink: {str(ink).lower()}, pts: &[{pts}] }},")
+    for contours, ink in out_paths:
+        cs = ", ".join(
+            "&[" + ", ".join(f"({x:.5},{y:.5})" for x, y in c) + "]" for c in contours
+        )
+        lines.append(f"    Poly {{ ink: {str(ink).lower()}, contours: &[{cs}] }},")
     body = "\n".join(lines)
 
     out = ROOT / "crates" / "chaos-app" / "src" / "logo_vector.rs"
@@ -86,9 +97,14 @@ def main():
         "//\n"
         "// This is the whole logo. Nothing here is a bitmap, so the window fills\n"
         "// it at whatever size it needs and loses nothing at any of them.\n"
+        "/// One SVG path: its subpaths, filled together with nonzero winding.\n"
+        "///\n"
+        "/// **Together is the point.** A path whose second subpath winds the\n"
+        "/// other way has a *hole* there, and filling the subpaths separately\n"
+        "/// fills the hole -- which is what erased this mark's eyes.\n"
         "pub struct Poly {\n"
         "    pub ink: bool,\n"
-        "    pub pts: &'static [(f32, f32)],\n"
+        "    pub contours: &'static [&'static [(f32, f32)]],\n"
         "}\n"
         "#[rustfmt::skip]\n"
         # A coordinate that happens to equal 0.30103 is log10(2) to clippy,
@@ -98,7 +114,8 @@ def main():
         encoding="utf-8",
     )
     print(
-        f"wrote {out}: {len(out_paths)} polygons, {after} points "
+        f"wrote {out}: {len(out_paths)} paths, "
+        f"{sum(len(c) for c, _ in out_paths)} contours, {after} points "
         f"(from {before}, {100 - after * 100 // max(before, 1)}% removed), "
         f"{out.stat().st_size // 1024} KB",
         file=sys.stderr,
