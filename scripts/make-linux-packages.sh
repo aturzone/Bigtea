@@ -12,7 +12,7 @@
 #
 #   scripts/make-linux-packages.sh <version> <staging-dir>
 #
-# Writes `chaos_<version>_amd64.deb` and `Chaos-<version>-x86_64.AppImage` into
+# Writes `chaos_<version>_amd64.deb` and `Chaos-<version>-linux-x86_64.AppImage` into
 # the working directory.
 set -euo pipefail
 
@@ -146,7 +146,9 @@ EOF
   fi
   chmod +x "$runtime"
 
-  local out="Chaos-${VER}-x86_64.AppImage"
+  # `linux-x86_64`, matching the tarball and the zip. Bare `x86_64` was the
+  # only asset on the page that did not say which platform it was for.
+  local out="Chaos-${VER}-linux-x86_64.AppImage"
   rm -f "$out" chaos.squashfs
   # -root-owned so the image does not carry the runner's uid; -noappend so a
   # rerun does not silently add a second copy of everything.
