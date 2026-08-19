@@ -26,17 +26,38 @@ fn every_name_resolves() {
     }
 }
 
-/// The stem must carry `{quant}`, or every quantisation of a model resolves to
-/// the same filename and the wrong one is downloaded.
+/// A stem offering more than one quantisation must carry `{quant}`, or they all
+/// resolve to the same filename and the wrong one is downloaded.
+///
+/// **Only when there is a choice to make.** The FLUX.2 autoencoder is one file
+/// with one form -- `split_files/vae/flux2-vae.safetensors` -- and demanding a
+/// `{quant}` placeholder in it would mean inventing a quantisation that does not
+/// exist. The check that matters is that no two quants of the same entry can
+/// collide, and with one quant there is nothing to collide with.
 #[test]
-fn every_stem_is_parameterised_by_quant() {
+fn a_stem_varies_by_quant_whenever_there_is_a_choice() {
     for e in CATALOGUE {
-        assert!(
-            e.stem.contains("{quant}"),
-            "{} has stem {:?}, which does not vary with the quantisation",
-            e.name,
-            e.stem
-        );
+        if e.quants.len() > 1 {
+            assert!(
+                e.stem.contains("{quant}"),
+                "{} offers {} quantisations but its stem {:?} does not vary with them",
+                e.name,
+                e.quants.len(),
+                e.stem
+            );
+        }
+        // And whatever the count, distinct quants must give distinct filenames.
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        for q in e.quants {
+            let files = e.files(q);
+            assert!(
+                !seen.contains(&files),
+                "{}: two quantisations resolve to the same files {:?}",
+                e.name,
+                files
+            );
+            seen.push(files);
+        }
     }
 }
 

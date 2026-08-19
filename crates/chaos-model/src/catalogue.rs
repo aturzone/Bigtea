@@ -30,6 +30,9 @@ pub struct Quant {
     pub always_read_bytes: u64,
 }
 
+/// Suffixes that mean a stem is a complete repo-relative path.
+const KNOWN_EXTENSIONS: &[&str] = &[".gguf", ".safetensors"];
+
 /// A model Chaos can fetch by name.
 #[derive(Debug, Clone, Copy)]
 pub struct Entry {
@@ -39,6 +42,13 @@ pub struct Entry {
     pub repo: &'static str,
     /// Filename stem; `{stem}-{i:05}-of-{n:05}.gguf` for a split container, or
     /// `{stem}.gguf` when `shards == 1`.
+    ///
+    /// **A stem that already ends in a known extension is a complete
+    /// repo-relative path**, subdirectory included. That is how the FLUX.2
+    /// autoencoder is expressed: it is
+    /// `split_files/vae/flux2-vae.safetensors`, neither a GGUF nor at the repo
+    /// root. Tested by suffix rather than by "contains a dot", because
+    /// `Qwen3.8-27B-{quant}` contains one.
     pub stem: &'static str,
     /// Architecture, so a fit can be predicted before a byte is downloaded.
     pub arch: &'static str,
@@ -49,6 +59,11 @@ impl Entry {
     /// The files this quant is made of, as repo-relative paths.
     pub fn files(&self, quant: &Quant) -> Vec<String> {
         let stem = self.stem.replace("{quant}", quant.name);
+        if KNOWN_EXTENSIONS.iter().any(|e| stem.ends_with(e)) {
+            // Already a full path. Sharding is not defined for these and no
+            // component uses it, so one file is the whole answer.
+            return vec![stem];
+        }
         if quant.shards <= 1 {
             return vec![format!("{stem}.gguf")];
         }
@@ -396,6 +411,63 @@ pub const CATALOGUE: &[Entry] = &[
             always_read_bytes: 5_643_820_832,
         }],
     },
+    // -- the rest of the image pipeline ------------------------------------
+    //
+    // **An image is four files, not one.** Read from leejet's own reference
+    // command line, and every size below is `Content-Length` from the real URL,
+    // checked 2026-08-19. Together they are 16.65 GB.
+    //
+    // These are *components*, not models to chat with, and `why_not_runnable`
+    // says so for each. Listing them anyway is the same reasoning that lists a
+    // model this engine cannot run: answering "where is the VAE?" with silence
+    // is worse than answering with what it is and what it is for.
+    Entry {
+        name: "ideogram-4-uncond",
+        repo: "leejet/ideogram-4-GGUF",
+        stem: "ideogram4_uncond-{quant}",
+        arch: "ideogram4uncond",
+        quants: &[Quant {
+            name: "Q4_0",
+            bytes: 5_643_820_832,
+            shards: 1,
+            always_read_bytes: 5_643_820_832,
+        }],
+    },
+    Entry {
+        // The text encoder. **A language model, which is the encouraging part**:
+        // this engine already runs the Qwen3 family, and what the denoiser wants
+        // is hidden states rather than logits.
+        name: "qwen3-vl-8b",
+        repo: "unsloth/Qwen3-VL-8B-Instruct-GGUF",
+        stem: "Qwen3-VL-8B-Instruct-{quant}",
+        arch: "qwen3vl",
+        quants: &[Quant {
+            name: "Q4_K_M",
+            bytes: 5_027_785_568,
+            shards: 1,
+            always_read_bytes: 5_027_785_568,
+        }],
+    },
+    Entry {
+        // The autoencoder, which turns the final latent into pixels.
+        //
+        // **From `Comfy-Org/flux2-dev`, not `black-forest-labs/FLUX.2-dev`**:
+        // the original is gated and answers 401 without an accepted licence.
+        // The mirror is the same weights, ungated. Read from its header: 251
+        // tensors, `decoder.conv_in.weight` is `[512, 32, 3, 3]` so the latent
+        // has 32 channels, and `decoder.conv_out.bias` is `[3]` so it ends in
+        // RGB -- which matches the denoiser's 128 patch channels as 32 x 2 x 2.
+        name: "flux2-vae",
+        repo: "Comfy-Org/flux2-dev",
+        stem: "split_files/vae/flux2-vae.safetensors",
+        arch: "flux2vae",
+        quants: &[Quant {
+            name: "F32",
+            bytes: 336_213_556,
+            shards: 1,
+            always_read_bytes: 336_213_556,
+        }],
+    },
 ];
 
 /// Architectures this engine implements *and* has diffed against llama.cpp.
@@ -537,6 +609,19 @@ pub fn why_not_runnable(arch: &str) -> Option<&'static str> {
              things around it -- the unconditional twin for guidance, a text encoder \
              (Qwen3-VL), and the FLUX.2 autoencoder to turn latents into pixels. \
              Image generation is being built; see backlog/image-generation-ideogram-4.md"
+        }
+        "ideogram4uncond" => {
+            "it is the unconditional half of Ideogram 4's denoiser -- one of the two \
+             graphs classifier-free guidance needs, not a model on its own"
+        }
+        "qwen3vl" => {
+            "it is the text encoder for image generation. It is a language model and this \
+             engine runs the family, but what a denoiser needs is hidden states rather \
+             than sampled tokens, and that path is not built"
+        }
+        "flux2vae" => {
+            "it is the FLUX.2 autoencoder -- 32-channel latents to RGB pixels. All \
+             convolutions and group norms, none of which a token loop has ever needed"
         }
         "qwen3moe" => "its forward pass does not yet match llama.cpp exactly",
         _ => "this architecture has never been diffed against llama.cpp",
