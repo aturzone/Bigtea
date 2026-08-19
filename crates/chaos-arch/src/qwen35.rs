@@ -160,6 +160,7 @@ pub fn arena_shapes(s: &SsmConfig, n_embd: i64, n_tokens: i64) -> Vec<(i64, i64)
         (n_embd, n_tokens),                                 // x
         (conv_dim, n_tokens),                               // qkv_mixed
         (n_tokens, conv_dim),                               // transposed
+        (n_tokens, conv_dim),                               // and made contiguous
         (window + n_tokens, conv_dim),                      // conv input, the widest
         (window + n_tokens, conv_dim),                      // and its copy for the op
         (conv_dim, n_tokens),                               // conv output
@@ -252,7 +253,7 @@ pub fn layer<'a>(
     // The stored window goes *in front of* this step's tokens along the time
     // axis, so token 0 of a single-token step still sees three tokens of
     // history. Transposed first because `ssm_conv` wants time on the fast axis.
-    let qkv_t = ctx.transpose(&qkv)?;
+    let qkv_t = ctx.cont_4d(&ctx.transpose(&qkv)?, [n_tokens, conv_dim, 1, 1])?;
     let conv_in = ctx.concat(&inp.conv, &qkv_t, 0)?;
 
     // The tail of that same buffer is the window for next time -- taken before

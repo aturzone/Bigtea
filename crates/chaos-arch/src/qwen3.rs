@@ -162,6 +162,16 @@ pub const VERIFIED_ARCHITECTURES: &[&str] = &[
     "phi3",
     "qwen2",
     "qwen3",
+    // **Qwen3.5, Qwen3.6 and Qwen3.8 all report `qwen35`.** Verified against
+    // llama.cpp on Qwen3.5-0.8B-Q8_0 three ways, with the debug dump OFF:
+    // all 24 layers by value and by sum, and byte-identical greedy output at
+    // 1-, 5- and 22-token prompts -- which is what covers both regimes of the
+    // fused delta rule, since it takes a different path at one token.
+    //
+    // `qwen35moe` is deliberately NOT here: no MoE container of this family has
+    // been run, and its routed path is untested. Sharing an implementation in
+    // llama.cpp is not the same as having been checked.
+    "qwen35",
     // `qwen3moe` WAS HERE AND HAS BEEN REMOVED — but what still keeps it out is
     // the *harness*, not the engine.
     //

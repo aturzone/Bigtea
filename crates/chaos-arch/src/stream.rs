@@ -2482,7 +2482,21 @@ impl<'m> StreamingRunner<'m> {
                     // products and tiny.
                     let t = std::time::Instant::now();
                     // After the graph, before the inputs.
-                    let _dev = cmp.realize_graph(&ctx, &[&q, &k, &v])?;
+                    // **The output gate is read back, so it has to be a root.** It
+                    // is a sibling view of the same `attn_q` matmul, not an ancestor
+                    // of q, k or v -- so a graph rooted at those three never
+                    // computes it, and `to_vec_f32` then returned whatever the
+                    // reused scratch arena happened to hold. On this laptop that was
+                    // the previous layer's leftovers: layers 0-2 (recurrent, no
+                    // gate) came out exact and layer 3 was wrong, and adding *any*
+                    // extra compute elsewhere changed the garbage and so changed the
+                    // answer. That is what made `CHAOS_DUMP_LAYERS=1` look like it
+                    // fixed the model.
+                    let roots: Vec<&Tensor> = match gate.as_ref() {
+                        Some(g) => vec![&q, &k, &v, g],
+                        None => vec![&q, &k, &v],
+                    };
+                    let _dev = cmp.realize_graph(&ctx, &roots)?;
                     cmp.set_f32(&xt, &xt_values)?;
                     if pos_per_token == 4 {
                         let mut four = Vec::with_capacity(positions.len() * 4);
@@ -2493,7 +2507,7 @@ impl<'m> StreamingRunner<'m> {
                     } else {
                         cmp.set_i32(&pos, &positions)?;
                     }
-                    cmp.run(&ctx, &[&q, &k, &v])?;
+                    cmp.run(&ctx, &roots)?;
                     if trace {
                         eprintln!("TRACE: qkv ok (layer)");
                     }

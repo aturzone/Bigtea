@@ -60,6 +60,15 @@ are the measurement that killed one.
 
 ## Correctness, which fails silently here
 
+- **A tensor you read back must be a *root* of the compute, not merely present
+  in the graph.** `ggml_build_forward_expand` walks a root's ancestors; a
+  *sibling* view of some node is not an ancestor of it. Qwen3.5's attention gate
+  is a strided view of the same `attn_q` matmul as q, so a graph rooted at
+  `[q, k, v]` never evaluated it and `to_vec_f32` returned the reused scratch
+  arena's leftovers. **The symptom was that turning the debug dump on fixed the
+  model** — any extra compute changed the leftovers — and bisecting the dump
+  pointed three phases away from the fault. If a value crosses back to the host,
+  name it as a root.
 - **A layer-by-layer diff can pass while the model is wrong.** The `qwen35` port
   matched `llama-eval-callback` on all 24 layers, by value *and* by sum over
   every prompt token — and generated different tokens when the dump was off,

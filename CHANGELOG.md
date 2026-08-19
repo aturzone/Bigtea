@@ -60,6 +60,57 @@ rather than for one tensor name:
 | `post_norms` | presence of `post_attention_norm` meant Gemma. Gemma's post-norms are a *pair*; demanding the missing `post_ffw_norm` refused a loadable model. |
 | `fused_qkv` | presence of `attn_qkv` meant Phi-3. On `qwen35` that tensor is the delta net's input projection, and attention layers have no such tensor at all. |
 
+### The bug is found: a tensor read back that was never computed
+
+The attention layers' **output gate** is a *sibling* view of the `attn_q` matmul,
+not an ancestor of q, k or v — so a graph rooted at those three never computed
+it, and `to_vec_f32` returned whatever the reused scratch arena held. The
+previous layer's leftovers.
+
+That explains every symptom:
+
+- Layers 0–2 are recurrent and have no gate, so they matched llama.cpp exactly;
+  layer 3, the first attention layer, was wrong.
+- Any extra compute anywhere changed the leftovers and so changed the answer —
+  which is why `CHAOS_DUMP_LAYERS=1` looked like it *fixed* the model.
+- Bisecting the debug computes pointed at the dense-FFN pass, three phases away
+  from the actual fault. The trigger and the bug were in different places.
+
+The fix is one line of intent: **the gate joins q, k and v as a root of both
+`realize_graph` and `run`.** `qwen35.rs` carries a textual regression test for
+it, because the failure is structural — it lives in which tensors `stream.rs`
+hands to the compute.
+
+### Verified, with the instrumentation off
+
+| check | result |
+|---|---|
+| all 24 layers, by value and by sum | match `llama-eval-callback` |
+| 1-token prompt `"Paris"` | `", France.\nThe first time I"` — identical |
+| 5-token prompt | `" Paris.\nThe capital of France is"` — identical |
+| 22-token prompt | `"</think>\n\n The sky appears"` — identical |
+| debug dump on vs off | **same output** |
+
+The three prompt lengths are not decoration: the fused delta rule takes a
+different path at one token than at many, so both regimes are covered.
+
+**`qwen35` is in `VERIFIED_ARCHITECTURES` and `RUNNABLE_ARCHS`** — Qwen3.5,
+Qwen3.6 and Qwen3.8 all report it, and `chaos-run` and `chaos-serve` take them
+without `--force`. `qwen35moe` stays out: no MoE container of the family has been
+run, and its refusal now names what is *untested* rather than what is
+unimplemented.
+
+### Three detections that read a familiar name and got the wrong architecture
+
+All three found by the layer diff, all three now testing for what they mean
+rather than for one tensor name:
+
+| flag | what went wrong |
+|---|---|
+| `parallel_residual` | absence of `ffn_norm` meant "one norm, parallel block". `qwen35` has two norms and calls the second `post_attention_norm`, so the FFN consumed `attn_norm(x)` — the value attention had already seen. The symptom was `attn_post_norm-0` coming out **identical to llama.cpp's `attn_norm-0`**, which is what named the bug. |
+| `post_norms` | presence of `post_attention_norm` meant Gemma. Gemma's post-norms are a *pair*; demanding the missing `post_ffw_norm` refused a loadable model. |
+| `fused_qkv` | presence of `attn_qkv` meant Phi-3. On `qwen35` that tensor is the delta net's input projection, and attention layers have no such tensor at all. |
+
 ### Not finished, and the reason is worth reading
 
 **`CHAOS_DUMP_LAYERS=1` changes the answer.** With it set the sampled ids are

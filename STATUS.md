@@ -57,12 +57,17 @@ its arguments and returns confident numbers rather than failing to build.
 sums its rolling window to 10 then 14; `gated_delta_net` returns
 `S*H*T*N + S*S*H*N` finite values with the carried state moved off zero.
 
-**Qwen3.8 does not run yet.** What is left is the layer wiring: the recurrent
-state cache, the delta-net layer graph, the config fields, mRoPE on the 16
-attention layers, and tolerating the MTP block — and then the diff against
-llama.cpp, which is the half that decides whether it ships. The integration
-point is the per-layer loop at `stream.rs:2107`, where every layer already
-crosses the ggml boundary as plain vectors. Full plan and shapes:
+**Qwen3.5, Qwen3.6 and Qwen3.8 run.** `qwen35` is in
+`VERIFIED_ARCHITECTURES`: all 24 layers of Qwen3.5-0.8B match
+`llama-eval-callback` by value and by sum, and greedy output is byte-identical to
+llama.cpp at 1-, 5- and 22-token prompts — both regimes of the fused delta rule,
+with the debug dump **off**.
+
+The bug that took the longest was a tensor read back that was never computed: the
+attention gate is a *sibling* view of the `attn_q` matmul, so a graph rooted at
+q, k and v never evaluated it and it returned scratch-arena leftovers. Turning
+the debug dump on changed the leftovers and appeared to fix the model.
+`qwen35moe` stays out — its routed path is untested. Detail:
 [`backlog/qwen35-gated-delta-net.md`](docs/graph/backlog/qwen35-gated-delta-net.md).
 
 **Image generation is untouched.** Ideogram 4 is listed and refused; nothing in
