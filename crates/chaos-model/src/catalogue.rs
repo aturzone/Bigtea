@@ -53,6 +53,13 @@ pub struct Entry {
     /// Architecture, so a fit can be predicted before a byte is downloaded.
     pub arch: &'static str,
     pub quants: &'static [Quant],
+    /// Adult content: the download asks for confirmation first.
+    ///
+    /// **A property of the entry, not a list kept somewhere else.** A separate
+    /// list of names would be a second place to update, and the one it failed to
+    /// mention would be the one that mattered. Every entry states it, so adding a
+    /// model without deciding is a compile error rather than a default.
+    pub adult: bool,
 }
 
 impl Entry {
@@ -114,6 +121,7 @@ pub const CATALOGUE: &[Entry] = &[
             // 155 GB, leaving 4-6% resident per shard.
             always_read_bytes: 7_920_157_020,
         }],
+        adult: false,
     },
     Entry {
         name: "qwen3-30b-a3b",
@@ -130,6 +138,7 @@ pub const CATALOGUE: &[Entry] = &[
             // stays resident -- which is why an 18 GB model runs on a laptop.
             always_read_bytes: 997_554_176,
         }],
+        adult: false,
     },
     // -- dense models -------------------------------------------------------
     //
@@ -163,6 +172,7 @@ pub const CATALOGUE: &[Entry] = &[
                 always_read_bytes: 23_214_832_288,
             },
         ],
+        adult: false,
     },
     Entry {
         name: "qwen3-14b",
@@ -175,6 +185,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 9_001_753_984,
         }],
+        adult: false,
     },
     Entry {
         name: "qwen3-8b",
@@ -187,6 +198,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 5_027_784_512,
         }],
+        adult: false,
     },
     Entry {
         name: "qwen3-4b",
@@ -199,6 +211,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 2_497_281_312,
         }],
+        adult: false,
     },
     Entry {
         name: "gemma3-27b",
@@ -211,6 +224,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 16_546_688_736,
         }],
+        adult: false,
     },
     Entry {
         name: "gemma3-12b",
@@ -223,6 +237,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 7_300_778_336,
         }],
+        adult: false,
     },
     Entry {
         name: "gemma3-4b",
@@ -235,6 +250,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 2_489_894_016,
         }],
+        adult: false,
     },
     Entry {
         name: "llama3.2-3b",
@@ -247,6 +263,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 2_019_377_600,
         }],
+        adult: false,
     },
     Entry {
         name: "llama3.2-1b",
@@ -259,6 +276,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 807_694_368,
         }],
+        adult: false,
     },
     Entry {
         name: "qwen2.5-coder-7b",
@@ -271,6 +289,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 4_683_073_504,
         }],
+        adult: false,
     },
     Entry {
         name: "phi4",
@@ -283,6 +302,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 8_890_306_112,
         }],
+        adult: false,
     },
     // -- Qwen 3.5/3.6, which this engine cannot run yet ----------------------
     //
@@ -356,6 +376,7 @@ pub const CATALOGUE: &[Entry] = &[
                 always_read_bytes: 29_047_086_048,
             },
         ],
+        adult: false,
     },
     Entry {
         name: "qwen3.6-35b-a3b",
@@ -377,6 +398,7 @@ pub const CATALOGUE: &[Entry] = &[
                 always_read_bytes: 1_751_935_488,
             },
         ],
+        adult: false,
     },
     // -- Ideogram 4, which is an image model and not a language model --------
     //
@@ -410,6 +432,7 @@ pub const CATALOGUE: &[Entry] = &[
             // byte is read on every one of the sampler's steps.
             always_read_bytes: 5_643_820_832,
         }],
+        adult: false,
     },
     // -- the rest of the image pipeline ------------------------------------
     //
@@ -432,6 +455,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 5_643_820_832,
         }],
+        adult: false,
     },
     Entry {
         // The text encoder. **A language model, which is the encouraging part**:
@@ -447,6 +471,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 5_027_785_568,
         }],
+        adult: false,
     },
     Entry {
         // The autoencoder, which turns the final latent into pixels.
@@ -467,6 +492,71 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 336_213_556,
         }],
+        adult: false,
+    },
+    // -- unfiltered image models, asked for by name ------------------------
+    //
+    // **Listed with what they actually are, which is not what the names
+    // suggest.** Every size below is `Content-Length` from the real URL, and
+    // three of the four requested repositories turned out to be something other
+    // than a model you can run:
+    //
+    // - `Arial311/NSFW-Image-Generator` **does not exist publicly**. The API
+    //   answers "Invalid username or password", which is what Hugging Face says
+    //   for a private or deleted repository. It is not listed, because listing a
+    //   name that 404s is worse than admitting it is not there.
+    // - Two of them are **LoRA adapters**, not models: 0.64 GiB and 0.32 GiB
+    //   against the 12-24 GiB a full Flux is. A LoRA is a delta applied to a base
+    //   model, and this engine has no adapter support at all -- `--lora` is in the
+    //   declined-flag table.
+    // - One is a full model, in **diffusers layout**: a directory of
+    //   `model.safetensors` plus `text_encoder/` and `text_encoder_2/`, not a
+    //   single container. That is a third packaging to support, after GGUF and a
+    //   single safetensors file.
+    //
+    // They are here so the answer to "where are they?" is specific rather than
+    // silence -- the same reason every unrunnable model in this file is listed.
+    Entry {
+        name: "flux-nsfw-uncensored",
+        repo: "Heartsync/Flux-NSFW-uncensored",
+        stem: "lora.safetensors",
+        arch: "loraflux",
+        quants: &[Quant {
+            name: "F16",
+            bytes: 687_476_088,
+            shards: 1,
+            always_read_bytes: 687_476_088,
+        }],
+        adult: true,
+    },
+    Entry {
+        name: "lustly-uncensored",
+        repo: "lustlyai/Flux_Lustly.ai_Uncensored_nsfw_v1",
+        stem: "flux_lustly-ai_v1.safetensors",
+        arch: "loraflux",
+        quants: &[Quant {
+            name: "F16",
+            bytes: 343_805_152,
+            shards: 1,
+            always_read_bytes: 343_805_152,
+        }],
+        adult: true,
+    },
+    Entry {
+        // A full model rather than an adapter -- and in diffusers layout, so the
+        // 6.46 GiB below is the denoiser only. Its two text encoders and its VAE
+        // are separate files in subdirectories.
+        name: "nsfw-gen-v2",
+        repo: "UnfilteredAI/NSFW-gen-v2",
+        stem: "model.safetensors",
+        arch: "diffusers",
+        quants: &[Quant {
+            name: "F16",
+            bytes: 6_938_043_264,
+            shards: 1,
+            always_read_bytes: 6_938_043_264,
+        }],
+        adult: true,
     },
 ];
 
@@ -581,6 +671,24 @@ pub fn architecture_from_tensors(has: impl Fn(&str) -> bool) -> Option<&'static 
     None
 }
 
+/// Does this line consent to adult content?
+///
+/// **A typed phrase, not a keypress.** `y` is muscle memory by the time the
+/// download prompt has been answered once; spelling something out is a
+/// deliberate act. Case and inner spacing are forgiven because they are not the
+/// point; the words are.
+///
+/// Here rather than beside the prompt so it can be tested without a terminal.
+pub fn says_i_am_18(line: &str) -> bool {
+    // No `trim()` first: `split_whitespace` already discards leading and
+    // trailing runs, and clippy is right that doing both is redundant.
+    let said: Vec<&str> = line.split_whitespace().collect();
+    said.len() == 3
+        && said[0].eq_ignore_ascii_case("i")
+        && said[1].eq_ignore_ascii_case("am")
+        && said[2] == "18"
+}
+
 /// Why a model cannot run here, or `None` if it can.
 ///
 /// **A catalogue that only lists what works is a catalogue that cannot answer
@@ -618,6 +726,15 @@ pub fn why_not_runnable(arch: &str) -> Option<&'static str> {
             "it is the text encoder for image generation. It is a language model and this \
              engine runs the family, but what a denoiser needs is hidden states rather \
              than sampled tokens, and that path is not built"
+        }
+        "loraflux" => {
+            "it is a LoRA adapter, not a model -- a few hundred megabytes of deltas that \
+             apply on top of a full Flux. Chaos has no adapter support, and no Flux either"
+        }
+        "diffusers" => {
+            "it is in diffusers layout: a denoiser plus separate text encoders and a VAE in \
+             subdirectories, rather than one container. Chaos reads GGUF and single \
+             safetensors files"
         }
         "flux2vae" => {
             "it is the FLUX.2 autoencoder -- 32-channel latents to RGB pixels. All \
@@ -991,5 +1108,61 @@ mod runnable_tests {
             RUNNABLE_ARCHS.contains(&"qwen35"),
             "a shape recorded against a refused architecture is a warning nobody can see"
         );
+    }
+
+    /// The age gate: exactly the phrase, and nothing that resembles a reflex.
+    #[test]
+    fn the_age_phrase_must_be_typed_out() {
+        for good in ["I AM 18", "i am 18", "  I   am   18  ", "I Am 18"] {
+            assert!(says_i_am_18(good), "{good:?} should be accepted");
+        }
+        for bad in [
+            "y",
+            "Y",
+            "yes",
+            "",
+            "18",
+            "i am",
+            "I AM 17",
+            "I AM 181",
+            "no",
+            "I AM EIGHTEEN",
+            "I AM 18 YEARS",
+        ] {
+            assert!(!says_i_am_18(bad), "{bad:?} must NOT be accepted");
+        }
+    }
+
+    /// Adult entries are marked, and only the ones that should be.
+    ///
+    /// The flag drives both the `[18+]` marker in the list and the gate before
+    /// the download, so an entry marked wrongly is either a missing warning or a
+    /// prompt nobody can get past.
+    #[test]
+    fn adult_entries_are_the_ones_marked() {
+        let adult: Vec<&str> = CATALOGUE
+            .iter()
+            .filter(|e| e.adult)
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(
+            adult,
+            vec!["flux-nsfw-uncensored", "lustly-uncensored", "nsfw-gen-v2"],
+            "the adult set changed; check both the list marker and the gate"
+        );
+        // Nothing that generates text is in it.
+        for e in CATALOGUE.iter().filter(|e| e.adult) {
+            assert!(
+                why_not_runnable(e.arch).is_some(),
+                "{}: an adult entry that claims to run needs a second look",
+                e.name
+            );
+        }
+        // And a spot check that ordinary models are not marked.
+        for name in ["llama-3.2-1b", "qwen3.8-27b", "ideogram-4"] {
+            if let Some(e) = find(name) {
+                assert!(!e.adult, "{name} must not be marked adult");
+            }
+        }
     }
 }
