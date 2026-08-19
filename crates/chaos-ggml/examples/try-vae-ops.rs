@@ -9,7 +9,11 @@
 //! - a 1×1 kernel of 2, over `[1, 2, 3, 4]`, must give `[2, 4, 6, 8]`;
 //! - group norm over one group of `[1, 2, 3, 4]` has mean 2.5 and population
 //!   variance 1.25, so the output is `(x - 2.5) / sqrt(1.25)` — about
-//!   `[-1.342, -0.447, 0.447, 1.342]`.
+//!   `[-1.342, -0.447, 0.447, 1.342]`;
+//! - nearest-neighbour 2x on the 2×2 `[[1,2],[3,4]]` doubles every pixel into
+//!   a 2×2 block;
+//! - `pad` puts its zeros on the **right and bottom only**, which is what
+//!   makes it diffusers' `F.pad(x, (0, 1, 0, 1))` rather than a symmetric one.
 
 fn main() {
     let ctx = match chaos_ggml::Context::new(256 << 20) {
@@ -93,6 +97,52 @@ fn main() {
             );
         }
         Err(e) => println!("  conv_2d_direct refused: {e:?}"),
+    }
+
+    // -- upscale_nearest ------------------------------------------------------
+    // [[1, 2], [3, 4]] at 2x is each pixel smeared over a 2x2 block.
+    println!("calling upscale_nearest ...");
+    match ctx.upscale_nearest(&data, 2) {
+        Ok(out) => {
+            ctx.compute(&out, 1).expect("compute upscale");
+            let got = out.to_vec_f32();
+            println!("  upscale_nearest -> {got:?}");
+            let want = [
+                1.0f32, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 3.0, 3.0, 4.0, 4.0,
+            ];
+            let ok = got.len() == 16 && got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-6);
+            println!(
+                "  {}",
+                if ok {
+                    "MATCHES a 2x2 nearest smear"
+                } else {
+                    "DIFFERS"
+                }
+            );
+        }
+        Err(e) => println!("  upscale_nearest refused: {e:?}"),
+    }
+
+    // -- pad ------------------------------------------------------------------
+    // Right and bottom only: rows become (1,2,0) and (3,4,0), then a zero row.
+    println!("calling pad ...");
+    match ctx.pad(&data, [1, 1, 0, 0]) {
+        Ok(out) => {
+            ctx.compute(&out, 1).expect("compute pad");
+            let got = out.to_vec_f32();
+            println!("  pad -> {got:?}");
+            let want = [1.0f32, 2.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0];
+            let ok = got.len() == 9 && got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-6);
+            println!(
+                "  {}",
+                if ok {
+                    "MATCHES -- zeros on the right and bottom, not centred"
+                } else {
+                    "DIFFERS -- the asymmetry assumption is wrong"
+                }
+            );
+        }
+        Err(e) => println!("  pad refused: {e:?}"),
     }
 
     println!("survived all calls");

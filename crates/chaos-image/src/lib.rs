@@ -41,3 +41,4 @@
 
 pub mod png;
 pub mod safetensors;
+pub mod vae;

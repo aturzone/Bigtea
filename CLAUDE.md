@@ -21,7 +21,7 @@ export GGML_LIB_DIR=C:/Projects/llamacpp-unsloth/build/ggml/src   # PowerShell: 
 # GPU work needs build-vulkan/ggml/src instead. That build has NO Vulkan archive,
 # and the GPU tests SKIP rather than fail without a card -- so a green "6 passed"
 # was once reported for a file whose two GPU tests never ran once.
-cargo test --release          # 757 tests
+cargo test --release          # 761 tests
 cargo test --release --test deepseek4_forward -- --ignored   # 19 V4-Flash, needs the container
 cargo build --release
 ./target/release/chaos-run <name-or-path> "prompt" -n 16   # bare `chaos-run` lists models
@@ -38,7 +38,7 @@ Windows needs the **GNU** Rust toolchain plus MSYS2 mingw64 on PATH, and
 residency policy · `io` cache-bypassing aligned reads · `model` sharded
 resolution, partial reads, name lookup · `ggml` FFI (graph, zero-copy weight
 binding) · `tokenizer` byte-level BPE · `jinja` chat templates · `arch`
-architectures + streaming forward pass
+architectures + streaming forward pass · `image` PNG, safetensors, FLUX.2 VAE
 
 ## Traps — one line each, full text in `docs/graph/reference/hard-won-facts.md`
 
@@ -49,7 +49,13 @@ are the measurement that killed an appealing idea.
   index, misaligned pointer. Size arenas up front, scale them with the prefill
   block, and check on the Rust side. It kills whole test binaries, not one test.
 - **ggml `ne[0]` is the fastest dimension**; row-major reading transposes every
-  matrix and yields confident nonsense.
+  matrix and yields confident nonsense. A PyTorch `[OC,IC,KH,KW]` conv weight is
+  ggml `[KW,KH,IC,OC]` — the same bytes reversed, never transposed.
+- **An image decoder is checked by round trip, never by looking.** Encode a real
+  photo, score the reconstruction, and ablate the check first: three deliberate
+  bugs each still produced a recognisable picture. `ggml_group_norm` applies no
+  weight/bias, and `ggml_pad` is right/bottom-only — which is exactly what
+  diffusers' downsampler wants.
 - **`compute()` re-evaluates the whole ancestor graph** — call it only before a
   `to_vec_*`/`set_*`. **`compute(&t, 0)` runs on ONE thread**, not all cores.
 - **Weights are bound zero-copy**; a copy needs 2× the model and will not fit.

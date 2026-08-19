@@ -22,5 +22,10 @@ description = "Diffusion-model support for Chaos: PNG output, safetensors, and t
 # here would be a second place for every fix to be missing from.
 chaos-grammar = { path = "../chaos-grammar" }
 
+# The autoencoder is a graph of convolutions, so it needs the same ggml the
+# token loop uses. It borrows the arithmetic and owns the architecture --
+# which is the arrangement everywhere else here too.
+chaos-ggml = { path = "../chaos-ggml" }
+
 # No build script: this crate produces no binaries, and
 # `cargo:rustc-link-arg-bins` is an error in a crate that has none.

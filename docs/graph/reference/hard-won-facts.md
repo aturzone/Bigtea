@@ -76,9 +76,33 @@ are the measurement that killed one.
   "roughly right" check does not separate those.
 - **The kernel is the first argument, the data the second.** They are the same
   type, so swapping them compiles and returns a differently shaped answer.
+- **`ggml_group_norm` normalises and stops — it never applies weight or bias.**
+  Diffusers scales and shifts per channel afterwards, so the caller reshapes the
+  `[C]` vectors to `[1,1,C,1]` and does it. Leaving that out is finite,
+  correctly shaped and wrong: it cost 19.3 dB of the autoencoder's round trip
+  (36.09 to 16.77) and nothing else.
+- **`ggml_pad` pads at the *far end only*, which is exactly what diffusers
+  wants.** `Downsample2D` applies `F.pad(x, (0, 1, 0, 1))` — right and bottom —
+  then convolves stride 2 with *no* padding. A symmetric `pad = 1` produces an
+  output of the same shape, shifted half a pixel at every level: 14.60 dB
+  against 36.09. **The shape matching is what makes this dangerous.**
+- **PyTorch's layout and ggml's are the same bytes described backwards.**
+  `[OC, IC, KH, KW]` contiguous *is* `ne = [KW, KH, IC, OC]`, and `[N,C,H,W]` is
+  `[W,H,C,N]`. So a safetensors conv weight binds with **no transpose**, just a
+  reversed shape. Getting it wrong does not produce a bad picture — the
+  input-channel assert fires and ggml **aborts**, which is the one failure in
+  this area that announces itself.
 
 ## Correctness, which fails silently here
 
+- **An autoencoder is checked by round trip, not by looking.** A decoder alone
+  can only be judged by what it produces, and a subtly wrong one produces a
+  plausible picture. Running the *encoder* too gives a number: the two halves
+  are separately trained weights over one shared latent space, so neither can
+  compensate for a bug in the other. Three deliberately introduced errors all
+  still produced a recognisable image and all three were caught by PSNR.
+  **Ablate the check before trusting it** — the same discipline as scoring a
+  residency policy against a null.
 - **A sweep that checks exit codes is not a test.** Twelve installed models were
   run and all twelve exited 0, which was written down as "twelve of twelve"
   before any output was read. Qwen3.6-27B exits 0 and prints

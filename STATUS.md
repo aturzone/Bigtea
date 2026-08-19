@@ -27,15 +27,34 @@ the installed `chaos-run` generated *" Paris."*, reinstall reported
 prefix, the registry key, the PATH entry and the staged helper — leaving the
 models directory untouched.
 
+**Chaos decodes images, and the autoencoder is verified rather than eyeballed**
+(2026-08-19). `chaos-image` builds the FLUX.2 autoencoder as a ggml graph — both
+halves, 248 tensors, no transposes. The decoder is what a diffusion pipeline
+needs; the **encoder was written so the decoder could be checked without a
+reference implementation**: encode a real photograph, decode the latent, compare.
+**36.09, 36.29, 36.49 and 40.89 dB** on four 256x256 photographs.
+
+That number is only worth printing because the check was ablated first. Against
+the same input, a `group_norm` missing its per-channel scale scores **16.77**, a
+symmetrically padded downsampler **14.60**, and a skipped mid-block attention
+**31.93** — all three still produce a recognisable picture, and all three would
+have passed "it looks right". Unreversed convolution kernels abort ggml outright.
+The suite carries the round trip at 128x128 as two `#[ignore]`d tests that
+**panic rather than skip** when the file is absent.
+
+**The denoiser is not started**, so Chaos cannot yet generate an image from a
+prompt — only decode a latent into one. `image-generation-ideogram-4.md` has the
+shapes and the order of work.
+
 **The project is now called `chaos`.** Every crate, binary, environment variable
 and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 `BIGTEA_THREADS` is `CHAOS_THREADS`, and nothing carries the old name. The git
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **757 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
-needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
-clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
+**Current**: **761 tests** (58 binaries, 0 failed, 33 ignored — the V4-Flash set
+needs the container, and the autoencoder set needs the 336 MB `flux2-vae`),
+clippy `--workspace --all-targets -D warnings` 0, fmt clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
 reading, which is the only way that number has ever been right.
 

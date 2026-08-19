@@ -302,6 +302,32 @@ extern "C" {
         n_groups: i32,
         eps: f32,
     ) -> *mut ggml_tensor;
+    /// Nearest-neighbour (or bilinear) resize by an integer factor.
+    ///
+    /// The decoder's three upsamplers are `interpolate(scale_factor=2,
+    /// mode="nearest")` followed by a convolution, so only mode 0 is used here.
+    fn ggml_upscale(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        scale_factor: i32,
+        mode: c_int,
+    ) -> *mut ggml_tensor;
+    /// Pad each dimension with zeros **at the end only**:
+    /// `[x, ..., x] -> [x, ..., x, 0, ..., 0]`.
+    ///
+    /// That asymmetry is the point. Diffusers' `Downsample2D` pads
+    /// `(0, 1, 0, 1)` -- right and bottom, never left or top -- and then
+    /// convolves with stride 2 and *no* padding. A symmetric `pad = 1` in the
+    /// convolution shifts every encoded feature half a pixel, which survives the
+    /// decoder as a picture that looks right and is not.
+    fn ggml_pad(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        p0: c_int,
+        p1: c_int,
+        p2: c_int,
+        p3: c_int,
+    ) -> *mut ggml_tensor;
     /// The whole gated delta rule, fused.
     ///
     /// **This is why running Qwen3.5/3.6/3.8 is a port rather than a project:**
@@ -761,6 +787,23 @@ impl Context {
         self.tensor(unsafe { ggml_new_tensor_4d(self.raw.as_ptr(), 1, ne0, ne1, ne2, ne3) })
     }
 
+    /// An F32 4-D tensor: a convolution kernel `[kw, kh, in, out]`, or an
+    /// activation `[w, h, channels, batch]`.
+    ///
+    /// **`conv_2d_direct` accepts this and `conv_2d` aborts on it.** The FLUX.2
+    /// autoencoder stores all 251 of its tensors F32, so this is the shape every
+    /// weight in that file binds to, with no conversion anywhere.
+    pub fn new_f32_4d(
+        &self,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        ne3: i64,
+    ) -> Result<Tensor<'_>, GgmlError> {
+        // SAFETY: valid context; type 0 is GGML_TYPE_F32.
+        self.tensor(unsafe { ggml_new_tensor_4d(self.raw.as_ptr(), 0, ne0, ne1, ne2, ne3) })
+    }
+
     pub fn new_typed_2d(
         &self,
         ty: chaos_gguf::GgmlType,
@@ -941,6 +984,41 @@ impl Context {
     ) -> Result<Tensor<'a>, GgmlError> {
         // SAFETY: as above.
         self.tensor(unsafe { ggml_group_norm(self.raw.as_ptr(), a.raw.as_ptr(), n_groups, eps) })
+    }
+
+    /// Nearest-neighbour upsample by an integer factor, over `ne[0]` and `ne[1]`.
+    ///
+    /// Mode 0 is `GGML_SCALE_MODE_NEAREST`. It is not a parameter because the
+    /// only caller is the autoencoder's upsampler, which is nearest by
+    /// definition -- bilinear here would blur every decoded image slightly and
+    /// never once fail a test.
+    pub fn upscale_nearest<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        factor: i32,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_upscale(self.raw.as_ptr(), a.raw.as_ptr(), factor, 0) })
+    }
+
+    /// Pad with zeros **at the far end of each dimension only**.
+    ///
+    /// `pad(x, 1, 1, 0, 0)` on `[w, h, c, n]` gives `[w + 1, h + 1, c, n]` with
+    /// the new column on the right and the new row at the bottom -- which is
+    /// exactly PyTorch's `F.pad(x, (0, 1, 0, 1))`, the padding diffusers'
+    /// `Downsample2D` applies before a stride-2 convolution.
+    pub fn pad<'a>(&'a self, a: &Tensor<'a>, p: [i32; 4]) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_pad(self.raw.as_ptr(), a.raw.as_ptr(), p[0], p[1], p[2], p[3]) })
+    }
+
+    /// Make a tensor contiguous with a 2-D shape.
+    ///
+    /// A `transpose` only relabels strides, so the result is not contiguous and
+    /// `mul_mat` will read it wrong. This is `cont_4d` with the trailing
+    /// dimensions at 1, named for the shape the caller is actually thinking in.
+    pub fn cont_2d<'a>(&'a self, a: &Tensor<'a>, ne: [i64; 2]) -> Result<Tensor<'a>, GgmlError> {
+        self.cont_4d(a, [ne[0], ne[1], 1, 1])
     }
 
     /// The fused gated delta rule. See the declaration for the shapes; the
@@ -1802,6 +1880,14 @@ impl Tensor<'_> {
     }
 
     /// This tensor's extents and byte strides, in ggml's `ne`/`nb` order.
+    /// The four dimensions, `ne[0]` fastest.
+    ///
+    /// `dims_and_strides` when the strides are not wanted -- which is most
+    /// callers, and all of the autoencoder's.
+    pub fn ne(&self) -> [i64; 4] {
+        self.dims_and_strides().0
+    }
+
     pub fn dims_and_strides(&self) -> ([i64; 4], [usize; 4]) {
         // SAFETY: valid tensor pointer for the context's lifetime; `RawTensor`
         // mirrors ggml's layout, which the FFI already relies on elsewhere.
