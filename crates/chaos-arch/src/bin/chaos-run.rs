@@ -4289,6 +4289,14 @@ fn run(
         },
         if config.qk_norm { "yes" } else { "no" }
     );
+    // A verified architecture at a size nobody diffed. Said before a token is
+    // produced, because after that it reads as an excuse for output the user has
+    // already started trusting.
+    if let Some(why) =
+        chaos_model::catalogue::why_shape_is_unverified(model.architecture(), config.n_layer)
+    {
+        chaos_arch::info!("shape      UNVERIFIED -- {why}");
+    }
     if !config.rope_type_is_known {
         // Say it rather than let the user discover it in the output. Both RoPE
         // conventions run without error on either layout, so a wrong guess is

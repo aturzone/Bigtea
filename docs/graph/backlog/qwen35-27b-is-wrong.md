@@ -53,24 +53,44 @@ The first four blocks' tensor names are identical between the two files, so the
 layer structure is the same and no tensor is being ignored. `rope.dimension_sections`
 is `[11, 11, 10, 0]` and `key_length` is 256 in both.
 
+**Repacking.** The last structural difference -- the 0.8B is Q8_0 throughout,
+the 27B is Q4_K 10.44 GiB + Q6_K 4.14 + Q5_K 0.97, and repacking rearranges
+quantised tensors into the CPU kernels' layout. Ruled out:
+
+```
+CHAOS_NO_REPACK=1 chaos-run Qwen3.6-27B-Q4_K_M.gguf "The capital of France is" -n 6 --temp 0
+  ทัน ทัน ...
+generated  6 tokens in 206.1s (0.03 tok/s)
+```
+
+Same nonsense, 1.6x slower for it. Not the quantisation layout.
+
 ## What is left to try, in order
 
-1. **Repacking.** The remaining structural difference: the 0.8B is Q8_0
-   throughout, the 27B is Q4_K 10.44 GiB + Q6_K 4.14 + Q5_K 0.97. Repacking is
-   on by default and rearranges quantised tensors into the CPU kernels' layout.
-   `CHAOS_NO_REPACK=1` on the 27B is one run and settles it.
-2. **A layer diff against llama.cpp on the 27B itself**, the way the 0.8B was
+1. **A layer diff against llama.cpp on the 27B itself**, the way the 0.8B was
    done — `llama-eval-callback` per layer, by value and by sum. Slower per
    iteration but it is the method that has worked twice.
-3. **Bisect by layer count.** If a 64-layer container is wrong and a 24-layer one
+2. **Bisect by layer count.** If a 64-layer container is wrong and a 24-layer one
    is right, the first attention layer is index 3 in both, so the difference is
    not "which layer is recurrent". Something that accumulates over depth, or a
    width that only the wider model exercises.
 
-## What must ship before any of that
+## Shipped ahead of the fix
 
-**`chaos-run` and `chaos-serve` must not present a `qwen35` container whose shape
-was never diffed as verified.** `VERIFIED_ARCHITECTURES` is per-architecture, and
-this is the first case where one architecture string covers a container that
-works and a container that does not. Either the warning names the shape that was
-checked, or the gate becomes finer than an architecture name.
+**An architecture name is not a shape.** `VERIFIED_ARCHITECTURES` is
+per-architecture, and this is the first case where one string covers a container
+that is exact and a container that is nonsense. `verified_block_counts` now
+records what was actually diffed — `qwen35` at 24 blocks — and
+`why_shape_is_unverified` turns a mismatch into a line both binaries print
+before a token is produced:
+
+```
+shape      UNVERIFIED -- qwen35 was diffed against llama.cpp at 24 blocks, and
+           this container has 64. The forward pass may be WRONG with no error
+           anywhere ... Treat the output as unverified
+```
+
+It **warns rather than refuses**, deliberately: the policy Atur asked for is run
+it and say what is known, and a size that has not been checked is not the same as
+a size known to fail. Said before generation, because afterwards it reads as an
+excuse for output the user has already started trusting.

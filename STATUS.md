@@ -20,7 +20,7 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **738 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
+**Current**: **741 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
 needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
 clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
@@ -95,6 +95,33 @@ hazard — a wrong forward pass produces fluent nonsense, never a crash — walk
 into by a test that checked exit codes. The claim is retracted; the sweep now
 requires the word `Paris` in the continuation of "The capital of France is",
 which is a correctness check rather than a liveness one.
+
+Re-run that way, one prompt each, greedy, on this 15.7 GiB machine:
+
+| model | on disk | tok/s | |
+|---|---|---|---|
+| Llama-3.2-1B | 0.75 GB | 19.52 | correct |
+| Qwen3.5-0.8B | 0.76 GB | 14.24 | correct |
+| gemma-3-4b | 2.32 GB | 7.09 | correct |
+| Qwen3-4B | 2.33 GB | 7.41 | correct |
+| Llama-3.2-3B | 1.88 GB | 7.01 | correct |
+| Qwen2.5-Coder-7B | 4.36 GB | 2.51 | correct |
+| Qwen3-8B | 4.68 GB | 4.39 | correct |
+| gemma-3-12b | 6.80 GB | 2.96 | correct |
+| phi-4 | 8.28 GB | 2.20 | correct |
+| Qwen3-14B | 8.38 GB | 1.03 | correct |
+| **gemma-3-27b** | **15.41 GB** | **0.05** | **correct** |
+| **Qwen3.6-27B** | **15.66 GB** | 0.02 | **WRONG** |
+
+**Eleven of twelve correct, and the twelfth is a bug rather than a limit.**
+The line worth keeping is gemma-3-27b: 15.41 GB of weights on a machine with
+~7 GiB free, generating correct text at 0.05 tok/s. Nothing about that is fast
+and nothing about it is refused, which is the order Atur asked for — make it
+run, then make it quick. V4-Flash adds a thirteenth at 144 GB, answering through
+the server at 0.45 tok/s.
+
+The failure is not "too big": gemma-3-27b is the same size and is right. It is
+`qwen35` at 64 blocks.
 
 `qwen35` is verified against llama.cpp **on Qwen3.5-0.8B**, byte-identical at
 three prompt lengths. It is not verified on Qwen3.6-27B, and the 27B is wrong.

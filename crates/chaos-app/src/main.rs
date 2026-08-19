@@ -1179,6 +1179,33 @@ mod windows_app {
             return;
         }
 
+        // **A verified architecture at a size nobody diffed.** Not a refusal --
+        // the model runs, and refusing something that might be fine is its own
+        // kind of wrong. But the window is where somebody reads the answer, so
+        // it is where the caveat has to appear: `chaos-serve` prints this on its
+        // stdout, which this app does not show.
+        //
+        // Qwen3.6-27B is the case. It loads, generates, and prints
+        // `ทัน ทัน ทัน` -- and 27B is the size Atur actually has.
+        if let Some((a, n)) = arch.as_deref().zip(block_count_of(&path)) {
+            if let Some(why) = chaos_model::catalogue::why_shape_is_unverified(a, n) {
+                unsafe {
+                    MessageBoxW(
+                        main_hwnd(),
+                        wide(&format!(
+                            "{label} will run, but its answers are UNVERIFIED.\n\n{why}.\n\n\
+                             It will load and reply normally. Whether the reply is correct has \
+                             not been checked at this size, and a wrong forward pass here reads \
+                             as a confident answer rather than an error."
+                        ))
+                        .as_ptr(),
+                        wide("Chaos").as_ptr(),
+                        MB_OK | MB_ICONWARNING,
+                    );
+                }
+            }
+        }
+
         // **`cfg.force` is whatever SETTINGS says**, and nothing here overrides
         // it. The previous version set it to `true` unconditionally, which made
         // the toggle on the settings page a decoration: turning it off changed
@@ -1309,6 +1336,23 @@ mod windows_app {
         f.by_ref().take(HEAD as u64).read_to_end(&mut buf).ok()?;
         let g = chaos_gguf::Gguf::parse(&buf).ok()?;
         g.get_str("general.architecture").map(str::to_string)
+    }
+
+    /// The block count in a container's header.
+    ///
+    /// Beside [`architecture_of`] and reading the same 32 MiB head, because the
+    /// two answers are always wanted together: the architecture says whether the
+    /// engine implements this model, and the block count says whether *this
+    /// size* of it was ever checked.
+    fn block_count_of(path: &std::path::Path) -> Option<u32> {
+        use std::io::Read;
+        const HEAD: usize = 32 << 20;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut buf = Vec::with_capacity(HEAD);
+        f.by_ref().take(HEAD as u64).read_to_end(&mut buf).ok()?;
+        let g = chaos_gguf::Gguf::parse(&buf).ok()?;
+        let arch = g.get_str("general.architecture")?;
+        g.get_u64(&format!("{arch}.block_count")).map(|v| v as u32)
     }
 
     fn unload_model() {

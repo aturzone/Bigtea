@@ -339,6 +339,13 @@ fn serve(
         "shape      {} layers, {} embd, {} heads ({} kv)",
         config.n_layer, config.n_embd, config.n_head, config.n_head_kv
     );
+    // Same warning the runner prints, and it matters more here: a client on the
+    // other end of the socket cannot see anything but the answer.
+    if let Some(why) =
+        chaos_model::catalogue::why_shape_is_unverified(model.architecture(), config.n_layer)
+    {
+        println!("shape      UNVERIFIED -- {why}");
+    }
     if !config.rope_type_is_known {
         println!(
             "           NOTE: {:?} is not an architecture this build has verified;",

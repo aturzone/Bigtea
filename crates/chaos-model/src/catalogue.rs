@@ -432,6 +432,50 @@ pub const RUNNABLE_ARCHS: &[&str] = &[
     "starcoder2",
 ];
 
+/// The container shape each architecture was actually diffed against.
+///
+/// **Because an architecture name is not a shape.** `qwen35` earned its place in
+/// the engine's verified list on Qwen3.5-0.8B -- 24 blocks, byte-identical to
+/// llama.cpp at three prompt lengths. Qwen3.6-27B declares the same
+/// architecture, has 64 blocks, exits 0 and generates nonsense.
+///
+/// It lives here rather than beside the verified list because **three places ask
+/// this question**: `chaos-run`, `chaos-serve` and the app's model list. The app
+/// does not depend on the engine crate, and a second copy of this table is a
+/// second place for the answer to be missing from -- which is exactly how eight
+/// binaries came to have no icon.
+///
+/// `None` means the architecture makes no such distinction, which is the status
+/// quo for every other one and is fine until it is not.
+pub fn verified_block_counts(arch: &str) -> Option<&'static [u32]> {
+    match arch {
+        // 24 blocks: Qwen3.5-0.8B. 64 blocks -- Qwen3.6-27B, Qwen3.8-27B -- is
+        // known WRONG rather than merely unchecked. See
+        // `backlog/qwen35-27b-is-wrong.md`.
+        "qwen35" => Some(&[24]),
+        _ => None,
+    }
+}
+
+/// What to tell a user about a known architecture at a size nobody diffed.
+///
+/// **Warns rather than refuses**, deliberately. The policy is to run what can be
+/// run and say what is known, and a size that has not been checked is not the
+/// same as a size known to fail.
+pub fn why_shape_is_unverified(arch: &str, n_layer: u32) -> Option<String> {
+    let known = verified_block_counts(arch)?;
+    if known.contains(&n_layer) {
+        return None;
+    }
+    let sizes: Vec<String> = known.iter().map(u32::to_string).collect();
+    Some(format!(
+        "{arch} was diffed against llama.cpp at {} blocks and this container has {n_layer}. \
+         The forward pass may be WRONG with no error anywhere -- on this architecture a \
+         64-block container is known to generate nonsense. Treat the output as unverified",
+        sizes.join(" or "),
+    ))
+}
+
 /// Why a model cannot run here, or `None` if it can.
 ///
 /// **A catalogue that only lists what works is a catalogue that cannot answer
