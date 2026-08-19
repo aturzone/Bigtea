@@ -11,8 +11,10 @@ right, so fix this file.
 **Twelve of thirteen installed models generate correct text** on this 15.7 GiB
 machine, checked by requiring `Paris` after "The capital of France is" rather
 than by exit code — including gemma-3-27b at 15.41 GB, larger than the free
-memory, correct at 0.05 tok/s, and V4-Flash at 144 GB through the server at 0.45
-tok/s. **The thirteenth, Qwen3.6-27B-Q4_K_M, fails in llama.cpp too**: the two
+memory, correct at 0.05 tok/s, and **V4-Flash at 144 GB answering the same prompt
+with `" Paris."`** — 0.42 tok/s prefill, 0.176 tok/s generation from `chaos-run`,
+and 0.45 tok/s on a shorter prompt through `chaos-serve`. **The thirteenth,
+Qwen3.6-27B-Q4_K_M, fails in llama.cpp too**: the two
 engines agree to five significant figures on every layer sum and then both
 overflow to NaN at `l_out-5`. Chaos warns before generating and points at the
 container.
@@ -123,6 +125,7 @@ Re-run that way, one prompt each, greedy, on this 15.7 GiB machine:
 | Qwen3-14B | 8.38 GB | 1.03 | correct |
 | **gemma-3-27b** | **15.41 GB** | **0.05** | **correct** |
 | **Qwen3.6-27B** | **15.66 GB** | 0.02 | **WRONG** |
+| **V4-Flash** | **144 GB** | 0.176 | **correct** |
 
 **Eleven of twelve correct — and the twelfth is not this engine's fault.**
 The line worth keeping is gemma-3-27b: 15.41 GB of weights on a machine with
