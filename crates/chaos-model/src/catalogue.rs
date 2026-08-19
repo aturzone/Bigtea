@@ -439,6 +439,14 @@ pub const RUNNABLE_ARCHS: &[&str] = &[
 /// llama.cpp at three prompt lengths. Qwen3.6-27B declares the same
 /// architecture, has 64 blocks, exits 0 and generates nonsense.
 ///
+/// **And so does llama.cpp on the same file**, which is the part that decides
+/// what this warning should say. Measured on `Qwen3.6-27B-Q4_K_M` with the
+/// prompt "The capital of France is", greedy: Chaos returns
+/// `ทัน ทัน ทัน`, llama.cpp returns `333333`, and the two agree on
+/// every layer sum up to and including layer 5 -- where the residual reaches
+/// 1.009e6 in both and then goes NaN in both. So the fault is not in this
+/// engine, and the warning must not imply it is: it points at the container.
+///
 /// It lives here rather than beside the verified list because **three places ask
 /// this question**: `chaos-run`, `chaos-serve` and the app's model list. The app
 /// does not depend on the engine crate, and a second copy of this table is a
@@ -470,8 +478,10 @@ pub fn why_shape_is_unverified(arch: &str, n_layer: u32) -> Option<String> {
     let sizes: Vec<String> = known.iter().map(u32::to_string).collect();
     Some(format!(
         "{arch} was diffed against llama.cpp at {} blocks and this container has {n_layer}. \
-         The forward pass may be WRONG with no error anywhere -- on this architecture a \
-         64-block container is known to generate nonsense. Treat the output as unverified",
+         Answers may be WRONG with no error anywhere. The known 64-block container, \
+         Qwen3.6-27B-Q4_K_M, overflows to NaN at layer 5 -- in llama.cpp as well as here, \
+         from identical layer sums -- so a different quantisation of it is worth trying \
+         before this engine is suspected",
         sizes.join(" or "),
     ))
 }

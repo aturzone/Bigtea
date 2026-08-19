@@ -8,12 +8,19 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
-### Qwen3.6-27B loads, generates, and is wrong
+### Qwen3.6-27B loads, generates, and is wrong — in llama.cpp too
 
 Found while checking that every installed model runs. It exits 0 and prints
 `ทัน ทัน ทัน ทัน ทัน ทัน`. Qwen3.5-0.8B — the same architecture at 24 layers
 instead of 64 — is byte-identical to llama.cpp at three prompt lengths, so
 `qwen35` is verified on the shape it was diffed against and not on this one.
+
+**And llama.cpp fails on the same file.** Same container, same prompt, greedy:
+llama.cpp answers `333333`. The per-layer sums agree to five significant figures
+through layer 5 — `attn_residual-5` 1009342 against 1009345 — and then both go
+NaN at `l_out-5`. So the port is faithful and the fault is upstream: either this
+Unsloth quantisation or llama.cpp's own `qwen35` at 64 blocks. Chaos warns before
+generating and points at the container rather than at itself.
 
 The first sweep of all twelve models recorded "twelve of twelve" because every
 one exited 0 and the outputs were never read. That is this project's own

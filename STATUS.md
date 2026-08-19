@@ -113,19 +113,36 @@ Re-run that way, one prompt each, greedy, on this 15.7 GiB machine:
 | **gemma-3-27b** | **15.41 GB** | **0.05** | **correct** |
 | **Qwen3.6-27B** | **15.66 GB** | 0.02 | **WRONG** |
 
-**Eleven of twelve correct, and the twelfth is a bug rather than a limit.**
+**Eleven of twelve correct — and the twelfth is not this engine's fault.**
 The line worth keeping is gemma-3-27b: 15.41 GB of weights on a machine with
 ~7 GiB free, generating correct text at 0.05 tok/s. Nothing about that is fast
 and nothing about it is refused, which is the order Atur asked for — make it
 run, then make it quick. V4-Flash adds a thirteenth at 144 GB, answering through
 the server at 0.45 tok/s.
 
+**Qwen3.6-27B fails in llama.cpp too, and from identical numbers.** Same
+container, same prompt, greedy: Chaos returns `ทัน ทัน ทัน`, llama.cpp returns
+`333333`. Neither says Paris. The per-layer sums agree to five significant
+figures through layer 5 — `l_out-0` 59.1449 against 59.1446, `attn_residual-5`
+1009342 against 1009345 — and then **both** go NaN at `l_out-5`, where the
+residual has climbed three orders of magnitude above layer 4's 128.
+
+Agreement that exact, up to and including the failure, is the strongest evidence
+yet that the `qwen35` port is faithful — stronger than the 0.8B diff, because it
+reproduces a pathological case step for step. Ruled out by measurement: the
+container is complete (851/851 tensors), no f32 weight holds a NaN (all 449
+scanned), repacking, the key-head broadcast, the tokenizer, and every shape.
+What is left is this Unsloth Q4_K/Q5_K/Q6_K quantisation or llama.cpp's `qwen35`
+at 64 blocks — and one different quantisation of the same model separates them.
+[`backlog/qwen35-27b-is-wrong.md`](docs/graph/backlog/qwen35-27b-is-wrong.md).
+
 The failure is not "too big": gemma-3-27b is the same size and is right. It is
 `qwen35` at 64 blocks.
 
 `qwen35` is verified against llama.cpp **on Qwen3.5-0.8B**, byte-identical at
-three prompt lengths. It is not verified on Qwen3.6-27B, and the 27B is wrong.
-What has been ruled out by measurement, not reasoning:
+three prompt lengths. On Qwen3.6-27B it is not verified — and the measurement
+below shows llama.cpp fails there too, from the same numbers, so what is
+unverified is the container rather than the port. Ruled out by measurement:
 
 - **The key-head broadcast.** The 27B has 16 key heads and 48 value heads where
   the 0.8B has 16 and 16, so a missing broadcast would be invisible at 0.8B and
