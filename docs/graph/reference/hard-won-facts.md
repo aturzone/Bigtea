@@ -382,6 +382,25 @@ compiling**, and three of these were believed fixed before a pixel was measured.
   detail panel meant a directory scan per repaint, and the transcript repaints
   on every token. Count it once, in the rescan.
 
+## Releasing
+
+- **`git tag -a -F file` deletes every line beginning with `#`.** A tag message
+  defaults to `--cleanup=strip`, which removes comment lines, and the release
+  workflow builds the release body from the annotation with `--notes-from-tag`.
+  So Markdown `##` headings vanish and the release page becomes one wall of
+  text. Pass `--cleanup=verbatim`, and check with
+  `git tag -l --format='%(contents)'` on a throwaway tag before pushing the real
+  one — the page is public the moment the tag lands.
+- **Asset names are read by people scanning a release page.** One prefix, one
+  version format, platform and architecture on every file. The `.deb` is the
+  documented exception: Debian policy wants `name_version_arch.deb`, lower case
+  and no `v`, and an installer that will not install is not tidier.
+- **A glob in the release workflow outlives the name it was written for.** After
+  the archives were renamed `Chaos-*`, a `Get-ChildItem -Filter 'chaos-*'` in the
+  installer test would have matched nothing and indexed `[0]` on an empty array
+  — in the step that proves the installer works. Grep the workflow for the old
+  name whenever an artefact is renamed.
+
 ## The installer
 
 - **A running executable cannot delete the directory it lives in, and the
