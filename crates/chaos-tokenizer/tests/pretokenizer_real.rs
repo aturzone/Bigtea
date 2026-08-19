@@ -224,3 +224,34 @@ fn phi4_adds_no_bos() {
     assert_eq!(ids.len(), 11, "{ids:?}");
     assert_eq!(ids[0], 3923, "a BOS was prepended: {ids:?}");
 }
+
+fn qwen35() -> Option<Tokenizer> {
+    load(
+        "CHAOS_TEST_QWEN35",
+        r"C:\Users\atur\.chaos\models\Qwen3.5-0.8B-Q8_0.gguf",
+    )
+}
+
+/// Qwen3.5 / 3.6 / 3.8 all declare `tokenizer.ggml.pre = "qwen35"`.
+///
+/// Two differences from `llama3`, and the digit one is visible in the first
+/// case below: `\p{N}` rather than `\p{N}{1,3}`, so `4567` is four tokens where
+/// llama-bpe gives two. Every expectation is `llama-tokenize` on this container.
+#[test]
+fn qwen35_declares_its_own_rule_and_matches_llama_cpp() {
+    let Some(tk) = qwen35() else {
+        eprintln!("skipping: no Qwen3.5 container");
+        return;
+    };
+    assert_eq!(tk.pre_tokenizer(), PreTokenizer::Qwen35);
+    check(
+        &tk,
+        &[
+            ("The capital of France is", &[760, 6511, 314, 9338, 369]),
+            ("4567", &[19, 20, 21, 22]),
+            ("don't", &[14572, 914]),
+            ("Hello, world!", &[9419, 11, 1814, 0]),
+        ],
+        "qwen3.5 (qwen35)",
+    );
+}

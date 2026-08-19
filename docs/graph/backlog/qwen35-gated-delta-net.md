@@ -4,7 +4,36 @@
 > architecture. Atur has asked for this three times, so it is written down
 > properly rather than answered again with "not supported".
 
-**Status: the arithmetic is bound and tested; the layer wiring is not written.**
+**Status: the forward pass is implemented and diffed against llama.cpp on
+Qwen3.5-0.8B — all 24 layers, by value and by sum. One thing is left, and it is
+not in the model: `chaos-run`'s incremental printer drops most pieces on this
+vocabulary, so `qwen35` is still out of `RUNNABLE_ARCHS`.**
+
+The evidence, `CHAOS_DUMP_LAYERS=1` against `llama-eval-callback`:
+
+```
+l_out-0   llama -0.3452  chaos -0.345155   sums -4.384898 / -4.384897
+l_out-3   llama -0.2049  chaos -0.204932   the first attention layer
+l_out-23  llama  0.3155  chaos  0.315493   sums 26.697807 / 26.697754
+sampled ids: " Paris" "." "
+" "The" " capital" " of"  -- llama.cpp's exactly
+```
+
+**The sums are the check that matters.** The delta net is recurrent, so a state
+carried wrongly leaves token 0 perfect and every later token wrong; comparing
+first rows alone said the port was correct while the answer was garbage.
+
+Three config detections had to be narrowed, all found by the layer diff:
+`parallel_residual` (absence of `ffn_norm` is not "one norm" — `qwen35` calls its
+second norm `post_attention_norm`), `post_norms` (Gemma's are a *pair*), and
+`fused_qkv` (on `qwen35` `attn_qkv` is the delta net's input projection).
+
+Left to do: the streaming detokeniser, then `qwen35` joins `RUNNABLE_ARCHS`;
+`qwen35moe` stays out until a MoE container of the family is run.
+
+---
+
+**Original status: the arithmetic is bound and tested; the layer wiring is not written.**
 Everything below was measured from the containers Atur has (`Qwen3.6-27B-Q4_K_M`,
 16.8 GB) and from llama.cpp's own implementation, which exists and is the oracle.
 

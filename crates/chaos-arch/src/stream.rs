@@ -305,9 +305,52 @@ impl Drop for ReadPool {
 /// a gigabyte per token for bytes that never change.
 type ExpertSlices = HashMap<(String, u32), Arc<[u8]>>;
 
+/// The residual stream after one layer, for diffing against llama.cpp.
+///
+/// **A wrong forward pass here answers in fluent nonsense**, so the only way to
+/// find which layer went wrong is to compare layer by layer against
+/// `llama-eval-callback`, whose name for this tensor is `l_out-N`. Printed in
+/// the same three-then-three shape that tool uses, so the two can be read side
+/// by side. Off unless `CHAOS_DUMP_LAYERS` is set.
+fn dump_layer(il: u32, x: &[f32], n_embd: i64) {
+    dump_named("l_out", il, x, n_embd);
+}
+
+/// One named tensor's first and last three values of row 0.
+fn dump_named(name: &str, il: u32, x: &[f32], n_embd: i64) {
+    if std::env::var_os("CHAOS_DUMP_LAYERS").is_none() {
+        return;
+    }
+    let n = n_embd as usize;
+    if x.len() < n {
+        return;
+    }
+    let f = |v: &f32| format!("{v:>12.6}");
+    let head: Vec<String> = x.iter().take(3).map(f).collect();
+    let tail: Vec<String> = x[n - 3..n].iter().map(f).collect();
+    // **The sum over every token, not just row 0.** `llama-eval-callback`
+    // prints one too, and it is the check that matters here: the delta net is
+    // recurrent, so a state carried wrongly leaves token 0 perfect and every
+    // token after it wrong. Comparing first rows alone said the port was
+    // correct while the sampled token was still garbage.
+    let sum: f64 = x.iter().map(|v| f64::from(*v)).sum();
+    eprintln!(
+        "{name}-{il}  [{}, ..., {}]  sum = {sum:.6}",
+        head.join(", "),
+        tail.join(", ")
+    );
+}
+
 pub struct StreamingRunner<'m> {
     model: &'m Model,
     arch: Qwen3Model,
+    /// The carried state of every gated delta-net layer, for `qwen35`.
+    ///
+    /// **Beside the KV cache, not inside it.** A KV cache appends and never
+    /// revises; this state is a matrix per value head that is rewritten at
+    /// every token, and it does not grow with context. Empty for every other
+    /// architecture, which is all of them but one.
+    recurrent: crate::qwen35::RecurrentState,
     /// Cache of expert slices already read this session, keyed by
     /// (tensor name, expert index). Bounded, because an unbounded cache would
     /// silently become the thing we set out to avoid.
@@ -550,6 +593,7 @@ impl<'m> StreamingRunner<'m> {
             // disk rather than compete for CPU.
             pool: ReadPool::new(ModelPtr(model as *const Model), cores),
             model,
+            recurrent: crate::qwen35::RecurrentState::new(&config),
             arch: Qwen3Model::new(config),
             cache: HashMap::new(),
             cache_budget,
@@ -1977,6 +2021,88 @@ impl<'m> StreamingRunner<'m> {
         }
     }
 
+    /// One gated delta-net layer, start to finish.
+    ///
+    /// **A self-contained graph per layer, like every other phase here.** The
+    /// input, the convolution window and the carried state go in as inputs and
+    /// the output and both new states come back as vectors, which is the same
+    /// shape of handoff the attention phases use — so nothing about arenas,
+    /// device placement or the expert cache has to know this path exists.
+    ///
+    /// The state is stored before returning. That ordering matters: a caller
+    /// that failed between the read and the store would leave the layer one
+    /// token behind and every answer after it subtly wrong.
+    fn recurrent_layer(
+        &mut self,
+        weights: &WeightSet<'_>,
+        il: u32,
+        x: &[f32],
+        n_new: i64,
+        threads: usize,
+    ) -> Result<Vec<f32>> {
+        let c = self.arch.config.clone();
+        let s = c.ssm.ok_or_else(|| {
+            ArchError::MissingMetadata("qwen35.ssm.conv_kernel (not a hybrid model)".into())
+        })?;
+        let n_embd = c.n_embd as i64;
+        let conv_dim = i64::from(s.conv_dim());
+        let window = i64::from(s.conv_kernel) - 1;
+
+        let shapes = crate::qwen35::arena_shapes(&s, n_embd, n_new);
+        let ctx = Context::new(arena_for(&shapes, 32))?;
+
+        let xt = ctx.new_f32_2d(n_embd, n_new)?;
+        xt.set_input();
+        let conv_in = ctx.new_f32_3d(window, conv_dim, 1)?;
+        conv_in.set_input();
+        let state_in = ctx.new_f32_1d(s.recurrent_state_len() as i64)?;
+        state_in.set_input();
+
+        let normed = self
+            .arch
+            .norm_named(&ctx, weights, &xt, &format!("blk.{il}.attn_norm"))?;
+        let inp = crate::qwen35::Inputs {
+            x: normed,
+            conv: conv_in,
+            state: state_in,
+        };
+        let o = crate::qwen35::layer(&ctx, weights, &c, il, &inp)?;
+
+        xt.set_f32(x)?;
+        conv_in.set_f32(self.recurrent.conv(il))?;
+        state_in.set_f32(self.recurrent.ssm(il))?;
+        // All three in one call: `compute` re-evaluates the whole ancestor
+        // graph, so computing them one at a time would run the layer three
+        // times over.
+        if std::env::var_os("CHAOS_DUMP_LAYERS").is_some() {
+            // `o.out` included, or it is read before it is computed and the
+            // dump reports a tensor of zeros -- which reads exactly like a
+            // layer contributing nothing, and cost a wrong diagnosis once.
+            ctx.compute_many(&[&o.qkv_mixed, &o.conv_raw, &o.scores, &o.out], threads)?;
+            for (name, v) in [
+                ("linear_attn_qkv_mixed", o.qkv_mixed.to_vec_f32()),
+                ("conv_output_raw", o.conv_raw.to_vec_f32()),
+                ("attn_output", o.scores.to_vec_f32()),
+                ("linear_attn_out", o.out.to_vec_f32()),
+            ] {
+                let f = |x: &f32| format!("{x:>12.6}");
+                let head: Vec<String> = v.iter().take(3).map(f).collect();
+                let tail: Vec<String> = v[v.len() - 3..].iter().map(f).collect();
+                eprintln!(
+                    "  {name}-{il}  [{}, ..., {}]",
+                    head.join(", "),
+                    tail.join(", ")
+                );
+            }
+        }
+        ctx.compute_many(&[&o.out, &o.conv, &o.state], threads)?;
+
+        let out = o.out.to_vec_f32();
+        self.recurrent
+            .store(il, o.conv.to_vec_f32(), o.state.to_vec_f32());
+        Ok(out)
+    }
+
     fn forward_cached_inner<'a>(
         &mut self,
         weights: &WeightSet<'a>,
@@ -2121,299 +2247,447 @@ impl<'m> StreamingRunner<'m> {
                 );
             }
             // Phase 1: Q, K and V for the new positions only.
-            let (q_v, k_v, v_v, residual, qkv_secs) = {
-                // Was a fixed 256 MiB, which aborted at a 4096-token block:
-                // ggml asked for 318,787,536 bytes and got told 268,435,456.
-                // Every arena in this function has to scale with the block.
-                let cmp = Self::target(
-                    sched,
-                    Self::layer_device_at(device, &placement, gpu_layers, il as usize),
-                    threads,
-                );
-                let ctx = cmp.context(arena_for(
+            // **Three quarters of a `qwen35` stack is not attention.** A
+            // recurrent layer needs only its own input and its carried state,
+            // and it produces the same thing attention does -- something to add
+            // to the residual -- so it replaces both phases below rather than
+            // threading through them. Everything after this point in the loop
+            // is the feed-forward, which is identical either way.
+            let (attn_out, residual) = if c.is_recurrent(il) {
+                let t = std::time::Instant::now();
+                let out = self.recurrent_layer(weights, il, &x, n_new, threads)?;
+                // Counted as attention time because that is the slot it fills;
+                // calling it something else would make the phase breakdown stop
+                // summing to the total.
+                self.stats.attn_seconds += t.elapsed().as_secs_f64();
+                (out, x.clone())
+            } else {
+                let (q_v, k_v, v_v, residual, qkv_secs, gate_v) = {
+                    // Was a fixed 256 MiB, which aborted at a 4096-token block:
+                    // ggml asked for 318,787,536 bytes and got told 268,435,456.
+                    // Every arena in this function has to scale with the block.
+                    let cmp = Self::target(
+                        sched,
+                        Self::layer_device_at(device, &placement, gpu_layers, il as usize),
+                        threads,
+                    );
+                    let ctx = cmp.context(arena_for(
+                        &[
+                            (n_embd, n_new),                     // input activations
+                            (n_embd, n_new),                     // normalised
+                            (n_embd, n_new),                     // rms intermediate
+                            (c.n_head as i64 * head_dim, n_new), // q
+                            (n_kv * head_dim, n_new),            // k
+                            (n_kv * head_dim, n_new),            // v
+                            (c.n_head as i64 * head_dim, n_new), // q normalised
+                            (n_kv * head_dim, n_new),            // k normalised
+                            (c.n_head as i64 * head_dim, n_new), // q roped
+                            (n_kv * head_dim, n_new),            // k roped
+                            // The bias adds produce three more of the same shapes.
+                            // Unlisted, they are covered only by `arena_for`'s
+                            // doubling, which is how three arenas in this file were
+                            // found short already.
+                            (c.n_head as i64 * head_dim, n_new),
+                            (n_kv * head_dim, n_new),
+                            (n_kv * head_dim, n_new),
+                        ],
+                        32,
+                    ))?;
+                    let xt = ctx.new_f32_2d(n_embd, n_new)?;
+                    xt.set_input();
+                    let xt_values = x.clone();
+                    // **mRoPE wants four position values per token, not one.**
+                    // ggml asserts `a->ne[2] * 4 == b->ne[0]` and aborts the
+                    // process when it does not hold. The four are the temporal and
+                    // spatial axes of an image; for text they are all the same
+                    // number, which is what llama.cpp does too -- it copies section
+                    // 0 over the other three.
+                    let pos_per_token = if c.rope_sections.is_some() { 4 } else { 1 };
+                    let pos = ctx.new_i32_1d(n_new * pos_per_token)?;
+                    pos.set_input();
+                    // Written after `realize`, with `xt`, and NOT here. On a device
+                    // this tensor has no memory until the context is realized, and
+                    // writing early is a segfault rather than an error -- which is
+                    // exactly what it was, at layer 0, right after the embedding.
+
+                    let normed =
+                        self.arch
+                            .norm_named(&ctx, weights, &xt, &format!("blk.{il}.attn_norm"))?;
+                    let (qw, kw, vw) = self.arch.qkv_weights(&ctx, weights, il)?;
+                    let q = ctx.mul_mat(&qw, &normed)?;
+                    let k = ctx.mul_mat(&kw, &normed)?;
+                    let v = ctx.mul_mat(&vw, &normed)?;
+                    // Qwen2 carries a bias on each projection; Qwen3 does not.
+                    // ggml broadcasts a `[n, 1]` addend across the columns, so the
+                    // same vector applies to every position in the block.
+                    let (q, k, v) = if c.attn_bias {
+                        (
+                            ctx.add(&q, &get(weights, format!("blk.{il}.attn_q.bias"))?)?,
+                            ctx.add(&k, &get(weights, format!("blk.{il}.attn_k.bias"))?)?,
+                            ctx.add(&v, &get(weights, format!("blk.{il}.attn_v.bias"))?)?,
+                        )
+                    } else {
+                        (q, k, v)
+                    };
+                    // MPT, DBRX and OLMo declare `attention.clamp_kqv`, and
+                    // llama.cpp clamps here — after the bias, before the reshape.
+                    // Order matters: clamping before the bias would bound a
+                    // different quantity. The OLMo-1B container declares 0.0, so
+                    // this branch is written against the reference's code rather
+                    // than exercised by a run.
+                    let (q, k, v) = if c.clamp_kqv > 0.0 {
+                        let (lo, hi) = (-c.clamp_kqv, c.clamp_kqv);
+                        (
+                            ctx.clamp(&q, lo, hi)?,
+                            ctx.clamp(&k, lo, hi)?,
+                            ctx.clamp(&v, lo, hi)?,
+                        )
+                    } else {
+                        (q, k, v)
+                    };
+
+                    // **Qwen3.5 projects the query and an output gate in one
+                    // matmul, interleaved per head**: head 0's query, head 0's
+                    // gate, head 1's query, and so on. Reading the tensor as a
+                    // plain query takes half of each pair; reading it as two
+                    // contiguous halves takes the queries of the first heads and
+                    // the gates of the last. Both are silent. Hence a strided view
+                    // at twice the head stride, and the gate is the same view one
+                    // head-width along.
+                    let head_stride = 4 * (head_dim * 2) as usize;
+                    let token_stride = head_stride * c.n_head as usize;
+                    let gate = if c.fused_q_gate {
+                        let g = ctx.view_3d(
+                            &q,
+                            head_dim,
+                            c.n_head as i64,
+                            n_new,
+                            head_stride,
+                            token_stride,
+                            4 * head_dim as usize,
+                        )?;
+                        Some(ctx.cont(&g)?)
+                    } else {
+                        None
+                    };
+                    let q = if c.fused_q_gate {
+                        ctx.view_3d(
+                            &q,
+                            head_dim,
+                            c.n_head as i64,
+                            n_new,
+                            head_stride,
+                            token_stride,
+                            0,
+                        )?
+                    } else {
+                        ctx.reshape_3d(&q, head_dim, c.n_head as i64, n_new)?
+                    };
+                    let k = ctx.reshape_3d(&k, head_dim, n_kv, n_new)?;
+                    // Qwen3 normalises each head before RoPE; llama, mistral,
+                    // qwen2, gemma and phi have no such tensors at all, so asking
+                    // for them refuses those containers outright.
+                    let (q, k) = if c.qk_norm {
+                        (
+                            self.arch.norm_scaled(
+                                &ctx,
+                                &q,
+                                &get(weights, format!("blk.{il}.attn_q_norm.weight"))?,
+                            )?,
+                            self.arch.norm_scaled(
+                                &ctx,
+                                &k,
+                                &get(weights, format!("blk.{il}.attn_k_norm.weight"))?,
+                            )?,
+                        )
+                    } else {
+                        (q, k)
+                    };
+
+                    // Per layer, not per model: Gemma-3's windowed layers are
+                    // trained at a different RoPE base from its global ones.
+                    let rp = self.rope_for(il);
+                    // NORM for llama/mistral, NeoX for qwen/phi/gemma. Both run
+                    // without error on either layout and the wrong one is fluent
+                    // nonsense, so it comes from the config rather than a constant.
+                    let rope_type = c.rope_type;
+                    // `n_rot`, not `head_dim`: StableLM rotates 16 of its 64 and
+                    // leaves the rest alone. Rotating all of them is not an error.
+                    let n_rot = c.n_rot as i32;
+                    // **Llama-3.1/3.2/3.3 ship their RoPE scaling as a tensor.**
+                    // `rope_freqs.weight` is `n_rot/2` divisors, one per frequency,
+                    // and `ggml_rope_ext` takes it where this used to pass `None`.
+                    // Without it the low frequencies rotate as though the model had
+                    // never been extended: short prompts still agree, longer ones
+                    // drift, and on Llama-3.2-1B four of eight parity prompts read
+                    // as "the reference disagrees with itself" while a fifth was a
+                    // clean FAIL. Nothing in the metadata announces it — llama.cpp
+                    // logs `create_tensor: loading tensor rope_freqs.weight` and
+                    // that line is the only sign.
+                    // The device copy when this block runs on the device, the
+                    // host one otherwise. `or_else` covers the all-device case,
+                    // where the original IS the device copy and no duplicate was
+                    // made.
+                    let freqs =
+                        if Self::layer_device_at(device, &placement, gpu_layers, il as usize)
+                            .is_some()
+                        {
+                            weights
+                                .get(SHARED_ROPE_DEVICE)
+                                .or_else(|| weights.get(SHARED_ROPE))
+                        } else {
+                            weights.get(SHARED_ROPE)
+                        };
+                    // **mRoPE is a different rotation, not a variant of the
+                    // same one.** The four sections decide which dimension pairs
+                    // rotate together, and a text-only prompt goes through it just
+                    // the same -- `rope_ext` would run without error and rotate the
+                    // wrong pairs. `ggml.h` says so outright: "for MROPE and VISION
+                    // mode, use ggml_rope_multi".
+                    let (q, k) = match c.rope_sections {
+                        Some(sections) => (
+                            ctx.rope_multi(
+                                &q,
+                                &pos,
+                                n_rot,
+                                sections,
+                                rope_type,
+                                c.rope_orig_ctx as i32,
+                                rp.freq_base,
+                                rp.freq_scale,
+                            )?,
+                            ctx.rope_multi(
+                                &k,
+                                &pos,
+                                n_rot,
+                                sections,
+                                rope_type,
+                                c.rope_orig_ctx as i32,
+                                rp.freq_base,
+                                rp.freq_scale,
+                            )?,
+                        ),
+                        None => (
+                            ctx.rope_ext(&q, &pos, freqs, n_rot, rope_type, 0, rp)?,
+                            ctx.rope_ext(&k, &pos, freqs, n_rot, rope_type, 0, rp)?,
+                        ),
+                    };
+
+                    // One compute materialises all three, which is what the comment
+                    // here claimed while the code called `compute` once per tensor.
+                    // `compute` re-evaluates the whole ancestor graph, so that ran
+                    // the shared normalisation three times and paid three graph
+                    // builds and three threadpool cycles — and at one token those
+                    // fixed costs dominate, because the matmuls are matrix-vector
+                    // products and tiny.
+                    let t = std::time::Instant::now();
+                    // After the graph, before the inputs.
+                    let _dev = cmp.realize_graph(&ctx, &[&q, &k, &v])?;
+                    cmp.set_f32(&xt, &xt_values)?;
+                    if pos_per_token == 4 {
+                        let mut four = Vec::with_capacity(positions.len() * 4);
+                        for _ in 0..4 {
+                            four.extend_from_slice(&positions);
+                        }
+                        cmp.set_i32(&pos, &four)?;
+                    } else {
+                        cmp.set_i32(&pos, &positions)?;
+                    }
+                    cmp.run(&ctx, &[&q, &k, &v])?;
+                    if trace {
+                        eprintln!("TRACE: qkv ok (layer)");
+                    }
+                    // Carried out of the block rather than added here: `cmp`
+                    // borrows `self` for as long as it lives, so the stats write
+                    // has to happen after it is dropped.
+                    if std::env::var_os("CHAOS_DUMP_LAYERS").is_some() {
+                        let width = head_dim * c.n_head as i64;
+                        cmp.run(&ctx, &[&q])?;
+                        dump_named("Qcur_final", il, &cmp.to_vec_f32(&q)?, width);
+                        if let Some(g) = gate.as_ref() {
+                            cmp.run(&ctx, &[g])?;
+                            dump_named("gate_reshaped", il, &cmp.to_vec_f32(g)?, width);
+                        }
+                    }
+                    let qkv_secs = t.elapsed().as_secs_f64();
+                    (
+                        cmp.to_vec_f32(&q)?,
+                        cmp.to_vec_f32(&k)?,
+                        cmp.to_vec_f32(&v)?,
+                        x.clone(),
+                        qkv_secs,
+                        // Carried across as a vector, like q, k and v: the
+                        // attention phase builds its own graph in its own arena and
+                        // cannot reach a tensor from this one.
+                        match gate.as_ref() {
+                            Some(g) => Some(cmp.to_vec_f32(g)?),
+                            None => None,
+                        },
+                    )
+                };
+                self.stats.qkv_seconds += qkv_secs;
+
+                // K and V for these positions never change again, so store them.
+                for t in 0..tokens.len() {
+                    let lo = t * kv_width;
+                    cache.push(
+                        il as usize,
+                        &k_v[lo..lo + kv_width],
+                        &v_v[lo..lo + kv_width],
+                    )?;
+                }
+
+                // Phase 2: attend over the whole history, not just the new part.
+                let n_total = (cache.len() + tokens.len()) as i64;
+                // The scores and their softmax dominate: n_total * n_new * n_head
+                // floats each. At 4395 tokens with a 512-token block that pair is
+                // ~576 MiB, so the arena runs past a gigabyte — and it was being
+                // allocated and first-touched afresh for every layer of every
+                // block, 432 times over a single prompt. Reuse one buffer.
+                // The fused kernel never builds the scores or their softmax, which
+                // were 288 MiB each at 4395 tokens and dominated this arena. What
+                // remains is Q, K, V, the mask and the output — about 100 MiB where
+                // the explicit path needed 1.3 GiB.
+                let n_head = c.n_head as i64;
+                // Every tensor here is one `ggml` allocation, and three were
+                // missing: the Q the caller sets, and the K and V read out of the
+                // cache — only their *permuted contiguous* copies were counted.
+                // `arena_for` doubles the total, which hid it until `n_total` grew
+                // enough for the K/V terms to dominate: Gemma-2 at 5201 tokens
+                // asked for 56,624,208 bytes and had 54,532,608. **3.8% short is
+                // still an abort** — ggml calls `GGML_ASSERT` and the process dies.
+                let need = arena_for(
                     &[
-                        (n_embd, n_new),                     // input activations
-                        (n_embd, n_new),                     // normalised
-                        (n_embd, n_new),                     // rms intermediate
-                        (c.n_head as i64 * head_dim, n_new), // q
-                        (n_kv * head_dim, n_new),            // k
-                        (n_kv * head_dim, n_new),            // v
-                        (c.n_head as i64 * head_dim, n_new), // q normalised
-                        (n_kv * head_dim, n_new),            // k normalised
-                        (c.n_head as i64 * head_dim, n_new), // q roped
-                        (n_kv * head_dim, n_new),            // k roped
-                        // The bias adds produce three more of the same shapes.
-                        // Unlisted, they are covered only by `arena_for`'s
-                        // doubling, which is how three arenas in this file were
-                        // found short already.
-                        (c.n_head as i64 * head_dim, n_new),
-                        (n_kv * head_dim, n_new),
-                        (n_kv * head_dim, n_new),
+                        (head_dim * n_head, n_new), // q, as set from the caller
+                        (head_dim * n_head, n_new), // q, permuted and contiguous
+                        (head_dim * n_head, n_new), // q, pre-scaled (Gemma only)
+                        (head_dim * n_kv, n_total), // k from the cache (F16, over-counted)
+                        (head_dim * n_kv, n_total), // k, permuted and contiguous
+                        (head_dim * n_kv, n_total), // v from the cache (F16, over-counted)
+                        (head_dim * n_kv, n_total), // v, permuted and contiguous
+                        (n_total, n_new),           // causal mask (F16, so over-counted)
+                        (head_dim * n_new, n_head), // attention output
+                        (head_dim * n_new, n_head), // ...made contiguous
+                        (n_embd, n_new),            // output projection
                     ],
                     32,
-                ))?;
-                let xt = ctx.new_f32_2d(n_embd, n_new)?;
-                xt.set_input();
-                let xt_values = x.clone();
-                let pos = ctx.new_i32_1d(n_new)?;
-                pos.set_input();
-                // Written after `realize`, with `xt`, and NOT here. On a device
-                // this tensor has no memory until the context is realized, and
-                // writing early is a segfault rather than an error -- which is
-                // exactly what it was, at layer 0, right after the embedding.
-
-                let normed =
-                    self.arch
-                        .norm_named(&ctx, weights, &xt, &format!("blk.{il}.attn_norm"))?;
-                let (qw, kw, vw) = self.arch.qkv_weights(&ctx, weights, il)?;
-                let q = ctx.mul_mat(&qw, &normed)?;
-                let k = ctx.mul_mat(&kw, &normed)?;
-                let v = ctx.mul_mat(&vw, &normed)?;
-                // Qwen2 carries a bias on each projection; Qwen3 does not.
-                // ggml broadcasts a `[n, 1]` addend across the columns, so the
-                // same vector applies to every position in the block.
-                let (q, k, v) = if c.attn_bias {
-                    (
-                        ctx.add(&q, &get(weights, format!("blk.{il}.attn_q.bias"))?)?,
-                        ctx.add(&k, &get(weights, format!("blk.{il}.attn_k.bias"))?)?,
-                        ctx.add(&v, &get(weights, format!("blk.{il}.attn_v.bias"))?)?,
-                    )
-                } else {
-                    (q, k, v)
-                };
-                // MPT, DBRX and OLMo declare `attention.clamp_kqv`, and
-                // llama.cpp clamps here — after the bias, before the reshape.
-                // Order matters: clamping before the bias would bound a
-                // different quantity. The OLMo-1B container declares 0.0, so
-                // this branch is written against the reference's code rather
-                // than exercised by a run.
-                let (q, k, v) = if c.clamp_kqv > 0.0 {
-                    let (lo, hi) = (-c.clamp_kqv, c.clamp_kqv);
-                    (
-                        ctx.clamp(&q, lo, hi)?,
-                        ctx.clamp(&k, lo, hi)?,
-                        ctx.clamp(&v, lo, hi)?,
-                    )
-                } else {
-                    (q, k, v)
-                };
-
-                let q = ctx.reshape_3d(&q, head_dim, c.n_head as i64, n_new)?;
-                let k = ctx.reshape_3d(&k, head_dim, n_kv, n_new)?;
-                // Qwen3 normalises each head before RoPE; llama, mistral,
-                // qwen2, gemma and phi have no such tensors at all, so asking
-                // for them refuses those containers outright.
-                let (q, k) = if c.qk_norm {
-                    (
-                        self.arch.norm_scaled(
-                            &ctx,
-                            &q,
-                            &get(weights, format!("blk.{il}.attn_q_norm.weight"))?,
-                        )?,
-                        self.arch.norm_scaled(
-                            &ctx,
-                            &k,
-                            &get(weights, format!("blk.{il}.attn_k_norm.weight"))?,
-                        )?,
-                    )
-                } else {
-                    (q, k)
-                };
-
-                // Per layer, not per model: Gemma-3's windowed layers are
-                // trained at a different RoPE base from its global ones.
-                let rp = self.rope_for(il);
-                // NORM for llama/mistral, NeoX for qwen/phi/gemma. Both run
-                // without error on either layout and the wrong one is fluent
-                // nonsense, so it comes from the config rather than a constant.
-                let rope_type = c.rope_type;
-                // `n_rot`, not `head_dim`: StableLM rotates 16 of its 64 and
-                // leaves the rest alone. Rotating all of them is not an error.
-                let n_rot = c.n_rot as i32;
-                // **Llama-3.1/3.2/3.3 ship their RoPE scaling as a tensor.**
-                // `rope_freqs.weight` is `n_rot/2` divisors, one per frequency,
-                // and `ggml_rope_ext` takes it where this used to pass `None`.
-                // Without it the low frequencies rotate as though the model had
-                // never been extended: short prompts still agree, longer ones
-                // drift, and on Llama-3.2-1B four of eight parity prompts read
-                // as "the reference disagrees with itself" while a fifth was a
-                // clean FAIL. Nothing in the metadata announces it — llama.cpp
-                // logs `create_tensor: loading tensor rope_freqs.weight` and
-                // that line is the only sign.
-                // The device copy when this block runs on the device, the
-                // host one otherwise. `or_else` covers the all-device case,
-                // where the original IS the device copy and no duplicate was
-                // made.
-                let freqs = if Self::layer_device_at(device, &placement, gpu_layers, il as usize)
-                    .is_some()
-                {
-                    weights
-                        .get(SHARED_ROPE_DEVICE)
-                        .or_else(|| weights.get(SHARED_ROPE))
-                } else {
-                    weights.get(SHARED_ROPE)
-                };
-                let q = ctx.rope_ext(&q, &pos, freqs, n_rot, rope_type, 0, rp)?;
-                let k = ctx.rope_ext(&k, &pos, freqs, n_rot, rope_type, 0, rp)?;
-
-                // One compute materialises all three, which is what the comment
-                // here claimed while the code called `compute` once per tensor.
-                // `compute` re-evaluates the whole ancestor graph, so that ran
-                // the shared normalisation three times and paid three graph
-                // builds and three threadpool cycles — and at one token those
-                // fixed costs dominate, because the matmuls are matrix-vector
-                // products and tiny.
-                let t = std::time::Instant::now();
-                // After the graph, before the inputs.
-                let _dev = cmp.realize_graph(&ctx, &[&q, &k, &v])?;
-                cmp.set_f32(&xt, &xt_values)?;
-                cmp.set_i32(&pos, &positions)?;
-                cmp.run(&ctx, &[&q, &k, &v])?;
-                if trace {
-                    eprintln!("TRACE: qkv ok (layer)");
-                }
-                // Carried out of the block rather than added here: `cmp`
-                // borrows `self` for as long as it lives, so the stats write
-                // has to happen after it is dropped.
-                let qkv_secs = t.elapsed().as_secs_f64();
-                (
-                    cmp.to_vec_f32(&q)?,
-                    cmp.to_vec_f32(&k)?,
-                    cmp.to_vec_f32(&v)?,
-                    x.clone(),
-                    qkv_secs,
-                )
-            };
-            self.stats.qkv_seconds += qkv_secs;
-
-            // K and V for these positions never change again, so store them.
-            for t in 0..tokens.len() {
-                let lo = t * kv_width;
-                cache.push(
-                    il as usize,
-                    &k_v[lo..lo + kv_width],
-                    &v_v[lo..lo + kv_width],
-                )?;
-            }
-
-            // Phase 2: attend over the whole history, not just the new part.
-            let n_total = (cache.len() + tokens.len()) as i64;
-            // The scores and their softmax dominate: n_total * n_new * n_head
-            // floats each. At 4395 tokens with a 512-token block that pair is
-            // ~576 MiB, so the arena runs past a gigabyte — and it was being
-            // allocated and first-touched afresh for every layer of every
-            // block, 432 times over a single prompt. Reuse one buffer.
-            // The fused kernel never builds the scores or their softmax, which
-            // were 288 MiB each at 4395 tokens and dominated this arena. What
-            // remains is Q, K, V, the mask and the output — about 100 MiB where
-            // the explicit path needed 1.3 GiB.
-            let n_head = c.n_head as i64;
-            // Every tensor here is one `ggml` allocation, and three were
-            // missing: the Q the caller sets, and the K and V read out of the
-            // cache — only their *permuted contiguous* copies were counted.
-            // `arena_for` doubles the total, which hid it until `n_total` grew
-            // enough for the K/V terms to dominate: Gemma-2 at 5201 tokens
-            // asked for 56,624,208 bytes and had 54,532,608. **3.8% short is
-            // still an abort** — ggml calls `GGML_ASSERT` and the process dies.
-            let need = arena_for(
-                &[
-                    (head_dim * n_head, n_new), // q, as set from the caller
-                    (head_dim * n_head, n_new), // q, permuted and contiguous
-                    (head_dim * n_head, n_new), // q, pre-scaled (Gemma only)
-                    (head_dim * n_kv, n_total), // k from the cache (F16, over-counted)
-                    (head_dim * n_kv, n_total), // k, permuted and contiguous
-                    (head_dim * n_kv, n_total), // v from the cache (F16, over-counted)
-                    (head_dim * n_kv, n_total), // v, permuted and contiguous
-                    (n_total, n_new),           // causal mask (F16, so over-counted)
-                    (head_dim * n_new, n_head), // attention output
-                    (head_dim * n_new, n_head), // ...made contiguous
-                    (n_embd, n_new),            // output projection
-                ],
-                32,
-            );
-            let mut buf = std::mem::take(&mut self.scratch);
-            if buf.len() < need {
-                buf.resize(need, 0);
-            }
-            let arch = &self.arch;
-            let out_w = get(weights, format!("blk.{il}.attn_output.weight"))?;
-            // Even layers slide, odd layers see everything — Gemma-2's pattern,
-            // and it starts with the window. Reversing it is not an error and
-            // not a crash; it is a model that answers slightly wrongly, so the
-            // ordering is checked against llama.cpp's output rather than
-            // reasoned about.
-            let layer_mask = match swa_mask.as_ref() {
-                Some(swa) if c.is_swa_layer(il) => swa,
-                _ => &mask,
-            };
-            let attn_result = (|| -> Result<(Vec<f32>, f64, f64)> {
-                // SAFETY: `buf` is a local outliving `ctx`, and no other context
-                // is live on it — the Q/K/V context above was dropped and its
-                // results copied out before this point.
-                let cmp = Self::target(
-                    sched,
-                    Self::layer_device_at(device, &placement, gpu_layers, il as usize),
-                    threads,
                 );
-                // The scratch buffer holds tensor METADATA on both paths. What
-                // differs is whether tensor DATA also comes from it: on a
-                // device it must not, or the graph would compute over host
-                // addresses the card cannot reach — the access violation the
-                // mixed-residency test recorded.
-                let ctx = unsafe { cmp.context_in_buffer(&mut buf)? };
-                let q = ctx.new_f32_3d(head_dim, n_head, n_new)?;
-                q.set_input();
-
-                // Whatever the cache stores, handed over unchanged — no
-                // conversion on this path at all. ggml's fused attention
-                // dispatches K through its type's `vec_dot` and V through its
-                // `to_float`, so a quantised cache needs no special case here;
-                // a type with neither would abort, which is why `KvType` is a
-                // closed set rather than an arbitrary id.
-                let tkv = std::time::Instant::now();
-                let kv_ty = chaos_gguf::GgmlType(cache.kind().ggml_type());
-                // Named rather than inlined so the INPUT flag lands on the base
-                // tensor: a reshape is a view, and flagging the view leaves the
-                // thing the scheduler must actually place unmarked.
-                let k_base = ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?;
-                k_base.set_input();
-                let k_all = ctx.reshape_3d(&k_base, head_dim, n_kv, n_total)?;
-                let k_bytes = cache.keys(il as usize);
-                let v_base = ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?;
-                v_base.set_input();
-                let v_all = ctx.reshape_3d(&v_base, head_dim, n_kv, n_total)?;
-                let v_bytes = cache.values(il as usize);
-                let kv_secs = tkv.elapsed().as_secs_f64();
-
-                // The mask tensor comes back unwritten: it has no device memory
-                // until this context is realized, which cannot happen until the
-                // graph is complete.
-                let (attn, mask_t) =
-                    arch.attention_flash(&ctx, &q, &k_all, &v_all, n_new, n_total, layer_mask)?;
-                // The builder creates the mask and returns it unwritten, so the
-                // flag is set here rather than inside every architecture.
-                mask_t.set_input();
-                let out = ctx.mul_mat(&out_w, &attn)?;
-                // StarCoder2 carries a bias here; most architectures do not.
-                let out =
-                    self.arch
-                        .add_bias(&ctx, weights, out, &format!("blk.{il}.attn_output"))?;
-                let t = std::time::Instant::now();
-                let _dev = cmp.realize_graph(&ctx, &[&out])?;
-                cmp.set_f32(&q, &q_v)?;
-                cmp.set_bytes(&k_all, k_bytes)?;
-                cmp.set_bytes(&v_all, v_bytes)?;
-                cmp.set_bytes(&mask_t, layer_mask)?;
-                cmp.run(&ctx, &[&out])?;
-                if trace {
-                    eprintln!("TRACE: attention ok (layer)");
+                let mut buf = std::mem::take(&mut self.scratch);
+                if buf.len() < need {
+                    buf.resize(need, 0);
                 }
-                Ok((cmp.to_vec_f32(&out)?, kv_secs, t.elapsed().as_secs_f64()))
-            })();
-            self.scratch = buf;
-            let (attn_out, kv_secs, attn_secs) = attn_result?;
-            self.stats.kv_build_seconds += kv_secs;
-            self.stats.attn_seconds += attn_secs;
+                let arch = &self.arch;
+                let out_w = get(weights, format!("blk.{il}.attn_output.weight"))?;
+                // Even layers slide, odd layers see everything — Gemma-2's pattern,
+                // and it starts with the window. Reversing it is not an error and
+                // not a crash; it is a model that answers slightly wrongly, so the
+                // ordering is checked against llama.cpp's output rather than
+                // reasoned about.
+                let layer_mask = match swa_mask.as_ref() {
+                    Some(swa) if c.is_swa_layer(il) => swa,
+                    _ => &mask,
+                };
+                let attn_result = (|| -> Result<(Vec<f32>, f64, f64)> {
+                    // SAFETY: `buf` is a local outliving `ctx`, and no other context
+                    // is live on it — the Q/K/V context above was dropped and its
+                    // results copied out before this point.
+                    let cmp = Self::target(
+                        sched,
+                        Self::layer_device_at(device, &placement, gpu_layers, il as usize),
+                        threads,
+                    );
+                    // The scratch buffer holds tensor METADATA on both paths. What
+                    // differs is whether tensor DATA also comes from it: on a
+                    // device it must not, or the graph would compute over host
+                    // addresses the card cannot reach — the access violation the
+                    // mixed-residency test recorded.
+                    let ctx = unsafe { cmp.context_in_buffer(&mut buf)? };
+                    let q = ctx.new_f32_3d(head_dim, n_head, n_new)?;
+                    q.set_input();
+
+                    // Whatever the cache stores, handed over unchanged — no
+                    // conversion on this path at all. ggml's fused attention
+                    // dispatches K through its type's `vec_dot` and V through its
+                    // `to_float`, so a quantised cache needs no special case here;
+                    // a type with neither would abort, which is why `KvType` is a
+                    // closed set rather than an arbitrary id.
+                    let tkv = std::time::Instant::now();
+                    let kv_ty = chaos_gguf::GgmlType(cache.kind().ggml_type());
+                    // Named rather than inlined so the INPUT flag lands on the base
+                    // tensor: a reshape is a view, and flagging the view leaves the
+                    // thing the scheduler must actually place unmarked.
+                    let k_base = ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?;
+                    k_base.set_input();
+                    let k_all = ctx.reshape_3d(&k_base, head_dim, n_kv, n_total)?;
+                    let k_bytes = cache.keys(il as usize);
+                    let v_base = ctx.new_typed_2d(kv_ty, head_dim, n_kv * n_total)?;
+                    v_base.set_input();
+                    let v_all = ctx.reshape_3d(&v_base, head_dim, n_kv, n_total)?;
+                    let v_bytes = cache.values(il as usize);
+                    let kv_secs = tkv.elapsed().as_secs_f64();
+
+                    // The mask tensor comes back unwritten: it has no device memory
+                    // until this context is realized, which cannot happen until the
+                    // graph is complete.
+                    let (attn, mask_t) =
+                        arch.attention_flash(&ctx, &q, &k_all, &v_all, n_new, n_total, layer_mask)?;
+                    // The builder creates the mask and returns it unwritten, so the
+                    // flag is set here rather than inside every architecture.
+                    mask_t.set_input();
+                    // **Qwen3.5 gates the attention output before projecting it**:
+                    // `attn * sigmoid(gate)`, with the gate coming from the second
+                    // half of each head's slice of `attn_q`. Skipping it leaves
+                    // every value un-attenuated -- which is not an error and not a
+                    // crash, just a model that has lost one of its two mixing
+                    // mechanisms.
+                    let gate_t = match gate_v.as_ref() {
+                        Some(_) => {
+                            let g = ctx.new_f32_2d(head_dim * c.n_head as i64, n_new)?;
+                            g.set_input();
+                            Some(g)
+                        }
+                        None => None,
+                    };
+                    let attn = match gate_t.as_ref() {
+                        Some(g) => ctx.mul(&attn, &ctx.sigmoid(g)?)?,
+                        None => attn,
+                    };
+                    let out = ctx.mul_mat(&out_w, &attn)?;
+                    // StarCoder2 carries a bias here; most architectures do not.
+                    let out =
+                        self.arch
+                            .add_bias(&ctx, weights, out, &format!("blk.{il}.attn_output"))?;
+                    let dump_attn = std::env::var_os("CHAOS_DUMP_LAYERS").is_some();
+                    let t = std::time::Instant::now();
+                    let _dev = cmp.realize_graph(&ctx, &[&out])?;
+                    cmp.set_f32(&q, &q_v)?;
+                    if let (Some(g), Some(v)) = (gate_t.as_ref(), gate_v.as_ref()) {
+                        cmp.set_f32(g, v)?;
+                    }
+                    cmp.set_bytes(&k_all, k_bytes)?;
+                    cmp.set_bytes(&v_all, v_bytes)?;
+                    cmp.set_bytes(&mask_t, layer_mask)?;
+                    cmp.run(&ctx, &[&out])?;
+                    if dump_attn {
+                        cmp.run(&ctx, &[&attn])?;
+                        dump_named(
+                            "attn_pregate",
+                            il,
+                            &cmp.to_vec_f32(&attn)?,
+                            head_dim * c.n_head as i64,
+                        );
+                    }
+                    if trace {
+                        eprintln!("TRACE: attention ok (layer)");
+                    }
+                    Ok((cmp.to_vec_f32(&out)?, kv_secs, t.elapsed().as_secs_f64()))
+                })();
+                self.scratch = buf;
+                let (attn_out, kv_secs, attn_secs) = attn_result?;
+                self.stats.kv_build_seconds += kv_secs;
+                self.stats.attn_seconds += attn_secs;
+                (attn_out, residual)
+            };
 
             // Residual, then the feed-forward.
             // Gemma normalises the attention output *before* it rejoins the
@@ -2436,6 +2710,8 @@ impl<'m> StreamingRunner<'m> {
             for (dst, v) in ffn_input.iter_mut().zip(attn_out) {
                 *dst += v;
             }
+            // llama.cpp's name for this sum, so the two dumps line up.
+            dump_named("attn_residual", il, &ffn_input, n_embd);
 
             let (normed_v, probs_v) = {
                 // The dense branch below runs the whole feed-forward in this
@@ -2495,8 +2771,7 @@ impl<'m> StreamingRunner<'m> {
                     self.arch
                         .norm_named(&ctx, weights, &pre, &format!("blk.{il}.attn_norm"))?
                 } else {
-                    self.arch
-                        .norm_named(&ctx, weights, &xt, &format!("blk.{il}.ffn_norm"))?
+                    self.arch.norm_named(&ctx, weights, &xt, &c.ffn_norm(il))?
                 };
                 if !c.is_moe() {
                     // Dense: no router at all. The FFN is one gate/up/down
@@ -2517,11 +2792,16 @@ impl<'m> StreamingRunner<'m> {
                         cmp.set_f32(&pre, pre_x)?;
                     }
                     cmp.run(&ctx, &[&out])?;
+                    if std::env::var_os("CHAOS_DUMP_LAYERS").is_some() {
+                        cmp.run(&ctx, &[&normed])?;
+                        dump_named("attn_post_norm", il, &cmp.to_vec_f32(&normed)?, n_embd);
+                    }
                     if trace {
                         eprintln!("TRACE: dense ffn ok (layer)");
                     }
                     self.stats.ffn_seconds += t.elapsed().as_secs_f64();
                     x = cmp.to_vec_f32(&out)?;
+                    dump_layer(il, &x, n_embd);
                     continue;
                 }
                 let logits = ctx.mul_mat(
@@ -2548,6 +2828,7 @@ impl<'m> StreamingRunner<'m> {
                 *dst += v;
             }
             x = next;
+            dump_layer(il, &x, n_embd);
         }
         cache.advance_by(tokens.len());
 
@@ -2587,6 +2868,12 @@ impl<'m> StreamingRunner<'m> {
             cmp.set_f32(&xt, &head_input)?;
             cmp.run(&ctx, &[&normed])?;
             self.last_embedding = Some(cmp.to_vec_f32(&normed)?);
+        }
+        if std::env::var_os("CHAOS_DUMP_LAYERS").is_some() {
+            let _dev = cmp.realize_graph(&ctx, &[&normed])?;
+            cmp.set_f32(&xt, &head_input)?;
+            cmp.run(&ctx, &[&normed])?;
+            dump_named("result_norm", 0, &cmp.to_vec_f32(&normed)?, n_embd);
         }
         let out_name = if weights.get("output.weight").is_some() {
             "output.weight"
@@ -2729,6 +3016,10 @@ mod tests {
             fused_gate_up: false,
             parallel_residual: false,
             post_norms: false,
+            ssm: None,
+            rope_sections: None,
+            ffn_norm_name: "ffn_norm",
+            fused_q_gate: false,
             scale_embeddings: false,
             attn_scale_dim: 16,
             prescale_q: false,

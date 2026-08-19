@@ -8,6 +8,72 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
+### The Qwen3.5 forward pass is implemented and diffed against llama.cpp
+
+`qwen35` — Qwen3.5, Qwen3.6 **and Qwen3.8**, all one architecture — now runs
+end to end. Developed against `Qwen3.5-0.8B-Q8_0` because it is the same
+architecture at 24 layers instead of 64, so a wrong step shows up in a second
+rather than a minute.
+
+**Verified, not asserted.** Every layer's output compared against
+`llama-eval-callback` on the same container and prompt, by value *and* by sum
+over all five prompt tokens:
+
+```
+l_out-0   llama -0.3452   chaos -0.345155    sum -4.384898 / -4.384897
+l_out-3   llama -0.2049   chaos -0.204932    (the first attention layer)
+l_out-23  llama  0.3155   chaos  0.315493    sum 26.697807 / 26.697754
+```
+
+**All 24 layers agree**, and the sampled token ids are llama.cpp's exactly:
+`" Paris"`, `"."`, `"
+"`, `"The"`, `" capital"`, `" of"`.
+
+The sums matter as much as the values: the delta net is recurrent, so a state
+carried wrongly leaves token 0 perfect and every token after it wrong. Comparing
+first rows alone said the port was correct while the answer was still garbage.
+
+What it took:
+
+- **The gated delta net** (`crates/chaos-arch/src/qwen35.rs`) — 18 of the 0.8B's
+  24 layers, 48 of the 27B's 64. Projections, a rolling depthwise convolution,
+  `l2_norm` on q and k, `ggml_gated_delta_net`, a gated norm, an output
+  projection. The state is host-side like the KV cache, so no in-graph cache
+  writes.
+- **mRoPE** for the attention layers, and **four position values per token** —
+  ggml asserts `ne[2] * 4 == b->ne[0]` and aborts otherwise.
+- **The fused query/gate projection**, interleaved *per head*: head 0's query,
+  head 0's gate, head 1's query. Two contiguous halves would take the queries of
+  the first heads and the gates of the last, silently.
+- **The `qwen35` pre-tokenizer** — one digit at a time, and combining marks
+  belonging to the word rather than the punctuation beside it. Checked against
+  `llama-tokenize`.
+
+### Three detections that read a familiar name and got the wrong architecture
+
+All three found by the layer diff, all three now testing for what they mean
+rather than for one tensor name:
+
+| flag | what went wrong |
+|---|---|
+| `parallel_residual` | absence of `ffn_norm` meant "one norm, parallel block". `qwen35` has two norms and calls the second `post_attention_norm`, so the FFN consumed `attn_norm(x)` — the value attention had already seen. The symptom was `attn_post_norm-0` coming out **identical to llama.cpp's `attn_norm-0`**, which is what named the bug. |
+| `post_norms` | presence of `post_attention_norm` meant Gemma. Gemma's post-norms are a *pair*; demanding the missing `post_ffw_norm` refused a loadable model. |
+| `fused_qkv` | presence of `attn_qkv` meant Phi-3. On `qwen35` that tensor is the delta net's input projection, and attention layers have no such tensor at all. |
+
+### Not finished
+
+**`qwen35` is deliberately still absent from `RUNNABLE_ARCHS`.** The forward pass
+is right and the token ids are right, but `chaos-run`'s *incremental* printer
+drops most pieces on this vocabulary — the ids decode correctly through
+`Tokenizer::decode`, so this is the streaming detokeniser and not the model.
+Flipping the flag before that is fixed would show a user garbage produced by a
+correct engine, which is the one thing this project's architecture gate exists to
+prevent. `--force` runs it today.
+
+`CHAOS_DUMP_LAYERS=1` prints the residual stream per layer in
+`llama-eval-callback`'s own format and names, which is how all of the above was
+found.
+
 ### Qwen3.8-27B is in the catalogue, and it is Qwen3.6's architecture
 
 Read from the container, not inferred: `general.architecture qwen35`, 866

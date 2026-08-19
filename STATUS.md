@@ -20,7 +20,7 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **733 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
+**Current**: **738 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
 needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
 clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
@@ -174,7 +174,7 @@ could not have done its job either: a pool collapsed onto one handle measures
 "unlucky". The plausibility bounds stay, the comparative claim lives in the
 research node where it was measured under control.
 
-**Current**: **733 tests**, 0 failed.
+**Current**: **738 tests**, 0 failed.
 
 ## The app has four pages and a menu (2026-08-18)
 
@@ -216,7 +216,7 @@ no-op. Scrollbars *are* fixable and were — `#F0F0F0` to `#171717`.
 residency. The engine measures all three and prints them to its log; nothing
 carries them over the socket. The page says so on its face.
 
-**Current**: **733 tests**, 0 failed.
+**Current**: **738 tests**, 0 failed.
 
 ## v0.0.6 — the app actually works now (2026-08-18)
 
@@ -285,7 +285,7 @@ nothing streams and the whole file must fit. It is what makes the app say
 `qwen3-32b 19.8 GB needs 19.8 GB - too big` honestly on this laptop, while
 `v4flash 155 GB needs 7.92 GB - streams`.
 
-**733 tests** (was 706), clippy 0, fmt clean.
+**738 tests** (was 706), clippy 0, fmt clean.
 
 ## 20 tok/s on V4-Flash is closed, with a number (2026-08-16)
 

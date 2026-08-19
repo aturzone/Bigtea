@@ -3884,6 +3884,12 @@ fn run_streaming(
             }
             let last = &logits[row..];
             let next = sampler.sample(last, &tokens);
+            if std::env::var_os("CHAOS_DUMP_LAYERS").is_some() {
+                eprintln!(
+                    "sampled {next} {:?}",
+                    tokenizer.decode(std::slice::from_ref(&next))
+                );
+            }
             if Some(next) == tokenizer.eos {
                 tokens.push(next);
                 break;
