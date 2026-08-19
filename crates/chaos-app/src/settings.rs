@@ -203,10 +203,16 @@ impl Settings {
             a.push("-c".into());
             a.push(c.to_string());
         }
-        if let Some(n) = self.ngl {
-            a.push("-ngl".into());
-            a.push(n.to_string());
-        }
+        // **`-ngl` is deliberately not sent.** `chaos-serve` refuses it -- its
+        // dense path binds weights straight into host memory rather than through
+        // the runner's device loader, so there is nowhere on a card to put them
+        // yet -- and an unknown flag is an error there now rather than something
+        // silently swallowed. Sending it would stop the server from starting.
+        //
+        // It was sent for three releases and did nothing whatsoever, which is
+        // the whole reason the flag is refused loudly today. The setting stays
+        // in the file so it survives the wiring; the GPU list says what is true.
+        let _ = self.ngl;
         if self.auto {
             a.push("--auto".into());
         }
@@ -318,17 +324,16 @@ mod tests {
             ..Settings::default()
         };
         let a = s.serve_args("m").join(" ");
-        for expected in [
-            "--cache 8",
-            "-t 4",
-            "-tb 20",
-            "-c 2048",
-            "-ngl 99",
-            "--auto",
-            "--force",
-        ] {
+        for expected in ["--cache 8", "-t 4", "-tb 20", "-c 2048", "--auto", "--force"] {
             assert!(a.contains(expected), "{expected} missing from {a}");
         }
+        // **And nothing the server refuses.** `-ngl` was sent for three
+        // releases and silently dropped; it is a hard error there now, so
+        // sending it would stop the server from starting at all.
+        assert!(
+            !a.contains("-ngl"),
+            "chaos-serve refuses -ngl -- sending it kills the server: {a}"
+        );
     }
 
     /// The model always comes first: `chaos-serve` takes it positionally.

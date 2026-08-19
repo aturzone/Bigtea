@@ -4226,6 +4226,14 @@ fn run(
     // none of the graph, so it gets its own path rather than a config branch.
     if model.architecture() == "deepseek4" {
         chaos_arch::info!("model      {} ({})", model.architecture(), model.io_mode());
+        // Say it rather than ignore it. Asking for a device here used to change
+        // nothing at all and print nothing at all.
+        if gpu_device.is_some() || gpu_layers.is_some_and(|n| n > 0) || !tensor_overrides.is_empty()
+        {
+            if let Some(why) = chaos_arch::why_no_device(model.architecture()) {
+                chaos_arch::info!("device     not used -- {why}");
+            }
+        }
         let mut tokenizer = Tokenizer::from_metadata(model.metadata())?;
         force_chat_template(&mut tokenizer, chat_template.as_deref())?;
         let tokenizer = tokenizer;

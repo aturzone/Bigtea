@@ -89,6 +89,16 @@ mod windows_app {
         /// here is nothing at all -- the connection test ran, passed, set the
         /// status line, and displayed no dialog whatsoever.
         report: Option<(String, bool)>,
+        /// What `chaos-serve` wrote to stderr, kept so a server that dies before
+        /// it is ready can say why.
+        ///
+        /// **It used to go nowhere.** The child is spawned with
+        /// `CREATE_NO_WINDOW` and inherits no console, so its one-line reason
+        /// for exiting -- "Only one usage of each socket address ... (os error
+        /// 10048)" -- was written to a handle nobody held. The window showed
+        /// "the model did not come up" after ten minutes of polling and the
+        /// actual sentence was lost.
+        serve_err: String,
     }
 
     /// Which set of models the MODELS page lists.
@@ -1087,6 +1097,23 @@ mod windows_app {
             return;
         };
 
+        // **Stop whatever is already running, before anything else.**
+        //
+        // This was missing, and it is the whole of "after one run the next model
+        // does not work". Loading a second model spawned a second
+        // `chaos-serve` while the first still held the port: the new process
+        // died with `os error 10048`, the readiness poll got its 200 from the
+        // OLD server, and the window reported the new model ready while every
+        // message went to the old weights. The old child's handle was also
+        // overwritten by the new one, so nothing could ever kill it -- it kept
+        // its residency until the machine was rebooted, which on a 15.7 GiB box
+        // running a 144 GB model is the difference between 0.45 tok/s and
+        // nothing at all.
+        //
+        // Measured, both halves: the second server exits 10048, and `/health`
+        // keeps answering with the first model's name.
+        stop_server();
+
         // Next to us, not on PATH: an app that finds a different Chaos than the
         // one it shipped with is a support problem nobody can reproduce.
         let exe = match std::env::current_exe() {
@@ -1159,6 +1186,17 @@ mod windows_app {
         // `chaos-serve` refuses by name and the refusal reaches the strip.
         let port = cfg.port;
 
+        // `kill` returns before Windows has released the listening socket, so a
+        // new server started immediately can still lose the bind. Wait for the
+        // port to go quiet, and if something that is not ours is sitting on it,
+        // say so instead of starting a process that will die.
+        if let Some(other) = wait_for_port_free(port) {
+            set_status(&format!(
+                "port {port} is already serving {other} -- stop it, or change the port in SETTINGS"
+            ));
+            return;
+        }
+
         let mut cmd = Command::new(&exe);
         for a in cfg.serve_args(&path.to_string_lossy()) {
             cmd.arg(a);
@@ -1167,9 +1205,31 @@ mod windows_app {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
+        // Kept rather than inherited, so the reason a server exits reaches the
+        // window instead of a console that does not exist.
+        cmd.stderr(std::process::Stdio::piped());
 
         match cmd.spawn() {
-            Ok(c) => {
+            Ok(mut c) => {
+                let pid = c.id();
+                if let Some(err) = c.stderr.take() {
+                    // Drained on its own thread: a full pipe blocks the writer,
+                    // which would hang the server rather than merely lose its
+                    // output.
+                    std::thread::spawn(move || {
+                        use std::io::BufRead;
+                        let mut keep: Vec<String> = Vec::new();
+                        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                            keep.push(line);
+                            // The last few lines are the ones that say why.
+                            if keep.len() > 8 {
+                                keep.remove(0);
+                            }
+                            let joined = keep.join(" ");
+                            shared().lock().unwrap().serve_err = joined;
+                        }
+                    });
+                }
                 UI.with(|u| {
                     if let Some(ui) = u.borrow_mut().as_mut() {
                         ui.server = Some(c);
@@ -1190,10 +1250,29 @@ mod windows_app {
                 std::thread::spawn(move || {
                     // Poll rather than parse stdout: readiness is exactly "does
                     // it answer", and that is the check a client makes too.
+                    //
+                    // **But watch the process as well as the port.** A server
+                    // that has already exited will never answer, and waiting
+                    // ten minutes to conclude that -- while its one-line reason
+                    // sits unread -- is how a port collision came to look like a
+                    // model too slow to load.
                     for _ in 0..1200 {
                         if client::health(port) {
                             let mut s = shared().lock().unwrap();
                             s.status = "ready".into();
+                            s.finished = true;
+                            drop(s);
+                            notify();
+                            return;
+                        }
+                        if process_gone(pid) {
+                            let mut s = shared().lock().unwrap();
+                            let why = s.serve_err.trim().to_string();
+                            s.status = if why.is_empty() {
+                                "chaos-serve stopped before it was ready".into()
+                            } else {
+                                format!("chaos-serve stopped: {why}")
+                            };
                             s.finished = true;
                             drop(s);
                             notify();
@@ -1243,6 +1322,39 @@ mod windows_app {
     /// Kill rather than ask: `chaos-serve` has no shutdown endpoint, it holds
     /// no state worth flushing, and a model mid-token would otherwise keep the
     /// process alive for minutes.
+    /// Has this process exited?
+    ///
+    /// By handle rather than by `try_wait`, because the poll runs on a worker
+    /// thread and the `Child` lives in `UI`, which is a `thread_local!` and is
+    /// `None` everywhere else. A handle that cannot be opened means the process
+    /// is gone, which is the answer being asked for.
+    fn process_gone(pid: u32) -> bool {
+        unsafe {
+            let h = OpenProcess(SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                return true;
+            }
+            let gone = WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+            CloseHandle(h);
+            gone
+        }
+    }
+
+    /// Wait for `port` to stop answering, and name whatever will not let go.
+    ///
+    /// Returns `None` once the port is free, or the model name still serving on
+    /// it. Five seconds is generous: this is the gap between `TerminateProcess`
+    /// returning and Windows releasing the socket, which is milliseconds.
+    fn wait_for_port_free(port: u16) -> Option<String> {
+        for _ in 0..20 {
+            client::health_model(port)?;
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        // Still answering. Name it if it said who it is.
+        client::health_model(port)
+            .map(|n| if n.is_empty() { "another server".into() } else { n })
+    }
+
     fn stop_server() {
         let child = UI.with(|u| u.borrow_mut().as_mut().and_then(|ui| ui.server.take()));
         if let Some(mut c) = child {

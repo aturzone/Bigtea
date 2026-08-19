@@ -183,19 +183,19 @@ pub fn ngl(m: Machine) -> Vec<Choice> {
             "Chaos found no usable GPU, so everything runs on the processor.",
         )];
     }
-    vec![
-        Choice::new("", "None", "Everything on the processor. Recommended here."),
-        Choice::new(
-            "99",
-            "All of them",
-            "Every layer on the GPU. Only helps if the model fits in video memory.",
-        ),
-        Choice::new(
-            "20",
-            "20 layers",
-            "A split. Useful when the model is slightly larger than video memory.",
-        ),
-    ]
+    // **What this list said and what the program did were different things.**
+    // It offered "all of them" and "20 layers"; the app passed `-ngl` to
+    // `chaos-serve`, which had never heard of the flag and dropped it. Every
+    // model in this window ran on the processor whatever was chosen here.
+    //
+    // So the list says that now. The GPU is real and `chaos-run -ngl 99` uses
+    // it; what is missing is the server's device loader, and until that lands an
+    // honest single option beats three that do nothing.
+    vec![Choice::new(
+        "",
+        "Processor (the GPU is not used here yet)",
+        "The window talks to chaos-serve, which has no device loader yet.          chaos-run -ngl 99 does use the card.",
+    )]
 }
 
 /// The choices for a settings field, by its control id.
@@ -352,17 +352,29 @@ mod tests {
         }
     }
 
-    /// With no GPU the list says so instead of offering layers that would do
-    /// nothing.
+    /// The GPU list never offers a layer count the window cannot deliver.
+    ///
+    /// **It used to offer three, on any machine with a card, and all three did
+    /// nothing** -- `chaos-serve` has no device loader, so every option ran on
+    /// the processor. With or without a GPU the honest answer is currently one
+    /// option, and this test is what will fail when the loader lands, which is
+    /// the right moment to write the list again.
     #[test]
-    fn no_gpu_means_no_gpu_options() {
-        let list = ngl(laptop());
-        assert_eq!(list.len(), 1);
-        assert!(list[0].label.contains("No GPU"));
-        assert!(
-            ngl(workstation()).len() > list.len(),
-            "a machine with a GPU must be offered more than one option"
-        );
+    fn the_gpu_list_never_offers_what_the_server_cannot_do() {
+        let no_card = ngl(laptop());
+        assert_eq!(no_card.len(), 1);
+        assert!(no_card[0].label.contains("No GPU"), "{}", no_card[0].label);
+
+        let with_card = ngl(workstation());
+        assert_eq!(with_card.len(), 1, "{with_card:?}");
+        // Every offered value must be empty, i.e. "pass no -ngl at all".
+        for c in &with_card {
+            assert!(
+                c.value.is_empty(),
+                "offers -ngl {:?}, which chaos-serve refuses",
+                c.value
+            );
+        }
     }
 
     /// The port and the models folder are typed, not chosen.
