@@ -20,11 +20,54 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **729 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
+**Current**: **733 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
 needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
 clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
 reading, which is the only way that number has ever been right.
+
+## Qwen3.8-27B is Qwen3.6's architecture, and the delta rule is one op (2026-08-19)
+
+Atur asked for **Qwen3.8-27B instead of 3.6**. It is the same architecture, read
+from the container rather than inferred:
+
+```
+gguf v3, 866 tensors, 51 metadata keys
+architecture                  qwen35
+tensor bytes          17,912,397,824      dense -- nothing streams
+```
+
+Upstream: `Qwen3_5ForConditionalGeneration`, `model_type qwen3_5`,
+`image-text-to-text`, plus a separate 928 MB `mmproj`. **3.8 is 3.6's gated delta
+net with a vision tower added** — strictly more work, not a way round it. Both
+are now in the catalogue, and a test asserts they agree on the architecture so
+this stops being true loudly rather than quietly. Note the fit too: 17.9 GB dense
+against 15.7 GB of RAM, so even once it runs, Q4 does not fit this laptop and
+`UD-Q2_K_XL` at 10.7 GB is the one that would.
+
+**The open question is answered: `ggml_gated_delta_net` is the whole chunked
+delta rule in one op, and it is in the archive this project already links.**
+That is what turns "a research project" into "a port". Bound and tested this
+session, with `ggml_ssm_conv`, `ggml_l2_norm`, `ggml_rope_multi` and the 4-D
+view/reshape/cont/repeat helpers.
+
+**Three numeric tests, not a compile check** — a wrong FFI declaration mis-reads
+its arguments and returns confident numbers rather than failing to build.
+`l2_norm` takes a row of four 2s to 0.5 (`rms_norm` would give 1.0); `ssm_conv`
+sums its rolling window to 10 then 14; `gated_delta_net` returns
+`S*H*T*N + S*S*H*N` finite values with the carried state moved off zero.
+
+**Qwen3.8 does not run yet.** What is left is the layer wiring: the recurrent
+state cache, the delta-net layer graph, the config fields, mRoPE on the 16
+attention layers, and tolerating the MTP block — and then the diff against
+llama.cpp, which is the half that decides whether it ships. The integration
+point is the per-layer loop at `stream.rs:2107`, where every layer already
+crosses the ggml boundary as plain vectors. Full plan and shapes:
+[`backlog/qwen35-gated-delta-net.md`](docs/graph/backlog/qwen35-gated-delta-net.md).
+
+**Image generation is untouched.** Ideogram 4 is listed and refused; nothing in
+[`backlog/image-generation-ideogram-4.md`](docs/graph/backlog/image-generation-ideogram-4.md)
+has been built.
 
 ## The window's three lies, found by using it (2026-08-19)
 
@@ -131,7 +174,7 @@ could not have done its job either: a pool collapsed onto one handle measures
 "unlucky". The plausibility bounds stay, the comparative claim lives in the
 research node where it was measured under control.
 
-**Current**: **729 tests**, 0 failed.
+**Current**: **733 tests**, 0 failed.
 
 ## The app has four pages and a menu (2026-08-18)
 
@@ -173,7 +216,7 @@ no-op. Scrollbars *are* fixable and were — `#F0F0F0` to `#171717`.
 residency. The engine measures all three and prints them to its log; nothing
 carries them over the socket. The page says so on its face.
 
-**Current**: **729 tests**, 0 failed.
+**Current**: **733 tests**, 0 failed.
 
 ## v0.0.6 — the app actually works now (2026-08-18)
 
@@ -242,7 +285,7 @@ nothing streams and the whole file must fit. It is what makes the app say
 `qwen3-32b 19.8 GB needs 19.8 GB - too big` honestly on this laptop, while
 `v4flash 155 GB needs 7.92 GB - streams`.
 
-**729 tests** (was 706), clippy 0, fmt clean.
+**733 tests** (was 706), clippy 0, fmt clean.
 
 ## 20 tok/s on V4-Flash is closed, with a number (2026-08-16)
 

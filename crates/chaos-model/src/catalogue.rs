@@ -319,6 +319,41 @@ pub const CATALOGUE: &[Entry] = &[
         ],
     },
     Entry {
+        name: "qwen3.8-27b",
+        repo: "unsloth/Qwen3.8-27B-GGUF",
+        stem: "Qwen3.8-27B-{quant}",
+        // **The same architecture as 3.6, read from the container.** Asking for
+        // the newer model does not route around the blocker: `chaos-meta` on
+        // `Qwen3.8-27B-UD-Q4_K_XL.gguf` reports `general.architecture qwen35`,
+        // 866 tensors, 51 metadata keys. It is 3.6's gated delta net with a
+        // vision tower added, and `Qwen3_5ForConditionalGeneration` upstream.
+        arch: "qwen35",
+        quants: &[
+            Quant {
+                name: "UD-Q4_K_XL",
+                // Measured from the repository, and the tensor table agrees to
+                // within the header: 17_912_397_824 bytes of tensors.
+                bytes: 17_923_394_624,
+                shards: 1,
+                // Dense. Zero routed-expert tensors, so nothing streams and the
+                // whole file has to fit -- which it does not, on this laptop.
+                always_read_bytes: 17_923_394_624,
+            },
+            Quant {
+                name: "Q4_K_M",
+                bytes: 17_106_775_008,
+                shards: 1,
+                always_read_bytes: 17_106_775_008,
+            },
+            Quant {
+                name: "UD-Q2_K_XL",
+                bytes: 10_676_423_744,
+                shards: 1,
+                always_read_bytes: 10_676_423_744,
+            },
+        ],
+    },
+    Entry {
         name: "qwen3.6-35b-a3b",
         repo: "unsloth/Qwen3.6-35B-A3B-GGUF",
         stem: "Qwen3.6-35B-A3B-{quant}",
@@ -600,7 +635,7 @@ mod runnable_tests {
     /// move them -- it fails once they become runnable.
     #[test]
     fn the_new_qwen_models_are_listed_and_refused() {
-        for name in ["qwen3.6-27b", "qwen3.6-35b-a3b"] {
+        for name in ["qwen3.6-27b", "qwen3.6-35b-a3b", "qwen3.8-27b"] {
             let e = find(name).unwrap_or_else(|| panic!("{name} is not listed"));
             let why = why_not_runnable(e.arch)
                 .unwrap_or_else(|| panic!("{name} now claims to run; move it and update this"));
@@ -646,6 +681,18 @@ mod runnable_tests {
                 assert_eq!(got_q.name, q.name, "{first}");
             }
         }
+    }
+
+    /// **Qwen3.8 is the same architecture as Qwen3.6.** Asking for the newer
+    /// model does not route around the gated delta net; read from the
+    /// container, both are `qwen35`. If this ever stops being true the port
+    /// notes need revisiting, so the test says it out loud.
+    #[test]
+    fn the_newest_qwen_is_the_same_architecture_as_the_last_one() {
+        let a = find("qwen3.6-27b").expect("3.6 is listed");
+        let b = find("qwen3.8-27b").expect("3.8 is listed");
+        assert_eq!(a.arch, b.arch, "3.6 and 3.8 must agree on the architecture");
+        assert_eq!(b.arch, "qwen35");
     }
 
     /// Ideogram 4 is listed and refused for being a different kind of model.

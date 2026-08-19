@@ -8,7 +8,29 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Qwen3.8-27B is in the catalogue, and it is Qwen3.6's architecture
+
+Read from the container, not inferred: `general.architecture qwen35`, 866
+tensors, 51 metadata keys, 17.9 GB dense. Upstream it is
+`Qwen3_5ForConditionalGeneration` with a vision tower and a separate 928 MB
+`mmproj`. Asking for the newer model does not route around the gated delta net —
+it adds to it. A test asserts 3.6 and 3.8 agree on the architecture.
+
+### The delta rule is one ggml op, and it is bound
+
+`ggml_gated_delta_net` performs the whole chunked delta scan and returns the
+carried state with the scores. It is present in the pinned `ggml-base.a`, and it
+is now bound along with `ggml_ssm_conv`, `ggml_l2_norm`, `ggml_rope_multi` and
+the 4-D view/reshape/cont/repeat helpers.
+
+**Three numeric tests rather than a compile check**, because a wrong FFI
+declaration mis-reads its arguments and returns confident numbers: `l2_norm`
+takes four 2s to 0.5 where `rms_norm` would give 1.0; `ssm_conv` sums its rolling
+window to 10 then 14; `gated_delta_net` returns `S*H*T*N + S*S*H*N` finite values
+with the state moved off zero.
+
+**Qwen3.8 does not run yet** — the layer wiring, the recurrent state cache and
+the llama.cpp diff are still to come.
 
 ## [0.0.8] — 2026-08-19
 
