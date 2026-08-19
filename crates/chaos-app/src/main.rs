@@ -1567,6 +1567,34 @@ mod windows_app {
             set_status("chaos-pull.exe is missing from this folder");
             return;
         }
+        // **The age gate, in the window rather than in the helper.**
+        //
+        // `chaos-pull` asks at a terminal, and the app spawns it with
+        // `CREATE_NO_WINDOW` -- so its prompt read EOF, cancelled, and returned
+        // success, and the window said "downloaded" for a file that was never
+        // fetched. The dialog belongs here, where there is somebody to answer it.
+        let adult = chaos_model::catalogue::find(&name).is_some_and(|e| e.adult);
+        if adult {
+            let answer = unsafe {
+                MessageBoxW(
+                    main_hwnd(),
+                    wide(&format!(
+                        "{name} is an ADULT model, published for generating explicit \
+                         imagery.\n\nChaos does not filter what a model produces.\n\n\
+                         Are you at least 18 years old, and is adult material lawful \
+                         where you are?"
+                    ))
+                    .as_ptr(),
+                    wide("Adult content -- 18+").as_ptr(),
+                    MB_YESNO | MB_ICONWARNING,
+                )
+            };
+            if answer != IDYES {
+                set_status(&format!("{name} not downloaded: age not confirmed"));
+                return;
+            }
+        }
+
         let dir = models::default_dir();
         let _ = std::fs::create_dir_all(&dir);
 
@@ -1574,7 +1602,15 @@ mod windows_app {
         // which files will appear, and what they will weigh in total.
         let files: Vec<std::path::PathBuf> = chaos_model::catalogue::find(&name)
             .and_then(|e| e.quant(&quant).map(|q| (e, q)))
-            .map(|(e, q)| e.files(q).into_iter().map(|f| dir.join(f)).collect())
+            // `local_name`, matching where `chaos-pull` actually writes: the
+            // watcher looked for `split_files/vae/x.safetensors` under the models
+            // folder and would have waited forever for a file saved as `x`.
+            .map(|(e, q)| {
+                e.files(q)
+                    .into_iter()
+                    .map(|f| dir.join(chaos_model::catalogue::Entry::local_name(&f)))
+                    .collect()
+            })
             .unwrap_or_default();
         UI.with(|u| {
             if let Some(ui) = u.borrow_mut().as_mut() {
@@ -1594,12 +1630,23 @@ mod windows_app {
                 .arg("--dir")
                 .arg(&dir)
                 .arg("--yes");
+            // Consent from the dialog above, passed on. Set only when a person
+            // clicked Yes; `--yes` above means "do not ask about the size" and
+            // has never meant this.
+            if adult {
+                cmd.env("CHAOS_ADULT_CONFIRMED", "1");
+            }
             {
                 use std::os::windows::process::CommandExt;
                 cmd.creation_flags(CREATE_NO_WINDOW);
             }
             let msg = match cmd.status() {
                 Ok(st) if st.success() => format!("{name} {quant} downloaded"),
+                // 3 is "the age check was not satisfied", which is not a
+                // failure to report as one.
+                Ok(st) if st.code() == Some(3) => {
+                    format!("{name} {quant} not downloaded: age not confirmed")
+                }
                 Ok(st) => format!("download failed (exit {})", st.code().unwrap_or(-1)),
                 Err(e) => format!("could not start chaos-pull: {e}"),
             };
@@ -2735,7 +2782,13 @@ Any value a client sends is accepted.                      The server still list
                     None => match catalog::verdict(o, ui.free_bytes) {
                         catalog::Verdict::Resident => "fits entirely in memory",
                         catalog::Verdict::Streams => "streams from disk on this machine",
-                        catalog::Verdict::TooBig => "too big for this machine",
+                        // **Never "too big".** The whole point of this runner
+                        // is models larger than memory; V4-Flash is 144 GB and
+                        // works on this machine. What is true is that it will be
+                        // slow, and that is what to say.
+                        catalog::Verdict::Rereads => {
+                            "runs, slowly -- weights are re-read from disk each token"
+                        }
                     },
                 };
                 let rows = vec![

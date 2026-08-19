@@ -628,8 +628,29 @@ impl Qwen3Config {
         let fused_gate_up = no_gate && declared_ff > 0 && up_ne1 == 2 * declared_ff;
         let ungated = no_gate && !fused_gate_up;
 
+        // **The last block may be a multi-token-prediction head, not a layer.**
+        // Qwen3.8-27B declares `block_count 65` and its block 64 carries
+        // `nextn.eh_proj`, `nextn.enorm`, `nextn.hnorm` and
+        // `nextn.shared_head_norm` -- the MTP head, which predicts a *second*
+        // token and is not part of the ordinary forward pass. Counting it as a
+        // layer sent the runner looking for `blk.64.attn_qkv.weight`, which does
+        // not exist, and the whole model refused to load.
+        //
+        // Detected by a tensor only that block has, rather than by noticing
+        // something is missing: "the last block lacks attn_qkv" would also be
+        // true of a truncated download, and the two deserve different answers.
+        //
+        // Speculative decoding with this head is real work and is not done; the
+        // note it prints says so rather than pretending the block is absent.
+        let declared = need("block_count")? as u32;
+        let mtp_head = declared > 0
+            && model
+                .location(&format!("blk.{}.nextn.eh_proj.weight", declared - 1))
+                .is_some();
+        let n_layer = if mtp_head { declared - 1 } else { declared };
+
         Ok(Qwen3Config {
-            n_layer: need("block_count")? as u32,
+            n_layer,
             n_embd,
             n_head,
             n_head_kv: model
@@ -685,7 +706,7 @@ impl Qwen3Config {
             // stack block 0 is a delta net and carries no `attn_q_norm` at all,
             // so testing block 0 reported "no QK norm" for a model that has it
             // on every attention layer it does have.
-            qk_norm: (0..need("block_count")? as u32)
+            qk_norm: (0..n_layer)
                 .find(|il| ssm.is_none_or(|s| (il + 1) % s.full_attention_interval.max(1) == 0))
                 .is_some_and(|il| {
                     model
@@ -703,7 +724,7 @@ impl Qwen3Config {
             },
             // Detected from the shape, not the arch name: a query projection
             // twice as wide as `head_dim * n_head` is carrying a gate beside it.
-            fused_q_gate: (0..need("block_count")? as u32)
+            fused_q_gate: (0..n_layer)
                 .filter_map(|il| model.location(&format!("blk.{il}.attn_q.weight")))
                 .next()
                 .is_some_and(|l| {
@@ -784,7 +805,7 @@ impl Qwen3Config {
             // llama.cpp picks this by model size, not by a metadata key: the
             // 27B Gemmas are the exception and every other size is head_dim.
             // Sizes are identified by layer count there and here.
-            attn_scale_dim: match (arch.as_str(), need("block_count")? as u32) {
+            attn_scale_dim: match (arch.as_str(), n_layer) {
                 ("gemma2", 46) | ("gemma3", 62) => n_embd / n_head.max(1),
                 _ => head_dim,
             },

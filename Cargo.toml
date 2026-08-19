@@ -16,6 +16,8 @@ members = [
     # Build-script helpers. A build dependency of several crates and a
     # runtime dependency of none.
     "crates/chaos-build",
+    # Diffusion-model support: PNG, safetensors, the sampler.
+    "crates/chaos-image",
 ]
 
 [workspace.package]

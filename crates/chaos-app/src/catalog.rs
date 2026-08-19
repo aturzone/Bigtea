@@ -27,6 +27,8 @@ pub struct Offer {
     /// answer is a sentence: this container needs something the engine does not
     /// implement. Hiding it also means the next person asks again.
     pub unsupported: Option<&'static str>,
+    /// Adult content. Marked in the list, and confirmed before a download.
+    pub adult: bool,
 }
 
 /// Everything fetchable, flattened to one row per quantisation.
@@ -42,6 +44,7 @@ pub fn offers() -> Vec<Offer> {
                 shards: q.shards,
                 arch: e.arch.to_string(),
                 unsupported: chaos_model::catalogue::why_not_runnable(e.arch),
+                adult: e.adult,
             });
         }
     }
@@ -49,13 +52,20 @@ pub fn offers() -> Vec<Offer> {
 }
 
 /// How a machine with `free` bytes of memory would fare.
+///
+/// **None of these mean "no".** This runner exists to run models larger than
+/// memory: DeepSeek-V4-Flash is 144 GB and generates correct text on a 15.7 GiB
+/// laptop. The three cases are three *speeds*, and naming the slowest one
+/// `TooBig` — which the window showed as "too big for this machine" — told the
+/// user a model would not work when it demonstrably does.
 pub enum Verdict {
     /// Everything fits; nothing streams.
     Resident,
     /// The always-read set fits, so it runs and the experts stream from disk.
     Streams,
-    /// The always-read set does not fit. It would re-read weights every token.
-    TooBig,
+    /// The always-read set does not fit either, so those weights are re-read
+    /// from disk on every token. Slow — and it runs.
+    Rereads,
 }
 
 pub fn verdict(o: &Offer, free_bytes: u64) -> Verdict {
@@ -64,7 +74,7 @@ pub fn verdict(o: &Offer, free_bytes: u64) -> Verdict {
     } else if o.always_read <= free_bytes {
         Verdict::Streams
     } else {
-        Verdict::TooBig
+        Verdict::Rereads
     }
 }
 
@@ -78,17 +88,21 @@ pub fn row(o: &Offer, free_bytes: u64) -> String {
         match verdict(o, free_bytes) {
             Verdict::Resident => "fits",
             Verdict::Streams => "streams",
-            Verdict::TooBig => "too big",
+            // Not "too big". It runs; the weights come back off the disk.
+            Verdict::Rereads => "slow, re-reads",
         }
     };
+    // Before the size, because it decides whether to read the rest of the row.
+    let flag = if o.adult { "  [18+]" } else { "" };
     let shards = if o.shards > 1 {
         format!(" [{} files]", o.shards)
     } else {
         String::new()
     };
     format!(
-        "{} {}   {}{}   needs {} - {}",
+        "{}{} {}   {}{}   needs {} - {}",
         o.name,
+        flag,
         o.quant,
         human_size(o.bytes),
         shards,
@@ -101,12 +115,30 @@ pub fn row(o: &Offer, free_bytes: u64) -> String {
 mod tests {
     use super::*;
 
+    /// The `[18+]` marker is in the row the window renders.
+    ///
+    /// It was in `chaos-pull --list` first and not here, so the window listed
+    /// adult models with no warning at all -- found by printing the rows through
+    /// this function rather than by looking at the window, which is the only way
+    /// it was going to be found.
+    #[test]
+    fn an_adult_offer_is_marked_in_the_row() {
+        let mut o = offer(1 << 20, 1 << 20);
+        assert!(
+            !row(&o, 1 << 30).contains("18+"),
+            "not marked when it is not"
+        );
+        o.adult = true;
+        assert!(row(&o, 1 << 30).contains("[18+]"), "{}", row(&o, 1 << 30));
+    }
+
     fn offer(bytes: u64, always: u64) -> Offer {
         Offer {
             name: "m".into(),
             quant: "q".into(),
             bytes,
             always_read: always,
+            adult: false,
             shards: 1,
             arch: "a".into(),
             unsupported: None,
@@ -169,7 +201,7 @@ mod tests {
     #[test]
     fn it_is_too_big_only_when_the_always_read_set_does_not_fit() {
         let v4 = offer(155_000_000_000, 7_925_000_000);
-        assert!(matches!(verdict(&v4, 4_000_000_000), Verdict::TooBig));
+        assert!(matches!(verdict(&v4, 4_000_000_000), Verdict::Rereads));
     }
 
     #[test]

@@ -8,12 +8,19 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
-### Qwen3.6-27B loads, generates, and is wrong
+### Qwen3.6-27B loads, generates, and is wrong — in llama.cpp too
 
 Found while checking that every installed model runs. It exits 0 and prints
 `ทัน ทัน ทัน ทัน ทัน ทัน`. Qwen3.5-0.8B — the same architecture at 24 layers
 instead of 64 — is byte-identical to llama.cpp at three prompt lengths, so
 `qwen35` is verified on the shape it was diffed against and not on this one.
+
+llama.cpp fails on the same file too — `333333` — and the per-layer sums agree to
+five significant figures through layer 5 before both overflow to NaN. **That is a
+clue, not a defence**: reproducing a wrong answer precisely is still a wrong
+answer, and this engine is judged on whether it replies correctly. What the
+agreement buys is knowing where not to look. Chaos warns before generating, and
+the warning names no other project.
 
 The first sweep of all twelve models recorded "twelve of twelve" because every
 one exited 0 and the outputs were never read. That is this project's own

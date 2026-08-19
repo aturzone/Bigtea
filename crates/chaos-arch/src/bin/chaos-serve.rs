@@ -341,10 +341,8 @@ fn serve(
     );
     // Same warning the runner prints, and it matters more here: a client on the
     // other end of the socket cannot see anything but the answer.
-    if let Some(why) =
-        chaos_model::catalogue::why_shape_is_unverified(model.architecture(), config.n_layer)
-    {
-        println!("shape      UNVERIFIED -- {why}");
+    if let Some(why) = chaos_arch::container_caveat(&model, config.n_layer) {
+        println!("caution    {why}");
     }
     if !config.rope_type_is_known {
         println!(

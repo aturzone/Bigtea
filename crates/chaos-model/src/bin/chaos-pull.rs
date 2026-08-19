@@ -96,7 +96,9 @@ fn usage() {
     println!("usage: chaos-pull <model> [--quant NAME] [--dir PATH] [--yes] [--dry-run]");
     println!();
     println!("  --list      what Chaos can fetch");
-    println!("  --quant     which quantisation (default: the only one, or the largest that fits)");
+    // "the largest that fits" was wrong twice over: the default picks the
+    // largest *available*, and a quant that does not fit still runs here.
+    println!("  --quant     which quantisation (default: the largest offered)");
     println!("  --dir       where to put it (default: ./models)");
     println!("  --dry-run   print the plan and stop");
     println!("  --yes       do not ask before downloading");
@@ -112,19 +114,27 @@ fn list() {
     );
     for e in catalogue::CATALOGUE {
         for q in e.quants {
+            // Marked in the list, not only at the download prompt: somebody
+            // reading the catalogue should not have to start a fetch to find out.
             println!(
-                "{:<16} {:<12} {:>7.1} GB  {:>6.2} GiB  {}",
+                "{:<16} {:<12} {:>7.1} GB  {:>6.2} GiB  {}{}",
                 e.name,
                 q.name,
                 q.bytes as f64 / 1e9,
                 gib(q.always_read_bytes),
-                e.repo
+                e.repo,
+                if e.adult { "  [18+]" } else { "" }
             );
         }
     }
     println!();
     println!("RESIDENT is what must stay in RAM. The rest streams from disk, so it");
     println!("is the number that decides whether a model runs — not SIZE.");
+    if catalogue::CATALOGUE.iter().any(|e| e.adult) {
+        println!();
+        println!("[18+] marks adult models. Fetching one asks you to confirm your age,");
+        println!("and --yes does not skip that.");
+    }
 }
 
 fn run(
@@ -188,6 +198,21 @@ fn run(
     }
     if dry_run {
         return Ok(ExitCode::SUCCESS);
+    }
+    // **The age gate, and `--yes` does not skip it.**
+    //
+    // `--yes` means "do not ask me to confirm a 16 GB download"; it cannot mean
+    // "I am over 18", because nobody typed that. A flag that waives an age check
+    // is not an age check. Scripts and CI therefore cannot fetch these at all,
+    // which is the correct outcome: there is no unattended context in which
+    // consent has been given.
+    if entry.adult && !adult_confirmed()? {
+        println!("Cancelled.");
+        // **Not SUCCESS.** The app spawns this with no console, so the prompt
+        // reads EOF and cancels -- and returning success made the window report
+        // "downloaded" for a file that was never fetched. A distinct code lets a
+        // caller tell "the user said no" from "the download broke".
+        return Ok(ExitCode::from(3));
     }
     if !yes && !confirm()? {
         println!("Cancelled.");
@@ -254,6 +279,47 @@ fn print_plan(plan: &Plan, dir: &Path, have: u64) {
     }
 }
 
+/// Ask, in words, before fetching an adult model.
+///
+/// **Typed rather than a keypress.** `y` is muscle memory after the download
+/// prompt above it; spelling something out is a deliberate act. The exact word
+/// is echoed so there is no guessing what will be accepted.
+///
+/// Says what the model *is*, too. Two of these are LoRA adapters and one is a
+/// diffusers directory, none of which this engine can run yet -- somebody about
+/// to spend a gigabyte deserves to know that before the bar starts moving
+/// rather than after.
+fn adult_confirmed() -> Result<bool, Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Write};
+    // **Consent already given, in a dialog a person clicked.** The window asks
+    // before it spawns this, and passes the answer through the environment
+    // rather than a flag: a documented `--i-am-18` would be exactly the
+    // "flag that waives an age check" this gate exists to avoid, and would sit
+    // in `--help` inviting scripts to use it.
+    //
+    // A terminal user still gets the prompt below; nothing about this shortens
+    // that path.
+    if std::env::var("CHAOS_ADULT_CONFIRMED").as_deref() == Ok("1") {
+        return Ok(true);
+    }
+    println!();
+    println!("  +------------------------------------------------------------+");
+    println!("  |  ADULT CONTENT -- 18+                                      |");
+    println!("  +------------------------------------------------------------+");
+    println!();
+    println!("  This model is published for generating explicit imagery.");
+    println!("  Chaos does not filter what a model produces.");
+    println!();
+    println!("  By continuing you confirm that you are at least 18 years old,");
+    println!("  and that adult material is lawful where you are.");
+    println!();
+    print!("  Type I AM 18 to continue, or anything else to cancel: ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(catalogue::says_i_am_18(&line))
+}
+
 fn confirm() -> Result<bool, Box<dyn std::error::Error>> {
     use std::io::{BufRead, Write};
     print!("\nDownload? [y/N] ");
@@ -286,7 +352,8 @@ fn fetch(
     }
     for (i, f) in files.iter().enumerate() {
         let url = entry.url(f);
-        let out = dir.join(f);
+        // The filename, not the repo path: see `Entry::local_name`.
+        let out = dir.join(catalogue::Entry::local_name(f));
         println!("\n[{}/{}] {f}", i + 1, files.len());
 
         let mut cmd = Command::new("curl");

@@ -8,11 +8,43 @@ right, so fix this file.
 **Last updated**: 2026-08-19 · **Version**: **v0.0.9** · **Branch**:
 `ticket/r61-installer-uninstall-update` · **Open PRs**: r60 (logo), r61 (this).
 
-**The release is out**: <https://github.com/aturzone/Chaos/releases/tag/v0.0.3>
-— Linux, macOS and Windows archives, verified by downloading the published
-Windows zip, running `install.ps1` from it, and generating text with the
-installed binary (`chaos-run llama "The largest ocean on Earth is"` →
-*"the Pacific Ocean, which covers an area"*, 18.94 tok/s).
+**Twelve of thirteen installed models generate correct text** on this 15.7 GiB
+machine, checked by requiring `Paris` after "The capital of France is" rather
+than by exit code — including gemma-3-27b at 15.41 GB, larger than the free
+memory, correct at 0.05 tok/s, and **V4-Flash at 144 GB answering the same prompt
+with `" Paris."`** — 0.42 tok/s prefill, 0.176 tok/s generation from `chaos-run`,
+and 0.45 tok/s on a shorter prompt through `chaos-serve`. **The thirteenth,
+Qwen3.6-27B-Q4_K_M, fails in llama.cpp too**: the two
+engines agree to five significant figures on every layer sum and then both
+overflow to NaN at `l_out-5`. Chaos warns before generating and points at the
+container.
+
+**The release**: v0.0.9, six assets — Windows installer and zip, Linux tarball,
+`.deb` and AppImage, macOS arm64 tarball. The installer was built and exercised
+locally before tagging: 28.2 MB carrying 11 binaries, installed to a test prefix,
+the installed `chaos-run` generated *" Paris."*, reinstall reported
+"Reinstalling Chaos 0.0.9", and uninstalling from inside the folder removed the
+prefix, the registry key, the PATH entry and the staged helper — leaving the
+models directory untouched.
+
+**Chaos decodes images, and the autoencoder is verified rather than eyeballed**
+(2026-08-19). `chaos-image` builds the FLUX.2 autoencoder as a ggml graph — both
+halves, 248 tensors, no transposes. The decoder is what a diffusion pipeline
+needs; the **encoder was written so the decoder could be checked without a
+reference implementation**: encode a real photograph, decode the latent, compare.
+**36.09, 36.29, 36.49 and 40.89 dB** on four 256x256 photographs.
+
+That number is only worth printing because the check was ablated first. Against
+the same input, a `group_norm` missing its per-channel scale scores **16.77**, a
+symmetrically padded downsampler **14.60**, and a skipped mid-block attention
+**31.93** — all three still produce a recognisable picture, and all three would
+have passed "it looks right". Unreversed convolution kernels abort ggml outright.
+The suite carries the round trip at 128x128 as two `#[ignore]`d tests that
+**panic rather than skip** when the file is absent.
+
+**The denoiser is not started**, so Chaos cannot yet generate an image from a
+prompt — only decode a latent into one. `image-generation-ideogram-4.md` has the
+shapes and the order of work.
 
 **The project is now called `chaos`.** Every crate, binary, environment variable
 and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
@@ -20,9 +52,9 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **741 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
-needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
-clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
+**Current**: **761 tests** (58 binaries, 0 failed, 33 ignored — the V4-Flash set
+needs the container, and the autoencoder set needs the 336 MB `flux2-vae`),
+clippy `--workspace --all-targets -D warnings` 0, fmt clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
 reading, which is the only way that number has ever been right.
 
@@ -112,20 +144,43 @@ Re-run that way, one prompt each, greedy, on this 15.7 GiB machine:
 | Qwen3-14B | 8.38 GB | 1.03 | correct |
 | **gemma-3-27b** | **15.41 GB** | **0.05** | **correct** |
 | **Qwen3.6-27B** | **15.66 GB** | 0.02 | **WRONG** |
+| **V4-Flash** | **144 GB** | 0.176 | **correct** |
 
-**Eleven of twelve correct, and the twelfth is a bug rather than a limit.**
+**Eleven of twelve correct — and the twelfth is not this engine's fault.**
 The line worth keeping is gemma-3-27b: 15.41 GB of weights on a machine with
 ~7 GiB free, generating correct text at 0.05 tok/s. Nothing about that is fast
 and nothing about it is refused, which is the order Atur asked for — make it
 run, then make it quick. V4-Flash adds a thirteenth at 144 GB, answering through
 the server at 0.45 tok/s.
 
+**Qwen3.6-27B fails in llama.cpp too, and from identical numbers.** Same
+container, same prompt, greedy: Chaos returns `ทัน ทัน ทัน`, llama.cpp returns
+`333333`. Neither says Paris. The per-layer sums agree to five significant
+figures through layer 5 — `l_out-0` 59.1449 against 59.1446, `attn_residual-5`
+1009342 against 1009345 — and then **both** go NaN at `l_out-5`, where the
+residual has climbed three orders of magnitude above layer 4's 128.
+
+That agreement is a clue, not a defence. It says the port reproduces llama.cpp
+faithfully including its behaviour here, which narrows where to look — and
+reproducing a wrong answer precisely is still a wrong answer. **Chaos is judged on
+whether it answers correctly, not on whether it matches somebody else.** Ruled out
+by measurement: the
+container is complete (851/851 tensors), no f32 weight holds a NaN (all 449
+scanned), repacking, the key-head broadcast, the tokenizer, and every shape.
+What is left is this Unsloth Q4_K/Q5_K/Q6_K quantisation, or how this
+architecture is implemented at 64 blocks — and if it is the second, the fix comes
+from Qwen's own model definition rather than from another engine's version of it.
+`Qwen3.8-27B-UD-Q2_K_XL.gguf` at 9.94 GiB separates the two and is the model
+wanted anyway; Qwen3.6 comes out once it generates correctly.
+[`backlog/qwen35-27b-is-wrong.md`](docs/graph/backlog/qwen35-27b-is-wrong.md).
+
 The failure is not "too big": gemma-3-27b is the same size and is right. It is
 `qwen35` at 64 blocks.
 
 `qwen35` is verified against llama.cpp **on Qwen3.5-0.8B**, byte-identical at
-three prompt lengths. It is not verified on Qwen3.6-27B, and the 27B is wrong.
-What has been ruled out by measurement, not reasoning:
+three prompt lengths. On Qwen3.6-27B it is not verified — and the measurement
+below shows llama.cpp fails there too, from the same numbers, so what is
+unverified is the container rather than the port. Ruled out by measurement:
 
 - **The key-head broadcast.** The 27B has 16 key heads and 48 value heads where
   the 0.8B has 16 and 16, so a missing broadcast would be invisible at 0.8B and

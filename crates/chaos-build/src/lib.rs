@@ -23,6 +23,11 @@ use std::process::Command;
 /// be the first build dependency in the workspace and they shell out to the same
 /// tool.
 ///
+/// **Only call this from a crate that produces at least one binary.**
+/// `cargo:rustc-link-arg-bins` is rejected outright by cargo in a library-only
+/// crate — "invalid instruction" — so adding this to one breaks its build rather
+/// than being ignored. `chaos-image` hit exactly that.
+///
 /// **Never fatal.** A missing `windres`, a missing icon or a failed compile
 /// leaves the binaries without an icon and the build succeeding. An icon is
 /// worth having; it is not worth a build that cannot be made on a machine with a

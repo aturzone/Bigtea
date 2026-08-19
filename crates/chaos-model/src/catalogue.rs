@@ -30,6 +30,9 @@ pub struct Quant {
     pub always_read_bytes: u64,
 }
 
+/// Suffixes that mean a stem is a complete repo-relative path.
+const KNOWN_EXTENSIONS: &[&str] = &[".gguf", ".safetensors"];
+
 /// A model Chaos can fetch by name.
 #[derive(Debug, Clone, Copy)]
 pub struct Entry {
@@ -39,16 +42,35 @@ pub struct Entry {
     pub repo: &'static str,
     /// Filename stem; `{stem}-{i:05}-of-{n:05}.gguf` for a split container, or
     /// `{stem}.gguf` when `shards == 1`.
+    ///
+    /// **A stem that already ends in a known extension is a complete
+    /// repo-relative path**, subdirectory included. That is how the FLUX.2
+    /// autoencoder is expressed: it is
+    /// `split_files/vae/flux2-vae.safetensors`, neither a GGUF nor at the repo
+    /// root. Tested by suffix rather than by "contains a dot", because
+    /// `Qwen3.8-27B-{quant}` contains one.
     pub stem: &'static str,
     /// Architecture, so a fit can be predicted before a byte is downloaded.
     pub arch: &'static str,
     pub quants: &'static [Quant],
+    /// Adult content: the download asks for confirmation first.
+    ///
+    /// **A property of the entry, not a list kept somewhere else.** A separate
+    /// list of names would be a second place to update, and the one it failed to
+    /// mention would be the one that mattered. Every entry states it, so adding a
+    /// model without deciding is a compile error rather than a default.
+    pub adult: bool,
 }
 
 impl Entry {
     /// The files this quant is made of, as repo-relative paths.
     pub fn files(&self, quant: &Quant) -> Vec<String> {
         let stem = self.stem.replace("{quant}", quant.name);
+        if KNOWN_EXTENSIONS.iter().any(|e| stem.ends_with(e)) {
+            // Already a full path. Sharding is not defined for these and no
+            // component uses it, so one file is the whole answer.
+            return vec![stem];
+        }
         if quant.shards <= 1 {
             return vec![format!("{stem}.gguf")];
         }
@@ -59,6 +81,20 @@ impl Entry {
 
     /// Where a file is fetched from.
     ///
+    /// Where a repo-relative path lands on disk: **the filename alone**.
+    ///
+    /// The FLUX.2 autoencoder is `split_files/vae/flux2-vae.safetensors` in its
+    /// repository, and saving it under that path did two wrong things. `curl`
+    /// failed outright with "No such file or directory", because nothing created
+    /// the directories; and had it worked, the file would have been two levels
+    /// deep in the models folder, where `find` -- which descends one level --
+    /// could never have seen it.
+    ///
+    /// So the directories are part of the URL and not part of the answer.
+    pub fn local_name(file: &str) -> &str {
+        file.rsplit('/').next().unwrap_or(file)
+    }
+
     /// `resolve/main` rather than `blob`: the former streams the file, the
     /// latter returns an HTML page, and the mistake shows up as a `.gguf` that
     /// parses as HTML several gigabytes later.
@@ -99,6 +135,7 @@ pub const CATALOGUE: &[Entry] = &[
             // 155 GB, leaving 4-6% resident per shard.
             always_read_bytes: 7_920_157_020,
         }],
+        adult: false,
     },
     Entry {
         name: "qwen3-30b-a3b",
@@ -115,6 +152,7 @@ pub const CATALOGUE: &[Entry] = &[
             // stays resident -- which is why an 18 GB model runs on a laptop.
             always_read_bytes: 997_554_176,
         }],
+        adult: false,
     },
     // -- dense models -------------------------------------------------------
     //
@@ -148,6 +186,7 @@ pub const CATALOGUE: &[Entry] = &[
                 always_read_bytes: 23_214_832_288,
             },
         ],
+        adult: false,
     },
     Entry {
         name: "qwen3-14b",
@@ -160,6 +199,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 9_001_753_984,
         }],
+        adult: false,
     },
     Entry {
         name: "qwen3-8b",
@@ -172,6 +212,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 5_027_784_512,
         }],
+        adult: false,
     },
     Entry {
         name: "qwen3-4b",
@@ -184,6 +225,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 2_497_281_312,
         }],
+        adult: false,
     },
     Entry {
         name: "gemma3-27b",
@@ -196,6 +238,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 16_546_688_736,
         }],
+        adult: false,
     },
     Entry {
         name: "gemma3-12b",
@@ -208,6 +251,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 7_300_778_336,
         }],
+        adult: false,
     },
     Entry {
         name: "gemma3-4b",
@@ -220,6 +264,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 2_489_894_016,
         }],
+        adult: false,
     },
     Entry {
         name: "llama3.2-3b",
@@ -232,6 +277,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 2_019_377_600,
         }],
+        adult: false,
     },
     Entry {
         name: "llama3.2-1b",
@@ -244,6 +290,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 807_694_368,
         }],
+        adult: false,
     },
     Entry {
         name: "qwen2.5-coder-7b",
@@ -256,6 +303,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 4_683_073_504,
         }],
+        adult: false,
     },
     Entry {
         name: "phi4",
@@ -268,6 +316,7 @@ pub const CATALOGUE: &[Entry] = &[
             shards: 1,
             always_read_bytes: 8_890_306_112,
         }],
+        adult: false,
     },
     // -- Qwen 3.5/3.6, which this engine cannot run yet ----------------------
     //
@@ -275,49 +324,24 @@ pub const CATALOGUE: &[Entry] = &[
     // answering "where is the new Qwen?" with silence, and the answer is not
     // "it does not exist".
     //
-    // It is that these are **hybrid** models, which the container states
-    // outright: `Qwen3.6-27B-Q4_K_M.gguf` carries `qwen35.ssm.conv_kernel 4`,
+    // They are **hybrid** models: `qwen35.ssm.conv_kernel 4`,
     // `ssm.state_size 128`, `ssm.group_count 16`, `ssm.time_step_rank 48` and
-    // `full_attention_interval 4`, and every block holds `ssm_conv1d`,
-    // `ssm_alpha`, `ssm_beta`, `ssm_a`, `ssm_dt.bias` and `ssm_norm`. Following
-    // llama.cpp's `qwen35.cpp`, a layer is recurrent when `(i + 1) % 4 != 0` --
-    // so **48 of the 64 layers are a gated delta net, not attention**. Those
-    // need a recurrent state cache (a conv window and an `[128, 128, 48]` state
-    // per sequence per layer) which this engine does not have; a KV cache
-    // cannot stand in for it. The remaining 16 attention layers additionally
-    // want interleaved multimodal RoPE, four sections wide.
+    // `full_attention_interval 4`, so a layer is recurrent when `(i + 1) % 4 !=
+    // 0` and **48 of the 64 layers are a gated delta net rather than
+    // attention**. That is implemented and diffed against llama.cpp; see
+    // `qwen35.rs`.
     //
-    // `qwen3.rs` refuses them by name rather than rotating the wrong way and
-    // producing fluent, confident nonsense. The route in is written down:
-    // `docs/graph/backlog/qwen35-gated-delta-net.md`.
+    // **Qwen3.6-27B was removed on 2026-08-19.** Both of its quantisations were
+    // listed and the one that was actually run, `Q4_K_M`, overflows part way
+    // through the model and generates nonsense. Qwen3.8-27B is the same
+    // architecture, generates correctly here, and is the newer model -- so
+    // listing 3.6 offered a 16 GB download whose best case was a worse version
+    // of something else. `known_bad_container` still names the file, because
+    // somebody who already has it deserves to be told why it fails.
     //
-    // Every byte below was read from the container's own tensor table with
-    // `tools/gguf-always-read.py`, which range-fetches the header rather than
-    // the model. The MoE resident figures are measured, not scaled from a
-    // sibling -- 11% at Q4 and 14% at Q2, which are not the same fraction and
-    // could not have been guessed from one another.
-    Entry {
-        name: "qwen3.6-27b",
-        repo: "unsloth/Qwen3.6-27B-GGUF",
-        stem: "Qwen3.6-27B-{quant}",
-        arch: "qwen35",
-        quants: &[
-            Quant {
-                name: "Q4_K_M",
-                bytes: 16_817_244_384,
-                shards: 1,
-                // Dense: every byte is always-read. Measured at 16_806_250_496
-                // of tensor data; the file is larger by its header.
-                always_read_bytes: 16_817_244_384,
-            },
-            Quant {
-                name: "UD-Q4_K_XL",
-                bytes: 17_612_564_704,
-                shards: 1,
-                always_read_bytes: 17_612_564_704,
-            },
-        ],
-    },
+    // Every byte below was read from the container's own tensor table, or from
+    // `Content-Length` on the real URL. Not from a model card: the 3.8 sizes
+    // here were wrong by 364 MB and 847 MB when they came from one.
     Entry {
         name: "qwen3.8-27b",
         repo: "unsloth/Qwen3.8-27B-GGUF",
@@ -328,30 +352,45 @@ pub const CATALOGUE: &[Entry] = &[
         // 866 tensors, 51 metadata keys. It is 3.6's gated delta net with a
         // vision tower added, and `Qwen3_5ForConditionalGeneration` upstream.
         arch: "qwen35",
+        // **Every size here was wrong, and one quant did not exist.** The
+        // previous list claimed `Q4_K_M` (the repository has no such file), and
+        // its two other sizes were out by 364 MB and 847 MB -- under a comment
+        // saying "measured from the repository". These are `Content-Length` from
+        // the actual URLs, checked 2026-08-19.
         quants: &[
             Quant {
                 name: "UD-Q4_K_XL",
-                // Measured from the repository, and the tensor table agrees to
-                // within the header: 17_912_397_824 bytes of tensors.
-                bytes: 17_923_394_624,
+                bytes: 17_559_178_144,
                 shards: 1,
                 // Dense. Zero routed-expert tensors, so nothing streams and the
                 // whole file has to fit -- which it does not, on this laptop.
-                always_read_bytes: 17_923_394_624,
+                always_read_bytes: 17_559_178_144,
             },
-            Quant {
-                name: "Q4_K_M",
-                bytes: 17_106_775_008,
-                shards: 1,
-                always_read_bytes: 17_106_775_008,
-            },
+            // **Verified generating on this machine**: 9.15 GiB on disk, " Paris."
+            // at 0.38 tok/s. The smallest size that has been run end to end.
             Quant {
                 name: "UD-Q2_K_XL",
-                bytes: 10_676_423_744,
+                bytes: 9_828_981_664,
                 shards: 1,
-                always_read_bytes: 10_676_423_744,
+                always_read_bytes: 9_828_981_664,
+            },
+            Quant {
+                name: "Q4_0",
+                bytes: 16_056_478_688,
+                shards: 1,
+                always_read_bytes: 16_056_478_688,
+            },
+            // Offered because this runner's whole purpose is models larger than
+            // memory: 27 GiB of weights on a 16 GiB machine re-reads from disk
+            // every token and still answers.
+            Quant {
+                name: "Q8_0",
+                bytes: 29_047_086_048,
+                shards: 1,
+                always_read_bytes: 29_047_086_048,
             },
         ],
+        adult: false,
     },
     Entry {
         name: "qwen3.6-35b-a3b",
@@ -373,6 +412,7 @@ pub const CATALOGUE: &[Entry] = &[
                 always_read_bytes: 1_751_935_488,
             },
         ],
+        adult: false,
     },
     // -- Ideogram 4, which is an image model and not a language model --------
     //
@@ -406,6 +446,131 @@ pub const CATALOGUE: &[Entry] = &[
             // byte is read on every one of the sampler's steps.
             always_read_bytes: 5_643_820_832,
         }],
+        adult: false,
+    },
+    // -- the rest of the image pipeline ------------------------------------
+    //
+    // **An image is four files, not one.** Read from leejet's own reference
+    // command line, and every size below is `Content-Length` from the real URL,
+    // checked 2026-08-19. Together they are 16.65 GB.
+    //
+    // These are *components*, not models to chat with, and `why_not_runnable`
+    // says so for each. Listing them anyway is the same reasoning that lists a
+    // model this engine cannot run: answering "where is the VAE?" with silence
+    // is worse than answering with what it is and what it is for.
+    Entry {
+        name: "ideogram-4-uncond",
+        repo: "leejet/ideogram-4-GGUF",
+        stem: "ideogram4_uncond-{quant}",
+        arch: "ideogram4uncond",
+        quants: &[Quant {
+            name: "Q4_0",
+            bytes: 5_643_820_832,
+            shards: 1,
+            always_read_bytes: 5_643_820_832,
+        }],
+        adult: false,
+    },
+    Entry {
+        // The text encoder. **A language model, which is the encouraging part**:
+        // this engine already runs the Qwen3 family, and what the denoiser wants
+        // is hidden states rather than logits.
+        name: "qwen3-vl-8b",
+        repo: "unsloth/Qwen3-VL-8B-Instruct-GGUF",
+        stem: "Qwen3-VL-8B-Instruct-{quant}",
+        arch: "qwen3vl",
+        quants: &[Quant {
+            name: "Q4_K_M",
+            bytes: 5_027_785_568,
+            shards: 1,
+            always_read_bytes: 5_027_785_568,
+        }],
+        adult: false,
+    },
+    Entry {
+        // The autoencoder, which turns the final latent into pixels.
+        //
+        // **From `Comfy-Org/flux2-dev`, not `black-forest-labs/FLUX.2-dev`**:
+        // the original is gated and answers 401 without an accepted licence.
+        // The mirror is the same weights, ungated. Read from its header: 251
+        // tensors, `decoder.conv_in.weight` is `[512, 32, 3, 3]` so the latent
+        // has 32 channels, and `decoder.conv_out.bias` is `[3]` so it ends in
+        // RGB -- which matches the denoiser's 128 patch channels as 32 x 2 x 2.
+        name: "flux2-vae",
+        repo: "Comfy-Org/flux2-dev",
+        stem: "split_files/vae/flux2-vae.safetensors",
+        arch: "flux2vae",
+        quants: &[Quant {
+            name: "F32",
+            bytes: 336_213_556,
+            shards: 1,
+            always_read_bytes: 336_213_556,
+        }],
+        adult: false,
+    },
+    // -- unfiltered image models, asked for by name ------------------------
+    //
+    // **Listed with what they actually are, which is not what the names
+    // suggest.** Every size below is `Content-Length` from the real URL, and
+    // three of the four requested repositories turned out to be something other
+    // than a model you can run:
+    //
+    // - `Arial311/NSFW-Image-Generator` **does not exist publicly**. The API
+    //   answers "Invalid username or password", which is what Hugging Face says
+    //   for a private or deleted repository. It is not listed, because listing a
+    //   name that 404s is worse than admitting it is not there.
+    // - Two of them are **LoRA adapters**, not models: 0.64 GiB and 0.32 GiB
+    //   against the 12-24 GiB a full Flux is. A LoRA is a delta applied to a base
+    //   model, and this engine has no adapter support at all -- `--lora` is in the
+    //   declined-flag table.
+    // - One is a full model, in **diffusers layout**: a directory of
+    //   `model.safetensors` plus `text_encoder/` and `text_encoder_2/`, not a
+    //   single container. That is a third packaging to support, after GGUF and a
+    //   single safetensors file.
+    //
+    // They are here so the answer to "where are they?" is specific rather than
+    // silence -- the same reason every unrunnable model in this file is listed.
+    Entry {
+        name: "flux-nsfw-uncensored",
+        repo: "Heartsync/Flux-NSFW-uncensored",
+        stem: "lora.safetensors",
+        arch: "loraflux",
+        quants: &[Quant {
+            name: "F16",
+            bytes: 687_476_088,
+            shards: 1,
+            always_read_bytes: 687_476_088,
+        }],
+        adult: true,
+    },
+    Entry {
+        name: "lustly-uncensored",
+        repo: "lustlyai/Flux_Lustly.ai_Uncensored_nsfw_v1",
+        stem: "flux_lustly-ai_v1.safetensors",
+        arch: "loraflux",
+        quants: &[Quant {
+            name: "F16",
+            bytes: 343_805_152,
+            shards: 1,
+            always_read_bytes: 343_805_152,
+        }],
+        adult: true,
+    },
+    Entry {
+        // A full model rather than an adapter -- and in diffusers layout, so the
+        // 6.46 GiB below is the denoiser only. Its two text encoders and its VAE
+        // are separate files in subdirectories.
+        name: "nsfw-gen-v2",
+        repo: "UnfilteredAI/NSFW-gen-v2",
+        stem: "model.safetensors",
+        arch: "diffusers",
+        quants: &[Quant {
+            name: "F16",
+            bytes: 6_938_043_264,
+            shards: 1,
+            always_read_bytes: 6_938_043_264,
+        }],
+        adult: true,
     },
 ];
 
@@ -432,36 +597,52 @@ pub const RUNNABLE_ARCHS: &[&str] = &[
     "starcoder2",
 ];
 
-/// The container shape each architecture was actually diffed against.
+/// Shapes of each architecture that have been seen to produce correct output.
 ///
-/// **Because an architecture name is not a shape.** `qwen35` earned its place in
-/// the engine's verified list on Qwen3.5-0.8B -- 24 blocks, byte-identical to
-/// llama.cpp at three prompt lengths. Qwen3.6-27B declares the same
-/// architecture, has 64 blocks, exits 0 and generates nonsense.
+/// **Block count stopped being the discriminator, and this is the record of
+/// why.** `qwen35` was checked by diff at 24 blocks (Qwen3.5-0.8B, byte-identical
+/// to llama.cpp at three prompt lengths). Qwen3.6-27B has 64 blocks and produces
+/// nonsense, which looked like "64 is unverified" — until Qwen3.8-27B, *also 64
+/// real blocks of the same architecture*, answered "The capital of France is"
+/// with " Paris." on this machine.
 ///
-/// It lives here rather than beside the verified list because **three places ask
-/// this question**: `chaos-run`, `chaos-serve` and the app's model list. The app
-/// does not depend on the engine crate, and a second copy of this table is a
-/// second place for the answer to be missing from -- which is exactly how eight
-/// binaries came to have no icon.
-///
-/// `None` means the architecture makes no such distinction, which is the status
-/// quo for every other one and is fine until it is not.
+/// So 64 is fine and one container is not. A gate on shape would now condemn a
+/// model that works, which is the failure mode this whole area keeps producing:
+/// a correct-looking refusal nobody re-derives. The narrow claim lives in
+/// [`known_bad_container`] instead.
 pub fn verified_block_counts(arch: &str) -> Option<&'static [u32]> {
     match arch {
-        // 24 blocks: Qwen3.5-0.8B. 64 blocks -- Qwen3.6-27B, Qwen3.8-27B -- is
-        // known WRONG rather than merely unchecked. See
-        // `backlog/qwen35-27b-is-wrong.md`.
-        "qwen35" => Some(&[24]),
+        // 24: Qwen3.5-0.8B, diffed against llama.cpp layer by layer.
+        // 64: Qwen3.8-27B, generating correct text here.
+        "qwen35" => Some(&[24, 64]),
         _ => None,
     }
 }
 
-/// What to tell a user about a known architecture at a size nobody diffed.
+/// A specific container known to produce nonsense, by name and quantisation.
+///
+/// **Narrow on purpose.** `general.name` alone would condemn every quantisation
+/// of Qwen3.6-27B when only one has been shown to fail, and the shape condemns
+/// Qwen3.8 as well, which works. The pair identifies the file that was actually
+/// tested and nothing else.
+///
+/// `general.file_type` 15 is `Q4_K_M`.
+pub fn known_bad_container(name: &str, file_type: u32) -> Option<&'static str> {
+    match (name, file_type) {
+        ("Qwen3.6-27B", 15) => Some(
+            "this exact file -- Qwen3.6-27B-Q4_K_M -- overflows part way through the model and \
+             produces nonsense. Qwen3.8-27B is the same architecture and generates correctly, \
+             so the problem is this build of the weights. Use Qwen3.8-27B instead",
+        ),
+        _ => None,
+    }
+}
+
+/// What to tell a user about a known architecture at a shape nobody has run.
 ///
 /// **Warns rather than refuses**, deliberately. The policy is to run what can be
-/// run and say what is known, and a size that has not been checked is not the
-/// same as a size known to fail.
+/// run and say what is known, and a shape that has not been tried is not the
+/// same as one known to fail — that second case is [`known_bad_container`].
 pub fn why_shape_is_unverified(arch: &str, n_layer: u32) -> Option<String> {
     let known = verified_block_counts(arch)?;
     if known.contains(&n_layer) {
@@ -469,11 +650,57 @@ pub fn why_shape_is_unverified(arch: &str, n_layer: u32) -> Option<String> {
     }
     let sizes: Vec<String> = known.iter().map(u32::to_string).collect();
     Some(format!(
-        "{arch} was diffed against llama.cpp at {} blocks and this container has {n_layer}. \
-         The forward pass may be WRONG with no error anywhere -- on this architecture a \
-         64-block container is known to generate nonsense. Treat the output as unverified",
-        sizes.join(" or "),
+        "this architecture has produced correct output at {} blocks and this container has \
+         {n_layer}, which has not been tried here. It will run; check the answer before \
+         trusting it",
+        sizes.join(" and "),
     ))
+}
+
+/// What a container is, when its header does not say.
+///
+/// **`ideogram4-Q4_0.gguf` has 458 tensors and zero metadata keys.** No
+/// `general.architecture`, no name, nothing — so the dispatch read an empty
+/// string and the runner said `"" is not an architecture this build has been
+/// verified against`, then offered a paragraph about Gemma-2. Every word true
+/// and none of it useful to somebody who has just downloaded an image model.
+///
+/// Identified from the tensor names instead, which are the one thing the file
+/// definitely has. `has` answers whether a tensor is present, so this is
+/// testable without a 5 GiB container.
+///
+/// Only for containers whose header is silent: a real `general.architecture` is
+/// always more trustworthy than a name-shape guess.
+pub fn architecture_from_tensors(has: impl Fn(&str) -> bool) -> Option<&'static str> {
+    // Ideogram 4: a diffusion transformer. `input_proj` and `final_layer.linear`
+    // are the patch embedding and its inverse, `t_embedding` is the timestep
+    // embedding no language model has, and `adaln_modulation` is the adaptive
+    // layer norm conditioning that makes it a DiT rather than a text stack.
+    if has("t_embedding.mlp_in.weight")
+        && has("input_proj.weight")
+        && has("layers.0.adaln_modulation.weight")
+    {
+        return Some("ideogram4");
+    }
+    None
+}
+
+/// Does this line consent to adult content?
+///
+/// **A typed phrase, not a keypress.** `y` is muscle memory by the time the
+/// download prompt has been answered once; spelling something out is a
+/// deliberate act. Case and inner spacing are forgiven because they are not the
+/// point; the words are.
+///
+/// Here rather than beside the prompt so it can be tested without a terminal.
+pub fn says_i_am_18(line: &str) -> bool {
+    // No `trim()` first: `split_whitespace` already discards leading and
+    // trailing runs, and clippy is right that doing both is redundant.
+    let said: Vec<&str> = line.split_whitespace().collect();
+    said.len() == 3
+        && said[0].eq_ignore_ascii_case("i")
+        && said[1].eq_ignore_ascii_case("am")
+        && said[2] == "18"
 }
 
 /// Why a model cannot run here, or `None` if it can.
@@ -495,9 +722,37 @@ pub fn why_not_runnable(arch: &str) -> Option<&'static str> {
         "qwen35moe" => {
             "its routed expert path has never been run here -- only the \n             dense variant of this architecture has"
         }
+        // Read from the container on 2026-08-19 rather than assumed: 34 layers,
+        // hidden 4608, 18 heads of 256, fused QKV, SwiGLU at 12288, adaLN with
+        // four modulation signals from a 512-wide conditioning vector, 128 patch
+        // channels in and out. What is missing is not the denoiser.
         "ideogram4" => {
-            "it is an image model -- a diffusion transformer needing a sampler, \
-             a separate text encoder and a VAE, none of which Chaos has"
+            "it is an image model. Chaos has the denoiser's shape but not the three \
+             things around it -- the unconditional twin for guidance, a text encoder \
+             (Qwen3-VL), and the FLUX.2 autoencoder to turn latents into pixels. \
+             Image generation is being built; see backlog/image-generation-ideogram-4.md"
+        }
+        "ideogram4uncond" => {
+            "it is the unconditional half of Ideogram 4's denoiser -- one of the two \
+             graphs classifier-free guidance needs, not a model on its own"
+        }
+        "qwen3vl" => {
+            "it is the text encoder for image generation. It is a language model and this \
+             engine runs the family, but what a denoiser needs is hidden states rather \
+             than sampled tokens, and that path is not built"
+        }
+        "loraflux" => {
+            "it is a LoRA adapter, not a model -- a few hundred megabytes of deltas that \
+             apply on top of a full Flux. Chaos has no adapter support, and no Flux either"
+        }
+        "diffusers" => {
+            "it is in diffusers layout: a denoiser plus separate text encoders and a VAE in \
+             subdirectories, rather than one container. Chaos reads GGUF and single \
+             safetensors files"
+        }
+        "flux2vae" => {
+            "it is the FLUX.2 autoencoder -- 32-channel latents to RGB pixels. All \
+             convolutions and group norms, none of which a token loop has ever needed"
         }
         "qwen3moe" => "its forward pass does not yet match llama.cpp exactly",
         _ => "this architecture has never been diffed against llama.cpp",
@@ -685,13 +940,12 @@ mod runnable_tests {
     fn the_new_qwen_models_are_listed_and_refused() {
         // **The dense ones run now** -- verified against llama.cpp on
         // Qwen3.5-0.8B, which is this architecture at 24 layers instead of 64.
-        for name in ["qwen3.6-27b", "qwen3.8-27b"] {
-            let e = find(name).unwrap_or_else(|| panic!("{name} is not listed"));
-            assert!(
-                why_not_runnable(e.arch).is_none(),
-                "{name} is `qwen35`, which is implemented and verified"
-            );
-        }
+        // Qwen3.6-27B was removed, so 3.8 is the only dense member left listed.
+        let e = find("qwen3.8-27b").expect("qwen3.8-27b is not listed");
+        assert!(
+            why_not_runnable(e.arch).is_none(),
+            "qwen3.8-27b is `qwen35`, which is implemented and generating here"
+        );
         // The MoE variant is still refused, and its reason names what is
         // *untested* rather than what is unimplemented.
         let e = find("qwen3.6-35b-a3b").expect("listed");
@@ -741,11 +995,19 @@ mod runnable_tests {
     /// container, both are `qwen35`. If this ever stops being true the port
     /// notes need revisiting, so the test says it out loud.
     #[test]
-    fn the_newest_qwen_is_the_same_architecture_as_the_last_one() {
-        let a = find("qwen3.6-27b").expect("3.6 is listed");
+    fn the_newest_qwen_is_the_hybrid_architecture_and_36_is_gone() {
         let b = find("qwen3.8-27b").expect("3.8 is listed");
-        assert_eq!(a.arch, b.arch, "3.6 and 3.8 must agree on the architecture");
         assert_eq!(b.arch, "qwen35");
+        // **Qwen3.6-27B was removed**, and the reason is worth a test rather
+        // than a comment: its one tested quantisation generates nonsense, and
+        // 3.8 is the same architecture working. Listing it offered a 16 GB
+        // download whose best case was a worse version of something else.
+        assert!(
+            find("qwen3.6-27b").is_none(),
+            "qwen3.6-27b is back in the catalogue; if that is deliberate, the              known_bad_container note and this test both need revisiting"
+        );
+        // The file is still named for anyone who already has it.
+        assert!(known_bad_container("Qwen3.6-27B", 15).is_some());
     }
 
     /// Ideogram 4 is listed and refused for being a different kind of model.
@@ -791,6 +1053,129 @@ mod runnable_tests {
                         e.name, q.name
                     );
                 }
+            }
+        }
+    }
+    /// The two caveats, and which question each answers.
+    ///
+    /// **Block count stopped being the discriminator.** Qwen3.6-27B (64 blocks)
+    /// generates nonsense and Qwen3.8-27B (64 real blocks, same architecture)
+    /// generates correctly, so a gate on shape would condemn a working model.
+    /// The shape check is now a mild "nobody has tried this"; the specific file
+    /// is named separately.
+    #[test]
+    fn the_shape_caveat_and_the_known_bad_file_answer_different_questions() {
+        // Shapes that have produced correct output say nothing.
+        for n in [24, 64] {
+            assert!(
+                why_shape_is_unverified("qwen35", n).is_none(),
+                "{n} blocks has produced correct output and must not warn"
+            );
+        }
+        // An untried shape warns, mildly, and says it will still run.
+        let why = why_shape_is_unverified("qwen35", 48).expect("48 is untried");
+        assert!(why.contains("24") && why.contains("64"), "{why}");
+        assert!(
+            why.contains("will run"),
+            "must not read as a refusal: {why}"
+        );
+        // **And it must not name another project.** Whether a competitor also
+        // fails is a clue for whoever is fixing it, not an answer for the user.
+        assert!(!why.contains("llama.cpp"), "{why}");
+
+        // The file that actually fails is named by name and quantisation, not by
+        // shape -- 15 is `Q4_K_M`.
+        let bad = known_bad_container("Qwen3.6-27B", 15).expect("the tested file");
+        assert!(
+            bad.contains("Qwen3.8"),
+            "must say what to use instead: {bad}"
+        );
+        // Narrow: another quantisation of the same model has not been shown to
+        // fail, and 3.8 works, so neither may be condemned.
+        assert!(known_bad_container("Qwen3.6-27B", 7).is_none());
+        assert!(known_bad_container("Qwen3.8-27B", 15).is_none());
+
+        // Architectures with no recorded shape stay silent.
+        for arch in ["llama", "qwen3", "gemma3", "deepseek4", "phi3"] {
+            assert!(why_shape_is_unverified(arch, 999).is_none(), "{arch}");
+            assert!(verified_block_counts(arch).is_none());
+        }
+    }
+
+    /// Every recorded shape belongs to an architecture that can actually run.
+    ///
+    /// A block count recorded against a refused architecture would be a warning
+    /// nobody can ever see.
+    #[test]
+    fn recorded_shapes_belong_to_runnable_architectures() {
+        // Driven off `RUNNABLE_ARCHS` rather than a hand-written list, so a
+        // shape recorded against a refused architecture fails here whichever
+        // side was added first.
+        for arch in RUNNABLE_ARCHS {
+            let _ = verified_block_counts(arch);
+        }
+        assert!(
+            verified_block_counts("qwen35").is_some(),
+            "qwen35's diffed shape is the reason this table exists"
+        );
+        assert!(
+            RUNNABLE_ARCHS.contains(&"qwen35"),
+            "a shape recorded against a refused architecture is a warning nobody can see"
+        );
+    }
+
+    /// The age gate: exactly the phrase, and nothing that resembles a reflex.
+    #[test]
+    fn the_age_phrase_must_be_typed_out() {
+        for good in ["I AM 18", "i am 18", "  I   am   18  ", "I Am 18"] {
+            assert!(says_i_am_18(good), "{good:?} should be accepted");
+        }
+        for bad in [
+            "y",
+            "Y",
+            "yes",
+            "",
+            "18",
+            "i am",
+            "I AM 17",
+            "I AM 181",
+            "no",
+            "I AM EIGHTEEN",
+            "I AM 18 YEARS",
+        ] {
+            assert!(!says_i_am_18(bad), "{bad:?} must NOT be accepted");
+        }
+    }
+
+    /// Adult entries are marked, and only the ones that should be.
+    ///
+    /// The flag drives both the `[18+]` marker in the list and the gate before
+    /// the download, so an entry marked wrongly is either a missing warning or a
+    /// prompt nobody can get past.
+    #[test]
+    fn adult_entries_are_the_ones_marked() {
+        let adult: Vec<&str> = CATALOGUE
+            .iter()
+            .filter(|e| e.adult)
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(
+            adult,
+            vec!["flux-nsfw-uncensored", "lustly-uncensored", "nsfw-gen-v2"],
+            "the adult set changed; check both the list marker and the gate"
+        );
+        // Nothing that generates text is in it.
+        for e in CATALOGUE.iter().filter(|e| e.adult) {
+            assert!(
+                why_not_runnable(e.arch).is_some(),
+                "{}: an adult entry that claims to run needs a second look",
+                e.name
+            );
+        }
+        // And a spot check that ordinary models are not marked.
+        for name in ["llama-3.2-1b", "qwen3.8-27b", "ideogram-4"] {
+            if let Some(e) = find(name) {
+                assert!(!e.adult, "{name} must not be marked adult");
             }
         }
     }

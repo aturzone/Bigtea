@@ -458,8 +458,8 @@ fn the_fit_verdict_uses_the_resident_requirement() {
     assert!(
         too_big
             .expect("no oversized model in the catalogue")
-            .contains("too big"),
-        "a model whose resident set does not fit must say so"
+            .contains("slow, re-reads"),
+        "a model whose resident set does not fit runs SLOWLY -- it is not \"too          big\", and saying so told the user a working model would not work.          V4-Flash is 144 GB and generates correct text on a 16 GiB machine"
     );
 }
 

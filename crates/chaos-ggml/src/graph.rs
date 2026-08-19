@@ -140,6 +140,15 @@ extern "C" {
         ne2: i64,
     ) -> *mut ggml_tensor;
 
+    fn ggml_new_tensor_4d(
+        ctx: *mut ggml_context,
+        ty: c_int,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        ne3: i64,
+    ) -> *mut ggml_tensor;
+
     fn ggml_get_rows(
         ctx: *mut ggml_context,
         a: *mut ggml_tensor,
@@ -243,6 +252,81 @@ extern "C" {
         ctx: *mut ggml_context,
         a: *mut ggml_tensor,
         b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    /// 2-D convolution, for a VAE decoder rather than a language model.
+    ///
+    /// **`a` is the kernel and `b` is the data**, which is the opposite order to
+    /// every reading of "convolve the image with the kernel" -- and the arguments
+    /// are the same type, so swapping them compiles and produces a differently
+    /// shaped answer instead of an error.
+    ///
+    /// The kernel must be **F16**: this goes through `im2col` plus a matmul, and
+    /// that path is written for a half-precision kernel. An F32 kernel aborts.
+    fn ggml_conv_2d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+        s0: i32,
+        s1: i32,
+        p0: i32,
+        p1: i32,
+        d0: i32,
+        d1: i32,
+    ) -> *mut ggml_tensor;
+    /// 2-D convolution that takes an **F32** kernel.
+    ///
+    /// The `im2col` path behind `ggml_conv_2d` needs F16 and aborts otherwise,
+    /// which would mean converting all 138 of a VAE decoder's weights. This one
+    /// has its type assert commented out in `ggml.c` and checks only that the
+    /// input-channel dimensions agree, so the weights can be bound as they are
+    /// stored. Verified rather than assumed -- see `examples/try-vae-ops.rs`.
+    fn ggml_conv_2d_direct(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+        s0: i32,
+        s1: i32,
+        p0: i32,
+        p1: i32,
+        d0: i32,
+        d1: i32,
+    ) -> *mut ggml_tensor;
+    /// Group normalisation: the VAE's norm, and not one any layer here uses.
+    ///
+    /// Normalises over `ne[0] * ne[1]` and groups of channels along `ne[2]`,
+    /// which is why it belongs to a convolutional decoder and `rms_norm` does
+    /// not.
+    fn ggml_group_norm(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        n_groups: i32,
+        eps: f32,
+    ) -> *mut ggml_tensor;
+    /// Nearest-neighbour (or bilinear) resize by an integer factor.
+    ///
+    /// The decoder's three upsamplers are `interpolate(scale_factor=2,
+    /// mode="nearest")` followed by a convolution, so only mode 0 is used here.
+    fn ggml_upscale(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        scale_factor: i32,
+        mode: c_int,
+    ) -> *mut ggml_tensor;
+    /// Pad each dimension with zeros **at the end only**:
+    /// `[x, ..., x] -> [x, ..., x, 0, ..., 0]`.
+    ///
+    /// That asymmetry is the point. Diffusers' `Downsample2D` pads
+    /// `(0, 1, 0, 1)` -- right and bottom, never left or top -- and then
+    /// convolves with stride 2 and *no* padding. A symmetric `pad = 1` in the
+    /// convolution shifts every encoded feature half a pixel, which survives the
+    /// decoder as a picture that looks right and is not.
+    fn ggml_pad(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        p0: c_int,
+        p1: c_int,
+        p2: c_int,
+        p3: c_int,
     ) -> *mut ggml_tensor;
     /// The whole gated delta rule, fused.
     ///
@@ -687,6 +771,39 @@ impl Context {
         self.tensor(unsafe { ggml_new_tensor_3d(self.raw.as_ptr(), 1, ne0, ne1, ne2) })
     }
 
+    /// An F16 4-D tensor — a 2-D convolution kernel's shape,
+    /// `[kw, kh, in_channels, out_channels]`.
+    ///
+    /// Exists so that building a kernel `conv_2d` will accept does not require
+    /// remembering that F32 aborts.
+    pub fn new_f16_4d(
+        &self,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        ne3: i64,
+    ) -> Result<Tensor<'_>, GgmlError> {
+        // SAFETY: valid context; type 1 is GGML_TYPE_F16.
+        self.tensor(unsafe { ggml_new_tensor_4d(self.raw.as_ptr(), 1, ne0, ne1, ne2, ne3) })
+    }
+
+    /// An F32 4-D tensor: a convolution kernel `[kw, kh, in, out]`, or an
+    /// activation `[w, h, channels, batch]`.
+    ///
+    /// **`conv_2d_direct` accepts this and `conv_2d` aborts on it.** The FLUX.2
+    /// autoencoder stores all 251 of its tensors F32, so this is the shape every
+    /// weight in that file binds to, with no conversion anywhere.
+    pub fn new_f32_4d(
+        &self,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        ne3: i64,
+    ) -> Result<Tensor<'_>, GgmlError> {
+        // SAFETY: valid context; type 0 is GGML_TYPE_F32.
+        self.tensor(unsafe { ggml_new_tensor_4d(self.raw.as_ptr(), 0, ne0, ne1, ne2, ne3) })
+    }
+
     pub fn new_typed_2d(
         &self,
         ty: chaos_gguf::GgmlType,
@@ -793,6 +910,115 @@ impl Context {
         self.tensor(unsafe {
             ggml_ssm_conv(self.raw.as_ptr(), a.raw.as_ptr(), kernel.raw.as_ptr())
         })
+    }
+
+    /// 2-D convolution. `kernel` must be F16; see the declaration for why.
+    ///
+    /// Argument order is `(kernel, data)`, matching ggml. The wrapper keeps that
+    /// order rather than "fixing" it, because a wrapper that disagrees with the
+    /// library it wraps is worse than one that reads oddly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_2d<'a>(
+        &'a self,
+        kernel: &Tensor<'a>,
+        data: &Tensor<'a>,
+        stride: (i32, i32),
+        pad: (i32, i32),
+        dilation: (i32, i32),
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above. **The F16 kernel requirement is not checked here**
+        // because `Tensor` exposes no type accessor, and inventing one for a
+        // single call site is worse than saying it plainly: an F32 kernel aborts
+        // the process. `new_f16_4d` exists so the correct thing is the easy one.
+        self.tensor(unsafe {
+            ggml_conv_2d(
+                self.raw.as_ptr(),
+                kernel.raw.as_ptr(),
+                data.raw.as_ptr(),
+                stride.0,
+                stride.1,
+                pad.0,
+                pad.1,
+                dilation.0,
+                dilation.1,
+            )
+        })
+    }
+
+    /// 2-D convolution with an F32 kernel, `[kw, kh, in, out]` over `[w, h, c, n]`.
+    ///
+    /// Preferred over [`Context::conv_2d`] for anything whose weights are stored
+    /// F32, which is every tensor in the FLUX.2 autoencoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_2d_direct<'a>(
+        &'a self,
+        kernel: &Tensor<'a>,
+        data: &Tensor<'a>,
+        stride: (i32, i32),
+        pad: (i32, i32),
+        dilation: (i32, i32),
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above. ggml asserts `a->ne[2] == b->ne[2]` and **aborts**,
+        // so the caller must match input channels.
+        self.tensor(unsafe {
+            ggml_conv_2d_direct(
+                self.raw.as_ptr(),
+                kernel.raw.as_ptr(),
+                data.raw.as_ptr(),
+                stride.0,
+                stride.1,
+                pad.0,
+                pad.1,
+                dilation.0,
+                dilation.1,
+            )
+        })
+    }
+
+    /// Group normalisation over `n_groups` groups of channels.
+    pub fn group_norm<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        n_groups: i32,
+        eps: f32,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_group_norm(self.raw.as_ptr(), a.raw.as_ptr(), n_groups, eps) })
+    }
+
+    /// Nearest-neighbour upsample by an integer factor, over `ne[0]` and `ne[1]`.
+    ///
+    /// Mode 0 is `GGML_SCALE_MODE_NEAREST`. It is not a parameter because the
+    /// only caller is the autoencoder's upsampler, which is nearest by
+    /// definition -- bilinear here would blur every decoded image slightly and
+    /// never once fail a test.
+    pub fn upscale_nearest<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        factor: i32,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_upscale(self.raw.as_ptr(), a.raw.as_ptr(), factor, 0) })
+    }
+
+    /// Pad with zeros **at the far end of each dimension only**.
+    ///
+    /// `pad(x, 1, 1, 0, 0)` on `[w, h, c, n]` gives `[w + 1, h + 1, c, n]` with
+    /// the new column on the right and the new row at the bottom -- which is
+    /// exactly PyTorch's `F.pad(x, (0, 1, 0, 1))`, the padding diffusers'
+    /// `Downsample2D` applies before a stride-2 convolution.
+    pub fn pad<'a>(&'a self, a: &Tensor<'a>, p: [i32; 4]) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_pad(self.raw.as_ptr(), a.raw.as_ptr(), p[0], p[1], p[2], p[3]) })
+    }
+
+    /// Make a tensor contiguous with a 2-D shape.
+    ///
+    /// A `transpose` only relabels strides, so the result is not contiguous and
+    /// `mul_mat` will read it wrong. This is `cont_4d` with the trailing
+    /// dimensions at 1, named for the shape the caller is actually thinking in.
+    pub fn cont_2d<'a>(&'a self, a: &Tensor<'a>, ne: [i64; 2]) -> Result<Tensor<'a>, GgmlError> {
+        self.cont_4d(a, [ne[0], ne[1], 1, 1])
     }
 
     /// The fused gated delta rule. See the declaration for the shapes; the
@@ -1654,6 +1880,14 @@ impl Tensor<'_> {
     }
 
     /// This tensor's extents and byte strides, in ggml's `ne`/`nb` order.
+    /// The four dimensions, `ne[0]` fastest.
+    ///
+    /// `dims_and_strides` when the strides are not wanted -- which is most
+    /// callers, and all of the autoencoder's.
+    pub fn ne(&self) -> [i64; 4] {
+        self.dims_and_strides().0
+    }
+
     pub fn dims_and_strides(&self) -> ([i64; 4], [usize; 4]) {
         // SAFETY: valid tensor pointer for the context's lifetime; `RawTensor`
         // mirrors ggml's layout, which the FFI already relies on elsewhere.
@@ -2121,6 +2355,62 @@ mod tests {
             &narrow[..8.min(narrow.len())],
             &widened[..8.min(widened.len())]
         );
+    }
+
+    /// The two ops a VAE decoder needs, against arithmetic done by hand.
+    ///
+    /// **Tried in `examples/try-vae-ops.rs` first.** ggml aborts rather than
+    /// returning errors, and an abort takes the whole test binary rather than one
+    /// test — so a new op is exercised where a crash costs one `cargo run` and
+    /// names the call that did it. Both of these survived that before arriving
+    /// here.
+    #[test]
+    fn conv_2d_and_group_norm_do_the_arithmetic() {
+        let ctx = Context::new(ARENA).expect("context");
+
+        // A 1x1 kernel of 2 over [1,2,3,4] doubles every element.
+        let data = ctx.new_f32_1d(4).expect("data");
+        data.set_f32(&[1.0, 2.0, 3.0, 4.0]).expect("set");
+        let data = ctx.reshape_4d(&data, [2, 2, 1, 1]).expect("reshape");
+        let kernel = ctx.new_f16_4d(1, 1, 1, 1).expect("kernel");
+        // **F16, and 0x4000 is 2.0.** An F32 kernel aborts: ggml's conv_2d goes
+        // through im2col and a matmul written for half precision.
+        kernel
+            .set_bytes(&0x4000u16.to_le_bytes())
+            .expect("set kernel");
+        let out = ctx
+            .conv_2d(&kernel, &data, (1, 1), (0, 0), (1, 1))
+            .expect("conv_2d");
+        // Not asserted for `conv_2d_direct` here: it wanted **17 MB of arena for
+        // a 1x1 convolution over four values**, which is far more than this
+        // shared `ARENA` holds, and an exhausted arena aborts the whole binary.
+        // Covered in `examples/try-vae-ops.rs`, which sizes its own context.
+
+        ctx.compute(&out, 1).expect("compute");
+        let got = out.to_vec_f32();
+        assert_eq!(got.len(), 4, "1x1 stride 1 no padding keeps the shape");
+        for (g, w) in got.iter().zip([2.0f32, 4.0, 6.0, 8.0]) {
+            assert!((g - w).abs() < 1e-3, "conv_2d gave {got:?}");
+        }
+
+        // Group norm over one group of [1,2,3,4]: mean 2.5, population variance
+        // 1.25, so (x - 2.5) / sqrt(1.25). **Population, not sample** -- dividing
+        // by n-1 would give 1.1547 instead of 1.3416, and that is the kind of
+        // difference a "looks about right" check misses.
+        let x = ctx.new_f32_1d(4).expect("x");
+        x.set_f32(&[1.0, 2.0, 3.0, 4.0]).expect("set");
+        let x = ctx.reshape_4d(&x, [4, 1, 1, 1]).expect("reshape");
+        let out = ctx.group_norm(&x, 1, 1e-5).expect("group_norm");
+        ctx.compute(&out, 1).expect("compute");
+        let got = out.to_vec_f32();
+        for (g, w) in got.iter().zip([-1.3416f32, -0.4472, 0.4472, 1.3416]) {
+            assert!((g - w).abs() < 2e-3, "group_norm gave {got:?}");
+        }
+        // Mean zero is the property, and it is worth stating separately: a
+        // normalisation that scaled correctly but shifted wrongly would pass the
+        // comparison above only by luck.
+        let mean: f32 = got.iter().sum::<f32>() / got.len() as f32;
+        assert!(mean.abs() < 1e-5, "group norm must centre: mean {mean}");
     }
 
     #[test]

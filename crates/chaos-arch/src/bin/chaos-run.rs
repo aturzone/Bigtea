@@ -4180,6 +4180,23 @@ fn run(
     // Refuse an architecture nobody has checked, rather than answering wrongly
     // and confidently. Gemma-2 loads through the generic dense path with no
     // error at all and replies to "The capital of France is" with "himſelf".
+    // **A container whose header says nothing still is something.** Ideogram 4
+    // has 458 tensors and zero metadata keys, so the check below read an empty
+    // architecture and answered with a paragraph about Gemma-2. Name it from its
+    // tensors first, and say the useful thing.
+    if model.architecture().is_empty() {
+        if let Some(kind) =
+            chaos_model::catalogue::architecture_from_tensors(|n| model.location(n).is_some())
+        {
+            let why = chaos_model::catalogue::why_not_runnable(kind)
+                .unwrap_or("this build cannot run it");
+            return Err(format!(
+                "this container carries no metadata at all -- no architecture, no name. \
+                 Its tensors identify it as {kind}: {why}."
+            )
+            .into());
+        }
+    }
     if !architecture_is_verified(model.architecture()) && !force {
         // Built line by line: a multi-line format string keeps its source
         // indentation and prints a ragged message.
@@ -4292,10 +4309,8 @@ fn run(
     // A verified architecture at a size nobody diffed. Said before a token is
     // produced, because after that it reads as an excuse for output the user has
     // already started trusting.
-    if let Some(why) =
-        chaos_model::catalogue::why_shape_is_unverified(model.architecture(), config.n_layer)
-    {
-        chaos_arch::info!("shape      UNVERIFIED -- {why}");
+    if let Some(why) = chaos_arch::container_caveat(&model, config.n_layer) {
+        chaos_arch::info!("caution    {why}");
     }
     if !config.rope_type_is_known {
         // Say it rather than let the user discover it in the output. Both RoPE

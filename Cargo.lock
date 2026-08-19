@@ -51,6 +51,14 @@ name = "chaos-grammar"
 version = "0.0.9"
 
 [[package]]
+name = "chaos-image"
+version = "0.0.9"
+dependencies = [
+ "chaos-ggml",
+ "chaos-grammar",
+]
+
+[[package]]
 name = "chaos-io"
 version = "0.0.9"
 dependencies = [

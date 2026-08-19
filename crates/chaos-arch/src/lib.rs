@@ -34,6 +34,29 @@ pub use deepseek4_forward::{
 };
 pub use expert_cache::{CacheStats, ExpertCache};
 pub use kv::{KvCache, KvError, KvType};
+/// The one warning line a container deserves, or `None`.
+///
+/// Two questions in one place so the runner, the server and the window cannot
+/// ask them differently: **is this the exact file known to be broken**, and
+/// failing that, is this a shape nobody has run? The first is specific and
+/// actionable; the second is a caveat.
+pub fn container_caveat(model: &chaos_model::Model, n_layer: u32) -> Option<String> {
+    let name = model
+        .metadata()
+        .get("general.name")
+        .and_then(chaos_gguf::Value::as_str)
+        .unwrap_or("");
+    let file_type = model
+        .metadata()
+        .get("general.file_type")
+        .and_then(chaos_gguf::Value::as_u64)
+        .unwrap_or(u64::MAX) as u32;
+    if let Some(why) = chaos_model::catalogue::known_bad_container(name, file_type) {
+        return Some(why.to_string());
+    }
+    chaos_model::catalogue::why_shape_is_unverified(model.architecture(), n_layer)
+}
+
 pub use qwen3::{
     architecture_is_verified, why_no_device, Qwen3Config, Qwen3Model, VERIFIED_ARCHITECTURES,
 };
