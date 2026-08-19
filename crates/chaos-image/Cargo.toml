@@ -33,5 +33,14 @@ chaos-grammar = { path = "../chaos-grammar" }
 # before anyone does.
 chaos-ggml = { path = "../chaos-ggml" }
 
+# The denoiser is a 5.26 GiB GGUF whose weights are streamed one layer at a
+# time, which is exactly what these two already do for language models.
+chaos-gguf = { path = "../chaos-gguf" }
+chaos-model = { path = "../chaos-model" }
+
+# Only the examples need it: the text encoder takes token ids, and something has
+# to turn a prompt into them.
+chaos-tokenizer = { path = "../chaos-tokenizer" }
+
 # No build script: this crate produces no binaries, and
 # `cargo:rustc-link-arg-bins` is an error in a crate that has none.
