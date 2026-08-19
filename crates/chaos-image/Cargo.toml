@@ -1,0 +1,21 @@
+# Image generation: the parts of a diffusion pipeline that are not a token loop.
+#
+# **No dependencies, like every other crate here.** That includes the PNG
+# encoder: `png` and `flate2` would be the first external crates in the
+# workspace, and a PNG is a signature, three chunks and a CRC. See `png.rs` for
+# why storing rather than compressing is the right first answer.
+[package]
+name = "chaos-image"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Diffusion-model support for Chaos: PNG output, safetensors, and the sampler."
+
+[dependencies]
+
+# No build script: this crate produces no binaries, and
+# `cargo:rustc-link-arg-bins` is an error in a crate that has none.
