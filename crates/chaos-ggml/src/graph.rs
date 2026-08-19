@@ -2048,6 +2048,81 @@ mod tests {
         );
     }
 
+    /// **Does the fused op broadcast fewer key heads over more value heads?**
+    ///
+    /// Qwen3.5-0.8B has `group_count 16` key heads and `time_step_rank 16`
+    /// value heads -- a 1:1 ratio, where a broadcast is a no-op and its absence
+    /// cannot be seen. Qwen3.6-27B has 16 key heads and **48** value heads, and
+    /// on that container the port generated fluent nonsense while the 0.8B was
+    /// byte-identical to llama.cpp. This test asks the op directly, on a 2:6
+    /// ratio, instead of trusting the comment that said it broadcasts.
+    ///
+    /// If the two calls agree, the op broadcasts and the caller must not.
+    /// If they differ, the caller must repeat q and k up to the value head
+    /// count before calling -- which is what llama.cpp's `repeat_4d` does.
+    #[test]
+    fn gated_delta_net_and_the_key_head_broadcast() {
+        let ctx = Context::new(ARENA).expect("context");
+        let (s, h_k, h_v, tokens, seqs) = (4i64, 2i64, 6i64, 3i64, 1i64);
+        let ramp = |ne: [i64; 4], step: f32| {
+            let n = (ne[0] * ne[1] * ne[2] * ne[3]) as usize;
+            let t = ctx.new_f32_1d(n as i64).expect("new");
+            // A ramp rather than a constant: with every head identical, a
+            // missing broadcast and a correct one give the same answer, and the
+            // test would pass while proving nothing.
+            let data: Vec<f32> = (0..n).map(|i| 0.05 + step * i as f32).collect();
+            t.set_f32(&data).expect("set");
+            ctx.reshape_4d(&t, ne).expect("reshape")
+        };
+        let v = ramp([s, h_v, tokens, seqs], 0.011);
+        let g = ramp([1, h_v, tokens, seqs], -0.03);
+        let beta = ramp([1, h_v, tokens, seqs], 0.017);
+        let state = ramp([s, s, h_v, seqs], 0.0);
+
+        // Narrow q and k: h_k heads, as the container stores them.
+        let q_narrow = ramp([s, h_k, tokens, seqs], 0.013);
+        let k_narrow = ramp([s, h_k, tokens, seqs], 0.019);
+        let narrow = ctx
+            .gated_delta_net(&q_narrow, &k_narrow, &v, &g, &beta, &state, 1)
+            .expect("narrow");
+        ctx.compute(&narrow, 1).expect("compute narrow");
+        let narrow = narrow.to_vec_f32();
+
+        // The same q and k, repeated up to h_v heads by hand.
+        let q_wide = ctx
+            .repeat_4d(&q_narrow, [s, h_v, tokens, seqs])
+            .expect("repeat q");
+        let k_wide = ctx
+            .repeat_4d(&k_narrow, [s, h_v, tokens, seqs])
+            .expect("repeat k");
+        let widened = ctx
+            .gated_delta_net(&q_wide, &k_wide, &v, &g, &beta, &state, 1)
+            .expect("widened");
+        ctx.compute(&widened, 1).expect("compute widened");
+        let widened = widened.to_vec_f32();
+
+        assert_eq!(narrow.len(), widened.len(), "same output shape either way");
+        assert!(
+            narrow.iter().chain(widened.iter()).all(|v| v.is_finite()),
+            "a non-finite value from the delta rule"
+        );
+        let same = narrow
+            .iter()
+            .zip(widened.iter())
+            .all(|(a, b)| (a - b).abs() < 1e-5);
+        assert!(
+            same,
+            "**the fused op does NOT broadcast key heads.** With {h_k} key \
+             heads and {h_v} value heads, calling it with narrow q and k gives \
+             a different answer than repeating them first, so `qwen35.rs` must \
+             repeat q and k up to the value head count. This is why \
+             Qwen3.6-27B (16 key, 48 value) generated nonsense while \
+             Qwen3.5-0.8B (16 and 16) was exact.\nnarrow  {:?}\nwidened {:?}",
+            &narrow[..8.min(narrow.len())],
+            &widened[..8.min(widened.len())]
+        );
+    }
+
     #[test]
     fn scale_and_sigmoid_behave() {
         let ctx = Context::new(ARENA).expect("context");

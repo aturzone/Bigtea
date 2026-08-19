@@ -57,6 +57,19 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             other => {
+                // **A mistyped flag is an error, not a filename.** The same
+                // catch-all in `chaos-serve` silently ate `-ngl`, `-c`, `--auto`
+                // and `--force` for three releases while the app sent all four,
+                // so every one of those settings did nothing and nothing said
+                // so. There is no shared helper for this: the check is one
+                // predicate with nothing to keep in sync, and an extra
+                // dependency edge between leaf crates would cost more than it
+                // saves.
+                if other.starts_with('-') && other.len() > 1 {
+                    eprintln!("chaos-pull: unknown option {other:?}");
+                    eprintln!("            chaos-pull --help lists what it accepts");
+                    return ExitCode::from(2);
+                }
                 if model.is_empty() {
                     model = other.to_string();
                 }
