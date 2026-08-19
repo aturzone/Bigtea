@@ -57,6 +57,15 @@ are the measurement that killed an appealing idea.
   not evidence, answering in English is not evidence — only a diff against
   llama.cpp counts, and that is what `VERIFIED_ARCHITECTURES` membership means.
   Nothing in a GGUF records the FFN activation; GELU-for-SiLU is silent.
+  **An exit code is not a diff** — a sweep once reported twelve of twelve models
+  working while one printed Thai. And **an architecture name is not a shape**:
+  `qwen35` is exact at 24 blocks and nonsense at 64, so
+  `catalogue::verified_block_counts` records what was diffed and both binaries
+  warn otherwise.
+- **When llama.cpp fails on the same file, the port is not what is wrong.**
+  Chaos and llama.cpp agree to five significant figures on every layer of
+  Qwen3.6-27B and then both go NaN at `l_out-5`; llama.cpp's own answer is
+  `333333`. Run the competitor on the container before suspecting this engine.
 - **Prompt length decides which code paths run** on V4-Flash — 2, 5, 165 and
   2048 tokens each reach a different attention builder.
 - **Routing is not bitwise stable across sequence lengths**; a test demanding
