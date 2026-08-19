@@ -88,17 +88,47 @@ pub fn content_of(payload: &str) -> Option<String> {
 
 /// Is the server up and answering?
 pub fn health(port: u16) -> bool {
+    health_model(port).is_some()
+}
+
+/// The model a healthy server reports, or `None` if it is not answering.
+///
+/// **Which model answered is the part that mattered.** Loading a second model
+/// used to leave the first server running: the new one could not bind the port
+/// and died, and an up-or-down check saw the *old* server's 200, called the new
+/// model ready, and sent every message to the wrong weights. The name is in the
+/// response body, so the question can be "is the model I just started
+/// answering" rather than "is anything answering".
+pub fn health_model(port: u16) -> Option<String> {
     let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
-        return false;
+        return None;
     };
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
     let req = "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     if s.write_all(req.as_bytes()).is_err() {
-        return false;
+        return None;
     }
     let mut buf = String::new();
     let _ = s.read_to_string(&mut buf);
-    buf.contains("\"status\":\"ok\"")
+    if !buf.contains("\"status\":\"ok\"") {
+        return None;
+    }
+    // An absent or unreadable name leaves an empty string rather than a
+    // failure: a server answering `ok` is up, whatever else the body holds.
+    Some(health_field(&buf, "model").unwrap_or_default())
+}
+
+/// The value of one flat string field in a small JSON body.
+///
+/// Enough for `/health`, which is three fields and no nesting. The chat stream
+/// has its own parser because it has to handle escapes; this one does not need
+/// to and says so rather than pretending to be general.
+fn health_field(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let start = body.find(&needle)? + needle.len();
+    let rest = &body[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 /// One line of a connection report.

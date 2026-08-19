@@ -89,6 +89,16 @@ mod windows_app {
         /// here is nothing at all -- the connection test ran, passed, set the
         /// status line, and displayed no dialog whatsoever.
         report: Option<(String, bool)>,
+        /// What `chaos-serve` wrote to stderr, kept so a server that dies before
+        /// it is ready can say why.
+        ///
+        /// **It used to go nowhere.** The child is spawned with
+        /// `CREATE_NO_WINDOW` and inherits no console, so its one-line reason
+        /// for exiting -- "Only one usage of each socket address ... (os error
+        /// 10048)" -- was written to a handle nobody held. The window showed
+        /// "the model did not come up" after ten minutes of polling and the
+        /// actual sentence was lost.
+        serve_err: String,
     }
 
     /// Which set of models the MODELS page lists.
@@ -1087,6 +1097,23 @@ mod windows_app {
             return;
         };
 
+        // **Stop whatever is already running, before anything else.**
+        //
+        // This was missing, and it is the whole of "after one run the next model
+        // does not work". Loading a second model spawned a second
+        // `chaos-serve` while the first still held the port: the new process
+        // died with `os error 10048`, the readiness poll got its 200 from the
+        // OLD server, and the window reported the new model ready while every
+        // message went to the old weights. The old child's handle was also
+        // overwritten by the new one, so nothing could ever kill it -- it kept
+        // its residency until the machine was rebooted, which on a 15.7 GiB box
+        // running a 144 GB model is the difference between 0.45 tok/s and
+        // nothing at all.
+        //
+        // Measured, both halves: the second server exits 10048, and `/health`
+        // keeps answering with the first model's name.
+        stop_server();
+
         // Next to us, not on PATH: an app that finds a different Chaos than the
         // one it shipped with is a support problem nobody can reproduce.
         let exe = match std::env::current_exe() {
@@ -1152,12 +1179,50 @@ mod windows_app {
             return;
         }
 
+        // **A verified architecture at a size nobody diffed.** Not a refusal --
+        // the model runs, and refusing something that might be fine is its own
+        // kind of wrong. But the window is where somebody reads the answer, so
+        // it is where the caveat has to appear: `chaos-serve` prints this on its
+        // stdout, which this app does not show.
+        //
+        // Qwen3.6-27B is the case. It loads, generates, and prints
+        // `ทัน ทัน ทัน` -- and 27B is the size Atur actually has.
+        if let Some((a, n)) = arch.as_deref().zip(block_count_of(&path)) {
+            if let Some(why) = chaos_model::catalogue::why_shape_is_unverified(a, n) {
+                unsafe {
+                    MessageBoxW(
+                        main_hwnd(),
+                        wide(&format!(
+                            "{label} will run, but its answers are UNVERIFIED.\n\n{why}.\n\n\
+                             It will load and reply normally. Whether the reply is correct has \
+                             not been checked at this size, and a wrong forward pass here reads \
+                             as a confident answer rather than an error."
+                        ))
+                        .as_ptr(),
+                        wide("Chaos").as_ptr(),
+                        MB_OK | MB_ICONWARNING,
+                    );
+                }
+            }
+        }
+
         // **`cfg.force` is whatever SETTINGS says**, and nothing here overrides
         // it. The previous version set it to `true` unconditionally, which made
         // the toggle on the settings page a decoration: turning it off changed
         // nothing, and an unverified architecture ran anyway. If it is off,
         // `chaos-serve` refuses by name and the refusal reaches the strip.
         let port = cfg.port;
+
+        // `kill` returns before Windows has released the listening socket, so a
+        // new server started immediately can still lose the bind. Wait for the
+        // port to go quiet, and if something that is not ours is sitting on it,
+        // say so instead of starting a process that will die.
+        if let Some(other) = wait_for_port_free(port) {
+            set_status(&format!(
+                "port {port} is already serving {other} -- stop it, or change the port in SETTINGS"
+            ));
+            return;
+        }
 
         let mut cmd = Command::new(&exe);
         for a in cfg.serve_args(&path.to_string_lossy()) {
@@ -1167,9 +1232,31 @@ mod windows_app {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
+        // Kept rather than inherited, so the reason a server exits reaches the
+        // window instead of a console that does not exist.
+        cmd.stderr(std::process::Stdio::piped());
 
         match cmd.spawn() {
-            Ok(c) => {
+            Ok(mut c) => {
+                let pid = c.id();
+                if let Some(err) = c.stderr.take() {
+                    // Drained on its own thread: a full pipe blocks the writer,
+                    // which would hang the server rather than merely lose its
+                    // output.
+                    std::thread::spawn(move || {
+                        use std::io::BufRead;
+                        let mut keep: Vec<String> = Vec::new();
+                        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                            keep.push(line);
+                            // The last few lines are the ones that say why.
+                            if keep.len() > 8 {
+                                keep.remove(0);
+                            }
+                            let joined = keep.join(" ");
+                            shared().lock().unwrap().serve_err = joined;
+                        }
+                    });
+                }
                 UI.with(|u| {
                     if let Some(ui) = u.borrow_mut().as_mut() {
                         ui.server = Some(c);
@@ -1190,10 +1277,29 @@ mod windows_app {
                 std::thread::spawn(move || {
                     // Poll rather than parse stdout: readiness is exactly "does
                     // it answer", and that is the check a client makes too.
+                    //
+                    // **But watch the process as well as the port.** A server
+                    // that has already exited will never answer, and waiting
+                    // ten minutes to conclude that -- while its one-line reason
+                    // sits unread -- is how a port collision came to look like a
+                    // model too slow to load.
                     for _ in 0..1200 {
                         if client::health(port) {
                             let mut s = shared().lock().unwrap();
                             s.status = "ready".into();
+                            s.finished = true;
+                            drop(s);
+                            notify();
+                            return;
+                        }
+                        if process_gone(pid) {
+                            let mut s = shared().lock().unwrap();
+                            let why = s.serve_err.trim().to_string();
+                            s.status = if why.is_empty() {
+                                "chaos-serve stopped before it was ready".into()
+                            } else {
+                                format!("chaos-serve stopped: {why}")
+                            };
                             s.finished = true;
                             drop(s);
                             notify();
@@ -1232,6 +1338,23 @@ mod windows_app {
         g.get_str("general.architecture").map(str::to_string)
     }
 
+    /// The block count in a container's header.
+    ///
+    /// Beside [`architecture_of`] and reading the same 32 MiB head, because the
+    /// two answers are always wanted together: the architecture says whether the
+    /// engine implements this model, and the block count says whether *this
+    /// size* of it was ever checked.
+    fn block_count_of(path: &std::path::Path) -> Option<u32> {
+        use std::io::Read;
+        const HEAD: usize = 32 << 20;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut buf = Vec::with_capacity(HEAD);
+        f.by_ref().take(HEAD as u64).read_to_end(&mut buf).ok()?;
+        let g = chaos_gguf::Gguf::parse(&buf).ok()?;
+        let arch = g.get_str("general.architecture")?;
+        g.get_u64(&format!("{arch}.block_count")).map(|v| v as u32)
+    }
+
     fn unload_model() {
         stop_server();
         sync_enabled();
@@ -1243,6 +1366,44 @@ mod windows_app {
     /// Kill rather than ask: `chaos-serve` has no shutdown endpoint, it holds
     /// no state worth flushing, and a model mid-token would otherwise keep the
     /// process alive for minutes.
+    /// Has this process exited?
+    ///
+    /// By handle rather than by `try_wait`, because the poll runs on a worker
+    /// thread and the `Child` lives in `UI`, which is a `thread_local!` and is
+    /// `None` everywhere else. A handle that cannot be opened means the process
+    /// is gone, which is the answer being asked for.
+    fn process_gone(pid: u32) -> bool {
+        unsafe {
+            let h = OpenProcess(SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                return true;
+            }
+            let gone = WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+            CloseHandle(h);
+            gone
+        }
+    }
+
+    /// Wait for `port` to stop answering, and name whatever will not let go.
+    ///
+    /// Returns `None` once the port is free, or the model name still serving on
+    /// it. Five seconds is generous: this is the gap between `TerminateProcess`
+    /// returning and Windows releasing the socket, which is milliseconds.
+    fn wait_for_port_free(port: u16) -> Option<String> {
+        for _ in 0..20 {
+            client::health_model(port)?;
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        // Still answering. Name it if it said who it is.
+        client::health_model(port).map(|n| {
+            if n.is_empty() {
+                "another server".into()
+            } else {
+                n
+            }
+        })
+    }
+
     fn stop_server() {
         let child = UI.with(|u| u.borrow_mut().as_mut().and_then(|ui| ui.server.take()));
         if let Some(mut c) = child {
@@ -2207,7 +2368,13 @@ Any value a client sends is accepted.                      The server still list
         // brand's *ground* -- what Hermes puts behind its wordmark -- and the
         // logo itself is black art. And not `StretchDIBits` over a 1-bit 56px
         // bitmap either, which is what made it a blob at 30 pixels.
-        let box_px = 32usize;
+        // **44, not 32.** At 32 the mark reads as a smudge next to a 20px
+        // wordmark -- the sun's rays are one pixel wide there and the eye inside
+        // it is not visible at all, which is what "the logos in the app are
+        // small and low quality" was about. The art is filtered from the 256px
+        // master at whatever size is asked for, so a larger box costs nothing but
+        // rail space, and the rail is 208px wide.
+        let box_px = 44usize;
         let cov = art::logo_scaled(box_px);
         let chan = |c: Rgb, shift: u32| ((c >> shift) & 0xFF) as i32;
         let mut px = vec![0u8; box_px * box_px * 4];
@@ -2259,7 +2426,7 @@ Any value a client sends is accepted.                      The server still list
         label(
             hdc,
             metric::INSET + box_px + 10,
-            32,
+            38,
             metric::RAIL,
             "CHAOS",
             ui.fonts.mark,

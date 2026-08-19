@@ -5,8 +5,8 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-19 · **Version**: **v0.0.8** · **Branch**:
-`main` · **Open PRs**: none.
+**Last updated**: 2026-08-19 · **Version**: **v0.0.9** · **Branch**:
+`ticket/r61-installer-uninstall-update` · **Open PRs**: r60 (logo), r61 (this).
 
 **The release is out**: <https://github.com/aturzone/Chaos/releases/tag/v0.0.3>
 — Linux, macOS and Windows archives, verified by downloading the published
@@ -20,11 +20,130 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **738 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
+**Current**: **741 tests** (57 binaries, 0 failed, 31 ignored — the V4-Flash set
 needs the container), clippy `--workspace --all-targets -D warnings` 0, fmt
 clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
 reading, which is the only way that number has ever been right.
+
+## Seven reported problems, seven measured causes (2026-08-19)
+
+Atur listed seven. Each turned out to have a cause that could be measured
+rather than guessed at, and in three cases the cause was not what the symptom
+pointed at.
+
+**1. Loading a second model sent the messages to the first one.** The window
+never stopped the running server, so the second `chaos-serve` died with
+`os error 10048` while `/health` kept answering from the old one — and the
+window called the new model ready. The orphan's handle was overwritten too, so
+its memory was held until reboot. **This, not the GPU, is what "after one run
+V4-Flash does not respond" was.** Reproduced both ways before the fix; A-then-B
+on one port now reports B.
+
+**2. The GPU was accepted and ignored on V4-Flash.** `--device` and `-ngl`
+changed nothing and printed nothing, so "I turned the GPU on and it does no
+work" described the program exactly. It says so now. Not built rather than not
+wanted: the always-read set is 7.38 GiB against 5.11 GiB free on this card, and
+the only measured streaming-MoE figure on it is **4.3x slower** than the host
+path.
+
+**3. Four of the app's settings did nothing.** `chaos-serve` swallowed every
+flag it did not know, and it knew none of `-ngl`, `-c`, `--auto`, `--force`
+while the app sent all four. An unknown flag is an error now — in
+`chaos-serve`, `chaos-probe`, `chaos-pull` and `chaos-model-info`. `-c`,
+`--force` and `--auto` work; `-ngl` is refused by name with the reason.
+
+**4. The uninstall could not finish**, for three independent reasons: a modal
+dialog outlived the staged helper's ten-second patience, `version.txt` was
+never removed so the folder could never be deleted, and `UninstallString`
+carried no arguments so Add/Remove Programs opened the *installer*. All three
+fixed, and the whole flow run end to end — directory, registry key and PATH
+entry all gone, with the helper reporting.
+
+**5. An update looked like a first install.** The upgrade line was only ever
+written into the report, after the install had run. The welcome screen now says
+it before the button is pressed, and the button says UPDATE.
+
+**6. Eight of ten binaries had no icon**, because `chaos-app` and `chaos-setup`
+each held a private copy of the `windres` work and the other four crates had
+nothing to include. One `chaos-build` crate now holds it; verified by
+extracting the icon from all ten executables — one hash. And Explorer caches an
+icon by path, so an upgrade kept showing the old one until the installer
+started telling the shell otherwise.
+
+**7. Mojo and `xtool`, answered from the sources.** Mojo is genuinely open
+source (Apache 2.0, compiler included, CUDA/HIP/Metal) and is a language rather
+than a memory manager — the residency policy it was hoped to provide is what
+this project already *is*. What it could replace is ggml's kernels, and the
+routed expert arithmetic is under 5% of a V4-Flash token. `xtool` builds *iOS*
+apps with SwiftPM, so it is the wrong tool for a Rust project targeting macOS —
+and the macOS build, the `.deb` and the AppImage already exist and shipped in
+v0.0.8. Full reasoning:
+[`research/mojo-and-macos-packaging-2026-08-19.md`](docs/graph/research/mojo-and-macos-packaging-2026-08-19.md).
+
+**The logo's eyes are back.** An SVG path is one region however many subpaths it
+has, so with the default nonzero winding a reversed subpath is a *hole* — and
+one path in this mark is a near-white shape whose hole is what the eyes show
+through. The generator filled each subpath independently and filled the hole
+too. 43 paths producing 44 polygons was the tell.
+
+**Slow but stable is the policy now — and the first sweep of it was wrong.**
+Twelve installed models were run and all twelve exited 0, which was written down
+as "twelve of twelve" before the outputs were read. **Qwen3.6-27B exits 0 and
+prints `ทัน ทัน ทัน ทัน ทัน ทัน`.** That is this project's own documented
+hazard — a wrong forward pass produces fluent nonsense, never a crash — walked
+into by a test that checked exit codes. The claim is retracted; the sweep now
+requires the word `Paris` in the continuation of "The capital of France is",
+which is a correctness check rather than a liveness one.
+
+Re-run that way, one prompt each, greedy, on this 15.7 GiB machine:
+
+| model | on disk | tok/s | |
+|---|---|---|---|
+| Llama-3.2-1B | 0.75 GB | 19.52 | correct |
+| Qwen3.5-0.8B | 0.76 GB | 14.24 | correct |
+| gemma-3-4b | 2.32 GB | 7.09 | correct |
+| Qwen3-4B | 2.33 GB | 7.41 | correct |
+| Llama-3.2-3B | 1.88 GB | 7.01 | correct |
+| Qwen2.5-Coder-7B | 4.36 GB | 2.51 | correct |
+| Qwen3-8B | 4.68 GB | 4.39 | correct |
+| gemma-3-12b | 6.80 GB | 2.96 | correct |
+| phi-4 | 8.28 GB | 2.20 | correct |
+| Qwen3-14B | 8.38 GB | 1.03 | correct |
+| **gemma-3-27b** | **15.41 GB** | **0.05** | **correct** |
+| **Qwen3.6-27B** | **15.66 GB** | 0.02 | **WRONG** |
+
+**Eleven of twelve correct, and the twelfth is a bug rather than a limit.**
+The line worth keeping is gemma-3-27b: 15.41 GB of weights on a machine with
+~7 GiB free, generating correct text at 0.05 tok/s. Nothing about that is fast
+and nothing about it is refused, which is the order Atur asked for — make it
+run, then make it quick. V4-Flash adds a thirteenth at 144 GB, answering through
+the server at 0.45 tok/s.
+
+The failure is not "too big": gemma-3-27b is the same size and is right. It is
+`qwen35` at 64 blocks.
+
+`qwen35` is verified against llama.cpp **on Qwen3.5-0.8B**, byte-identical at
+three prompt lengths. It is not verified on Qwen3.6-27B, and the 27B is wrong.
+What has been ruled out by measurement, not reasoning:
+
+- **The key-head broadcast.** The 27B has 16 key heads and 48 value heads where
+  the 0.8B has 16 and 16, so a missing broadcast would be invisible at 0.8B and
+  fatal at 27B. `gated_delta_net_and_the_key_head_broadcast` asks the fused op
+  directly at a 2:6 ratio: narrow q/k and hand-repeated q/k agree, so the op
+  broadcasts and the caller correctly does not. The test stays, because that was
+  a comment asserting a behaviour nobody had checked.
+- **Every tensor shape.** `attn_qkv` 10240 = `2*key_dim + value_dim`,
+  `ssm_conv1d` 10240, `ssm_norm` 128 = `head_v_dim`, `attn_q` 12288 =
+  `2 * head_count * key_length`, and 851 tensors = 48 recurrent + 16 attention
+  blocks plus three. Every one scales exactly as `SsmConfig` computes it, and
+  the first four blocks' tensor names are identical between the two containers.
+
+Still open: repacking is the remaining structural difference — the 0.8B is Q8_0
+and the 27B is a Q4_K/Q5_K/Q6_K mix — and `CHAOS_NO_REPACK=1` is the next
+experiment. **`chaos-run` must warn, or refuse, on a `qwen35` container whose
+shape is not the one that was diffed.** Ticket:
+[`backlog/qwen35-27b-is-wrong.md`](docs/graph/backlog/qwen35-27b-is-wrong.md).
 
 ## Qwen3.8-27B is Qwen3.6's architecture, and the delta rule is one op (2026-08-19)
 
@@ -115,12 +234,10 @@ the *installed* build measure 238 px.
 
 ### The two that are not fixed, and why
 
-**Qwen3.5 / 3.6 needs a recurrent memory, not a rope fix.** Read from the
-container: `full_attention_interval 4` over 64 blocks means **48 of the 64
-layers are a gated delta net** carrying `ssm_conv1d`, `ssm_a`, `ssm_alpha`,
-`ssm_beta`, `ssm_dt.bias` and `ssm_norm`. A KV cache cannot hold a state that is
-carried and rewritten rather than appended. Four pieces of work, written down in
-[`backlog/qwen35-gated-delta-net.md`](docs/graph/backlog/qwen35-gated-delta-net.md).
+**Qwen3.5 / 3.6 / 3.8 is done** — see the section above. It needed a recurrent
+memory rather than a rope fix, and `qwen35` is now in `VERIFIED_ARCHITECTURES`:
+Qwen3.6-27B generates on this machine, slowly. `qwen35moe` is still out, because
+no MoE container of the family has been run here.
 
 **Ideogram 4 is open-weight and is an image model.** Listed in the catalogue,
 sized from the repository, refused with the reason. One image needs four parts —
@@ -131,10 +248,13 @@ metadata keys**, so there is not even a `general.architecture` to dispatch on.
 Two honest routes in
 [`backlog/image-generation-ideogram-4.md`](docs/graph/backlog/image-generation-ideogram-4.md).
 
-**Neither is LTS-blocking work that can be faked.** This release is v0.0.8, not
-an LTS: two of the six things asked for are architecture ports, and calling a
-release long-term-supported with them open would be a claim about the wrong
-thing.
+**One of the two is now closed, and the other is honestly named.** Qwen3.5/3.6/3.8
+runs and is diffed against llama.cpp; Ideogram 4 is an image model needing four
+components this engine has none of. **v0.0.9 is not called an LTS**, and the
+reason is Ideogram plus the server's missing device loader: a release that calls
+itself long-term-supported while a settings control it ships cannot do anything
+is making a claim about the wrong thing. What v0.0.9 *is*: every control on
+every page does what it says, or says why it cannot.
 
 ## A browser interface, and what a browser found (2026-08-17)
 

@@ -114,7 +114,15 @@ fn main() -> ExitCode {
         match a.as_str() {
             "--budget" => budget_gib = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
             "--load" => do_load = true,
-            _ => {}
+            // A mistyped flag is an error. `--budgt 8` used to run with no
+            // budget at all and print a fit report for a machine nobody asked
+            // about -- the same silent swallow that left four of the app's
+            // settings doing nothing for three releases.
+            other => {
+                eprintln!("chaos-model-info: unknown option {other:?}");
+                eprintln!("usage: chaos-model-info <any-shard.gguf> [--budget GIB] [--load]");
+                return ExitCode::from(2);
+            }
         }
     }
 

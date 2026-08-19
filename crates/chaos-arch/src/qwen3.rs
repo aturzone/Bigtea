@@ -113,6 +113,32 @@ fn ffn_act_for(arch: &str) -> FfnAct {
     }
 }
 
+/// Why a device does nothing on the streaming expert path, or `None` when the
+/// architecture can use one.
+///
+/// **A flag that is accepted and ignored is worse than one that is refused.**
+/// `--device` and `-ngl` were parsed, printed nothing, and left the GPU idle on
+/// V4-Flash -- so "I turned the GPU on and it does no work" was an accurate
+/// report of what the program did. The streaming path never opens a backend:
+/// its weights are bound zero-copy from the mapped container and its experts are
+/// read per token into host memory, and neither has a device equivalent yet.
+///
+/// The numbers behind not simply building it: V4-Flash's always-read set is
+/// 7.38 GiB and this machine's discrete card has 5.11 GiB free, so the resident
+/// half does not fit; and the only measured figure for a streaming MoE on this
+/// device is **4.3x slower** than the host path. Saying so is honest. Claiming
+/// a GPU run would not be.
+pub fn why_no_device(arch: &str) -> Option<&'static str> {
+    match arch {
+        "deepseek4" => Some(
+            "the streaming expert path has no device implementation: its weights are bound \
+             zero-copy from the container and its experts are read per token into host memory. \
+             The run continues on the processor",
+        ),
+        _ => None,
+    }
+}
+
 /// Architectures whose output has been diffed against llama.cpp, token for
 /// token, on this build.
 ///

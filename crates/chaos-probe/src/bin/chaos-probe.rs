@@ -39,7 +39,22 @@ fn main() -> ExitCode {
                 println!("  --processes  what is holding RAM, and what closing it would free.");
                 return ExitCode::SUCCESS;
             }
-            other => path = other.to_string(),
+            other => {
+                // **A mistyped flag is an error, not a filename.** The same
+                // catch-all in `chaos-serve` silently ate `-ngl`, `-c`, `--auto`
+                // and `--force` for three releases while the app sent all four,
+                // so every one of those settings did nothing and nothing said
+                // so. There is no shared helper for this: the check is one
+                // predicate with nothing to keep in sync, and an extra
+                // dependency edge between leaf crates would cost more than it
+                // saves.
+                if other.starts_with('-') && other.len() > 1 {
+                    eprintln!("chaos-probe: unknown option {other:?}");
+                    eprintln!("             chaos-probe --help lists what it accepts");
+                    return ExitCode::from(2);
+                }
+                path = other.to_string();
+            }
         }
     }
 

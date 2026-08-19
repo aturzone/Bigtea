@@ -49,6 +49,9 @@ fn main() -> ExitCode {
     let mut port = 8080u16;
     let mut cache_gib = 0f64;
     let mut api_key: Option<String> = None;
+    let mut context: Option<usize> = None;
+    let mut force = false;
+    let mut auto = false;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -90,11 +93,50 @@ fn main() -> ExitCode {
                     .filter(|v| !v.is_empty());
                 i += 2;
             }
-            "-h" | "--help" => {
-                usage();
-                return ExitCode::SUCCESS;
+            // The context limit. **The app has had a control for this since
+            // the settings page existed and it did nothing**: the flag was
+            // swallowed by the catch-all below, along with every other flag
+            // this parser did not know.
+            "-c" | "--context" => {
+                context = args.get(i + 1).and_then(|v| v.parse::<usize>().ok());
+                i += 2;
+            }
+            // Run an architecture that has not been diffed against llama.cpp.
+            //
+            // The runner has had this and the server refused to, on the grounds
+            // that a client cannot see that an answer is unsound. That reasoning
+            // still holds for a stranger's client -- and it does not hold for the
+            // person who typed the flag, who is the only one who can pass it. It
+            // is off by default and it says what it is doing.
+            "--force" => {
+                force = true;
+                i += 1;
+            }
+            // Size the expert cache from what the machine actually has free.
+            //
+            // The runner's `--auto` also picks a device and a layer split; that
+            // half has nowhere to go here yet and says so rather than being
+            // quietly dropped. What is left is the number that matters most on
+            // the streaming path, and it was a flag the app had been sending
+            // into a void.
+            "--auto" => {
+                auto = true;
+                i += 1;
             }
             other => {
+                // **An unknown flag is an error now.** It used to fall into the
+                // model-path slot and vanish, which is how `-ngl`, `-c`,
+                // `--auto` and `--force` all came to be accepted and ignored:
+                // the app passed four settings the server had never heard of and
+                // nothing anywhere said so. A flag is a promise.
+                if other.starts_with('-') && other.len() > 1 {
+                    eprintln!("chaos-serve: unknown option {other:?}");
+                    if let Some(why) = declined(other) {
+                        eprintln!("             {why}");
+                    }
+                    eprintln!("             chaos-serve --help lists what this build accepts");
+                    return ExitCode::from(2);
+                }
                 if path.is_empty() {
                     path = other.to_string();
                 }
@@ -135,7 +177,7 @@ fn main() -> ExitCode {
         eprintln!("             run `chaos-pull` again -- it resumes.");
         return ExitCode::from(2);
     }
-    match serve(&path, port, cache_gib, api_key) {
+    match serve(&path, port, cache_gib, api_key, context, force, auto) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("chaos-serve: {e}");
@@ -171,24 +213,55 @@ fn usage() {
     println!("Binds to localhost only: no TLS, one request at a time.");
 }
 
+/// Why a flag the runner accepts is not accepted here.
+///
+/// **The list exists so a refusal names its reason.** These four were silently
+/// swallowed until now: the app passed `-ngl`, `-c`, `--auto` and `--force` and
+/// the server had never heard of any of them. Two are implemented now; these
+/// are the two that are not, and a wrong-but-specific message beats a correct
+/// but empty one.
+fn declined(flag: &str) -> Option<&'static str> {
+    match flag {
+        "-ngl" | "--n-gpu-layers" | "--device" | "--main-gpu" => Some(
+            "the server loads its weights directly rather than through the runner's device \
+             loader, so there is nowhere to put them on a card yet. chaos-run takes -ngl and \
+             --device today; wiring the same loader in here is the open work.",
+        ),
+        _ => None,
+    }
+}
+
 fn serve(
     path: &str,
     port: u16,
     cache_gib: f64,
     api_key: Option<String>,
+    context: Option<usize>,
+    force: bool,
+    auto: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cache_gib = cache_gib;
     let t0 = std::time::Instant::now();
     let model = Model::open_split(path)?;
     let tokenizer = Tokenizer::from_metadata(model.metadata())?;
     // Same rule as the runner: refuse an architecture nobody has checked rather
     // than serving confident nonsense to an agent that cannot tell.
-    if !architecture_is_verified(model.architecture()) {
+    if !architecture_is_verified(model.architecture()) && !force {
         return Err(format!(
             "{:?} is not an architecture this build has been verified against              (verified: {}). It may load and answer WRONG with no error.              chaos-run --force will run it; the server will not, because a client              has no way to see that the answer is unsound.",
             model.architecture(),
             VERIFIED_ARCHITECTURES.join(", "),
         )
         .into());
+    }
+    if !architecture_is_verified(model.architecture()) {
+        // Said every time, not once at startup, because the person reading the
+        // answers may not be the person who launched this.
+        println!(
+            "forced     {:?} has NOT been diffed against llama.cpp -- answers may be",
+            model.architecture()
+        );
+        println!("           fluently wrong with no error anywhere. --force was given.");
     }
     println!("model      {} ({})", model.architecture(), model.io_mode());
     let format = tokenizer.chat_format();
@@ -206,6 +279,20 @@ fn serve(
         let config = Deepseek4Config::from_model(&model)?;
         let machine = chaos_probe::Machine::probe(std::path::Path::new("."), false);
         let reserve = (1u64 << 30) + (512 << 20) + (768 << 20);
+        if auto && cache_gib == 0.0 {
+            // Whatever is left after the always-read weights and the reserve.
+            // Below a quarter of a gigabyte a cache holds too few expert slices
+            // to pay for the memory, so it is left off rather than set to a
+            // number that only looks like tuning.
+            let spare = machine.usable_ram_for_weights(reserve) as f64 / GIB;
+            if spare >= 0.25 {
+                cache_gib = spare;
+                println!("auto       expert cache {cache_gib:.2} GiB, from the free memory now");
+            } else {
+                println!("auto       no expert cache: {spare:.2} GiB free is too little to help");
+            }
+            println!("auto       device not chosen here -- the server has no device loader yet");
+        }
         let (mut resident, report) =
             ResidentSet::load(&model, machine.usable_ram_for_weights(reserve))?;
         println!("resident   {report}");
@@ -239,6 +326,7 @@ fn serve(
         let engine = Engine::Deepseek4 {
             fw: &fw,
             config: &config,
+            asked: context,
         };
         return run_loop(engine, &tokenizer, port, t0, api_key);
     }
@@ -251,6 +339,13 @@ fn serve(
         "shape      {} layers, {} embd, {} heads ({} kv)",
         config.n_layer, config.n_embd, config.n_head, config.n_head_kv
     );
+    // Same warning the runner prints, and it matters more here: a client on the
+    // other end of the socket cannot see anything but the answer.
+    if let Some(why) =
+        chaos_model::catalogue::why_shape_is_unverified(model.architecture(), config.n_layer)
+    {
+        println!("shape      UNVERIFIED -- {why}");
+    }
     if !config.rope_type_is_known {
         println!(
             "           NOTE: {:?} is not an architecture this build has verified;",
@@ -314,6 +409,7 @@ fn serve(
         weights: &weights,
         name: &name,
         config: config.clone(),
+        asked: context,
     };
     run_loop(engine, &tokenizer, port, t0, api_key)
 }
@@ -739,6 +835,8 @@ enum Engine<'a> {
     Deepseek4 {
         fw: &'a Deepseek4Forward<'a>,
         config: &'a Deepseek4Config,
+        /// `-c`, when it was given and is not above what the path can hold.
+        asked: Option<usize>,
     },
     /// Dense Llama/Qwen, through the SAME `StreamingRunner` the CLI uses.
     ///
@@ -756,6 +854,8 @@ enum Engine<'a> {
         weights: &'a WeightSet<'a>,
         name: &'a str,
         config: Qwen3Config,
+        /// `-c`, when it was given and is not above what the path can hold.
+        asked: Option<usize>,
     },
 }
 
@@ -769,6 +869,21 @@ impl Engine<'_> {
 
     /// Tokens this path can hold in total, prompt plus generation.
     fn context_limit(&self) -> usize {
+        // **`-c` lowers this and never raises it.** A ceiling asked for above
+        // what the path can actually hold would be a promise the engine breaks
+        // mid-request, which is worse than a refusal at the door.
+        let (ceiling, asked) = match self {
+            Engine::Deepseek4 { asked, .. } => (self.hard_context_limit(), *asked),
+            Engine::Dense { asked, .. } => (self.hard_context_limit(), *asked),
+        };
+        match asked {
+            Some(n) if n > 0 => n.min(ceiling),
+            _ => ceiling,
+        }
+    }
+
+    /// What the engine can hold regardless of what was asked for.
+    fn hard_context_limit(&self) -> usize {
         match self {
             // **Was 256, and stayed 256 for a release after the engine stopped
             // needing it.** #61 replaced the position-indexed raw latents with

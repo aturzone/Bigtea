@@ -8,6 +8,159 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
+### Qwen3.6-27B loads, generates, and is wrong
+
+Found while checking that every installed model runs. It exits 0 and prints
+`ทัน ทัน ทัน ทัน ทัน ทัน`. Qwen3.5-0.8B — the same architecture at 24 layers
+instead of 64 — is byte-identical to llama.cpp at three prompt lengths, so
+`qwen35` is verified on the shape it was diffed against and not on this one.
+
+The first sweep of all twelve models recorded "twelve of twelve" because every
+one exited 0 and the outputs were never read. That is this project's own
+documented hazard walked into by a test that checked liveness instead of
+correctness. The sweep now requires the word `Paris` in the continuation of
+"The capital of France is".
+
+Ruled out by measurement, not reasoning: the key-head broadcast (the 27B has 16
+key heads and 48 value heads where the 0.8B has 16 and 16, so a missing
+broadcast would be invisible there — a new test calls the fused op at a 2:6
+ratio and proves it broadcasts on its own), and every tensor shape in both
+containers against what the config computes. Open, with the next three
+experiments written down, in `backlog/qwen35-27b-is-wrong.md`.
+
+### Loading a second model sent your messages to the first one
+
+The window never stopped the running server before starting the next. So
+loading a second model spawned a second `chaos-serve` while the first still
+held the port: the new process died with `os error 10048`, the readiness check
+took its 200 from the **old** server, and the window said the new model was
+ready while every message went to the old weights. The dead child's handle
+overwrote the live one, so nothing could kill the orphan either — it kept its
+memory, which on a 15.7 GiB machine running a 144 GB model is the difference
+between 0.45 tok/s and nothing at all.
+
+Both halves were reproduced before the fix and re-checked after. The window now
+stops the server first, waits for the port to be released, watches the process
+rather than only the port, and shows the server's own reason when one exits —
+that sentence used to be written to a console the app does not have.
+
+### Four settings that did nothing
+
+`chaos-serve`'s argument parser swallowed anything it did not recognise. It had
+no `-ngl`, no `-c`, no `--auto` and no `--force`, and the app sent all four — so
+the GPU list, the context list and the AUTO and FORCE toggles were decorations
+for three releases.
+
+- An unknown flag is an error now, in `chaos-serve`, `chaos-probe`,
+  `chaos-pull` and `chaos-model-info`. A flag is a promise.
+- `-c` works, and only ever *lowers* the limit: a ceiling above what the engine
+  can hold is a promise broken mid-request.
+- `--force` works, and says on every start that the architecture is unverified.
+- `--auto` sizes the expert cache from the memory actually free.
+- `-ngl` is refused **by name, with the reason**: the server binds weights
+  straight into host memory rather than through the runner's device loader. The
+  GPU list now says the window runs on the processor and that `chaos-run -ngl
+  99` uses the card. One true option beats three that do nothing.
+
+### The GPU on V4-Flash was accepted and ignored
+
+`--device` and `-ngl` on the streaming expert path changed nothing and printed
+nothing, so "I turned the GPU on and it does no work" was an accurate
+description of the program. `chaos-run` now says so, with the reason. Not built
+rather than not wanted: V4-Flash's always-read set is 7.38 GiB against 5.11 GiB
+free on this card, and the only measured figure for a streaming MoE on this
+device is **4.3x slower** than the host path.
+
+### The uninstall could not finish
+
+Three causes, each sufficient on its own:
+
+- **A dialog outlived the helper's patience.** An uninstall started from inside
+  the install folder stages a copy of itself in `%TEMP%`, because a running
+  executable keeps its own file open. The parent then showed a modal and only
+  quit once dismissed — while the helper retried for ten seconds and gave up.
+  The helper now waits for its parent by process handle and reports the result
+  itself.
+- **`version.txt` was never removed.** The install wrote it; the uninstall
+  removed the manifest and the log and not this, so the folder could never be
+  deleted and a stale version file was left claiming Chaos was installed. Found
+  on a real machine, not in a test. Both ends now read one list.
+- **Add/Remove Programs opened the installer.** `UninstallString` carried no
+  arguments, so Windows Settings showed the welcome screen with INSTALL as its
+  primary button. It now asks once and removes. `QuietUninstallString` is there
+  too, for `winget uninstall`.
+
+### An update looked exactly like a first install
+
+The upgrade line existed and was only ever written into the report — *after* the
+install had run. The welcome screen now reads the chosen folder first and says
+"Chaos 0.0.8 is installed here. This updates it to 0.0.9.", with the button
+relabelled UPDATE, or REINSTALL for the same version. It re-reads when the path
+is edited.
+
+### Eight of ten binaries had no icon, and Explorer kept showing the old one
+
+`chaos-app` and `chaos-setup` each carried a private copy of the same `windres`
+work, so the other four crates that build binaries had nothing to include:
+`chaos-run.exe`, `chaos-serve.exe`, `chaos-pull.exe`, `chaos-probe.exe`,
+`gguf-info.exe` and the benches all shipped with the blank Windows default. One
+`chaos-build` crate now holds it — a build dependency, linked into nothing.
+Verified by extracting the icon from all ten executables: one hash, ten
+binaries.
+
+And the file being right was not enough. Explorer caches an icon by path and
+does not re-read a file overwritten in place, so an upgrade kept showing the
+previous version's icon. The installer now tells the shell otherwise, which is
+what every installer does at the end of a copy.
+
+### The mark was too small to read
+
+The icon's art filled the middle 68% of its tile; at 32px that leaves the sun's
+rays one pixel wide and the eye invisible. Now 84%. The app's rail mark went
+from 32px to 44 in a 208px rail, and the installer's welcome mark from 68px to
+96 in a 900px window, where it had less presence than the wordmark beneath it.
+Nothing was resampled to get there — the art is filtered from the 256px master
+at whatever size is asked for.
+
+### The logo lost its eyes
+
+**An SVG path is one region, however many subpaths it has.** With no
+`fill-rule` the default is nonzero, so a subpath winding the other way is a
+*hole* — and one path in this mark is a near-white shape whose hole is what the
+eyes show through. The generator emitted every subpath as its own shape and
+filled each independently, so the hole was filled too. 43 paths producing 44
+polygons was the tell, and `assets/logo.png` — rendered by a different tool that
+collects a path's edges before scanning — had always shown the eyes. Two
+renderers of the same art disagreeing was the whole bug.
+
+### Release assets are named one way
+
+v0.0.8 shipped a mix of `chaos-` and `Chaos-`, and the AppImage was the only
+asset that did not say which platform it was for. Now one prefix, one version
+format, and platform and architecture on everything — with the `.deb` keeping
+Debian's mandated `name_version_arch.deb`, because an installer that will not
+install is not tidier. The README lists all five downloads with what to do with
+each, and says plainly that the window is Windows-only.
+
+### Mojo and xtool, asked and answered
+
+Both in `research/mojo-and-macos-packaging-2026-08-19.md`.
+
+**Mojo** is genuinely open source now — Apache 2.0, compiler included, CUDA,
+HIP and Metal. It is also a language, not a memory manager: deciding which of
+256 experts stay resident is policy, and that policy is what this project *is*.
+What it could replace is ggml's kernels, and the measured numbers say that is
+not where the time goes — the routed expert arithmetic is under 5% of a
+V4-Flash token, which is 1.56 s of disk read. It would also be the first
+external toolchain here, and Modular is not accepting compiler contributions
+until the end of 2026.
+
+**`xtool`** builds *iOS* apps with SwiftPM. This is a Rust project and the ask
+was macOS, so it is the wrong tool rather than a tool used wrongly. A macOS
+build needs the Apple SDK on Apple hardware — which the release workflow
+already has, on a `macos-latest` runner. The `.deb` and the AppImage already
+existed too, verified in CI with a real `dpkg -i` and a PATH check.
+
 ### The Qwen3.5 forward pass is implemented and diffed against llama.cpp
 
 `qwen35` — Qwen3.5, Qwen3.6 **and Qwen3.8**, all one architecture — now runs

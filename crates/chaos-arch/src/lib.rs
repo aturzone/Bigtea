@@ -34,7 +34,9 @@ pub use deepseek4_forward::{
 };
 pub use expert_cache::{CacheStats, ExpertCache};
 pub use kv::{KvCache, KvError, KvType};
-pub use qwen3::{architecture_is_verified, Qwen3Config, Qwen3Model, VERIFIED_ARCHITECTURES};
+pub use qwen3::{
+    architecture_is_verified, why_no_device, Qwen3Config, Qwen3Model, VERIFIED_ARCHITECTURES,
+};
 pub use sample::{neg_log_prob, Sampler, SamplerConfig, SamplerStage};
 pub use stream::{
     configured_threads, configured_threads_batch, StreamStats, StreamingRunner, TensorOverride,

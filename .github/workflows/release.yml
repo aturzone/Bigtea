@@ -180,7 +180,14 @@ jobs:
         shell: bash
         run: |
           VER="${GITHUB_REF_NAME:-dev}"
-          DIR="chaos-${VER}-${{ matrix.name }}"
+          # **One prefix, one version format, platform and architecture
+          # always present.** The v0.0.8 assets were a mix of `chaos-` and
+          # `Chaos-`, and a release page where the same project spells its own
+          # name two ways looks unfinished. `Chaos` is the product name, so that
+          # is the one that survives. The .deb keeps its own scheme below,
+          # because Debian policy requires `name_version_arch.deb` in lower case
+          # with no `v`, and an installer that will not install is not tidier.
+          DIR="Chaos-${VER}-${{ matrix.name }}"
           mkdir -p "$DIR"
           # chaos-app ships but is deliberately absent from the smoke test
           # above: with no arguments it opens a window, and CI would wait
@@ -200,14 +207,14 @@ jobs:
             # And beside the archive, under a name that says what it is: someone
             # who wants an installer should not have to find and unpack a zip to
             # reach it. One file, download and run.
-            cp target/release/chaos-setup.exe "Chaos-${VER}-Setup.exe"
+            cp target/release/chaos-setup.exe "Chaos-${VER}-windows-x86_64-Setup.exe"
           fi
           if [ "${{ matrix.archive }}" = "zip" ]; then
             7z a "$DIR.zip" "$DIR" >/dev/null
           else
             tar czf "$DIR.tar.gz" "$DIR"
           fi
-          ls -la chaos-*.${{ matrix.archive }}
+          ls -la Chaos-*.${{ matrix.archive }}
 
       # A tarball asks the user to decide where binaries go and to edit their
       # PATH; neither answer is obvious to somebody who just wants to run a
@@ -244,7 +251,7 @@ jobs:
           # Same hazard: `ls` of a missing glob is non-zero, and under
           # `pipefail` that fails the step rather than skipping the check.
           img=""
-          for f in Chaos-*-x86_64.AppImage; do [ -e "$f" ] && img="$f" && break; done
+          for f in Chaos-*-linux-x86_64.AppImage; do [ -e "$f" ] && img="$f" && break; done
           if [ -n "$img" ]; then
             # --appimage-extract avoids needing FUSE on the runner.
             ./"$img" --appimage-extract >/dev/null
@@ -325,14 +332,53 @@ jobs:
           $u = Start-Process -FilePath $setup -ArgumentList '/S', '--uninstall', '--prefix', $prefix -Wait -PassThru
           if ($u.ExitCode -ne 0) { throw "uninstall exited $($u.ExitCode)" }
           if (Test-Path (Join-Path $prefix 'bin')) { throw "uninstall left bin behind" }
+          # **The whole prefix, not just bin.** `version.txt` was written by the
+          # install and not removed by the uninstall, so the folder survived and
+          # a stale version file claimed Chaos was installed when nothing was.
+          # Found on a real machine, which is where this assertion comes from.
+          if (Test-Path $prefix) {
+            Get-ChildItem -Recurse $prefix | Select-Object -First 20 FullName
+            throw "uninstall left the prefix behind"
+          }
           if (-not (Test-Path $models)) { throw "UNINSTALL DELETED THE MODELS DIRECTORY" }
           Write-Host 'setup: install / run / uninstall clean, models untouched'
+
+          # **Uninstalling from INSIDE the folder being deleted**, which is what
+          # Add/Remove Programs does and what was actually broken: a running
+          # executable keeps its own file open, so the installer stages a copy in
+          # %TEMP% and lets that do the work. The parent used to show a dialog
+          # and only exit once dismissed, while the helper gave up after ten
+          # seconds -- so the uninstall "finished" with every binary on disk.
+          #
+          # The helper waits for its parent and outlives this process, so the
+          # check has to be a poll rather than an exit code.
+          $p2 = Start-Process -FilePath $setup -ArgumentList '/S', '--prefix', $prefix -Wait -PassThru
+          if ($p2.ExitCode -ne 0) { throw "second install exited $($p2.ExitCode)" }
+          $inside = Join-Path $prefix 'bin/chaos-setup.exe'
+          if (-not (Test-Path $inside)) { throw "the installer did not copy itself into bin" }
+          Start-Process -FilePath $inside -ArgumentList '/S', '--uninstall', '--prefix', $prefix
+          $gone = $false
+          foreach ($i in 1..60) {
+            if (-not (Test-Path $prefix)) { $gone = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $gone) {
+            Get-Content (Join-Path $env:TEMP 'chaos-uninstall.log') -ErrorAction SilentlyContinue
+            Get-ChildItem -Recurse $prefix | Select-Object -First 20 FullName
+            throw "uninstalling from inside the prefix left it behind"
+          }
+          if (-not (Test-Path $models)) { throw "UNINSTALL DELETED THE MODELS DIRECTORY" }
+          Write-Host 'setup: uninstall from inside the prefix is clean too'
 
       - name: The installer installs (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $dir = (Get-ChildItem -Directory -Filter 'chaos-*-windows-x86_64')[0].FullName
+          # `Chaos-*`, matching the archive name. This line looked for
+          # `chaos-*` and would have found nothing the moment the prefix changed
+          # -- an indexing error on an empty array, in the step that proves the
+          # installer works.
+          $dir = (Get-ChildItem -Directory -Filter 'Chaos-*-windows-x86_64')[0].FullName
           $prefix = Join-Path $env:RUNNER_TEMP 'chaos-install-test'
           $models = Join-Path $env:RUNNER_TEMP 'chaos-models-test'
           # -NoPath: a CI runner's user PATH is not ours to edit, and the
@@ -356,10 +402,10 @@ jobs:
         with:
           name: chaos-${{ matrix.name }}
           path: |
-            chaos-*.${{ matrix.archive }}
+            Chaos-*.${{ matrix.archive }}
             Chaos-*-Setup.exe
             chaos_*_amd64.deb
-            Chaos-*-x86_64.AppImage
+            Chaos-*-linux-x86_64.AppImage
           if-no-files-found: error
 
   publish:

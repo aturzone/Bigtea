@@ -13,7 +13,7 @@
   <a href="https://github.com/aturzone/Chaos/releases"><img alt="version" src="https://img.shields.io/badge/version-0.0.6-orange"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue"></a>
   <a href="https://github.com/aturzone/Chaos/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aturzone/Chaos/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-738%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-741%20passing-brightgreen">
 </p>
 
 ---
@@ -22,17 +22,32 @@
 
 **1. Install.**
 
-**Windows** -- download **`Chaos-Setup.exe`** from
-[Releases](https://github.com/aturzone/Chaos/releases) and run it. One file with
-everything inside it: no archive to unpack, no PowerShell, no administrator
-rights. It installs per-user, puts Chaos on your PATH, and adds a Start Menu
-entry.
+Every platform gets a file from
+[Releases](https://github.com/aturzone/Chaos/releases). Pick the one for yours.
 
-**Linux / macOS** -- unpack the archive and copy the binaries:
+| you have | download | what it does |
+|---|---|---|
+| **Windows** | `Chaos-vX.Y.Z-windows-x86_64-Setup.exe` | double-click; per-user, no admin rights |
+| **Debian / Ubuntu** | `chaos_X.Y.Z_amd64.deb` | `sudo apt install ./chaos_*.deb` |
+| **any Linux** | `Chaos-vX.Y.Z-linux-x86_64.AppImage` | one file, `chmod +x` and run |
+| **macOS (Apple silicon)** | `Chaos-vX.Y.Z-macos-arm64.tar.gz` | unpack, then the copy below |
+| **Windows / Linux, no installer** | the `.zip` / `.tar.gz` | unpack it yourself |
+
+The Windows installer carries every binary inside it: no archive to unpack, no
+PowerShell, no administrator rights. It puts Chaos on your PATH and adds a Start
+Menu entry, and it says whether it is installing or updating before you press the
+button.
+
+From an archive, copy the binaries yourself:
 
 ```bash
-sudo install -m 755 chaos-*/chaos-* /usr/local/bin/ && mkdir -p ~/.chaos/models
+sudo install -m 755 Chaos-*/chaos-* /usr/local/bin/ && mkdir -p ~/.chaos/models
 ```
+
+**The window is Windows-only.** `chaos-app` is written against Win32, so the
+Linux and macOS builds are the command-line tools -- `chaos-run`, `chaos-serve`,
+`chaos-probe`, `chaos-pull` and the rest. `chaos-serve` speaks the OpenAI API, so
+any client works on every platform.
 
 **2. Get a model.** Ask Chaos for one:
 

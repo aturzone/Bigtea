@@ -113,6 +113,53 @@ pub fn upgrade_line(before: Option<&Existing>, to: &str) -> String {
     }
 }
 
+/// Everything the install writes into the prefix itself, outside `bin`.
+///
+/// **One list, so both ends agree.** The uninstall had its own copy and
+/// `version.txt` was not in it, so the prefix was never empty, `remove_dir`
+/// always failed, and a stale version file was left behind claiming Chaos was
+/// installed when nothing was. That leftover was found on a real machine, not
+/// in a test.
+pub fn prefix_files(prefix: &Path) -> Vec<PathBuf> {
+    vec![
+        manifest_path(prefix),
+        version_path(prefix),
+        prefix.join("setup.log"),
+    ]
+}
+
+/// What the primary button says, and the line above it, before anything is
+/// written.
+///
+/// The counterpart to [`upgrade_line`], which describes the same thing
+/// afterwards. Both exist because the report alone was not enough: a user who
+/// installs a new version over an old one wants to know it is an update
+/// *before* pressing the button.
+pub fn welcome_action(before: Option<&Existing>, to: &str) -> (&'static str, String) {
+    match before {
+        None => ("INSTALL", String::new()),
+        Some(e) => match &e.version {
+            Some(v) if v == to => (
+                "REINSTALL",
+                format!("Chaos {v} is already installed here. This reinstalls it."),
+            ),
+            Some(v) => (
+                "UPDATE",
+                format!("Chaos {v} is installed here. This updates it to {to}."),
+            ),
+            // Installed before the version file existed, so the file count is
+            // all there is to go on. Still an update, and still worth saying.
+            None => (
+                "UPDATE",
+                format!(
+                    "An older Chaos ({} files) is installed here. This updates it to {to}.",
+                    e.files
+                ),
+            ),
+        },
+    }
+}
+
 /// Which of the previously installed names this version no longer ships.
 pub fn stale(previous: &[String], incoming: &[String]) -> Vec<String> {
     previous
@@ -371,5 +418,60 @@ mod step_tests {
         assert_eq!(human_millis(999), "999ms");
         assert_eq!(human_millis(1000), "1.0s");
         assert_eq!(human_millis(12480), "12.5s");
+    }
+
+    #[test]
+    fn the_uninstall_removes_the_version_file() {
+        // The bug this guards: `version.txt` was written by the install and not
+        // removed by the uninstall, so the prefix could never be deleted and a
+        // stale version file said Chaos was installed when it was not.
+        let dir = Path::new("C:").join("nowhere");
+        let names: Vec<String> = prefix_files(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"version.txt".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"installed-files.txt".to_string()),
+            "{names:?}"
+        );
+        assert!(names.contains(&"setup.log".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_second_install_says_it_is_an_update() {
+        // Nothing there: the plain case.
+        let (label, notice) = welcome_action(None, "0.0.9");
+        assert_eq!(label, "INSTALL");
+        assert!(notice.is_empty());
+
+        // An older version: the button has to say so before it is pressed.
+        let old = Existing {
+            version: Some("0.0.8".into()),
+            files: 9,
+        };
+        let (label, notice) = welcome_action(Some(&old), "0.0.9");
+        assert_eq!(label, "UPDATE");
+        assert!(
+            notice.contains("0.0.8") && notice.contains("0.0.9"),
+            "{notice}"
+        );
+
+        // The same version is a reinstall, and saying "update" there would be a
+        // lie the user could check.
+        let same = Existing {
+            version: Some("0.0.9".into()),
+            files: 9,
+        };
+        assert_eq!(welcome_action(Some(&same), "0.0.9").0, "REINSTALL");
+
+        // Installed before version.txt existed: still an update.
+        let unknown = Existing {
+            version: None,
+            files: 7,
+        };
+        let (label, notice) = welcome_action(Some(&unknown), "0.0.9");
+        assert_eq!(label, "UPDATE");
+        assert!(notice.contains('7'), "{notice}");
     }
 }

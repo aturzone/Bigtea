@@ -20,3 +20,8 @@ repository.workspace = true
 name = "chaos-probe"
 path = "src/bin/chaos-probe.rs"
 test = false
+
+[build-dependencies]
+# The icon every shipped .exe carries, in one place rather than a copy
+# per crate. Not linked into anything: it runs on the build machine.
+chaos-build = { path = "../chaos-build" }
