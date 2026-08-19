@@ -829,6 +829,49 @@ mod setup {
         }
     }
 
+    /// Arrange for the staged uninstaller to delete itself.
+    ///
+    /// **A 29 MB executable left in `%TEMP%` is not a clean uninstall.** The
+    /// staged copy carries the whole payload and cannot remove itself while it
+    /// is running.
+    ///
+    /// `MoveFileEx(.., NULL, MOVEFILE_DELAY_UNTIL_REBOOT)` is the documented
+    /// answer and **it does not work here**: it needs administrator rights, and
+    /// this installer's whole point is that it needs none. Measured rather than
+    /// assumed -- unelevated it returns false and sets error 3.
+    ///
+    /// So: a detached `cmd` that waits for this process to be gone and then
+    /// deletes the file. `ping` is the delay because `timeout` needs a console
+    /// and this process has none.
+    ///
+    /// Best effort by design. A failure leaves one file in a temporary
+    /// directory, which is not worth failing an uninstall over.
+    fn schedule_self_deletion() {
+        let Ok(me) = std::env::current_exe() else {
+            return;
+        };
+        // Only the staged copy, never an installer somebody keeps in Downloads.
+        if me.parent() != Some(std::env::temp_dir().as_path()) {
+            return;
+        }
+        let mut cmd = Command::new("cmd");
+        {
+            use std::os::windows::process::CommandExt;
+            // **`raw_arg`, not `arg`.** Rust quotes arguments by the C runtime's
+            // rules and `cmd.exe` parses its command line by its own, so the
+            // redirection and the `&` came through quoted and cmd answered
+            // "The filename, directory name, or volume label syntax is
+            // incorrect." Measured, not guessed.
+            let q = char::from(34);
+            cmd.raw_arg(format!(
+                "/c ping -n 4 127.0.0.1 >nul & del /f /q {q}{}{q}",
+                me.display()
+            ));
+            cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        }
+        let _ = cmd.spawn();
+    }
+
     /// Tell Explorer the icons changed.
     ///
     /// **Because the file being right is not enough.** Explorer caches an
@@ -1048,6 +1091,10 @@ mod setup {
                 }
             }
         }
+
+        // Asked for before the work, so it happens even if a file below is
+        // locked and the uninstall reports a partial result.
+        schedule_self_deletion();
 
         remove_dir_all_retrying(&bin);
         for f in prefix_files(&prefix) {
