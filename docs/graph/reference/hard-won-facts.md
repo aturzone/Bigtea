@@ -60,6 +60,29 @@ are the measurement that killed one.
 
 ## Correctness, which fails silently here
 
+- **A sweep that checks exit codes is not a test.** Twelve installed models were
+  run and all twelve exited 0, which was written down as "twelve of twelve"
+  before any output was read. Qwen3.6-27B exits 0 and prints
+  `ทัน ทัน ทัน ทัน ทัน ทัน`. Ask for a token the prompt makes obvious —
+  `Paris` after "The capital of France is" — and compare *that*.
+- **When the reference implementation fails too, the port is not what is
+  wrong.** Chaos and llama.cpp agree to five significant figures on every layer
+  sum of Qwen3.6-27B and then *both* go NaN at `l_out-5`, where the residual has
+  climbed to 1.009e6. llama.cpp's own answer is `333333`. Agreement that exact,
+  up to and including the failure, is stronger evidence of a faithful port than
+  a clean diff on a model that works — so before blaming this engine, run the
+  competitor on the same file.
+- **An architecture name is not a shape.** `qwen35` is byte-identical to
+  llama.cpp at 24 blocks and nonsense at 64. `VERIFIED_ARCHITECTURES` is
+  per-architecture, so the shape needs its own record —
+  `catalogue::verified_block_counts` — and a warning that names what was
+  actually diffed.
+- **A comment asserting a behaviour is not a test of it.** `qwen35.rs` said the
+  fused delta-net op broadcasts key heads over value heads on its own. True, as
+  it turns out — but only checked after it became the leading suspect for a bug,
+  and only checkable at all because a 2:6 head ratio was tried. At the 1:1 ratio
+  the 0.8B has, a missing broadcast and a correct one give the same answer.
+
 - **A tensor you read back must be a *root* of the compute, not merely present
   in the graph.** `ggml_build_forward_expand` walks a root's ancestors; a
   *sibling* view of some node is not an ancestor of it. Qwen3.5's attention gate
@@ -360,6 +383,40 @@ compiling**, and three of these were believed fixed before a pixel was measured.
   on every token. Count it once, in the rescan.
 
 ## The installer
+
+- **A running executable cannot delete the directory it lives in, and the
+  staged helper needs its parent to be *gone*, not merely finished.** The
+  installer copies itself into `bin` so Add/Remove Programs has something to
+  launch, which means the normal uninstall runs from inside the folder it is
+  removing. It stages a copy in `%TEMP%` and lets that do the work — and the
+  parent then showed a message box and only exited when it was dismissed, while
+  the helper retried for ten seconds and gave up. **Ten seconds against however
+  long somebody takes to read a dialog** is what "uninstall does not work" was.
+  Pass the parent's pid, wait on the handle, and let the helper do the talking.
+- **`MoveFileEx(.., NULL, MOVEFILE_DELAY_UNTIL_REBOOT)` needs administrator
+  rights.** It is the documented way for a running executable to arrange its own
+  deletion and it is unavailable to a per-user installer: unelevated it returns
+  false and sets error 3. What works is a detached `cmd` that waits and deletes,
+  with `ping` as the delay because `timeout` needs a console.
+- **`raw_arg`, not `arg`, when the program is `cmd.exe`.** Rust quotes arguments
+  by the C runtime's rules and `cmd` parses its command line by its own, so a
+  redirection or an `&` arrives quoted and cmd answers "The filename, directory
+  name, or volume label syntax is incorrect."
+- **The uninstall must remove everything the install wrote, and `version.txt`
+  was missed.** The prefix was therefore never empty, `remove_dir` always
+  failed, and a stale version file was left claiming Chaos was installed. Found
+  on a real machine. One list, `prefix_files`, read by both ends.
+- **`UninstallString` needs its arguments.** Without them, clicking Uninstall in
+  Windows Settings opens the installer's welcome screen with INSTALL as the
+  primary button — the one action the user asked for is the one not offered.
+- **Explorer caches an executable's icon by path** and does not re-read a file
+  overwritten in place, so an upgrade keeps showing the previous version's icon
+  on the taskbar, in the Start Menu and on the shortcut. The file being correct
+  is not enough: call `SHChangeNotify(SHCNE_ASSOCCHANGED)` at the end of a copy.
+- **An icon resource has to be added per crate.** `cargo:rustc-link-arg-bins`
+  applies only to the crate that prints it, so two crates with their own copy of
+  the `windres` dance left the other four crates' binaries with the blank
+  Windows default — eight of ten executables, for eight releases.
 
 - **`Vec::as_ptr()` on an empty vector is a dangling pointer, and Windows will
   dereference it.** `DrawTextW` with a zero-length buffer took the installer
