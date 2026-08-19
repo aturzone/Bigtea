@@ -8,11 +8,22 @@ right, so fix this file.
 **Last updated**: 2026-08-19 · **Version**: **v0.0.9** · **Branch**:
 `ticket/r61-installer-uninstall-update` · **Open PRs**: r60 (logo), r61 (this).
 
-**The release is out**: <https://github.com/aturzone/Chaos/releases/tag/v0.0.3>
-— Linux, macOS and Windows archives, verified by downloading the published
-Windows zip, running `install.ps1` from it, and generating text with the
-installed binary (`chaos-run llama "The largest ocean on Earth is"` →
-*"the Pacific Ocean, which covers an area"*, 18.94 tok/s).
+**Twelve of thirteen installed models generate correct text** on this 15.7 GiB
+machine, checked by requiring `Paris` after "The capital of France is" rather
+than by exit code — including gemma-3-27b at 15.41 GB, larger than the free
+memory, correct at 0.05 tok/s, and V4-Flash at 144 GB through the server at 0.45
+tok/s. **The thirteenth, Qwen3.6-27B-Q4_K_M, fails in llama.cpp too**: the two
+engines agree to five significant figures on every layer sum and then both
+overflow to NaN at `l_out-5`. Chaos warns before generating and points at the
+container.
+
+**The release**: v0.0.9, six assets — Windows installer and zip, Linux tarball,
+`.deb` and AppImage, macOS arm64 tarball. The installer was built and exercised
+locally before tagging: 28.2 MB carrying 11 binaries, installed to a test prefix,
+the installed `chaos-run` generated *" Paris."*, reinstall reported
+"Reinstalling Chaos 0.0.9", and uninstalling from inside the folder removed the
+prefix, the registry key, the PATH entry and the staged helper — leaving the
+models directory untouched.
 
 **The project is now called `chaos`.** Every crate, binary, environment variable
 and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
