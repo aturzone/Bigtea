@@ -15,6 +15,15 @@
 //! - `pad` puts its zeros on the **right and bottom only**, which is what
 //!   makes it diffusers' `F.pad(x, (0, 1, 0, 1))` rather than a symmetric one.
 
+/// Without ggml there is nothing to try, and an example with no `main` does not
+/// compile at all — which is why this is a cfg on the function rather than the
+/// `#![cfg(have_ggml)]` the gated *tests* in this crate use.
+#[cfg(not(have_ggml))]
+fn main() {
+    eprintln!("built without ggml -- set GGML_LIB_DIR and rebuild to try these ops");
+}
+
+#[cfg(have_ggml)]
 fn main() {
     let ctx = match chaos_ggml::Context::new(256 << 20) {
         Ok(c) => c,

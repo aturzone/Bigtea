@@ -23,8 +23,14 @@ description = "Diffusion-model support for Chaos: PNG output, safetensors, and t
 chaos-grammar = { path = "../chaos-grammar" }
 
 # The autoencoder is a graph of convolutions, so it needs the same ggml the
-# token loop uses. It borrows the arithmetic and owns the architecture --
-# which is the arrangement everywhere else here too.
+# token loop uses. It borrows the arithmetic and owns the architecture -- which
+# is the arrangement everywhere else here too.
+#
+# **This makes chaos-image the second crate that needs `GGML_LIB_DIR`**, after
+# chaos-arch. `png` and `safetensors` do not, and splitting them out would keep
+# image *output* available on a machine that has never compiled C -- worth doing
+# if anyone wants it, and not worth a build script guessing at ggml's presence
+# before anyone does.
 chaos-ggml = { path = "../chaos-ggml" }
 
 # No build script: this crate produces no binaries, and
