@@ -804,4 +804,60 @@ mod runnable_tests {
             }
         }
     }
+    /// The shape gate: silent on what was diffed, loud on what was not.
+    ///
+    /// Shipped without a test first time round, which is exactly the habit that
+    /// let four settings do nothing for three releases.
+    #[test]
+    fn the_shape_gate_is_silent_only_on_what_was_diffed() {
+        // 24 blocks is the container `qwen35` was checked against.
+        assert!(why_shape_is_unverified("qwen35", 24).is_none());
+
+        // 64 is Qwen3.6-27B and Qwen3.8-27B, which overflow to NaN.
+        let why = why_shape_is_unverified("qwen35", 64).expect("64 blocks must warn");
+        assert!(why.contains("24"), "must name what WAS diffed: {why}");
+        assert!(why.contains("64"), "must name what it found: {why}");
+        // **It must not blame this engine.** llama.cpp fails on the same file,
+        // and a warning that sends the user to fix Chaos sends them to fix
+        // something that is not broken.
+        assert!(
+            why.contains("llama.cpp"),
+            "must say the reference fails too: {why}"
+        );
+        assert!(
+            why.contains("quantisation"),
+            "must suggest what to actually try: {why}"
+        );
+
+        // Any other unverified size warns too, rather than only the known-bad one.
+        assert!(why_shape_is_unverified("qwen35", 48).is_some());
+
+        // An architecture that makes no such distinction stays silent, which is
+        // every other one.
+        for arch in ["llama", "qwen3", "gemma3", "deepseek4", "phi3"] {
+            assert!(
+                why_shape_is_unverified(arch, 999).is_none(),
+                "{arch} has no recorded shape and must not warn"
+            );
+            assert!(verified_block_counts(arch).is_none());
+        }
+    }
+
+    /// Every recorded shape belongs to an architecture that can actually run.
+    ///
+    /// A block count recorded against a refused architecture would be a warning
+    /// nobody can ever see.
+    #[test]
+    fn recorded_shapes_belong_to_runnable_architectures() {
+        for arch in ["qwen35"] {
+            assert!(
+                verified_block_counts(arch).is_some(),
+                "{arch} should have a recorded shape"
+            );
+            assert!(
+                why_not_runnable(arch).is_none(),
+                "{arch} records a shape but is refused, so the warning is unreachable"
+            );
+        }
+    }
 }
