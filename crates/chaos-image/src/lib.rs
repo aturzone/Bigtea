@@ -40,3 +40,4 @@
 //! image, which is this project's oldest hazard wearing different clothes.
 
 pub mod png;
+pub mod safetensors;

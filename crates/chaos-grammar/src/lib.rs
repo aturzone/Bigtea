@@ -47,6 +47,15 @@ mod schema;
 
 pub use gbnf::{Element, ElementType};
 pub use matcher::Matcher;
+/// **The workspace's JSON parser**, exported because it is the only one.
+///
+/// It lives here because JSON Schema is where it was first needed, and it is
+/// reused rather than rewritten: `chaos-image` reads safetensors headers, which
+/// are JSON, and a second parser would be a second place for every fix to be
+/// missing from. Its objects are an ordered `Vec` rather than a map, which is
+/// what makes both callers deterministic -- a grammar whose properties reorder
+/// per run, and a tensor table whose order is the file's own.
+pub use schema::Json;
 
 use std::fmt;
 

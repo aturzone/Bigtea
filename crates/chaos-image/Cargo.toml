@@ -16,6 +16,11 @@ authors.workspace = true
 description = "Diffusion-model support for Chaos: PNG output, safetensors, and the sampler."
 
 [dependencies]
+# **For its JSON parser, not for grammars.** A safetensors header is JSON, and
+# `chaos-grammar` holds the workspace's only JSON parser -- with ordered objects,
+# which keeps the tensor table in the file's own order. Writing a second parser
+# here would be a second place for every fix to be missing from.
+chaos-grammar = { path = "../chaos-grammar" }
 
 # No build script: this crate produces no binaries, and
 # `cargo:rustc-link-arg-bins` is an error in a crate that has none.
