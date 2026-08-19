@@ -332,14 +332,53 @@ jobs:
           $u = Start-Process -FilePath $setup -ArgumentList '/S', '--uninstall', '--prefix', $prefix -Wait -PassThru
           if ($u.ExitCode -ne 0) { throw "uninstall exited $($u.ExitCode)" }
           if (Test-Path (Join-Path $prefix 'bin')) { throw "uninstall left bin behind" }
+          # **The whole prefix, not just bin.** `version.txt` was written by the
+          # install and not removed by the uninstall, so the folder survived and
+          # a stale version file claimed Chaos was installed when nothing was.
+          # Found on a real machine, which is where this assertion comes from.
+          if (Test-Path $prefix) {
+            Get-ChildItem -Recurse $prefix | Select-Object -First 20 FullName
+            throw "uninstall left the prefix behind"
+          }
           if (-not (Test-Path $models)) { throw "UNINSTALL DELETED THE MODELS DIRECTORY" }
           Write-Host 'setup: install / run / uninstall clean, models untouched'
+
+          # **Uninstalling from INSIDE the folder being deleted**, which is what
+          # Add/Remove Programs does and what was actually broken: a running
+          # executable keeps its own file open, so the installer stages a copy in
+          # %TEMP% and lets that do the work. The parent used to show a dialog
+          # and only exit once dismissed, while the helper gave up after ten
+          # seconds -- so the uninstall "finished" with every binary on disk.
+          #
+          # The helper waits for its parent and outlives this process, so the
+          # check has to be a poll rather than an exit code.
+          $p2 = Start-Process -FilePath $setup -ArgumentList '/S', '--prefix', $prefix -Wait -PassThru
+          if ($p2.ExitCode -ne 0) { throw "second install exited $($p2.ExitCode)" }
+          $inside = Join-Path $prefix 'bin/chaos-setup.exe'
+          if (-not (Test-Path $inside)) { throw "the installer did not copy itself into bin" }
+          Start-Process -FilePath $inside -ArgumentList '/S', '--uninstall', '--prefix', $prefix
+          $gone = $false
+          foreach ($i in 1..60) {
+            if (-not (Test-Path $prefix)) { $gone = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $gone) {
+            Get-Content (Join-Path $env:TEMP 'chaos-uninstall.log') -ErrorAction SilentlyContinue
+            Get-ChildItem -Recurse $prefix | Select-Object -First 20 FullName
+            throw "uninstalling from inside the prefix left it behind"
+          }
+          if (-not (Test-Path $models)) { throw "UNINSTALL DELETED THE MODELS DIRECTORY" }
+          Write-Host 'setup: uninstall from inside the prefix is clean too'
 
       - name: The installer installs (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $dir = (Get-ChildItem -Directory -Filter 'chaos-*-windows-x86_64')[0].FullName
+          # `Chaos-*`, matching the archive name. This line looked for
+          # `chaos-*` and would have found nothing the moment the prefix changed
+          # -- an indexing error on an empty array, in the step that proves the
+          # installer works.
+          $dir = (Get-ChildItem -Directory -Filter 'Chaos-*-windows-x86_64')[0].FullName
           $prefix = Join-Path $env:RUNNER_TEMP 'chaos-install-test'
           $models = Join-Path $env:RUNNER_TEMP 'chaos-models-test'
           # -NoPath: a CI runner's user PATH is not ours to edit, and the
