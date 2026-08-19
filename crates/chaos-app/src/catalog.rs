@@ -49,13 +49,20 @@ pub fn offers() -> Vec<Offer> {
 }
 
 /// How a machine with `free` bytes of memory would fare.
+///
+/// **None of these mean "no".** This runner exists to run models larger than
+/// memory: DeepSeek-V4-Flash is 144 GB and generates correct text on a 15.7 GiB
+/// laptop. The three cases are three *speeds*, and naming the slowest one
+/// `TooBig` — which the window showed as "too big for this machine" — told the
+/// user a model would not work when it demonstrably does.
 pub enum Verdict {
     /// Everything fits; nothing streams.
     Resident,
     /// The always-read set fits, so it runs and the experts stream from disk.
     Streams,
-    /// The always-read set does not fit. It would re-read weights every token.
-    TooBig,
+    /// The always-read set does not fit either, so those weights are re-read
+    /// from disk on every token. Slow — and it runs.
+    Rereads,
 }
 
 pub fn verdict(o: &Offer, free_bytes: u64) -> Verdict {
@@ -64,7 +71,7 @@ pub fn verdict(o: &Offer, free_bytes: u64) -> Verdict {
     } else if o.always_read <= free_bytes {
         Verdict::Streams
     } else {
-        Verdict::TooBig
+        Verdict::Rereads
     }
 }
 
@@ -78,7 +85,8 @@ pub fn row(o: &Offer, free_bytes: u64) -> String {
         match verdict(o, free_bytes) {
             Verdict::Resident => "fits",
             Verdict::Streams => "streams",
-            Verdict::TooBig => "too big",
+            // Not "too big". It runs; the weights come back off the disk.
+            Verdict::Rereads => "slow, re-reads",
         }
     };
     let shards = if o.shards > 1 {
@@ -169,7 +177,7 @@ mod tests {
     #[test]
     fn it_is_too_big_only_when_the_always_read_set_does_not_fit() {
         let v4 = offer(155_000_000_000, 7_925_000_000);
-        assert!(matches!(verdict(&v4, 4_000_000_000), Verdict::TooBig));
+        assert!(matches!(verdict(&v4, 4_000_000_000), Verdict::Rereads));
     }
 
     #[test]

@@ -96,7 +96,9 @@ fn usage() {
     println!("usage: chaos-pull <model> [--quant NAME] [--dir PATH] [--yes] [--dry-run]");
     println!();
     println!("  --list      what Chaos can fetch");
-    println!("  --quant     which quantisation (default: the only one, or the largest that fits)");
+    // "the largest that fits" was wrong twice over: the default picks the
+    // largest *available*, and a quant that does not fit still runs here.
+    println!("  --quant     which quantisation (default: the largest offered)");
     println!("  --dir       where to put it (default: ./models)");
     println!("  --dry-run   print the plan and stop");
     println!("  --yes       do not ask before downloading");

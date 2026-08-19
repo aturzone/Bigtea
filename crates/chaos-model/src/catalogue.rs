@@ -275,49 +275,24 @@ pub const CATALOGUE: &[Entry] = &[
     // answering "where is the new Qwen?" with silence, and the answer is not
     // "it does not exist".
     //
-    // It is that these are **hybrid** models, which the container states
-    // outright: `Qwen3.6-27B-Q4_K_M.gguf` carries `qwen35.ssm.conv_kernel 4`,
+    // They are **hybrid** models: `qwen35.ssm.conv_kernel 4`,
     // `ssm.state_size 128`, `ssm.group_count 16`, `ssm.time_step_rank 48` and
-    // `full_attention_interval 4`, and every block holds `ssm_conv1d`,
-    // `ssm_alpha`, `ssm_beta`, `ssm_a`, `ssm_dt.bias` and `ssm_norm`. Following
-    // llama.cpp's `qwen35.cpp`, a layer is recurrent when `(i + 1) % 4 != 0` --
-    // so **48 of the 64 layers are a gated delta net, not attention**. Those
-    // need a recurrent state cache (a conv window and an `[128, 128, 48]` state
-    // per sequence per layer) which this engine does not have; a KV cache
-    // cannot stand in for it. The remaining 16 attention layers additionally
-    // want interleaved multimodal RoPE, four sections wide.
+    // `full_attention_interval 4`, so a layer is recurrent when `(i + 1) % 4 !=
+    // 0` and **48 of the 64 layers are a gated delta net rather than
+    // attention**. That is implemented and diffed against llama.cpp; see
+    // `qwen35.rs`.
     //
-    // `qwen3.rs` refuses them by name rather than rotating the wrong way and
-    // producing fluent, confident nonsense. The route in is written down:
-    // `docs/graph/backlog/qwen35-gated-delta-net.md`.
+    // **Qwen3.6-27B was removed on 2026-08-19.** Both of its quantisations were
+    // listed and the one that was actually run, `Q4_K_M`, overflows part way
+    // through the model and generates nonsense. Qwen3.8-27B is the same
+    // architecture, generates correctly here, and is the newer model -- so
+    // listing 3.6 offered a 16 GB download whose best case was a worse version
+    // of something else. `known_bad_container` still names the file, because
+    // somebody who already has it deserves to be told why it fails.
     //
-    // Every byte below was read from the container's own tensor table with
-    // `tools/gguf-always-read.py`, which range-fetches the header rather than
-    // the model. The MoE resident figures are measured, not scaled from a
-    // sibling -- 11% at Q4 and 14% at Q2, which are not the same fraction and
-    // could not have been guessed from one another.
-    Entry {
-        name: "qwen3.6-27b",
-        repo: "unsloth/Qwen3.6-27B-GGUF",
-        stem: "Qwen3.6-27B-{quant}",
-        arch: "qwen35",
-        quants: &[
-            Quant {
-                name: "Q4_K_M",
-                bytes: 16_817_244_384,
-                shards: 1,
-                // Dense: every byte is always-read. Measured at 16_806_250_496
-                // of tensor data; the file is larger by its header.
-                always_read_bytes: 16_817_244_384,
-            },
-            Quant {
-                name: "UD-Q4_K_XL",
-                bytes: 17_612_564_704,
-                shards: 1,
-                always_read_bytes: 17_612_564_704,
-            },
-        ],
-    },
+    // Every byte below was read from the container's own tensor table, or from
+    // `Content-Length` on the real URL. Not from a model card: the 3.8 sizes
+    // here were wrong by 364 MB and 847 MB when they came from one.
     Entry {
         name: "qwen3.8-27b",
         repo: "unsloth/Qwen3.8-27B-GGUF",
@@ -328,28 +303,42 @@ pub const CATALOGUE: &[Entry] = &[
         // 866 tensors, 51 metadata keys. It is 3.6's gated delta net with a
         // vision tower added, and `Qwen3_5ForConditionalGeneration` upstream.
         arch: "qwen35",
+        // **Every size here was wrong, and one quant did not exist.** The
+        // previous list claimed `Q4_K_M` (the repository has no such file), and
+        // its two other sizes were out by 364 MB and 847 MB -- under a comment
+        // saying "measured from the repository". These are `Content-Length` from
+        // the actual URLs, checked 2026-08-19.
         quants: &[
             Quant {
                 name: "UD-Q4_K_XL",
-                // Measured from the repository, and the tensor table agrees to
-                // within the header: 17_912_397_824 bytes of tensors.
-                bytes: 17_923_394_624,
+                bytes: 17_559_178_144,
                 shards: 1,
                 // Dense. Zero routed-expert tensors, so nothing streams and the
                 // whole file has to fit -- which it does not, on this laptop.
-                always_read_bytes: 17_923_394_624,
+                always_read_bytes: 17_559_178_144,
             },
-            Quant {
-                name: "Q4_K_M",
-                bytes: 17_106_775_008,
-                shards: 1,
-                always_read_bytes: 17_106_775_008,
-            },
+            // **Verified generating on this machine**: 9.15 GiB on disk, " Paris."
+            // at 0.38 tok/s. The smallest size that has been run end to end.
             Quant {
                 name: "UD-Q2_K_XL",
-                bytes: 10_676_423_744,
+                bytes: 9_828_981_664,
                 shards: 1,
-                always_read_bytes: 10_676_423_744,
+                always_read_bytes: 9_828_981_664,
+            },
+            Quant {
+                name: "Q4_0",
+                bytes: 16_056_478_688,
+                shards: 1,
+                always_read_bytes: 16_056_478_688,
+            },
+            // Offered because this runner's whole purpose is models larger than
+            // memory: 27 GiB of weights on a 16 GiB machine re-reads from disk
+            // every token and still answers.
+            Quant {
+                name: "Q8_0",
+                bytes: 29_047_086_048,
+                shards: 1,
+                always_read_bytes: 29_047_086_048,
             },
         ],
     },
@@ -432,50 +421,52 @@ pub const RUNNABLE_ARCHS: &[&str] = &[
     "starcoder2",
 ];
 
-/// The container shape each architecture was actually diffed against.
+/// Shapes of each architecture that have been seen to produce correct output.
 ///
-/// **Because an architecture name is not a shape.** `qwen35` earned its place in
-/// the engine's verified list on Qwen3.5-0.8B -- 24 blocks, byte-identical to
-/// llama.cpp at three prompt lengths. Qwen3.6-27B declares the same
-/// architecture, has 64 blocks, exits 0 and generates nonsense.
+/// **Block count stopped being the discriminator, and this is the record of
+/// why.** `qwen35` was checked by diff at 24 blocks (Qwen3.5-0.8B, byte-identical
+/// to llama.cpp at three prompt lengths). Qwen3.6-27B has 64 blocks and produces
+/// nonsense, which looked like "64 is unverified" — until Qwen3.8-27B, *also 64
+/// real blocks of the same architecture*, answered "The capital of France is"
+/// with " Paris." on this machine.
 ///
-/// **llama.cpp fails on the same file, and that is a clue rather than an
-/// excuse.** Measured on `Qwen3.6-27B-Q4_K_M` with the prompt "The capital of
-/// France is", greedy: Chaos returns `ทัน ทัน ทัน`, llama.cpp returns
-/// `333333`, and the two agree on every layer sum up to and including layer 5 --
-/// where the residual reaches 1.009e6 in both, and then both go NaN.
-///
-/// Matching a wrong answer is not a defence. It says this engine reproduces
-/// llama.cpp faithfully *including its behaviour here*, which narrows the search
-/// to the two things that can produce it -- the quantisation, or the way both
-/// engines implement this architecture at 64 blocks -- and neither is fixed by
-/// pointing at the other project. **Chaos is judged on whether it answers
-/// correctly, not on whether it matches somebody else.** So the warning says
-/// what is not known and what to try, and claims nothing about fault.
-///
-/// It lives here rather than beside the verified list because **three places ask
-/// this question**: `chaos-run`, `chaos-serve` and the app's model list. The app
-/// does not depend on the engine crate, and a second copy of this table is a
-/// second place for the answer to be missing from -- which is exactly how eight
-/// binaries came to have no icon.
-///
-/// `None` means the architecture makes no such distinction, which is the status
-/// quo for every other one and is fine until it is not.
+/// So 64 is fine and one container is not. A gate on shape would now condemn a
+/// model that works, which is the failure mode this whole area keeps producing:
+/// a correct-looking refusal nobody re-derives. The narrow claim lives in
+/// [`known_bad_container`] instead.
 pub fn verified_block_counts(arch: &str) -> Option<&'static [u32]> {
     match arch {
-        // 24 blocks: Qwen3.5-0.8B. 64 blocks -- Qwen3.6-27B, Qwen3.8-27B -- is
-        // known WRONG rather than merely unchecked. See
-        // `backlog/qwen35-27b-is-wrong.md`.
-        "qwen35" => Some(&[24]),
+        // 24: Qwen3.5-0.8B, diffed against llama.cpp layer by layer.
+        // 64: Qwen3.8-27B, generating correct text here.
+        "qwen35" => Some(&[24, 64]),
         _ => None,
     }
 }
 
-/// What to tell a user about a known architecture at a size nobody diffed.
+/// A specific container known to produce nonsense, by name and quantisation.
+///
+/// **Narrow on purpose.** `general.name` alone would condemn every quantisation
+/// of Qwen3.6-27B when only one has been shown to fail, and the shape condemns
+/// Qwen3.8 as well, which works. The pair identifies the file that was actually
+/// tested and nothing else.
+///
+/// `general.file_type` 15 is `Q4_K_M`.
+pub fn known_bad_container(name: &str, file_type: u32) -> Option<&'static str> {
+    match (name, file_type) {
+        ("Qwen3.6-27B", 15) => Some(
+            "this exact file -- Qwen3.6-27B-Q4_K_M -- overflows part way through the model and \
+             produces nonsense. Qwen3.8-27B is the same architecture and generates correctly, \
+             so the problem is this build of the weights. Use Qwen3.8-27B instead",
+        ),
+        _ => None,
+    }
+}
+
+/// What to tell a user about a known architecture at a shape nobody has run.
 ///
 /// **Warns rather than refuses**, deliberately. The policy is to run what can be
-/// run and say what is known, and a size that has not been checked is not the
-/// same as a size known to fail.
+/// run and say what is known, and a shape that has not been tried is not the
+/// same as one known to fail — that second case is [`known_bad_container`].
 pub fn why_shape_is_unverified(arch: &str, n_layer: u32) -> Option<String> {
     let known = verified_block_counts(arch)?;
     if known.contains(&n_layer) {
@@ -483,12 +474,39 @@ pub fn why_shape_is_unverified(arch: &str, n_layer: u32) -> Option<String> {
     }
     let sizes: Vec<String> = known.iter().map(u32::to_string).collect();
     Some(format!(
-        "this architecture has been checked at {} blocks and this container has {n_layer}, \
-         so answers may be WRONG with no error anywhere. The 64-block build we have tested, \
-         Qwen3.6-27B-Q4_K_M, overflows to NaN part way through and produces nonsense. \
-         A smaller quantisation is worth trying, and the failure is being worked on",
-        sizes.join(" or "),
+        "this architecture has produced correct output at {} blocks and this container has \
+         {n_layer}, which has not been tried here. It will run; check the answer before \
+         trusting it",
+        sizes.join(" and "),
     ))
+}
+
+/// What a container is, when its header does not say.
+///
+/// **`ideogram4-Q4_0.gguf` has 458 tensors and zero metadata keys.** No
+/// `general.architecture`, no name, nothing — so the dispatch read an empty
+/// string and the runner said `"" is not an architecture this build has been
+/// verified against`, then offered a paragraph about Gemma-2. Every word true
+/// and none of it useful to somebody who has just downloaded an image model.
+///
+/// Identified from the tensor names instead, which are the one thing the file
+/// definitely has. `has` answers whether a tensor is present, so this is
+/// testable without a 5 GiB container.
+///
+/// Only for containers whose header is silent: a real `general.architecture` is
+/// always more trustworthy than a name-shape guess.
+pub fn architecture_from_tensors(has: impl Fn(&str) -> bool) -> Option<&'static str> {
+    // Ideogram 4: a diffusion transformer. `input_proj` and `final_layer.linear`
+    // are the patch embedding and its inverse, `t_embedding` is the timestep
+    // embedding no language model has, and `adaln_modulation` is the adaptive
+    // layer norm conditioning that makes it a DiT rather than a text stack.
+    if has("t_embedding.mlp_in.weight")
+        && has("input_proj.weight")
+        && has("layers.0.adaln_modulation.weight")
+    {
+        return Some("ideogram4");
+    }
+    None
 }
 
 /// Why a model cannot run here, or `None` if it can.
@@ -510,9 +528,15 @@ pub fn why_not_runnable(arch: &str) -> Option<&'static str> {
         "qwen35moe" => {
             "its routed expert path has never been run here -- only the \n             dense variant of this architecture has"
         }
+        // Read from the container on 2026-08-19 rather than assumed: 34 layers,
+        // hidden 4608, 18 heads of 256, fused QKV, SwiGLU at 12288, adaLN with
+        // four modulation signals from a 512-wide conditioning vector, 128 patch
+        // channels in and out. What is missing is not the denoiser.
         "ideogram4" => {
-            "it is an image model -- a diffusion transformer needing a sampler, \
-             a separate text encoder and a VAE, none of which Chaos has"
+            "it is an image model. Chaos has the denoiser's shape but not the three \
+             things around it -- the unconditional twin for guidance, a text encoder \
+             (Qwen3-VL), and the FLUX.2 autoencoder to turn latents into pixels. \
+             Image generation is being built; see backlog/image-generation-ideogram-4.md"
         }
         "qwen3moe" => "its forward pass does not yet match llama.cpp exactly",
         _ => "this architecture has never been diffed against llama.cpp",
@@ -700,13 +724,12 @@ mod runnable_tests {
     fn the_new_qwen_models_are_listed_and_refused() {
         // **The dense ones run now** -- verified against llama.cpp on
         // Qwen3.5-0.8B, which is this architecture at 24 layers instead of 64.
-        for name in ["qwen3.6-27b", "qwen3.8-27b"] {
-            let e = find(name).unwrap_or_else(|| panic!("{name} is not listed"));
-            assert!(
-                why_not_runnable(e.arch).is_none(),
-                "{name} is `qwen35`, which is implemented and verified"
-            );
-        }
+        // Qwen3.6-27B was removed, so 3.8 is the only dense member left listed.
+        let e = find("qwen3.8-27b").expect("qwen3.8-27b is not listed");
+        assert!(
+            why_not_runnable(e.arch).is_none(),
+            "qwen3.8-27b is `qwen35`, which is implemented and generating here"
+        );
         // The MoE variant is still refused, and its reason names what is
         // *untested* rather than what is unimplemented.
         let e = find("qwen3.6-35b-a3b").expect("listed");
@@ -756,11 +779,19 @@ mod runnable_tests {
     /// container, both are `qwen35`. If this ever stops being true the port
     /// notes need revisiting, so the test says it out loud.
     #[test]
-    fn the_newest_qwen_is_the_same_architecture_as_the_last_one() {
-        let a = find("qwen3.6-27b").expect("3.6 is listed");
+    fn the_newest_qwen_is_the_hybrid_architecture_and_36_is_gone() {
         let b = find("qwen3.8-27b").expect("3.8 is listed");
-        assert_eq!(a.arch, b.arch, "3.6 and 3.8 must agree on the architecture");
         assert_eq!(b.arch, "qwen35");
+        // **Qwen3.6-27B was removed**, and the reason is worth a test rather
+        // than a comment: its one tested quantisation generates nonsense, and
+        // 3.8 is the same architecture working. Listing it offered a 16 GB
+        // download whose best case was a worse version of something else.
+        assert!(
+            find("qwen3.6-27b").is_none(),
+            "qwen3.6-27b is back in the catalogue; if that is deliberate, the              known_bad_container note and this test both need revisiting"
+        );
+        // The file is still named for anyone who already has it.
+        assert!(known_bad_container("Qwen3.6-27B", 15).is_some());
     }
 
     /// Ideogram 4 is listed and refused for being a different kind of model.
@@ -809,46 +840,48 @@ mod runnable_tests {
             }
         }
     }
-    /// The shape gate: silent on what was diffed, loud on what was not.
+    /// The two caveats, and which question each answers.
     ///
-    /// Shipped without a test first time round, which is exactly the habit that
-    /// let four settings do nothing for three releases.
+    /// **Block count stopped being the discriminator.** Qwen3.6-27B (64 blocks)
+    /// generates nonsense and Qwen3.8-27B (64 real blocks, same architecture)
+    /// generates correctly, so a gate on shape would condemn a working model.
+    /// The shape check is now a mild "nobody has tried this"; the specific file
+    /// is named separately.
     #[test]
-    fn the_shape_gate_is_silent_only_on_what_was_diffed() {
-        // 24 blocks is the container `qwen35` was checked against.
-        assert!(why_shape_is_unverified("qwen35", 24).is_none());
-
-        // 64 is Qwen3.6-27B and Qwen3.8-27B, which overflow to NaN.
-        let why = why_shape_is_unverified("qwen35", 64).expect("64 blocks must warn");
-        assert!(why.contains("24"), "must name what WAS diffed: {why}");
-        assert!(why.contains("64"), "must name what it found: {why}");
-        // **It must not name another project.** Whether llama.cpp also fails is
-        // a clue for the developer, not an answer for the user -- and a message
-        // that reads as "the competitor is wrong too" is an excuse. Chaos is
-        // judged on whether it answers correctly.
-        assert!(
-            !why.contains("llama.cpp"),
-            "the user-facing warning must not point at another project: {why}"
-        );
-        assert!(
-            why.contains("quantisation"),
-            "must suggest what to actually try: {why}"
-        );
-        assert!(
-            why.contains("worked on"),
-            "must say it is being fixed rather than merely reported: {why}"
-        );
-
-        // Any other unverified size warns too, rather than only the known-bad one.
-        assert!(why_shape_is_unverified("qwen35", 48).is_some());
-
-        // An architecture that makes no such distinction stays silent, which is
-        // every other one.
-        for arch in ["llama", "qwen3", "gemma3", "deepseek4", "phi3"] {
+    fn the_shape_caveat_and_the_known_bad_file_answer_different_questions() {
+        // Shapes that have produced correct output say nothing.
+        for n in [24, 64] {
             assert!(
-                why_shape_is_unverified(arch, 999).is_none(),
-                "{arch} has no recorded shape and must not warn"
+                why_shape_is_unverified("qwen35", n).is_none(),
+                "{n} blocks has produced correct output and must not warn"
             );
+        }
+        // An untried shape warns, mildly, and says it will still run.
+        let why = why_shape_is_unverified("qwen35", 48).expect("48 is untried");
+        assert!(why.contains("24") && why.contains("64"), "{why}");
+        assert!(
+            why.contains("will run"),
+            "must not read as a refusal: {why}"
+        );
+        // **And it must not name another project.** Whether a competitor also
+        // fails is a clue for whoever is fixing it, not an answer for the user.
+        assert!(!why.contains("llama.cpp"), "{why}");
+
+        // The file that actually fails is named by name and quantisation, not by
+        // shape -- 15 is `Q4_K_M`.
+        let bad = known_bad_container("Qwen3.6-27B", 15).expect("the tested file");
+        assert!(
+            bad.contains("Qwen3.8"),
+            "must say what to use instead: {bad}"
+        );
+        // Narrow: another quantisation of the same model has not been shown to
+        // fail, and 3.8 works, so neither may be condemned.
+        assert!(known_bad_container("Qwen3.6-27B", 7).is_none());
+        assert!(known_bad_container("Qwen3.8-27B", 15).is_none());
+
+        // Architectures with no recorded shape stay silent.
+        for arch in ["llama", "qwen3", "gemma3", "deepseek4", "phi3"] {
+            assert!(why_shape_is_unverified(arch, 999).is_none(), "{arch}");
             assert!(verified_block_counts(arch).is_none());
         }
     }

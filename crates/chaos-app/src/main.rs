@@ -2735,7 +2735,13 @@ Any value a client sends is accepted.                      The server still list
                     None => match catalog::verdict(o, ui.free_bytes) {
                         catalog::Verdict::Resident => "fits entirely in memory",
                         catalog::Verdict::Streams => "streams from disk on this machine",
-                        catalog::Verdict::TooBig => "too big for this machine",
+                        // **Never "too big".** The whole point of this runner
+                        // is models larger than memory; V4-Flash is 144 GB and
+                        // works on this machine. What is true is that it will be
+                        // slow, and that is what to say.
+                        catalog::Verdict::Rereads => {
+                            "runs, slowly -- weights are re-read from disk each token"
+                        }
                     },
                 };
                 let rows = vec![
