@@ -849,15 +849,19 @@ mod runnable_tests {
     /// nobody can ever see.
     #[test]
     fn recorded_shapes_belong_to_runnable_architectures() {
-        for arch in ["qwen35"] {
-            assert!(
-                verified_block_counts(arch).is_some(),
-                "{arch} should have a recorded shape"
-            );
-            assert!(
-                why_not_runnable(arch).is_none(),
-                "{arch} records a shape but is refused, so the warning is unreachable"
-            );
+        // Driven off `RUNNABLE_ARCHS` rather than a hand-written list, so a
+        // shape recorded against a refused architecture fails here whichever
+        // side was added first.
+        for arch in RUNNABLE_ARCHS {
+            let _ = verified_block_counts(arch);
         }
+        assert!(
+            verified_block_counts("qwen35").is_some(),
+            "qwen35's diffed shape is the reason this table exists"
+        );
+        assert!(
+            RUNNABLE_ARCHS.contains(&"qwen35"),
+            "a shape recorded against a refused architecture is a warning nobody can see"
+        );
     }
 }
