@@ -60,15 +60,25 @@ rather than for one tensor name:
 | `post_norms` | presence of `post_attention_norm` meant Gemma. Gemma's post-norms are a *pair*; demanding the missing `post_ffw_norm` refused a loadable model. |
 | `fused_qkv` | presence of `attn_qkv` meant Phi-3. On `qwen35` that tensor is the delta net's input projection, and attention layers have no such tensor at all. |
 
-### Not finished
+### Not finished, and the reason is worth reading
 
-**`qwen35` is deliberately still absent from `RUNNABLE_ARCHS`.** The forward pass
-is right and the token ids are right, but `chaos-run`'s *incremental* printer
-drops most pieces on this vocabulary — the ids decode correctly through
-`Tokenizer::decode`, so this is the streaming detokeniser and not the model.
-Flipping the flag before that is fixed would show a user garbage produced by a
-correct engine, which is the one thing this project's architecture gate exists to
-prevent. `--force` runs it today.
+**`CHAOS_DUMP_LAYERS=1` changes the answer.** With it set the sampled ids are
+llama.cpp's; without it they are wrong. Same binary, same prompt, `--temp 0`.
+
+So the layer diff above is real *and* insufficient: the debug pass computes extra
+tensors in the same arenas, which changes when a buffer is written, and the plain
+path reads one at the wrong moment. **A model whose output depends on whether it
+is being observed is not verified**, so `qwen35` is out of
+`VERIFIED_ARCHITECTURES` and `RUNNABLE_ARCHS` — it was briefly added during this
+work and has been taken back out.
+
+Ruled out by measurement: thread count (1, 2 and 4 all identically wrong),
+`--force`, computing the layer twice, `scores` as an explicit graph root, `cont`
+copies of both carried states, and a `cont` copy of the convolution's input. The
+delta net's *own* debug pass makes no difference either — so the trigger is one
+of the three extra computes in the **attention** and dense-FFN phases, and the
+first suspect is the strided fused query/gate views. The bisect and the next step
+are written down in `docs/graph/backlog/qwen35-gated-delta-net.md`.
 
 `CHAOS_DUMP_LAYERS=1` prints the residual stream per layer in
 `llama-eval-callback`'s own format and names, which is how all of the above was

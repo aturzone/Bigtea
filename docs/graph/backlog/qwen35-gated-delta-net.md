@@ -28,8 +28,48 @@ Three config detections had to be narrowed, all found by the layer diff:
 second norm `post_attention_norm`), `post_norms` (Gemma's are a *pair*), and
 `fused_qkv` (on `qwen35` `attn_qkv` is the delta net's input projection).
 
-Left to do: the streaming detokeniser, then `qwen35` joins `RUNNABLE_ARCHS`;
-`qwen35moe` stays out until a MoE container of the family is run.
+## The one bug left, and exactly where the search stopped
+
+**`CHAOS_DUMP_LAYERS=1` changes the answer.** With it set the sampled ids are
+llama.cpp's (`" Paris" "." "\n" "The"`); without it they are wrong
+(`"." "\n\n" "\n"`). Same binary, same prompt, same seed, `--temp 0`.
+
+That is a latent aliasing or ordering fault: the debug pass computes extra
+tensors in the same arenas, which changes *when* something is written, and the
+plain path reads a buffer at the wrong moment. **It is not the detokeniser** —
+`Tokenizer::decode` and `decode_bytes` both return the right bytes for the right
+ids, and `Writer::push` demonstrably prints them; the ids themselves differ.
+
+Ruled out, each by measurement rather than reasoning:
+
+| tried | result |
+|---|---|
+| thread count 1, 2, 4 | identical wrong output — not a race |
+| `--force` on/off | no effect |
+| computing the layer's outputs twice | no effect |
+| adding `scores` as an explicit graph root | no effect |
+| `cont` copies of the carried conv window and state | no effect |
+| giving `ssm_conv` its own `cont` copy of its input | no effect |
+| the recurrent layer's own debug pass alone (`CHAOS_DUMP_A`) | **no effect** |
+
+**So the trigger is one of the three debug computes in the *attention* and
+*dense-FFN* phases**, not in the delta net: `cmp.run(&ctx, &[&normed])` in the
+dense FFN, `cmp.run(&ctx, &[&q])` and the gate in the qkv phase, or
+`cmp.run(&ctx, &[&attn])` in the attention phase. Splitting those three onto
+separate env vars is the next step and is about ten minutes of work; the bisect
+harness is already in the file.
+
+The strong suspicion, given only 6 of 24 layers are attention and those three
+are all in the attention path: **the fused query/gate views**. `q` and `gate` are
+strided views into the same `attn_q` matmul output at twice the head stride, and
+`gate` is `cont`-ed while `q` is not. A `cont` on `q` as well, or reading both
+before anything else recomputes, is the first thing to try.
+
+**Until that is found, `qwen35` stays out of `VERIFIED_ARCHITECTURES` and
+`RUNNABLE_ARCHS`.** It was briefly added and has been taken back out: an
+architecture whose output depends on whether it is being observed is not
+verified, whatever the layer diff says. `qwen35moe` stays out regardless until a
+MoE container of the family is run.
 
 ---
 

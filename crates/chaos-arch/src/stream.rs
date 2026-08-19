@@ -2095,7 +2095,7 @@ impl<'m> StreamingRunner<'m> {
                 );
             }
         }
-        ctx.compute_many(&[&o.out, &o.conv, &o.state], threads)?;
+        ctx.compute_many(&[&o.scores, &o.out, &o.conv, &o.state], threads)?;
 
         let out = o.out.to_vec_f32();
         self.recurrent

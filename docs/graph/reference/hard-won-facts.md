@@ -60,6 +60,19 @@ are the measurement that killed one.
 
 ## Correctness, which fails silently here
 
+- **A layer-by-layer diff can pass while the model is wrong.** The `qwen35` port
+  matched `llama-eval-callback` on all 24 layers, by value *and* by sum over
+  every prompt token — and generated different tokens when the dump was off,
+  because the dump's extra computes changed when a buffer was written. **The diff
+  and the answer are two measurements, and both have to be taken with the
+  instrumentation in the state it will ship in.** Add a run with the debug flag
+  *off* to every parity check.
+- **A per-layer sum catches what a per-layer value cannot.** llama.cpp's callback
+  prints one, and it is the check that matters for a recurrent layer: a state
+  carried wrongly leaves token 0 perfect and every later token wrong, so
+  comparing first rows alone said a port was correct while the answer was
+  garbage.
+
 - A **wrong tokenizer or forward pass produces fluent nonsense**, never a crash.
   Test pieces separately.
 - **Missing causal mask → repeated tokens**, not an error. Masked positions need

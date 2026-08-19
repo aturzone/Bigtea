@@ -161,6 +161,7 @@ pub fn arena_shapes(s: &SsmConfig, n_embd: i64, n_tokens: i64) -> Vec<(i64, i64)
         (conv_dim, n_tokens),                               // qkv_mixed
         (n_tokens, conv_dim),                               // transposed
         (window + n_tokens, conv_dim),                      // conv input, the widest
+        (window + n_tokens, conv_dim),                      // and its copy for the op
         (conv_dim, n_tokens),                               // conv output
         (conv_dim, n_tokens),                               // silu of it
         (value_dim, n_tokens),                              // z
@@ -176,6 +177,8 @@ pub fn arena_shapes(s: &SsmConfig, n_embd: i64, n_tokens: i64) -> Vec<(i64, i64)
         (value_dim, n_tokens),                              // normalised scores
         (value_dim, n_tokens),                              // gated
         (n_embd, n_tokens),                                 // output projection
+        (window * conv_dim, 1),                             // the conv window, copied
+        (side * side * heads, 1),                           // the state, copied
     ]
 }
 
@@ -265,7 +268,16 @@ pub fn layer<'a>(
         F32 * (cne[0] - window) as usize,
     )?;
 
-    let convolved_raw = ctx.ssm_conv(&conv_in, get(format!("blk.{il}.ssm_conv1d.weight"))?)?;
+    // **The convolution gets its own copy of the window.** `conv_next` above is
+    // a view into `conv_in`, and ggml's allocator is free to place
+    // `ssm_conv`'s output over an input buffer it can prove is dead -- so the
+    // window being carried forward was read *after* the op had written over it.
+    // The symptom was as bad as symptoms get: with a debug pass over the same
+    // graph the tokens matched llama.cpp exactly, and without it they did not,
+    // because the extra pass changed when the clobber happened. A `cont` here
+    // makes the op read a buffer nothing else needs.
+    let conv_for_op = ctx.cont_4d(&conv_in, [cne[0], conv_dim, 1, 1])?;
+    let convolved_raw = ctx.ssm_conv(&conv_for_op, get(format!("blk.{il}.ssm_conv1d.weight"))?)?;
     let convolved = ctx.silu(&convolved_raw)?;
 
     // -- split q, k, v out of the convolved block ---------------------------
@@ -337,6 +349,17 @@ pub fn layer<'a>(
 
     let flat = ctx.reshape_2d(&ctx.cont(&gated)?, value_dim, n_tokens)?;
     let out = ctx.mul_mat(get(format!("blk.{il}.ssm_out.weight"))?, &flat)?;
+
+    // **Both carried states are copied out, not handed back as views.**
+    // `conv_next` is a window into the concat buffer and `state_next` a window
+    // into the fused op's output; reading either as a view made the result
+    // depend on *what else* was computed in the same graph -- with a debug pass
+    // over `scores` the tokens matched llama.cpp exactly, and without it they
+    // did not. A `cont` gives each its own buffer and makes the read
+    // order-independent, which is the difference between a port that works and
+    // one that works while being measured.
+    let conv_next = ctx.cont_4d(&conv_next, [window, conv_dim, 1, 1])?;
+    let state_next = ctx.cont_4d(&state_next, [side, side, h_v, 1])?;
 
     Ok(Outputs {
         out,

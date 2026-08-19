@@ -47,6 +47,9 @@ impl TokenWriter {
         };
         if good > 0 {
             let text = String::from_utf8_lossy(&self.pending[..good]).into_owned();
+            if std::env::var_os("CHAOS_DUMP_LAYERS").is_some() {
+                eprintln!("push id={id} good={good} text={text:?}");
+            }
             print!("{text}");
             let _ = std::io::stdout().flush();
             self.pending.drain(..good);
@@ -3884,10 +3887,13 @@ fn run_streaming(
             }
             let last = &logits[row..];
             let next = sampler.sample(last, &tokens);
-            if std::env::var_os("CHAOS_DUMP_LAYERS").is_some() {
+            if std::env::var_os("CHAOS_DUMP_TOKENS").is_some() {
                 eprintln!(
-                    "sampled {next} {:?}",
-                    tokenizer.decode(std::slice::from_ref(&next))
+                    "sampled {next} decode={:?} bytes={:02x?} text={:?} ctrl={}",
+                    tokenizer.decode(std::slice::from_ref(&next)),
+                    tokenizer.decode_bytes(std::slice::from_ref(&next)),
+                    tokenizer.token_text(next),
+                    tokenizer.is_control(next),
                 );
             }
             if Some(next) == tokenizer.eos {
