@@ -1,0 +1,10 @@
+[package]
+name = "chaos-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build-script helpers shared by every crate in the workspace."
+
+[lib]
+path = "src/lib.rs"

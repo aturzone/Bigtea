@@ -37,3 +37,8 @@ test = false
 name = "chaos-meta"
 path = "src/bin/chaos-meta.rs"
 test = false
+
+[build-dependencies]
+# The icon every shipped .exe carries, in one place rather than a copy
+# per crate. Not linked into anything: it runs on the build machine.
+chaos-build = { path = "../chaos-build" }

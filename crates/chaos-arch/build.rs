@@ -17,6 +17,9 @@ use std::path::PathBuf;
 const REQUIRED: [&str; 3] = ["ggml-base", "ggml-cpu", "ggml"];
 
 fn main() {
+    // Every binary in this crate -- chaos-run, chaos-serve and the benches --
+    // shipped with the blank Windows default until the icon logic was shared.
+    chaos_build::embed_icon();
     generate_flag_list();
     println!("cargo:rerun-if-env-changed=GGML_LIB_DIR");
 

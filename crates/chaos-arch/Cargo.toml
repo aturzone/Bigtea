@@ -47,3 +47,8 @@ test = false
 name = "chaos-kernelbench"
 path = "src/bin/chaos-kernelbench.rs"
 test = false
+
+[build-dependencies]
+# The icon every shipped .exe carries, in one place rather than a copy
+# per crate. Not linked into anything: it runs on the build machine.
+chaos-build = { path = "../chaos-build" }

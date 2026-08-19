@@ -431,7 +431,10 @@ mod step_tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"version.txt".to_string()), "{names:?}");
-        assert!(names.contains(&"installed-files.txt".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"installed-files.txt".to_string()),
+            "{names:?}"
+        );
         assert!(names.contains(&"setup.log".to_string()), "{names:?}");
     }
 
@@ -449,7 +452,10 @@ mod step_tests {
         };
         let (label, notice) = welcome_action(Some(&old), "0.0.9");
         assert_eq!(label, "UPDATE");
-        assert!(notice.contains("0.0.8") && notice.contains("0.0.9"), "{notice}");
+        assert!(
+            notice.contains("0.0.8") && notice.contains("0.0.9"),
+            "{notice}"
+        );
 
         // The same version is a reinstall, and saying "update" there would be a
         // lie the user could check.

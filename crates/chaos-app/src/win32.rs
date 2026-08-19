@@ -691,6 +691,26 @@ extern "system" {
     pub fn CloseHandle(hObject: HANDLE) -> BOOL;
 }
 
+/// `SHCNE_ASSOCCHANGED`: "what a file looks like has changed."
+///
+/// Explorer keeps a database of the icons it has already seen, keyed by file
+/// path, and it does **not** re-read an executable that has been overwritten.
+/// So a new version with a new icon shows the old one until the cache is
+/// rebuilt, which is why "the app icon is still the old one for me" is a real
+/// report about a correct file. This is the documented way to say otherwise.
+pub const SHCNE_ASSOCCHANGED: i32 = 0x0800_0000;
+pub const SHCNF_IDLIST: u32 = 0x0000;
+
+#[link(name = "shell32")]
+extern "system" {
+    pub fn SHChangeNotify(
+        wEventId: i32,
+        uFlags: u32,
+        dwItem1: *const c_void,
+        dwItem2: *const c_void,
+    );
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     pub fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> *mut c_void;

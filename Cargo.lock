@@ -6,6 +6,7 @@ version = 3
 name = "chaos-app"
 version = "0.0.8"
 dependencies = [
+ "chaos-build",
  "chaos-gguf",
  "chaos-model",
  "chaos-probe",
@@ -15,6 +16,7 @@ dependencies = [
 name = "chaos-arch"
 version = "0.0.8"
 dependencies = [
+ "chaos-build",
  "chaos-ggml",
  "chaos-gguf",
  "chaos-grammar",
@@ -24,6 +26,10 @@ dependencies = [
  "chaos-probe",
  "chaos-tokenizer",
 ]
+
+[[package]]
+name = "chaos-build"
+version = "0.0.8"
 
 [[package]]
 name = "chaos-ggml"
@@ -36,6 +42,9 @@ dependencies = [
 [[package]]
 name = "chaos-gguf"
 version = "0.0.8"
+dependencies = [
+ "chaos-build",
+]
 
 [[package]]
 name = "chaos-grammar"
@@ -44,6 +53,9 @@ version = "0.0.8"
 [[package]]
 name = "chaos-io"
 version = "0.0.8"
+dependencies = [
+ "chaos-build",
+]
 
 [[package]]
 name = "chaos-jinja"
@@ -53,6 +65,7 @@ version = "0.0.8"
 name = "chaos-model"
 version = "0.0.8"
 dependencies = [
+ "chaos-build",
  "chaos-gguf",
  "chaos-io",
  "chaos-plan",
@@ -69,12 +82,16 @@ dependencies = [
 [[package]]
 name = "chaos-probe"
 version = "0.0.8"
+dependencies = [
+ "chaos-build",
+]
 
 [[package]]
 name = "chaos-setup"
 version = "0.0.8"
 dependencies = [
  "chaos-app",
+ "chaos-build",
 ]
 
 [[package]]

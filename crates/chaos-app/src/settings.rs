@@ -324,7 +324,14 @@ mod tests {
             ..Settings::default()
         };
         let a = s.serve_args("m").join(" ");
-        for expected in ["--cache 8", "-t 4", "-tb 20", "-c 2048", "--auto", "--force"] {
+        for expected in [
+            "--cache 8",
+            "-t 4",
+            "-tb 20",
+            "-c 2048",
+            "--auto",
+            "--force",
+        ] {
             assert!(a.contains(expected), "{expected} missing from {a}");
         }
         // **And nothing the server refuses.** `-ngl` was sent for three

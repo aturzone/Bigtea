@@ -175,7 +175,7 @@ mod setup {
 
     /// Newline. Spelled out because these strings are assembled for message
     /// boxes, where an escaped one inside a `format!` is easy to lose.
-    const LF: char = 10 as u8 as char;
+    const LF: char = 10 as char;
 
     const ID_PREFIX: i32 = 201;
     const ID_INSTALL: i32 = 202;
@@ -800,9 +800,11 @@ mod setup {
                 std::ptr::null_mut(),
                 wide(&format!(
                     "Remove Chaos from{}{}  {}{}{}Your downloaded models are kept.",
-                    LF, LF,
+                    LF,
+                    LF,
                     prefix.display(),
-                    LF, LF,
+                    LF,
+                    LF,
                 ))
                 .as_ptr(),
                 wide("Uninstall Chaos").as_ptr(),
@@ -824,6 +826,26 @@ mod setup {
                     if ok { MB_ICONINFORMATION } else { MB_ICONERROR },
                 );
             }
+        }
+    }
+
+    /// Tell Explorer the icons changed.
+    ///
+    /// **Because the file being right is not enough.** Explorer caches an
+    /// executable's icon by path and does not re-read a file that was
+    /// overwritten in place, so an upgrade kept showing the previous version's
+    /// icon on the taskbar, in the Start Menu and on the shortcut -- which is
+    /// exactly the report "the app icon is still old for me", against an .exe
+    /// whose embedded icon was verified correct. One documented call, and it is
+    /// what every installer does at the end of a copy.
+    fn refresh_icons() {
+        unsafe {
+            SHChangeNotify(
+                SHCNE_ASSOCCHANGED,
+                SHCNF_IDLIST,
+                std::ptr::null(),
+                std::ptr::null(),
+            );
         }
     }
 
@@ -897,6 +919,7 @@ mod setup {
         add_to_path(&bin.to_string_lossy());
         make_shortcut(&bin);
         register_uninstall(&prefix);
+        refresh_icons();
 
         let head = upgrade_line(before.as_ref(), env!("CARGO_PKG_VERSION"));
         let nl = char::from(10);
@@ -1137,7 +1160,11 @@ mod setup {
         hkcu_write_string(
             key,
             "UninstallString",
-            &format!("\"{}\" --uninstall --prefix \"{}\"", exe.display(), prefix.display()),
+            &format!(
+                "\"{}\" --uninstall --prefix \"{}\"",
+                exe.display(),
+                prefix.display()
+            ),
         );
         hkcu_write_string(key, "URLInfoAbout", "https://github.com/aturzone/Chaos");
         // The icon Settings shows next to the entry.
@@ -1146,7 +1173,11 @@ mod setup {
         hkcu_write_string(
             key,
             "QuietUninstallString",
-            &format!("\"{}\" /S --uninstall --prefix \"{}\"", exe.display(), prefix.display()),
+            &format!(
+                "\"{}\" /S --uninstall --prefix \"{}\"",
+                exe.display(),
+                prefix.display()
+            ),
         );
     }
 
@@ -1348,7 +1379,9 @@ mod setup {
     unsafe fn paint_welcome(hdc: HDC, s: &S, r: RECT) {
         let t = &s.theme;
         let cx = r.right / 2;
-        mark(hdc, cx - 34, 84, 68, t.fg, t.bg);
+        // 96, not 68: this is the first thing anyone sees of the project and
+        // it had less presence than the wordmark under it.
+        mark(hdc, cx - 48, 68, 96, t.fg, t.bg);
         wordmark(hdc, cx, 186, "CHAOS", s.display, t.fg, 10);
         text(
             hdc,
@@ -1414,7 +1447,7 @@ mod setup {
         let t = &s.theme;
         let x = PAD;
         let w = r.right - PAD * 2;
-        mark(hdc, x, PAD, 44, t.fg, t.bg);
+        mark(hdc, x, PAD, 56, t.fg, t.bg);
         text(
             hdc,
             RECT {
@@ -1582,7 +1615,7 @@ mod setup {
         let x = PAD;
         let w = r.right - PAD * 2;
         let failed = progress().lock().unwrap().failure.clone();
-        mark(hdc, x, PAD, 44, t.fg, t.bg);
+        mark(hdc, x, PAD, 56, t.fg, t.bg);
         text(
             hdc,
             RECT {

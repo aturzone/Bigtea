@@ -107,7 +107,7 @@ def build(path, render):
 # inverted on the way in.
 TILE = (0x00, 0x00, 0xF2)
 MARK = (255, 255, 255)
-INK_INSET = 0.16  # the mark occupies the middle 68% of the tile
+INK_INSET = 0.08  # the mark occupies the middle 84% of the tile
 RADIUS_FRAC = 0.22  # corner radius as a fraction of the side; iOS-ish, not a circle
 
 

@@ -13,6 +13,9 @@ members = [
     "crates/chaos-arch",
     "crates/chaos-app",
     "crates/chaos-setup",
+    # Build-script helpers. A build dependency of several crates and a
+    # runtime dependency of none.
+    "crates/chaos-build",
 ]
 
 [workspace.package]

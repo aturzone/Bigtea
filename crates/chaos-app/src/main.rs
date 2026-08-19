@@ -1351,8 +1351,13 @@ mod windows_app {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
         // Still answering. Name it if it said who it is.
-        client::health_model(port)
-            .map(|n| if n.is_empty() { "another server".into() } else { n })
+        client::health_model(port).map(|n| {
+            if n.is_empty() {
+                "another server".into()
+            } else {
+                n
+            }
+        })
     }
 
     fn stop_server() {
@@ -2319,7 +2324,13 @@ Any value a client sends is accepted.                      The server still list
         // brand's *ground* -- what Hermes puts behind its wordmark -- and the
         // logo itself is black art. And not `StretchDIBits` over a 1-bit 56px
         // bitmap either, which is what made it a blob at 30 pixels.
-        let box_px = 32usize;
+        // **44, not 32.** At 32 the mark reads as a smudge next to a 20px
+        // wordmark -- the sun's rays are one pixel wide there and the eye inside
+        // it is not visible at all, which is what "the logos in the app are
+        // small and low quality" was about. The art is filtered from the 256px
+        // master at whatever size is asked for, so a larger box costs nothing but
+        // rail space, and the rail is 208px wide.
+        let box_px = 44usize;
         let cov = art::logo_scaled(box_px);
         let chan = |c: Rgb, shift: u32| ((c >> shift) & 0xFF) as i32;
         let mut px = vec![0u8; box_px * box_px * 4];
@@ -2371,7 +2382,7 @@ Any value a client sends is accepted.                      The server still list
         label(
             hdc,
             metric::INSET + box_px + 10,
-            32,
+            38,
             metric::RAIL,
             "CHAOS",
             ui.fonts.mark,
