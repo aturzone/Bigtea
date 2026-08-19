@@ -208,7 +208,11 @@ fn run(
     // consent has been given.
     if entry.adult && !adult_confirmed()? {
         println!("Cancelled.");
-        return Ok(ExitCode::SUCCESS);
+        // **Not SUCCESS.** The app spawns this with no console, so the prompt
+        // reads EOF and cancels -- and returning success made the window report
+        // "downloaded" for a file that was never fetched. A distinct code lets a
+        // caller tell "the user said no" from "the download broke".
+        return Ok(ExitCode::from(3));
     }
     if !yes && !confirm()? {
         println!("Cancelled.");
@@ -287,6 +291,17 @@ fn print_plan(plan: &Plan, dir: &Path, have: u64) {
 /// rather than after.
 fn adult_confirmed() -> Result<bool, Box<dyn std::error::Error>> {
     use std::io::{BufRead, Write};
+    // **Consent already given, in a dialog a person clicked.** The window asks
+    // before it spawns this, and passes the answer through the environment
+    // rather than a flag: a documented `--i-am-18` would be exactly the
+    // "flag that waives an age check" this gate exists to avoid, and would sit
+    // in `--help` inviting scripts to use it.
+    //
+    // A terminal user still gets the prompt below; nothing about this shortens
+    // that path.
+    if std::env::var("CHAOS_ADULT_CONFIRMED").as_deref() == Ok("1") {
+        return Ok(true);
+    }
     println!();
     println!("  +------------------------------------------------------------+");
     println!("  |  ADULT CONTENT -- 18+                                      |");

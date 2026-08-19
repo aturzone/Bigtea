@@ -1567,6 +1567,34 @@ mod windows_app {
             set_status("chaos-pull.exe is missing from this folder");
             return;
         }
+        // **The age gate, in the window rather than in the helper.**
+        //
+        // `chaos-pull` asks at a terminal, and the app spawns it with
+        // `CREATE_NO_WINDOW` -- so its prompt read EOF, cancelled, and returned
+        // success, and the window said "downloaded" for a file that was never
+        // fetched. The dialog belongs here, where there is somebody to answer it.
+        let adult = chaos_model::catalogue::find(&name).is_some_and(|e| e.adult);
+        if adult {
+            let answer = unsafe {
+                MessageBoxW(
+                    main_hwnd(),
+                    wide(&format!(
+                        "{name} is an ADULT model, published for generating explicit \
+                         imagery.\n\nChaos does not filter what a model produces.\n\n\
+                         Are you at least 18 years old, and is adult material lawful \
+                         where you are?"
+                    ))
+                    .as_ptr(),
+                    wide("Adult content -- 18+").as_ptr(),
+                    MB_YESNO | MB_ICONWARNING,
+                )
+            };
+            if answer != IDYES {
+                set_status(&format!("{name} not downloaded: age not confirmed"));
+                return;
+            }
+        }
+
         let dir = models::default_dir();
         let _ = std::fs::create_dir_all(&dir);
 
@@ -1594,12 +1622,23 @@ mod windows_app {
                 .arg("--dir")
                 .arg(&dir)
                 .arg("--yes");
+            // Consent from the dialog above, passed on. Set only when a person
+            // clicked Yes; `--yes` above means "do not ask about the size" and
+            // has never meant this.
+            if adult {
+                cmd.env("CHAOS_ADULT_CONFIRMED", "1");
+            }
             {
                 use std::os::windows::process::CommandExt;
                 cmd.creation_flags(CREATE_NO_WINDOW);
             }
             let msg = match cmd.status() {
                 Ok(st) if st.success() => format!("{name} {quant} downloaded"),
+                // 3 is "the age check was not satisfied", which is not a
+                // failure to report as one.
+                Ok(st) if st.code() == Some(3) => {
+                    format!("{name} {quant} not downloaded: age not confirmed")
+                }
                 Ok(st) => format!("download failed (exit {})", st.code().unwrap_or(-1)),
                 Err(e) => format!("could not start chaos-pull: {e}"),
             };
