@@ -416,11 +416,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      # This job builds nothing, so a checkout looks like waste -- but `gh`
-      # infers the repository from the git remote, and `--notes-from-tag` is
-      # refused outright when `--repo` is passed instead ("using
-      # `--notes-from-tag` with `--repo` is not supported"). `fetch-depth: 0`
-      # brings the tags, which is where the notes come from.
+      # This job builds nothing, so a checkout looks like waste -- but the notes
+      # come from the annotated tag's own message, and `fetch-depth: 0` is what
+      # brings the tags.
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: actions/download-artifact@v4
@@ -437,11 +435,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF_NAME}"
+
+          # **`--notes-from-tag` published the commit message instead of the tag
+          # message on v0.0.10** -- `Co-Authored-By` trailer and all -- and the
+          # user-facing notes written into the tag were never seen. Read the tag
+          # object directly instead.
+          #
+          # The guard is `cat-file -t`, not an emptiness check: for a
+          # *lightweight* tag `%(contents)` silently returns the commit message,
+          # which is the exact failure being fixed and would sail straight
+          # through `[ -s ]`. Only an annotated tag has type `tag`.
+          if [ "$(git cat-file -t "$TAG")" != "tag" ]; then
+            echo "::error::$TAG is a lightweight tag, so it carries no notes."
+            echo "::error::Release notes are written for users, not taken from a commit. Tag with:"
+            echo "::error::  git tag -a --cleanup=verbatim $TAG -F notes.md"
+            exit 1
+          fi
+          git tag -l --format='%(contents)' "$TAG" > tag-notes.md
+          echo "--- release notes, as they will be published ---"
+          cat tag-notes.md
+
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            # --verify-tag refuses to invent a tag that does not exist, and
-            # --notes-from-tag uses the annotated tag's own message rather than
-            # generating a commit list nobody wrote.
-            gh release create "$TAG" --title "$TAG" --notes-from-tag --verify-tag
+            # --verify-tag refuses to invent a tag that does not exist.
+            gh release create "$TAG" --title "$TAG" --notes-file tag-notes.md --verify-tag
+          else
+            # A re-run must not leave the first run's notes in place.
+            gh release edit "$TAG" --notes-file tag-notes.md
           fi
           gh release upload "$TAG" dist/* --clobber
           echo "### Published \`$TAG\`" >> $GITHUB_STEP_SUMMARY
