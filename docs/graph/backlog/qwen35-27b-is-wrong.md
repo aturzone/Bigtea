@@ -1,6 +1,6 @@
-# Qwen3.6-27B generates nonsense — and so does llama.cpp on the same file
+# Qwen3.6-27B generates nonsense, and matching llama.cpp is not a defence
 
-**Status**: cause located outside this engine, 2026-08-19. Not a Chaos bug.
+**Status**: open. Narrowed, not fixed, 2026-08-19.
 **Links**: [`qwen35-gated-delta-net`](qwen35-gated-delta-net.md) ·
 [`hard-won-facts`](../reference/hard-won-facts.md)
 
@@ -13,8 +13,12 @@ Same container, same prompt, greedy, CPU only:
 | Chaos | `ทัน ทัน ทัน ทัน ทัน ทัน` |
 | **llama.cpp** | **`333333`** |
 
-Neither says Paris. **The reference implementation fails on this file too**, so
-the port is not what is wrong, and every conclusion below follows from that.
+Neither says Paris.
+
+**That llama.cpp fails too is a clue, not an excuse.** It narrows the search — it
+does not mean Chaos is allowed to be wrong here. Chaos is judged on whether it
+answers correctly, and on this container it does not. What the agreement buys is
+knowing *where* to look: not in the parts both engines compute identically.
 
 Commands, so this is citable:
 
@@ -45,9 +49,9 @@ residual reaches 1.009e6 at layer 5 — three orders of magnitude above layer 4'
 same collapse in more detail: `ffn_up-5` is finite at 377.58 while `ffn_gate-5`,
 `ffn_swiglu-5` and `linear_attn_qkv_mixed-5` are all NaN.
 
-Agreement this exact, up to and including the failure, is the strongest evidence
-the `qwen35` port is faithful that has been collected — stronger than the 0.8B
-diff, because it reproduces a pathological case step for step.
+Agreement this exact says the port reproduces llama.cpp faithfully **including
+its behaviour here**. That is worth knowing and it is not a result: reproducing a
+wrong answer precisely is still a wrong answer.
 
 ## Ruled out, each by measurement
 
@@ -71,34 +75,45 @@ diff, because it reproduces a pathological case step for step.
 
 ## So what is it
 
-One of two things, and this machine can separate them only with a second file:
+One of two things. Both are this project's problem to solve — the second one
+especially, because "llama.cpp does it this way" is not a specification:
 
 1. **This quantisation.** `Q4_K 10.44 GiB + Q6_K 4.14 + Q5_K 0.97`, an Unsloth
    imatrix build. A block whose scale decodes to something enormous would push
    layer 5's residual to 1e6 without storing a single non-finite f32.
-2. **llama.cpp's own `qwen35` implementation at 64 blocks**, faithfully
-   reproduced here.
+2. **The way this architecture is implemented at 64 blocks**, in llama.cpp and
+   copied faithfully here. If that is the answer, the fix is to work from Qwen's
+   own model definition rather than from another implementation of it — a
+   residual that legitimately reaches 1.009e6 by layer 5 is something the correct
+   forward pass must survive, and finding out how it does is the job.
 
-**The test that separates them is a different quantisation of the same model** —
-`UD-Q2_K_XL` at 10.7 GB, which has the side benefit of fitting this machine. If
-it generates correctly it was the file; if it fails identically it is the
-architecture at this depth, and that belongs upstream rather than here.
+**The test that separates them is a different quantisation** —
+`Qwen3.8-27B-UD-Q2_K_XL.gguf` at 9.94 GiB, which is also the model Atur actually
+wants and the only 27B size that fits this machine. If it generates correctly the
+first cause was the file. If it fails the same way, the answer is in how this
+architecture is implemented at 64 blocks, and then the work is to derive it from
+**Qwen's own model definition** rather than from another engine's version of it.
 
-## Shipped ahead of that
+Qwen3.6 comes out of the catalogue, the tests and the docs once 3.8 generates
+correctly — Atur's instruction, and the right shape for it: one supported member
+of the family that works, rather than two that do not.
 
-`catalogue::verified_block_counts` records what was diffed — `qwen35` at 24
-blocks — and `why_shape_is_unverified` turns a mismatch into a line
-`chaos-run`, `chaos-serve` and the app all show before a token is produced. It
-names the container rather than the engine, because the measurement says the
-engine agrees with the reference:
+## Shipped ahead of the fix
+
+`catalogue::verified_block_counts` records the shape that was checked — `qwen35`
+at 24 blocks — and `why_shape_is_unverified` turns a mismatch into a line
+`chaos-run`, `chaos-serve` and the app all show before a token is produced.
+
+**It names no other project.** Whether llama.cpp fails too is a clue for whoever
+is fixing this; to the person waiting for an answer it is an excuse, and a test
+asserts the string never mentions it:
 
 ```
-shape      UNVERIFIED -- qwen35 was diffed against llama.cpp at 24 blocks and
-           this container has 64. Answers may be WRONG with no error anywhere.
-           The known 64-block container, Qwen3.6-27B-Q4_K_M, overflows to NaN at
-           layer 5 -- in llama.cpp as well as here, from identical layer sums --
-           so a different quantisation of it is worth trying before this engine
-           is suspected
+shape      UNVERIFIED -- this architecture has been checked at 24 blocks and this
+           container has 64, so answers may be WRONG with no error anywhere. The
+           64-block build we have tested, Qwen3.6-27B-Q4_K_M, overflows to NaN
+           part way through and produces nonsense. A smaller quantisation is
+           worth trying, and the failure is being worked on
 ```
 
 It **warns rather than refuses**: the policy is to run what can be run and say

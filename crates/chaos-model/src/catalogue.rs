@@ -439,13 +439,19 @@ pub const RUNNABLE_ARCHS: &[&str] = &[
 /// llama.cpp at three prompt lengths. Qwen3.6-27B declares the same
 /// architecture, has 64 blocks, exits 0 and generates nonsense.
 ///
-/// **And so does llama.cpp on the same file**, which is the part that decides
-/// what this warning should say. Measured on `Qwen3.6-27B-Q4_K_M` with the
-/// prompt "The capital of France is", greedy: Chaos returns
-/// `ทัน ทัน ทัน`, llama.cpp returns `333333`, and the two agree on
-/// every layer sum up to and including layer 5 -- where the residual reaches
-/// 1.009e6 in both and then goes NaN in both. So the fault is not in this
-/// engine, and the warning must not imply it is: it points at the container.
+/// **llama.cpp fails on the same file, and that is a clue rather than an
+/// excuse.** Measured on `Qwen3.6-27B-Q4_K_M` with the prompt "The capital of
+/// France is", greedy: Chaos returns `ทัน ทัน ทัน`, llama.cpp returns
+/// `333333`, and the two agree on every layer sum up to and including layer 5 --
+/// where the residual reaches 1.009e6 in both, and then both go NaN.
+///
+/// Matching a wrong answer is not a defence. It says this engine reproduces
+/// llama.cpp faithfully *including its behaviour here*, which narrows the search
+/// to the two things that can produce it -- the quantisation, or the way both
+/// engines implement this architecture at 64 blocks -- and neither is fixed by
+/// pointing at the other project. **Chaos is judged on whether it answers
+/// correctly, not on whether it matches somebody else.** So the warning says
+/// what is not known and what to try, and claims nothing about fault.
 ///
 /// It lives here rather than beside the verified list because **three places ask
 /// this question**: `chaos-run`, `chaos-serve` and the app's model list. The app
@@ -477,11 +483,10 @@ pub fn why_shape_is_unverified(arch: &str, n_layer: u32) -> Option<String> {
     }
     let sizes: Vec<String> = known.iter().map(u32::to_string).collect();
     Some(format!(
-        "{arch} was diffed against llama.cpp at {} blocks and this container has {n_layer}. \
-         Answers may be WRONG with no error anywhere. The known 64-block container, \
-         Qwen3.6-27B-Q4_K_M, overflows to NaN at layer 5 -- in llama.cpp as well as here, \
-         from identical layer sums -- so a different quantisation of it is worth trying \
-         before this engine is suspected",
+        "this architecture has been checked at {} blocks and this container has {n_layer}, \
+         so answers may be WRONG with no error anywhere. The 64-block build we have tested, \
+         Qwen3.6-27B-Q4_K_M, overflows to NaN part way through and produces nonsense. \
+         A smaller quantisation is worth trying, and the failure is being worked on",
         sizes.join(" or "),
     ))
 }
@@ -817,16 +822,21 @@ mod runnable_tests {
         let why = why_shape_is_unverified("qwen35", 64).expect("64 blocks must warn");
         assert!(why.contains("24"), "must name what WAS diffed: {why}");
         assert!(why.contains("64"), "must name what it found: {why}");
-        // **It must not blame this engine.** llama.cpp fails on the same file,
-        // and a warning that sends the user to fix Chaos sends them to fix
-        // something that is not broken.
+        // **It must not name another project.** Whether llama.cpp also fails is
+        // a clue for the developer, not an answer for the user -- and a message
+        // that reads as "the competitor is wrong too" is an excuse. Chaos is
+        // judged on whether it answers correctly.
         assert!(
-            why.contains("llama.cpp"),
-            "must say the reference fails too: {why}"
+            !why.contains("llama.cpp"),
+            "the user-facing warning must not point at another project: {why}"
         );
         assert!(
             why.contains("quantisation"),
             "must suggest what to actually try: {why}"
+        );
+        assert!(
+            why.contains("worked on"),
+            "must say it is being fixed rather than merely reported: {why}"
         );
 
         // Any other unverified size warns too, rather than only the known-bad one.

@@ -15,12 +15,12 @@ Found while checking that every installed model runs. It exits 0 and prints
 instead of 64 — is byte-identical to llama.cpp at three prompt lengths, so
 `qwen35` is verified on the shape it was diffed against and not on this one.
 
-**And llama.cpp fails on the same file.** Same container, same prompt, greedy:
-llama.cpp answers `333333`. The per-layer sums agree to five significant figures
-through layer 5 — `attn_residual-5` 1009342 against 1009345 — and then both go
-NaN at `l_out-5`. So the port is faithful and the fault is upstream: either this
-Unsloth quantisation or llama.cpp's own `qwen35` at 64 blocks. Chaos warns before
-generating and points at the container rather than at itself.
+llama.cpp fails on the same file too — `333333` — and the per-layer sums agree to
+five significant figures through layer 5 before both overflow to NaN. **That is a
+clue, not a defence**: reproducing a wrong answer precisely is still a wrong
+answer, and this engine is judged on whether it replies correctly. What the
+agreement buys is knowing where not to look. Chaos warns before generating, and
+the warning names no other project.
 
 The first sweep of all twelve models recorded "twelve of twelve" because every
 one exited 0 and the outputs were never read. That is this project's own

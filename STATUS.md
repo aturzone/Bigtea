@@ -141,13 +141,18 @@ figures through layer 5 — `l_out-0` 59.1449 against 59.1446, `attn_residual-5`
 1009342 against 1009345 — and then **both** go NaN at `l_out-5`, where the
 residual has climbed three orders of magnitude above layer 4's 128.
 
-Agreement that exact, up to and including the failure, is the strongest evidence
-yet that the `qwen35` port is faithful — stronger than the 0.8B diff, because it
-reproduces a pathological case step for step. Ruled out by measurement: the
+That agreement is a clue, not a defence. It says the port reproduces llama.cpp
+faithfully including its behaviour here, which narrows where to look — and
+reproducing a wrong answer precisely is still a wrong answer. **Chaos is judged on
+whether it answers correctly, not on whether it matches somebody else.** Ruled out
+by measurement: the
 container is complete (851/851 tensors), no f32 weight holds a NaN (all 449
 scanned), repacking, the key-head broadcast, the tokenizer, and every shape.
-What is left is this Unsloth Q4_K/Q5_K/Q6_K quantisation or llama.cpp's `qwen35`
-at 64 blocks — and one different quantisation of the same model separates them.
+What is left is this Unsloth Q4_K/Q5_K/Q6_K quantisation, or how this
+architecture is implemented at 64 blocks — and if it is the second, the fix comes
+from Qwen's own model definition rather than from another engine's version of it.
+`Qwen3.8-27B-UD-Q2_K_XL.gguf` at 9.94 GiB separates the two and is the model
+wanted anyway; Qwen3.6 comes out once it generates correctly.
 [`backlog/qwen35-27b-is-wrong.md`](docs/graph/backlog/qwen35-27b-is-wrong.md).
 
 The failure is not "too big": gemma-3-27b is the same size and is right. It is
