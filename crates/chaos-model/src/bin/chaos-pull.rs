@@ -352,7 +352,8 @@ fn fetch(
     }
     for (i, f) in files.iter().enumerate() {
         let url = entry.url(f);
-        let out = dir.join(f);
+        // The filename, not the repo path: see `Entry::local_name`.
+        let out = dir.join(catalogue::Entry::local_name(f));
         println!("\n[{}/{}] {f}", i + 1, files.len());
 
         let mut cmd = Command::new("curl");

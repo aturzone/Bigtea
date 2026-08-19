@@ -1602,7 +1602,15 @@ mod windows_app {
         // which files will appear, and what they will weigh in total.
         let files: Vec<std::path::PathBuf> = chaos_model::catalogue::find(&name)
             .and_then(|e| e.quant(&quant).map(|q| (e, q)))
-            .map(|(e, q)| e.files(q).into_iter().map(|f| dir.join(f)).collect())
+            // `local_name`, matching where `chaos-pull` actually writes: the
+            // watcher looked for `split_files/vae/x.safetensors` under the models
+            // folder and would have waited forever for a file saved as `x`.
+            .map(|(e, q)| {
+                e.files(q)
+                    .into_iter()
+                    .map(|f| dir.join(chaos_model::catalogue::Entry::local_name(&f)))
+                    .collect()
+            })
             .unwrap_or_default();
         UI.with(|u| {
             if let Some(ui) = u.borrow_mut().as_mut() {

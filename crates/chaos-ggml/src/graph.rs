@@ -273,6 +273,24 @@ extern "C" {
         d0: i32,
         d1: i32,
     ) -> *mut ggml_tensor;
+    /// 2-D convolution that takes an **F32** kernel.
+    ///
+    /// The `im2col` path behind `ggml_conv_2d` needs F16 and aborts otherwise,
+    /// which would mean converting all 138 of a VAE decoder's weights. This one
+    /// has its type assert commented out in `ggml.c` and checks only that the
+    /// input-channel dimensions agree, so the weights can be bound as they are
+    /// stored. Verified rather than assumed -- see `examples/try-vae-ops.rs`.
+    fn ggml_conv_2d_direct(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+        s0: i32,
+        s1: i32,
+        p0: i32,
+        p1: i32,
+        d0: i32,
+        d1: i32,
+    ) -> *mut ggml_tensor;
     /// Group normalisation: the VAE's norm, and not one any layer here uses.
     ///
     /// Normalises over `ne[0] * ne[1]` and groups of channels along `ne[2]`,
@@ -871,6 +889,36 @@ impl Context {
         // the process. `new_f16_4d` exists so the correct thing is the easy one.
         self.tensor(unsafe {
             ggml_conv_2d(
+                self.raw.as_ptr(),
+                kernel.raw.as_ptr(),
+                data.raw.as_ptr(),
+                stride.0,
+                stride.1,
+                pad.0,
+                pad.1,
+                dilation.0,
+                dilation.1,
+            )
+        })
+    }
+
+    /// 2-D convolution with an F32 kernel, `[kw, kh, in, out]` over `[w, h, c, n]`.
+    ///
+    /// Preferred over [`Context::conv_2d`] for anything whose weights are stored
+    /// F32, which is every tensor in the FLUX.2 autoencoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_2d_direct<'a>(
+        &'a self,
+        kernel: &Tensor<'a>,
+        data: &Tensor<'a>,
+        stride: (i32, i32),
+        pad: (i32, i32),
+        dilation: (i32, i32),
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above. ggml asserts `a->ne[2] == b->ne[2]` and **aborts**,
+        // so the caller must match input channels.
+        self.tensor(unsafe {
+            ggml_conv_2d_direct(
                 self.raw.as_ptr(),
                 kernel.raw.as_ptr(),
                 data.raw.as_ptr(),
@@ -2247,6 +2295,11 @@ mod tests {
         let out = ctx
             .conv_2d(&kernel, &data, (1, 1), (0, 0), (1, 1))
             .expect("conv_2d");
+        // Not asserted for `conv_2d_direct` here: it wanted **17 MB of arena for
+        // a 1x1 convolution over four values**, which is far more than this
+        // shared `ARENA` holds, and an exhausted arena aborts the whole binary.
+        // Covered in `examples/try-vae-ops.rs`, which sizes its own context.
+
         ctx.compute(&out, 1).expect("compute");
         let got = out.to_vec_f32();
         assert_eq!(got.len(), 4, "1x1 stride 1 no padding keeps the shape");

@@ -12,7 +12,7 @@
 //!   `[-1.342, -0.447, 0.447, 1.342]`.
 
 fn main() {
-    let ctx = match chaos_ggml::Context::new(16 << 20) {
+    let ctx = match chaos_ggml::Context::new(256 << 20) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("no context: {e:?}");
@@ -70,5 +70,30 @@ fn main() {
         }
         Err(e) => println!("  group_norm refused: {e:?}"),
     }
-    println!("survived both calls");
+    // -- conv_2d_direct, with an F32 kernel ----------------------------------
+    // If this works, the VAE's 138 F32 weights need no conversion at all.
+    let k32 = ctx.new_f32_1d(1).expect("k32");
+    k32.set_f32(&[2.0]).expect("set k32");
+    let k32 = ctx.reshape_4d(&k32, [1, 1, 1, 1]).expect("reshape k32");
+    println!("calling conv_2d_direct with an F32 kernel ...");
+    match ctx.conv_2d_direct(&k32, &data, (1, 1), (0, 0), (1, 1)) {
+        Ok(out) => {
+            ctx.compute(&out, 1).expect("compute direct");
+            let got = out.to_vec_f32();
+            println!("  conv_2d_direct -> {got:?}");
+            let want = [2.0f32, 4.0, 6.0, 8.0];
+            let ok = got.len() == 4 && got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-3);
+            println!(
+                "  {}",
+                if ok {
+                    "MATCHES -- F32 kernels work, no conversion needed"
+                } else {
+                    "DIFFERS"
+                }
+            );
+        }
+        Err(e) => println!("  conv_2d_direct refused: {e:?}"),
+    }
+
+    println!("survived all calls");
 }

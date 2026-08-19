@@ -81,6 +81,20 @@ impl Entry {
 
     /// Where a file is fetched from.
     ///
+    /// Where a repo-relative path lands on disk: **the filename alone**.
+    ///
+    /// The FLUX.2 autoencoder is `split_files/vae/flux2-vae.safetensors` in its
+    /// repository, and saving it under that path did two wrong things. `curl`
+    /// failed outright with "No such file or directory", because nothing created
+    /// the directories; and had it worked, the file would have been two levels
+    /// deep in the models folder, where `find` -- which descends one level --
+    /// could never have seen it.
+    ///
+    /// So the directories are part of the URL and not part of the answer.
+    pub fn local_name(file: &str) -> &str {
+        file.rsplit('/').next().unwrap_or(file)
+    }
+
     /// `resolve/main` rather than `blob`: the former streams the file, the
     /// latter returns an HTML page, and the mistake shows up as a `.gguf` that
     /// parses as HTML several gigabytes later.

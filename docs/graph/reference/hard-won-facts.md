@@ -58,6 +58,25 @@ are the measurement that killed one.
   instead (`WeightBytes` covers any `Deref<Target=[u8]>`); that mistake alone
   cost 12s of a 27s run.
 
+## Convolutions, for the image path
+
+- **`ggml_conv_2d` needs an F16 kernel and aborts on F32.** It goes through
+  `im2col` plus a matmul written for half precision. **`ggml_conv_2d_direct`
+  does not** — its type assert is commented out in `ggml.c` and it checks only
+  that the input-channel dimensions agree, so a VAE's 138 F32 weights can be
+  bound as stored instead of converted. Measured, not read: an F32 kernel
+  through it gives `[2,4,6,8]` for a 1x1 kernel of 2 over `[1,2,3,4]`.
+- **`conv_2d_direct` wanted 17 MB of arena for a 1x1 convolution over four
+  values.** Whatever it reserves is not proportional to the work, so an image
+  path needs its arena sized by experiment rather than by arithmetic — and an
+  exhausted arena aborts the process, so the experiment belongs in an example
+  rather than in the test suite.
+- **`group_norm` uses population variance.** `(x - mean) / sqrt(var)` with `var`
+  over `n`, not `n-1`: for `[1,2,3,4]` that is 1.3416 rather than 1.1547. A
+  "roughly right" check does not separate those.
+- **The kernel is the first argument, the data the second.** They are the same
+  type, so swapping them compiles and returns a differently shaped answer.
+
 ## Correctness, which fails silently here
 
 - **A sweep that checks exit codes is not a test.** Twelve installed models were
