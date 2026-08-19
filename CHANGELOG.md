@@ -8,6 +8,84 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
+## [0.0.10] — 2026-08-20
+
+### Chaos decodes images, and the autoencoder is verified rather than eyeballed
+
+`chaos-image::vae` builds the FLUX.2 autoencoder as a ggml graph — both halves,
+248 tensors, and **no transposes anywhere**, because a contiguous PyTorch
+`[OC, IC, KH, KW]` convolution weight *is* ggml's `[KW, KH, IC, OC]` read
+backwards. The decoder turns a latent into pixels; the **encoder exists so the
+decoder could be checked without a reference implementation**.
+
+Encode a real photograph, take the distribution's mean, decode it, compare. The
+two halves are separately trained weights over one shared latent space, so
+neither can compensate for a bug in the other. Four 256×256 photographs:
+**36.09, 36.29, 36.49 and 40.89 dB**.
+
+That is only worth printing because the check was ablated first. Against the
+same input, baseline 36.09 dB:
+
+| deliberate error | PSNR |
+|---|---|
+| `group_norm` without its per-channel scale and shift | 16.77 dB |
+| downsampler padded symmetrically instead of `(0,1,0,1)` | 14.60 dB |
+| mid-block attention skipped | 31.93 dB |
+| convolution kernels not dimension-reversed | ggml aborts |
+
+Three of the four still produce a recognisable picture, and all three would have
+passed "it looks like a photograph" — which is this project's oldest hazard.
+
+**The denoiser is not started**, so Chaos cannot yet generate an image from a
+prompt; it can decode a latent into one. The text encoder and the unconditional
+twin are fetchable but not yet fetched.
+
+New ggml bindings, each exercised in `try-vae-ops` against a hand-computed
+answer before going near the suite: `new_f32_4d`, `upscale_nearest`, `pad`,
+`cont_2d`, and a `Tensor::ne` accessor. `ggml_pad` puts its zeros at the far end
+of each dimension only, which is exactly diffusers' asymmetric downsample
+padding.
+
+### The file has 251 tensors and the graphs name 248
+
+The remainder is a BatchNorm — `bn.running_mean`, `bn.running_var`,
+`bn.num_batches_tracked` — holding the **latent normalisation**, which is what
+earlier autoencoders did with a scalar `scaling_factor`. It is **128-wide, not
+32**: the patchified channel count, 32 latent channels times a 2×2 patch, which
+is exactly what the denoiser consumes.
+
+A round trip never touches it, because encode and decode are inverses whatever
+the normalisation is — which is what makes the round trip a fair test of this
+port and *not* a test of the interface to the denoiser. Recorded because leaving
+it out is the next chance to produce a confident, plausible, wrong image.
+
+### `usable without ggml` had been red, and was reported as green
+
+The check failed from the commit that added `try-vae-ops` onwards: `cargo clippy
+--all-targets` builds examples, and that example names `Context`, which is
+`#[cfg(have_ggml)]`. Four of five checks green was read as green. The gated
+*tests* in that crate use `#![cfg(have_ggml)]` on the whole file; an example
+cannot, because a file with no `main` does not compile at all, so the cfg goes on
+the function with a stub that says what to set.
+
+### Fixed
+
+- The new autoencoder tests panicked when the 336 MB file was absent, which is
+  what they were written to do and which turned three CI jobs red — CI runs
+  `cargo test --workspace -- --ignored` on three platforms that do not have it.
+  They skip now, the way the V4-Flash set does. Because that is the hazard this
+  project has already been burned by, the skip prints **"SKIPPED, NOTHING WAS
+  CHECKED"** and names the file, and `CHAOS_REQUIRE_VAE=1` turns absence back
+  into a failure.
+
+### Note on 0.0.9
+
+There is no v0.0.9 release. The version was bumped in `Cargo.toml` and the
+installer was exercised locally, but the tag was never pushed, so v0.0.8 was the
+newest release until this one. Everything that section would have contained ships
+here.
+
+
 ### Qwen3.6-27B loads, generates, and is wrong — in llama.cpp too
 
 Found while checking that every installed model runs. It exits 0 and prints
@@ -1017,7 +1095,14 @@ Qwen3-30B-A3B Q4_K_M prefill, Chaos / llama.cpp:
   requires a competitor's exact command line and output before any competitive
   claim is citable.
 
-[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.10...HEAD
+[0.0.10]: https://github.com/aturzone/Chaos/releases/tag/v0.0.10
+[0.0.8]: https://github.com/aturzone/Chaos/releases/tag/v0.0.8
+[0.0.7]: https://github.com/aturzone/Chaos/releases/tag/v0.0.7
+[0.0.6]: https://github.com/aturzone/Chaos/releases/tag/v0.0.6
+[0.0.5]: https://github.com/aturzone/Chaos/releases/tag/v0.0.5
+[0.0.4]: https://github.com/aturzone/Chaos/releases/tag/v0.0.4
+[0.0.3]: https://github.com/aturzone/Chaos/releases/tag/v0.0.3
 [0.0.2]: https://github.com/aturzone/Chaos/releases/tag/v0.0.2
 [0.0.1]: https://github.com/aturzone/Chaos/releases/tag/v0.0.1
 [0.0.0]: https://github.com/aturzone/Chaos/releases/tag/v0.0.0

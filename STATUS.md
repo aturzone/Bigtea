@@ -5,8 +5,8 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-19 · **Version**: **v0.0.9** · **Branch**:
-`ticket/r61-installer-uninstall-update` · **Open PRs**: r60 (logo), r61 (this).
+**Last updated**: 2026-08-20 · **Version**: **v0.0.10** · **Branch**: `main` ·
+**Open PRs**: none.
 
 **Twelve of thirteen installed models generate correct text** on this 15.7 GiB
 machine, checked by requiring `Paris` after "The capital of France is" rather
@@ -19,13 +19,18 @@ engines agree to five significant figures on every layer sum and then both
 overflow to NaN at `l_out-5`. Chaos warns before generating and points at the
 container.
 
-**The release**: v0.0.9, six assets — Windows installer and zip, Linux tarball,
-`.deb` and AppImage, macOS arm64 tarball. The installer was built and exercised
-locally before tagging: 28.2 MB carrying 11 binaries, installed to a test prefix,
-the installed `chaos-run` generated *" Paris."*, reinstall reported
-"Reinstalling Chaos 0.0.9", and uninstalling from inside the folder removed the
-prefix, the registry key, the PATH entry and the staged helper — leaving the
-models directory untouched.
+**The release**: v0.0.10, six assets — Windows installer and zip, Linux tarball,
+`.deb` and AppImage, macOS arm64 tarball.
+
+**There is no v0.0.9.** The version was bumped in `Cargo.toml` and the installer
+was exercised locally, but **the tag was never pushed**, so v0.0.8 stayed the
+newest release and this file claimed a release that did not exist. Corrected on
+2026-08-20; the tag list is the authority, not this paragraph. What *was* checked
+locally at 0.0.9 still holds and shipped in 0.0.10: 28.2 MB carrying 11 binaries,
+installed to a test prefix, the installed `chaos-run` generated *" Paris."*,
+reinstall reported "Reinstalling Chaos", and uninstalling from inside the folder
+removed the prefix, the registry key, the PATH entry and the staged helper —
+leaving the models directory untouched.
 
 **Chaos decodes images, and the autoencoder is verified rather than eyeballed**
 (2026-08-19). `chaos-image` builds the FLUX.2 autoencoder as a ggml graph — both
@@ -305,10 +310,10 @@ Two honest routes in
 
 **One of the two is now closed, and the other is honestly named.** Qwen3.5/3.6/3.8
 runs and is diffed against llama.cpp; Ideogram 4 is an image model needing four
-components this engine has none of. **v0.0.9 is not called an LTS**, and the
+components this engine has none of. **v0.0.10 is not called an LTS**, and the
 reason is Ideogram plus the server's missing device loader: a release that calls
 itself long-term-supported while a settings control it ships cannot do anything
-is making a claim about the wrong thing. What v0.0.9 *is*: every control on
+is making a claim about the wrong thing. What v0.0.10 *is*: every control on
 every page does what it says, or says why it cannot.
 
 ## A browser interface, and what a browser found (2026-08-17)
