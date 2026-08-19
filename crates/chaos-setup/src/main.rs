@@ -92,21 +92,34 @@ fn main() {
     // `Start-Process -Wait -PassThru` and read `.ExitCode`, or `cmd /c start
     // /wait`. NSIS and every other GUI installer behave the same way.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let silent = args
-        .iter()
-        .any(|a| a.eq_ignore_ascii_case("/S") || a == "--silent");
-    if silent {
-        let uninstall = args
-            .iter()
-            .any(|a| a.eq_ignore_ascii_case("/uninstall") || a == "--uninstall");
-        let prefix = args
-            .iter()
-            .position(|a| a == "--prefix")
+    let flag = |names: &[&str]| {
+        args.iter()
+            .any(|a| names.iter().any(|n| a.eq_ignore_ascii_case(n)))
+    };
+    let value = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
             .and_then(|i| args.get(i + 1))
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(chaos_setup::default_prefix);
+            .cloned()
+    };
+    let silent = flag(&["/S", "--silent"]);
+    let uninstall = flag(&["/uninstall", "--uninstall"]);
+    let prefix = value("--prefix")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(chaos_setup::default_prefix);
+
+    // **Wait for whoever started this before touching their directory.** A
+    // running executable keeps its own file open, so the staged uninstaller
+    // cannot delete the folder its parent lives in until that parent is gone.
+    // Retrying blind is what failed: ten seconds of attempts against however
+    // long a person takes to dismiss a message box.
+    if let Some(pid) = value("--wait-for").and_then(|s| s.parse::<u32>().ok()) {
+        setup::wait_for_process(pid);
+    }
+
+    if silent {
         let (ok, msg) = if uninstall {
-            setup::uninstall_to(&prefix)
+            setup::uninstall_to(&prefix, flag(&["--report"]))
         } else {
             setup::install_to(&prefix)
         };
@@ -123,7 +136,27 @@ fn main() {
             prefix.join("setup.log")
         };
         let _ = std::fs::write(log, &msg);
+        // The staged uninstaller is the only thing left running by then, so if
+        // nothing says the removal finished, nothing does.
+        if flag(&["--report"]) {
+            use chaos_app::win32::{wide, MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION};
+            unsafe {
+                MessageBoxW(
+                    std::ptr::null_mut(),
+                    wide(&msg).as_ptr(),
+                    wide("Chaos Setup").as_ptr(),
+                    if ok { MB_ICONINFORMATION } else { MB_ICONERROR },
+                );
+            }
+        }
         std::process::exit(if ok { 0 } else { 1 });
+    }
+    // Launched by Add/Remove Programs, which passes `--uninstall` and expects a
+    // window rather than a silent removal. Ask, then hand off to the staged
+    // helper -- the same path the button in the installer takes.
+    if uninstall {
+        setup::run_uninstall(&prefix);
+        return;
     }
     setup::run();
 }
@@ -139,6 +172,10 @@ mod setup {
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::Instant;
+
+    /// Newline. Spelled out because these strings are assembled for message
+    /// boxes, where an escaped one inside a `format!` is easy to lose.
+    const LF: char = 10 as u8 as char;
 
     const ID_PREFIX: i32 = 201;
     const ID_INSTALL: i32 = 202;
@@ -174,6 +211,10 @@ mod setup {
         ground: HBRUSH,
         status: String,
         done: bool,
+        /// What the welcome screen says about an install already at the chosen
+        /// path -- so a second install announces itself as an update *before*
+        /// the button is pressed, not in the report afterwards.
+        notice: String,
     }
 
     thread_local! {
@@ -377,8 +418,11 @@ mod setup {
                     ground,
                     status: String::new(),
                     done: false,
+                    notice: String::new(),
                 })
             });
+
+            sync_action();
 
             if payload::FILES.is_empty() {
                 // Said on the face of the window rather than discovered by
@@ -423,6 +467,37 @@ mod setup {
                 if !h.is_null() {
                     ShowWindow(h, if welcome { SW_SHOW } else { SW_HIDE });
                 }
+            }
+        }
+    }
+
+    /// Name the button and the notice after what is already at the chosen path.
+    ///
+    /// **The upgrade line existed and nobody ever saw it.** It was written into
+    /// the report, after the install had already run -- so installing a new
+    /// version over an old one looked exactly like a first install, and the one
+    /// question a returning user has ("will this replace what I have?") went
+    /// unanswered until it already had. It belongs on the first screen.
+    fn sync_action() {
+        let prefix = prefix_value();
+        let (label, notice) = welcome_action(
+            existing_install(&prefix).as_ref(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let h = S.with(|s| {
+            let mut b = s.borrow_mut();
+            b.as_mut().map(|s| {
+                s.notice = notice;
+                (s.main, unsafe { GetDlgItem(s.main, ID_INSTALL) })
+            })
+        });
+        // Borrow closed first: both calls below repaint, and a repaint borrows.
+        if let Some((main, install)) = h {
+            unsafe {
+                if !install.is_null() {
+                    SetWindowTextW(install, wide(label).as_ptr());
+                }
+                InvalidateRect(main, std::ptr::null(), 1);
             }
         }
     }
@@ -696,31 +771,75 @@ mod setup {
     fn do_uninstall() {
         let prefix = prefix_value();
         let inside = running_inside(&prefix);
-        let (ok, msg) = uninstall_to(&prefix);
+        let (ok, msg) = uninstall_to(&prefix, true);
         set_status(&msg);
 
         // **When this window is running from inside the folder being removed,
-        // it has to go.** The staged helper cannot delete a directory while
-        // this process holds an executable open in it, so it retries for ten
-        // seconds and then gives up -- which is what "I cannot uninstall the
-        // app" was. Show the result, then leave.
+        // it has to go, and it has to go NOW.** The staged helper is waiting on
+        // this process: a running executable keeps its own file open, so the
+        // directory cannot be deleted while this window exists.
+        //
+        // There used to be a message box here, and it was the bug. The helper
+        // gave up after ten seconds of retries, a person reading a dialog takes
+        // longer than that, and the result was "uninstall does not work" with
+        // every binary still on disk. The helper now waits for this process and
+        // reports the outcome itself, so the right thing to do here is leave.
         if ok && inside {
+            unsafe { PostQuitMessage(0) };
+        }
+    }
+
+    /// Uninstall from a window, which is how Add/Remove Programs arrives.
+    ///
+    /// No installer chrome: a person who clicked "Uninstall" in Windows
+    /// Settings has already chosen. One confirmation, then the staged helper
+    /// does the work and says how it went.
+    pub fn run_uninstall(prefix: &std::path::Path) {
+        let answer = unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                wide(&format!(
+                    "Remove Chaos from{}{}  {}{}{}Your downloaded models are kept.",
+                    LF, LF,
+                    prefix.display(),
+                    LF, LF,
+                ))
+                .as_ptr(),
+                wide("Uninstall Chaos").as_ptr(),
+                MB_YESNO | MB_ICONQUESTION,
+            )
+        };
+        if answer != IDYES {
+            return;
+        }
+        let (ok, msg) = uninstall_to(prefix, true);
+        // When the helper took over it reports for itself; this process has to
+        // exit for it to make progress. Only speak up if it never started.
+        if !ok || !running_inside(prefix) {
             unsafe {
                 MessageBoxW(
                     std::ptr::null_mut(),
-                    wide(
-                        "Chaos has been removed.
-
-                         Your models were left where they are.
-
-                         This window will now close so the last files can be deleted.",
-                    )
-                    .as_ptr(),
+                    wide(&msg).as_ptr(),
                     wide("Chaos Setup").as_ptr(),
-                    MB_ICONINFORMATION,
+                    if ok { MB_ICONINFORMATION } else { MB_ICONERROR },
                 );
-                PostQuitMessage(0);
             }
+        }
+    }
+
+    /// Wait for another process to exit, so a directory it holds open can go.
+    ///
+    /// Bounded: a parent that hangs must not leave an uninstall stuck forever,
+    /// and the retry loop that follows is still there as a backstop. A null
+    /// handle means the process has already gone, which is the happy case.
+    pub fn wait_for_process(pid: u32) {
+        unsafe {
+            let h = OpenProcess(SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                return;
+            }
+            WaitForSingleObject(h, 30_000);
+            CloseHandle(h);
         }
     }
 
@@ -826,7 +945,7 @@ mod setup {
     /// and returns immediately, and the child retries until the lock clears.
     ///
     /// This is how NSIS uninstallers behave too, for exactly this reason.
-    fn relaunch_from_temp(prefix: &std::path::Path) -> Result<String, String> {
+    fn relaunch_from_temp(prefix: &std::path::Path, report: bool) -> Result<String, String> {
         let me = std::env::current_exe().map_err(|e| e.to_string())?;
         // A fixed name rather than a random one: this workspace has no random
         // number generator, a stale copy is simply overwritten, and it sits in
@@ -835,7 +954,20 @@ mod setup {
         std::fs::copy(&me, &tmp).map_err(|e| format!("cannot stage the uninstaller: {e}"))?;
 
         let mut cmd = Command::new(&tmp);
-        cmd.arg("/S").arg("--uninstall").arg("--prefix").arg(prefix);
+        cmd.arg("/S")
+            .arg("--uninstall")
+            .arg("--prefix")
+            .arg(prefix)
+            // Wait for this process rather than guessing how long it needs, and
+            // say what happened once it has: after this window closes the
+            // helper is the only part of the uninstall still running.
+            .arg("--wait-for")
+            .arg(unsafe { GetCurrentProcessId() }.to_string());
+        // Only when a person is watching. A scripted `/S --uninstall` that
+        // opened a message box would hang the script that called it.
+        if report {
+            cmd.arg("--report");
+        }
         {
             use std::os::windows::process::CommandExt;
             // DETACHED_PROCESS too: the child must outlive this one.
@@ -852,7 +984,10 @@ mod setup {
     /// Windows keeps a running executable's file open until it has. A single
     /// attempt fails in that window; a few seconds of retries does not.
     fn remove_dir_all_retrying(dir: &std::path::Path) -> bool {
-        for _ in 0..40 {
+        // Thirty seconds. The staged helper already waits for its parent to
+        // exit, so this is the backstop for the rest: an antivirus scanning the
+        // files it just saw written, or a `chaos-run` the user forgot about.
+        for _ in 0..120 {
             if !dir.exists() {
                 return true;
             }
@@ -865,7 +1000,7 @@ mod setup {
     }
 
     /// Remove an install from `prefix`.
-    pub fn uninstall_to(prefix: &std::path::Path) -> (bool, String) {
+    pub fn uninstall_to(prefix: &std::path::Path, report: bool) -> (bool, String) {
         let prefix = prefix.to_path_buf();
         let bin = bin_dir(&prefix);
 
@@ -880,7 +1015,7 @@ mod setup {
         // directory and let that one do the work. The relaunched process is
         // holding a file nothing is about to delete.
         if running_inside(&prefix) {
-            match relaunch_from_temp(&prefix) {
+            match relaunch_from_temp(&prefix, report) {
                 Ok(msg) => return (true, msg),
                 // Falling through is still better than stopping: everything
                 // except this one executable can be removed from here.
@@ -892,8 +1027,9 @@ mod setup {
         }
 
         remove_dir_all_retrying(&bin);
-        let _ = std::fs::remove_file(manifest_path(&prefix));
-        let _ = std::fs::remove_file(prefix.join("setup.log"));
+        for f in prefix_files(&prefix) {
+            let _ = std::fs::remove_file(f);
+        }
         // Only if empty: the prefix may be a directory the user chose and
         // already had things of their own in.
         let _ = std::fs::remove_dir(&prefix);
@@ -994,8 +1130,24 @@ mod setup {
         hkcu_write_string(key, "DisplayVersion", env!("CARGO_PKG_VERSION"));
         hkcu_write_string(key, "Publisher", "aturzone");
         hkcu_write_string(key, "InstallLocation", &prefix.to_string_lossy());
-        hkcu_write_string(key, "UninstallString", &format!("\"{}\"", exe.display()));
+        // **With `--uninstall`.** Without it, clicking Uninstall in Windows
+        // Settings opened the installer's welcome screen with INSTALL as the
+        // primary button -- so the one action the user asked for was the one
+        // the window did not offer.
+        hkcu_write_string(
+            key,
+            "UninstallString",
+            &format!("\"{}\" --uninstall --prefix \"{}\"", exe.display(), prefix.display()),
+        );
         hkcu_write_string(key, "URLInfoAbout", "https://github.com/aturzone/Chaos");
+        // The icon Settings shows next to the entry.
+        hkcu_write_string(key, "DisplayIcon", &exe.display().to_string());
+        // For `winget uninstall` and any other unattended remover.
+        hkcu_write_string(
+            key,
+            "QuietUninstallString",
+            &format!("\"{}\" /S --uninstall --prefix \"{}\"", exe.display(), prefix.display()),
+        );
     }
 
     fn unregister_uninstall() {
@@ -1212,6 +1364,21 @@ mod setup {
             t.fg_secondary,
             DT_CENTER | DT_WORDBREAK,
         );
+        if !s.notice.is_empty() {
+            text(
+                hdc,
+                RECT {
+                    left: PAD * 2,
+                    top: 344,
+                    right: r.right - PAD * 2,
+                    bottom: 366,
+                },
+                &s.notice,
+                s.font,
+                t.accent,
+                DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        }
         text(
             hdc,
             RECT {
@@ -1617,6 +1784,11 @@ mod setup {
             }
             WM_COMMAND => {
                 let id = (wp & 0xFFFF) as i32;
+                // A different folder can hold a different version, or none.
+                if id == ID_PREFIX && ((wp >> 16) & 0xFFFF) as u16 == EN_CHANGE {
+                    sync_action();
+                    return 0;
+                }
                 if ((wp >> 16) & 0xFFFF) as u16 == BN_CLICKED {
                     match id {
                         ID_INSTALL => do_install(),

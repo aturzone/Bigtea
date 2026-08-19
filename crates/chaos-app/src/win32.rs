@@ -227,6 +227,7 @@ pub const IDYES: i32 = 6;
 pub const MB_ICONERROR: u32 = 0x0000_0010;
 pub const MB_OK: u32 = 0x0000_0000;
 pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
+pub const MB_ICONQUESTION: u32 = 0x0000_0020;
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// The child must outlive the parent that spawned it -- used by the
@@ -640,6 +641,10 @@ pub const DT_VCENTER: u32 = 0x0004;
 pub const DT_SINGLELINE: u32 = 0x0020;
 pub const DT_WORDBREAK: u32 = 0x0010;
 pub const DT_END_ELLIPSIS: u32 = 0x0000_8000;
+
+/// `EN_CHANGE`: an `EDIT` reporting that its text is now different, which is
+/// how a window notices the user typed a different path.
+pub const EN_CHANGE: u16 = 0x0300;
 pub const DT_CALCRECT: u32 = 0x0400;
 pub const DT_NOPREFIX: u32 = 0x0800;
 
@@ -669,6 +674,21 @@ extern "system" {
     pub fn DeleteDC(hdc: HDC) -> BOOL;
     pub fn MoveToEx(hdc: HDC, x: i32, y: i32, lppt: *mut POINT) -> BOOL;
     pub fn LineTo(hdc: HDC, x: i32, y: i32) -> BOOL;
+}
+
+pub type HANDLE = *mut c_void;
+
+/// Wait on another process. `SYNCHRONIZE` is the whole access right needed --
+/// asking for more fails on a process you did not create.
+pub const SYNCHRONIZE: u32 = 0x0010_0000;
+pub const WAIT_OBJECT_0: u32 = 0;
+
+#[link(name = "kernel32")]
+extern "system" {
+    pub fn GetCurrentProcessId() -> u32;
+    pub fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: BOOL, dwProcessId: u32) -> HANDLE;
+    pub fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) -> u32;
+    pub fn CloseHandle(hObject: HANDLE) -> BOOL;
 }
 
 #[link(name = "kernel32")]
