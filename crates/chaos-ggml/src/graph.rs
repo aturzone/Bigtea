@@ -193,6 +193,105 @@ extern "C" {
         nb2: usize,
         offset: usize,
     ) -> *mut ggml_tensor;
+    fn ggml_view_4d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        ne3: i64,
+        nb1: usize,
+        nb2: usize,
+        nb3: usize,
+        offset: usize,
+    ) -> *mut ggml_tensor;
+    fn ggml_reshape_4d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        ne3: i64,
+    ) -> *mut ggml_tensor;
+    fn ggml_cont_4d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        ne3: i64,
+    ) -> *mut ggml_tensor;
+    fn ggml_repeat_4d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        ne3: i64,
+    ) -> *mut ggml_tensor;
+    /// Root-mean-square normalisation without the learned weight: divides each
+    /// row by its own L2 norm. Not `rms_norm` -- that divides by the root
+    /// *mean* square, this by the norm itself, and the delta net wants the
+    /// latter on Q and K.
+    fn ggml_l2_norm(ctx: *mut ggml_context, a: *mut ggml_tensor, eps: f32) -> *mut ggml_tensor;
+    /// Depthwise causal 1-D convolution over a rolling window.
+    ///
+    /// `a` is `[window + n_tokens - 1, channels, n_seqs]` -- the stored tail of
+    /// the previous call concatenated with this call's input -- and `b` is the
+    /// kernel `[window, channels]`. Output is `[channels, n_tokens, n_seqs]`.
+    fn ggml_ssm_conv(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    /// The whole gated delta rule, fused.
+    ///
+    /// **This is why running Qwen3.5/3.6/3.8 is a port rather than a project:**
+    /// the chunked delta scan is one op, so the layer around it is projections,
+    /// a convolution and a gated norm. Shapes, from `ggml.h`:
+    ///
+    /// ```text
+    /// q, k  : [S_k, H_k, n_tokens, n_seqs]
+    /// v     : [S_v, H_v, n_tokens, n_seqs]
+    /// g     : [1,   H_v, n_tokens, n_seqs]   scalar gate
+    /// beta  : [1,   H_v, n_tokens, n_seqs]
+    /// state : [S_v, S_v, H_v, n_seqs]        the carried state going in
+    /// ```
+    ///
+    /// The result packs the attention scores `[S_v, H_v, n_tokens, n_seqs]`
+    /// **followed by `k` state snapshots**, most recent first. With `k == 1`
+    /// that is one final state, which is all a linear decode needs.
+    fn ggml_gated_delta_net(
+        ctx: *mut ggml_context,
+        q: *mut ggml_tensor,
+        k: *mut ggml_tensor,
+        v: *mut ggml_tensor,
+        g: *mut ggml_tensor,
+        beta: *mut ggml_tensor,
+        state: *mut ggml_tensor,
+        n_state_snapshots: i64,
+    ) -> *mut ggml_tensor;
+    /// Multi-section rotary embedding -- llama.cpp's mRoPE / IMROPE.
+    ///
+    /// `sections` is four counts splitting `n_dims` between temporal and
+    /// spatial axes; a text-only prompt still goes through it, because the
+    /// section split changes which dimension pairs rotate together.
+    fn ggml_rope_multi(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+        c: *mut ggml_tensor,
+        n_dims: i32,
+        sections: *const i32,
+        mode: i32,
+        n_ctx_orig: i32,
+        freq_base: f32,
+        freq_scale: f32,
+        ext_factor: f32,
+        attn_factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+    ) -> *mut ggml_tensor;
     /// Attaches per-head sink logits to an existing `flash_attn_ext` node.
     /// Mutates `a` in place and returns nothing — it is not a graph builder.
     fn ggml_flash_attn_ext_add_sinks(a: *mut ggml_tensor, sinks: *mut ggml_tensor);
@@ -603,6 +702,161 @@ impl Context {
     pub fn get_rows<'a>(&'a self, a: &Tensor<'a>, b: &Tensor<'a>) -> Result<Tensor<'a>, GgmlError> {
         // SAFETY: both tensors belong to this context.
         self.tensor(unsafe { ggml_get_rows(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) })
+    }
+
+    pub fn view_4d<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        ne: [i64; 4],
+        nb: [usize; 3],
+        offset_bytes: usize,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above. ggml does not bounds-check views.
+        self.tensor(unsafe {
+            ggml_view_4d(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                ne[0],
+                ne[1],
+                ne[2],
+                ne[3],
+                nb[0],
+                nb[1],
+                nb[2],
+                offset_bytes,
+            )
+        })
+    }
+
+    pub fn reshape_4d<'a>(&'a self, a: &Tensor<'a>, ne: [i64; 4]) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe {
+            ggml_reshape_4d(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                ne[0],
+                ne[1],
+                ne[2],
+                ne[3],
+            )
+        })
+    }
+
+    pub fn cont_4d<'a>(&'a self, a: &Tensor<'a>, ne: [i64; 4]) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe {
+            ggml_cont_4d(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                ne[0],
+                ne[1],
+                ne[2],
+                ne[3],
+            )
+        })
+    }
+
+    /// Broadcast to a larger shape. Used to widen the delta net's 16 key heads
+    /// to its 48 value heads.
+    pub fn repeat_4d<'a>(&'a self, a: &Tensor<'a>, ne: [i64; 4]) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe {
+            ggml_repeat_4d(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                ne[0],
+                ne[1],
+                ne[2],
+                ne[3],
+            )
+        })
+    }
+
+    /// Divide each row by its own L2 norm.
+    ///
+    /// **Not `rms_norm`.** That divides by the root *mean* square and takes a
+    /// learned weight; this divides by the norm and takes none. Substituting
+    /// one for the other scales every row by `sqrt(n)` and the model answers
+    /// fluently and wrongly.
+    pub fn l2_norm<'a>(&'a self, a: &Tensor<'a>, eps: f32) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe { ggml_l2_norm(self.raw.as_ptr(), a.raw.as_ptr(), eps) })
+    }
+
+    /// Depthwise causal convolution over `[window + n_tokens - 1, channels]`.
+    pub fn ssm_conv<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        kernel: &Tensor<'a>,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above.
+        self.tensor(unsafe {
+            ggml_ssm_conv(self.raw.as_ptr(), a.raw.as_ptr(), kernel.raw.as_ptr())
+        })
+    }
+
+    /// The fused gated delta rule. See the declaration for the shapes; the
+    /// result packs the scores then `snapshots` copies of the carried state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net<'a>(
+        &'a self,
+        q: &Tensor<'a>,
+        k: &Tensor<'a>,
+        v: &Tensor<'a>,
+        g: &Tensor<'a>,
+        beta: &Tensor<'a>,
+        state: &Tensor<'a>,
+        snapshots: i64,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above. ggml asserts the shape relationships itself and
+        // **aborts** rather than returning an error, so the caller checks them
+        // on the Rust side first.
+        self.tensor(unsafe {
+            ggml_gated_delta_net(
+                self.raw.as_ptr(),
+                q.raw.as_ptr(),
+                k.raw.as_ptr(),
+                v.raw.as_ptr(),
+                g.raw.as_ptr(),
+                beta.raw.as_ptr(),
+                state.raw.as_ptr(),
+                snapshots,
+            )
+        })
+    }
+
+    /// Multi-section rotary embedding (mRoPE).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_multi<'a>(
+        &'a self,
+        a: &Tensor<'a>,
+        pos: &Tensor<'a>,
+        n_dims: i32,
+        sections: [i32; 4],
+        mode: i32,
+        n_ctx_orig: i32,
+        freq_base: f32,
+        freq_scale: f32,
+    ) -> Result<Tensor<'a>, GgmlError> {
+        // SAFETY: as above. `sections` is read as four `int`s and not retained.
+        self.tensor(unsafe {
+            ggml_rope_multi(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                pos.raw.as_ptr(),
+                std::ptr::null_mut(),
+                n_dims,
+                sections.as_ptr(),
+                mode,
+                n_ctx_orig,
+                freq_base,
+                freq_scale,
+                0.0,
+                1.0,
+                32.0,
+                1.0,
+            )
+        })
     }
 
     pub fn concat<'a>(
@@ -1704,6 +1958,94 @@ mod tests {
         let s = ctx.sum_rows(&m).expect("sum_rows");
         ctx.compute(&s, 1).expect("compute");
         assert_eq!(s.to_vec_f32(), vec![6.0, 60.0]);
+    }
+
+    /// **The delta net's ops, exercised once each before anything is built on
+    /// them.** A wrong FFI declaration here does not fail to compile -- it
+    /// mis-reads arguments and produces confident numbers, which is the failure
+    /// mode this whole project is organised against. So each new binding gets
+    /// one case with an answer worked out by hand.
+    #[test]
+    fn l2_norm_divides_by_the_norm_not_the_root_mean_square() {
+        let ctx = Context::new(ARENA).expect("context");
+        // A row of four 2s: L2 norm is 4, so every element becomes 0.5.
+        // `rms_norm` would divide by 2 and leave 1.0 -- which is the mistake
+        // this test exists to catch.
+        let x = ctx.new_f32_2d(4, 1).expect("x");
+        x.set_f32(&[2.0, 2.0, 2.0, 2.0]).expect("set");
+        let n = ctx.l2_norm(&x, 1e-6).expect("l2_norm");
+        ctx.compute(&n, 1).expect("compute");
+        let out = n.to_vec_f32();
+        for (i, v) in out.iter().enumerate() {
+            assert!((v - 0.5).abs() < 1e-5, "element {i} is {v}, wanted 0.5");
+        }
+    }
+
+    /// A depthwise causal convolution, one channel, kernel `[1, 1, 1, 1]`.
+    ///
+    /// Input is the rolling window: three stored values then two new tokens, so
+    /// the two outputs are the sums of the trailing four values at each step.
+    #[test]
+    fn ssm_conv_sums_its_window_per_channel() {
+        let ctx = Context::new(ARENA).expect("context");
+        let window = 4;
+        let n_tokens = 2;
+        // [window - 1 + n_tokens, channels, seqs] = [5, 1, 1]
+        let a = ctx.new_f32_3d(window - 1 + n_tokens, 1, 1).expect("a");
+        a.set_f32(&[1.0, 2.0, 3.0, 4.0, 5.0]).expect("set a");
+        let k = ctx.new_f32_2d(window, 1).expect("k");
+        k.set_f32(&[1.0, 1.0, 1.0, 1.0]).expect("set k");
+        let c = ctx.ssm_conv(&a, &k).expect("ssm_conv");
+        assert_eq!(c.dims_and_strides().0[0], 1, "channels on the fast axis");
+        assert_eq!(c.dims_and_strides().0[1], n_tokens);
+        ctx.compute(&c, 1).expect("compute");
+        let out = c.to_vec_f32();
+        assert!((out[0] - 10.0).abs() < 1e-5, "1+2+3+4 = {}", out[0]);
+        assert!((out[1] - 14.0).abs() < 1e-5, "2+3+4+5 = {}", out[1]);
+    }
+
+    /// The fused delta rule, at the shapes Qwen3.5 uses but one head wide.
+    ///
+    /// Checks the contract rather than the arithmetic: the result must pack the
+    /// scores and then the state snapshot, so its element count is
+    /// `S*H*T*N + S*S*H*N`. Getting `snapshots` wrong, or the argument order,
+    /// makes ggml **abort the whole test binary** -- so this test passing at all
+    /// is most of what it is for.
+    #[test]
+    fn gated_delta_net_packs_scores_then_the_state() {
+        let ctx = Context::new(ARENA).expect("context");
+        let (s, h, tokens, seqs) = (4i64, 1i64, 3i64, 1i64);
+        let mk4 = |ne: [i64; 4], fill: f32| {
+            let n = (ne[0] * ne[1] * ne[2] * ne[3]) as usize;
+            let t = ctx.new_f32_1d(n as i64).expect("new");
+            t.set_f32(&vec![fill; n]).expect("set");
+            ctx.reshape_4d(&t, ne).expect("reshape")
+        };
+        let q = mk4([s, h, tokens, seqs], 0.1);
+        let k = mk4([s, h, tokens, seqs], 0.2);
+        let v = mk4([s, h, tokens, seqs], 0.3);
+        let g = mk4([1, h, tokens, seqs], -0.5);
+        let beta = mk4([1, h, tokens, seqs], 0.4);
+        let state = mk4([s, s, h, seqs], 0.0);
+
+        let out = ctx
+            .gated_delta_net(&q, &k, &v, &g, &beta, &state, 1)
+            .expect("gated_delta_net");
+        ctx.compute(&out, 1).expect("compute");
+        let got = out.to_vec_f32();
+        let want = (s * h * tokens * seqs + s * s * h * seqs) as usize;
+        assert_eq!(got.len(), want, "scores then one state snapshot");
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "the delta rule produced a non-finite value"
+        );
+        // With a zero initial state and a positive beta the first token must
+        // move the state off zero, or the op is not accumulating anything.
+        let scores = (s * h * tokens * seqs) as usize;
+        assert!(
+            got[scores..].iter().any(|v| v.abs() > 1e-9),
+            "the carried state came back all zero"
+        );
     }
 
     #[test]
