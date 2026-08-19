@@ -56,9 +56,14 @@ no catalogue, no network. MODELS marks the row, LOAD refuses and names the
 shortfall, DOWNLOAD becomes the resume button, and `chaos-run`/`chaos-serve`
 refuse before binding anything.
 
-**Every installed model was then run.** Six generate correct text (Llama-3.2
-1B/3B, Qwen2.5-Coder-7B, Qwen3-4B, Qwen3-8B, Gemma-3-4B/12B), three were refused
-as unfinished, one as an unimplemented architecture, and V4-Flash generates.
+**Every installed model was then run, through the installed v0.0.8 rather than
+the build tree.** Ten of eleven generate correct text — Llama-3.2 1B/3B,
+Qwen2.5-Coder-7B, Qwen3-4B, Qwen3-8B, Qwen3-14B, Gemma-3 4B/12B/27B, Phi-4 —
+and V4-Flash generates. The eleventh, Qwen3.6-27B, is refused by architecture.
+
+**v0.0.8 is released** with all six assets, and the published installer was
+downloaded and run: 0.0.7 → 0.0.8 in place, 12 binaries, and the dropdowns on
+the *installed* build measure 238 px.
 
 ### The two that are not fixed, and why
 

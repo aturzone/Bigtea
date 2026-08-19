@@ -108,12 +108,17 @@ same as verified.
 
 ### Verified by running them
 
-Every model on Atur's machine was run with the release build. **Nine generate
-correct text** — Llama-3.2 1B and 3B, Qwen2.5-Coder-7B, Qwen3-4B, Qwen3-8B,
-Qwen3-14B, Gemma-3-4B and 12B, and Phi-4. **DeepSeek-V4-Flash generates**
-(*" Paris."*, 0.340 tok/s, 5 prompt tokens in 8.5 s) from
-`C:\Projects\models\v4flash` without a byte being moved. Qwen3.6-27B is
-refused by architecture, with the reason. Nothing crashed and nothing hung.
+Every model on Atur's machine was run through the **installed** v0.0.8 — what
+he has, not what the repository has.
+
+**Ten of the eleven generate correct text**: Llama-3.2 1B and 3B,
+Qwen2.5-Coder-7B, Qwen3-4B, Qwen3-8B, Qwen3-14B, Gemma-3 4B, 12B and 27B, and
+Phi-4. **DeepSeek-V4-Flash generates too** — *" Paris."*, 0.340 tok/s, 5 prompt
+tokens in 8.5 s — from `C:\Projects\models\v4flash`, without a byte being
+moved.
+
+The eleventh is Qwen3.6-27B, refused by architecture with the reason. Nothing
+crashed and nothing hung.
 
 ## [0.0.7] — 2026-08-19
 
