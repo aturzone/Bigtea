@@ -114,7 +114,7 @@ fn main() {
     println!(
         "memory       {:.1} GiB per denoiser layer, {:.1} GiB to decode",
         arena as f64 / (1u64 << 30) as f64,
-        chaos_image::vae::decode_arena_bytes(req.image_size() as usize, req.image_size() as usize)
+        chaos_image::vae::decode_planned_bytes(req.image_size() as usize, req.image_size() as usize)
             as f64
             / (1u64 << 30) as f64
     );

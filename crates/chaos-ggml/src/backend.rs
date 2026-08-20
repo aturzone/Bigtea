@@ -649,6 +649,42 @@ impl GraphAllocator {
         }
     }
 
+    /// A planner for graphs that run on the **CPU**.
+    ///
+    /// # Why this exists next to `new`
+    ///
+    /// [`Self::new`] needs a [`Backend`], which means a device from the
+    /// registry. The autoencoder's decoder runs on the host and wants the same
+    /// thing a device graph gets: **buffers reused as soon as a tensor is
+    /// dead**. A `Context`'s own arena never reuses anything, so a graph that
+    /// holds a hundred intermediates pays for all hundred at once — which is why
+    /// decoding a 768x768 image asked for 29.5 GiB and aborted the process,
+    /// while the live set at any moment is three or four tensors.
+    ///
+    /// Use with [`Context::new_no_alloc`]: the context still supplies tensor
+    /// structs, the graph and the compute work buffer, and only the tensor
+    /// *data* comes from the plan.
+    ///
+    /// **Weights bound zero-copy are left alone**, because `ggml_gallocr` skips
+    /// any tensor that already has a data pointer. Inputs do not: set them
+    /// *after* [`Self::alloc`], never before.
+    pub fn for_cpu() -> Result<Self, GgmlError> {
+        #[cfg(not(have_ggml))]
+        {
+            Err(GgmlError::Unavailable)
+        }
+        #[cfg(have_ggml)]
+        {
+            // SAFETY: the CPU buffer type is a process-lifetime singleton.
+            let buft = unsafe { ffi::ggml_backend_cpu_buffer_type() };
+            // SAFETY: `buft` is a live buffer type.
+            let raw = unsafe { ffi::ggml_gallocr_new(buft) };
+            NonNull::new(raw)
+                .map(|raw| Self { raw })
+                .ok_or(GgmlError::DeviceOutOfMemory)
+        }
+    }
+
     /// Plan storage for every tensor in `outputs`' graph, without running it.
     ///
     /// Call before [`Self::alloc`]: reserving measures the plan and sizes the

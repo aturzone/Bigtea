@@ -128,6 +128,28 @@ are the measurement that killed one.
   test image is not merely a faster test — it is a different one, and a
   disappointing picture at 256 is not evidence of a bug.
 
+## Graph memory, which is a ceiling until it is not
+
+- **A `Context` arena never reuses anything.** Every tensor in a graph gets its
+  own storage and keeps it until the context drops, so a graph pays for every
+  intermediate it ever wrote. `ggml_gallocr` plans the graph and shares buffers
+  between tensors whose lifetimes do not overlap. On the host path this was worth
+  **18x on the autoencoder's decoder and 7x on the denoiser**, bit-identical
+  both times — 1024x1024 images went from impossible to ordinary.
+  `GraphAllocator::for_cpu` plus `Context::new_no_alloc`.
+- **A `no_alloc` context cannot hold a weight.** It still hands out tensor
+  structs, graphs and the compute work buffer, but not tensor *data* — so
+  copying bytes into one is a segmentation fault rather than an error. Either
+  bind weights zero-copy (`set_data_ptr`, which the planner then skips because
+  the tensor already has a pointer) or put them in a second, ordinary context.
+  ggml is happy to walk a graph whose tensors come from two contexts.
+- **The plan owns the buffer the answer lives in.** Dropping the `GraphAllocator`
+  frees every tensor's data, so reading the output *after* the planner goes out
+  of scope is a use-after-free — which segfaults only sometimes. Read before
+  returning.
+- **Inputs are written after `alloc`, never before.** Until the plan is
+  allocated they have no storage at all.
+
 ## Correctness, which fails silently here
 
 - **An autoencoder is checked by round trip, not by looking.** A decoder alone
