@@ -1,0 +1,47 @@
+# The native Windows app.
+#
+# Windows-only and deliberately not part of the default build: everything else
+# in this workspace compiles on three platforms, and a crate full of `HWND`
+# would end that. It is listed as a workspace member so `cargo test` sees it,
+# and every Win32 item is behind `#[cfg(windows)]` so a Linux CI run compiles an
+# empty binary rather than failing.
+#
+# **No dependencies, like everything else here.** The window, the controls, the
+# painting and the process control are raw `extern "system"` declarations
+# against libraries Windows already ships. A GUI toolkit would be the largest
+# dependency in the project by an order of magnitude, and the rule that there
+# are none is the reason a release binary starts on a machine with no runtime.
+[package]
+name = "chaos-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Native Windows app for Chaos: pick a model, run it, watch it work."
+
+[dependencies]
+chaos-model = { path = "../../core/model" }
+# For the settings page: core count, memory and whether a GPU exists, so the
+# options offered are the ones that make sense on *this* machine. Zero external
+# dependencies of its own, like everything else here.
+chaos-probe = { path = "../../core/probe" }
+# To read `general.architecture` out of a container before starting a server
+# for it. The filename says "Qwen3.6"; only the header says `qwen35`.
+chaos-gguf = { path = "../../core/gguf" }
+
+[[bin]]
+name = "chaos-app"
+path = "src/main.rs"
+test = false
+
+[lib]
+name = "chaos_app"
+path = "src/lib.rs"
+
+[build-dependencies]
+# The icon every shipped .exe carries, in one place rather than a copy
+# per crate. Not linked into anything: it runs on the build machine.
+chaos-build = { path = "../../core/build" }

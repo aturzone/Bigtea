@@ -1,0 +1,37 @@
+# `chaos-run`: the command a person types.
+#
+# **Its own crate, in `cli/`.** It was a binary inside `chaos-arch`, which is the
+# crate that owns forward passes -- true of what it calls, and silent about the
+# fact that this is the front door. It uses only public API, so moving it changed
+# no code; what moved with it is the build script that generates its shell
+# completion list by reading its own source.
+[package]
+name = "chaos-run"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Run a model that does not fit in memory, from a terminal."
+build = "build.rs"
+
+[dependencies]
+chaos-arch = { path = "../../core/arch" }
+chaos-gguf = { path = "../../core/gguf" }
+chaos-ggml = { path = "../../core/ggml" }
+chaos-io = { path = "../../core/io" }
+chaos-model = { path = "../../core/model" }
+chaos-probe = { path = "../../core/probe" }
+chaos-grammar = { path = "../../core/grammar" }
+chaos-jinja = { path = "../../core/jinja" }
+chaos-tokenizer = { path = "../../core/tokenizer" }
+
+[build-dependencies]
+chaos-build = { path = "../../core/build" }
+
+[[bin]]
+name = "chaos-run"
+path = "src/main.rs"
+test = false

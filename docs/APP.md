@@ -28,7 +28,7 @@ and pressing UNINSTALL.
 ```
 +----------------+----------------------------------------------+
 | ✳ CHAOS        |  Chat                                        |
-|   v0.0.12      |  Talk to the running model, or point a       |
+|   v0.0.13      |  Talk to the running model, or point a       |
 |                |  coding agent at its endpoint.               |
 | ▎CHAT          |                                              |
 |  MODELS        |  +----------------------------------------+  |

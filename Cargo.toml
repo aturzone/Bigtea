@@ -1,27 +1,44 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/chaos-gguf",
-    "crates/chaos-probe",
-    "crates/chaos-plan",
-    "crates/chaos-io",
-    "crates/chaos-model",
-    "crates/chaos-ggml",
-    "crates/chaos-tokenizer",
-    "crates/chaos-grammar",
-    "crates/chaos-jinja",
-    "crates/chaos-arch",
-    "crates/chaos-app",
-    "crates/chaos-setup",
-    # Build-script helpers. A build dependency of several crates and a
-    # runtime dependency of none.
-    "crates/chaos-build",
-    # Diffusion-model support: PNG, safetensors, the sampler.
-    "crates/chaos-image",
+    # **Grouped by what a crate is for**, the shape the Rust book's workspace
+    # chapter shows: a `core/` of libraries, a `cli/` of command-line binaries,
+    # a `gui/` of things with windows, and `network/` for the server. Everything
+    # used to sit in one flat `crates/`, which said nothing about which of
+    # fourteen crates a person needed to read first.
+    #
+    # **Crate names did not change with the directories.** `core/gguf` is still
+    # the `chaos-gguf` package, so every `-p chaos-gguf` in CI, every binary
+    # name in the release workflow and every `use chaos_gguf::` still means what
+    # it did. The move is directories and `path =` lines, nothing else.
+
+    # The engine, roughly bottom to top.
+    "core/build",     # build-script helpers: the icon, and nothing at runtime
+    "core/gguf",      # container parsing
+    "core/ggml",      # the FFI: graphs, zero-copy weight binding
+    "core/io",        # cache-bypassing aligned reads
+    "core/probe",     # hardware, and how much memory can be reclaimed
+    "core/plan",      # prediction and residency policy
+    "core/model",     # sharded resolution, partial reads, the catalogue
+    "core/tokenizer", # byte-level BPE
+    "core/grammar",   # constrained decoding, and the workspace's JSON parser
+    "core/jinja",     # chat templates
+    "core/arch",      # architectures and the streaming forward pass
+    "core/image",     # PNG, safetensors, the FLUX.2 autoencoder, the sampler
+
+    # What a person types.
+    "cli/run",        # chaos-run: a model, a prompt, a terminal
+
+    # What an agent talks to.
+    "network/serve",  # chaos-serve: the OpenAI API and a browser page
+
+    # What a person opens.
+    "gui/app",        # the Windows window
+    "gui/setup",      # the installer, which carries every binary
 ]
 
 [workspace.package]
-version = "0.0.12"
+version = "0.0.13"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"

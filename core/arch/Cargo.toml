@@ -1,0 +1,41 @@
+[package]
+name = "chaos-arch"
+description = "Model architectures: turning weights and tokens into logits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+chaos-gguf = { path = "../../core/gguf" }
+chaos-ggml = { path = "../../core/ggml" }
+chaos-io = { path = "../../core/io" }
+chaos-model = { path = "../../core/model" }
+chaos-probe = { path = "../../core/probe" }
+chaos-grammar = { path = "../../core/grammar" }
+chaos-jinja = { path = "../../core/jinja" }
+chaos-tokenizer = { path = "../../core/tokenizer" }
+
+[[bin]]
+name = "chaos-spectrum"
+path = "src/bin/chaos-spectrum.rs"
+test = false
+
+[[bin]]
+name = "chaos-gpubench"
+path = "src/bin/chaos-gpubench.rs"
+# `test = false` like its neighbours: an empty harness is pointless, and Smart
+# App Control blocks unsigned fresh binaries on Windows.
+test = false
+
+[[bin]]
+name = "chaos-kernelbench"
+path = "src/bin/chaos-kernelbench.rs"
+test = false
+
+[build-dependencies]
+# The icon every shipped .exe carries, in one place rather than a copy
+# per crate. Not linked into anything: it runs on the build machine.
+chaos-build = { path = "../../core/build" }

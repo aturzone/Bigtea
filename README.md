@@ -13,7 +13,7 @@
   <a href="https://github.com/aturzone/Chaos/releases"><img alt="version" src="https://img.shields.io/badge/version-0.0.6-orange"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue"></a>
   <a href="https://github.com/aturzone/Chaos/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aturzone/Chaos/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-814%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-815%20passing-brightgreen">
 </p>
 
 ---
@@ -243,6 +243,32 @@ answer even though it is not the hoped-for one, and it is the kind of thing this
 project exists to tell you before you spend money.
 [`v4flash-ram-frontier-2026-08-16.md`](docs/graph/research/v4flash-ram-frontier-2026-08-16.md)
 has the sweep, the fit (R² = 0.997) and the controls.
+
+## How the repository is laid out
+
+Grouped by what a crate is *for*, which is the shape the Rust book's workspace
+chapter shows:
+
+```
+Chaos/
+├── Cargo.toml
+├── core/      the engine: containers, ggml, IO, residency, architectures, images
+├── cli/       chaos-run -- a model, a prompt, a terminal
+├── network/   chaos-serve -- the OpenAI API and a browser page
+└── gui/       the Windows window, and the installer that carries every binary
+```
+
+Everything used to sit in one flat `crates/`, which said nothing about which of
+fourteen crates to read first. **The crate names did not change with the
+directories** — `core/gguf` is still the `chaos-gguf` package — so `cargo build
+-p chaos-gguf`, every binary name, and every `use chaos_gguf::` mean exactly
+what they did before.
+
+`core/` bottom to top: `build` (build-script helpers) · `gguf` (containers) ·
+`ggml` (the FFI) · `io` (cache-bypassing reads) · `probe` (hardware) · `plan`
+(prediction, residency) · `model` (sharding, the catalogue, releases) ·
+`tokenizer` · `grammar` · `jinja` · `arch` (the forward pass) · `image`
+(diffusion, PNG, safetensors).
 
 ## Build from source
 

@@ -8,6 +8,39 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
+## [0.0.13] — 2026-08-20
+
+### The workspace has a shape now
+
+`core/` `cli/` `network/` `gui/`, which is what the Rust book's workspace
+chapter shows. Fourteen crates used to sit in one flat `crates/` that said
+nothing about which of them to read first.
+
+**Crate names did not change** — `core/gguf` is still the `chaos-gguf` package —
+so `cargo build -p chaos-gguf`, every binary name and every `use chaos_gguf::`
+mean exactly what they did. `chaos-run` and `chaos-serve` became their own
+crates, because a `cli/` and a `network/` with nothing in them would be
+decoration.
+
+### Fixed
+
+- **Two console windows flashed before the app appeared.** `probe_machine()` ran
+  twice during startup and each probe spawns `nvidia-smi`, a console program —
+  so Windows made a console for each. Suppressed with `CREATE_NO_WINDOW`, and
+  the probe is cached besides: its answer cannot change between two calls a few
+  milliseconds apart.
+- **"ideogram models not loaded and nothing works."** They load fine —
+  `chaos-draw` was checked end to end while investigating. What the app *said*
+  when you pressed LOAD was written before the pipeline existed: *"Image
+  generation is being built."* It ships in the release that message was printed
+  by. All four image entries now name the command that runs them.
+- **Nine of eleven binaries did not answer `--version`**, and several treated the
+  flag as a filename — `chaos-model-info --version` reported "cannot find the
+  file specified", and `chaos-gpubench --version` started benchmarking. All of
+  them answer now, checked before any argument is taken as a path, with a test
+  that walks every `src/bin/*.rs` in the workspace.
+
+
 ## [0.0.12] — 2026-08-20
 
 ### The app updates itself
@@ -1315,7 +1348,8 @@ Qwen3-30B-A3B Q4_K_M prefill, Chaos / llama.cpp:
   requires a competitor's exact command line and output before any competitive
   claim is citable.
 
-[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.12...HEAD
+[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.13...HEAD
+[0.0.13]: https://github.com/aturzone/Chaos/releases/tag/v0.0.13
 [0.0.12]: https://github.com/aturzone/Chaos/releases/tag/v0.0.12
 [0.0.11]: https://github.com/aturzone/Chaos/releases/tag/v0.0.11
 [0.0.10]: https://github.com/aturzone/Chaos/releases/tag/v0.0.10

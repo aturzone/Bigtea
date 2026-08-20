@@ -1,0 +1,39 @@
+# The server: one loaded model, reachable over HTTP.
+#
+# **Its own crate, in `network/`, because that is what it is.** It was a binary
+# inside `chaos-arch` -- the crate that owns forward passes -- which said nothing
+# about the fact that the thing an agent talks to lives here. It uses only
+# `chaos-arch`'s public API, so moving it changed no code.
+[package]
+name = "chaos-serve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "The Chaos server: the OpenAI API and a browser page, over one loaded model."
+build = "build.rs"
+
+[dependencies]
+chaos-arch = { path = "../../core/arch" }
+chaos-gguf = { path = "../../core/gguf" }
+chaos-ggml = { path = "../../core/ggml" }
+chaos-io = { path = "../../core/io" }
+chaos-model = { path = "../../core/model" }
+chaos-probe = { path = "../../core/probe" }
+chaos-grammar = { path = "../../core/grammar" }
+chaos-jinja = { path = "../../core/jinja" }
+chaos-tokenizer = { path = "../../core/tokenizer" }
+
+[build-dependencies]
+chaos-build = { path = "../../core/build" }
+
+[[bin]]
+name = "chaos-serve"
+path = "src/main.rs"
+# Unlike the other binaries this one has real unit tests -- request parsing and
+# JSON escaping, where a mistake corrupts a response rather than failing -- so
+# its harness is not empty and must run.
+test = true
