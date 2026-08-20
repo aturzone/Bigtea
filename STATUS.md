@@ -19,12 +19,22 @@ engines agree to five significant figures on every layer sum and then both
 overflow to NaN at `l_out-5`. Chaos warns before generating and points at the
 container.
 
-**The release**: v0.0.12, **eight** assets across **five** builds — Windows
+**The release**: v0.0.12, **published 2026-08-20**, **eight** assets across
+**five** builds — Windows
 installer and zip; Linux x86_64 tarball, `.deb` and AppImage; Linux **arm64**
 tarball; macOS **arm64** and **x86_64** tarballs. The last two are new in
 v0.0.12: `macos-latest` is Apple Silicon only, so an Intel Mac had nothing that
 ran, and `ubuntu-latest` is x86_64 only, so a Pi or an Ampere box had nothing
-either.
+either. The eight names were read back off the releases API after publishing
+rather than predicted from the workflow.
+
+**The Intel Mac build was written against a retired runner and caught by a dry
+run, not by a release.** `macos-13` was retired on 2025-12-08, and a retired
+label does not fail — it **queues**, against a pool with no runners, reporting
+nothing. Had v0.0.12 been tagged on that matrix, `publish` (`needs: build`)
+would have been skipped and the release page would have had **no assets at
+all**. `macos-15-intel` is the current and last Intel image; Intel macOS ends
+when it retires in autumn 2027.
 
 **`chaos-draw` ships in v0.0.12.** It was an example, held back by a comment
 saying it would become a binary "when there is evidence, not before". The

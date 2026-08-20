@@ -121,7 +121,10 @@ are the measurement that killed an appealing idea.
 
 ## Next
 
-**v0.0.3 released 2026-08-16** under the new name, installer and all.
+**v0.0.12 released 2026-08-20**: eight assets, five builds (Intel Mac and arm64
+Linux are new). The window runs in the background — closing hides it to the
+notification area, **Exit** is the only thing that stops the engine — updates
+itself from inside the app, and `chaos-draw` ships as a binary.
 `STATUS.md` is the scoreboard; `backlog/next-session-handoff.md` is the queue.
 
 **Against llama.cpp, measured 2026-08-16 with both engines alternating**
