@@ -837,3 +837,50 @@ fn the_tray_icon_says_what_is_running() {
         assert!(menu.contains(want), "the tray menu has no {want}");
     }
 }
+
+/// Launching Chaos twice must not run Chaos twice.
+///
+/// **This became necessary the moment closing stopped quitting.** With the
+/// window hidden in the tray, double-clicking the shortcut is an easy mistake
+/// with an expensive result: two windows, two icons, and two engines each
+/// holding a model's worth of memory, with the first one invisible.
+///
+/// The mutex is the test and the window is the answer. `FindWindowW` alone is
+/// not enough -- between an instance starting and registering its class there
+/// is a gap in which a second launch finds nothing and both proceed.
+#[test]
+fn a_second_launch_hands_over_to_the_first() {
+    let src = main_rs();
+    let i = src
+        .find("fn already_running()")
+        .expect("no single-instance guard");
+    let body = &src[i..(i + 1800).min(src.len())];
+    assert!(
+        body.contains("CreateMutexW") && body.contains("ERROR_ALREADY_EXISTS"),
+        "the guard does not use a named mutex, so two launches can race"
+    );
+    assert!(
+        body.contains("FindWindowW"),
+        "the guard knows another instance exists but not where it is"
+    );
+    // And the caller acts on it before building a window of its own.
+    let c = src
+        .find("if let Some(existing) = already_running()")
+        .expect("never called");
+    let call = &src[c..(c + 500).min(src.len())];
+    assert!(
+        call.contains("IDM_TRAY_OPEN"),
+        "the second launch does not bring the first window back"
+    );
+    assert!(
+        call.contains("return"),
+        "the second launch carries on anyway"
+    );
+    // The *call*, not the mention of it in this file's own header comment.
+    assert!(
+        c < src
+            .find("RegisterClassW(&wc)")
+            .expect("no class registration"),
+        "the guard runs after a window class is registered, which is too late"
+    );
+}

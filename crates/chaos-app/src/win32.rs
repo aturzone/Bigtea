@@ -158,6 +158,7 @@ pub const WM_PAINT: u32 = 0x000F;
 pub const WM_CLOSE: u32 = 0x0010;
 /// Does nothing, which is the point: posting it wakes a message loop.
 pub const WM_NULL: u32 = 0x0000;
+pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
@@ -413,6 +414,18 @@ extern "system" {
 
 #[link(name = "kernel32")]
 extern "system" {
+    /// A named object every process on the desktop can see.
+    ///
+    /// **This is the single-instance mechanism**, and the useful part is not
+    /// the mutex but `GetLastError` returning `ERROR_ALREADY_EXISTS` while the
+    /// call still *succeeds*: the second instance learns it is second without
+    /// racing anything.
+    pub fn CreateMutexW(
+        lpMutexAttributes: *mut c_void,
+        bInitialOwner: BOOL,
+        lpName: *const u16,
+    ) -> *mut c_void;
+    pub fn GetLastError() -> u32;
     pub fn GetModuleHandleW(lpModuleName: *const u16) -> HINSTANCE;
 }
 
@@ -670,6 +683,9 @@ extern "system" {
         prcRect: *const RECT,
     ) -> i32;
     pub fn GetCursorPos(lpPoint: *mut POINT) -> BOOL;
+    /// Find a window by class name. Used to hand a second launch over to the
+    /// instance already running.
+    pub fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> HWND;
     pub fn SetForegroundWindow(hWnd: HWND) -> BOOL;
     pub fn IsWindowVisible(hWnd: HWND) -> BOOL;
     pub fn DestroyMenu(hMenu: HMENU) -> BOOL;

@@ -312,6 +312,21 @@ mod windows_app {
         // afterwards. Without it Windows renders the app at 96 DPI and stretches
         // the result: soft text, and every coordinate in a made-up space.
         chaos_app::win32::become_dpi_aware();
+
+        // **One Chaos at a time.** Closing the window no longer quits, so a
+        // second launch used to be an easy mistake with an expensive result:
+        // two windows, two icons, and two engines each holding a model's worth
+        // of memory, with the first one invisible. Hand the launch to whoever
+        // is already running and stop.
+        if let Some(existing) = already_running() {
+            unsafe {
+                // Its own restore path, so the two agree about what "open"
+                // means -- restore, show, foreground.
+                SendMessageW(existing, WM_COMMAND, nav::IDM_TRAY_OPEN as WPARAM, 0);
+            }
+            return;
+        }
+
         let cfg = settings::Settings::load();
 
         unsafe {
@@ -3940,6 +3955,48 @@ Any value a client sends is accepted.                      The server still list
         let small = LoadImageW(hinst, id, IMAGE_ICON, 16, 16, LR_SHARED);
         if !small.is_null() {
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small as LPARAM);
+        }
+    }
+
+    /// The window of a Chaos already running, if there is one.
+    ///
+    /// **The mutex is the test; the window is the answer.** A named mutex says
+    /// reliably whether another instance exists -- `CreateMutexW` succeeds
+    /// either way and `GetLastError` reports `ERROR_ALREADY_EXISTS` -- but it
+    /// cannot say *where* it is. `FindWindowW` on our own class does, and on
+    /// its own it is not enough: between one instance starting and registering
+    /// its class there is a window in which a second launch finds nothing and
+    /// both proceed.
+    ///
+    /// The handle is deliberately never closed. It must live as long as the
+    /// process -- releasing it early is what would let a second instance in --
+    /// and Windows reclaims it at exit.
+    fn already_running() -> Option<HWND> {
+        unsafe {
+            let name = wide("Local\\ChaosAppSingleInstance");
+            let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+            if h.is_null() {
+                // The guard could not be created. Starting is the safer
+                // failure: refusing to launch because a mutex would not open
+                // is worse than two windows.
+                return None;
+            }
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                // **The handle is never closed, on purpose.** It has to live as
+                // long as the process -- closing it is what would let a second
+                // instance in -- and Windows releases it at exit. Nothing to
+                // `forget`: a raw handle is `Copy`, so dropping the binding
+                // does not close anything.
+                return None;
+            }
+            // Someone else has it. Their window may be hidden in the tray,
+            // which `FindWindowW` still finds -- hidden is not destroyed.
+            let hwnd = FindWindowW(wide("ChaosAppWindow").as_ptr(), std::ptr::null());
+            if hwnd.is_null() {
+                None
+            } else {
+                Some(hwnd)
+            }
         }
     }
 

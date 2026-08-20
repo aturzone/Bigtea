@@ -47,6 +47,11 @@ always run in background and just finish work with exit button."*
 - **Right-click it** for Open, Stop *model*, and Exit. **Exit is now the only
   thing that stops the engine** — not the X, not the taskbar's close.
 - The first close explains itself with a notification, once per run.
+- **One Chaos at a time.** This became necessary the moment closing stopped
+  quitting: with the window hidden, double-clicking the shortcut would have
+  started a second engine holding a second model's worth of memory, with the
+  first one invisible. A second launch now finds the first, brings its window
+  back and stops.
 
 On Windows 11 a new tray icon starts behind the `^`; that is where the system
 puts every one of them, and pinning it is a Windows setting rather than

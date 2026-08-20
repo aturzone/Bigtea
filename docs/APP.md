@@ -143,6 +143,11 @@ run. On Windows 11 the icon starts **behind the `^`** in the tray; that is where
 the system puts every new one, and pinning it is a Windows setting rather than
 something an application can do for you.
 
+**Launching Chaos again brings the window back.** One Chaos runs at a time — a
+second launch finds the first, restores its window and stops. So the shortcut,
+the Start menu and the taskbar all do the obvious thing whether the window is on
+screen or in the tray.
+
 > **Exit is the only thing that stops the engine.** Not the X, not the taskbar's
 > close, not minimising. If you want the memory back, use Exit — or **STOP** on
 > the strip, which unloads the model and leaves the window open.
