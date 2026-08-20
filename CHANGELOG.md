@@ -50,7 +50,13 @@ Six reports, each one a real defect:
   an eye, drawn at 44px with 16 levels of antialiasing — about one level per ray
   edge. Now 64px at 64 levels, scan-converted from outlines and cached.
 - The models list gives the name its own column, so a narrow window eats a
-  measurement rather than the end of `Qwen3-VL-8B-Instruct-Q4_K_M`.
+  measurement rather than the end of `Qwen3-VL-8B-Instruct-Q4_K_M`. The
+  **AVAILABLE** tab has columns too, and it was worse there — drawn as one
+  string, "needs 16.5 GB - slow, re-reads" came out "needs 16.5 GB - sl…",
+  cutting the one word the row exists to say. The list also got wider, and the
+  resident requirement is now printed **only when it differs from the download
+  size**: on a dense model they are the same number, so twenty rows out of
+  twenty-seven were spending a column to repeat themselves.
 - The window is DPI-aware (per-monitor v2) and opens centred in the work area
   rather than off the corner of a scaled display.
 

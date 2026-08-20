@@ -2494,7 +2494,7 @@ Any value a client sends is accepted.                      The server still list
     /// Where the model list ends and the model's own page begins.
     fn models_split(page: RECT) -> i32 {
         let usable = page.right - page.left - metric::INSET * 2;
-        page.left + metric::INSET + (usable * 44 / 100)
+        page.left + metric::INSET + (usable * 54 / 100)
     }
 
     /// The first line of a page's content, under the title block.
