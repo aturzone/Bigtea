@@ -49,7 +49,7 @@ mod windows_app {
     use chaos_app::nav::{self, Page};
     use chaos_app::theme::{self, metric, size, weight, Mode, Rgb, Theme};
     use chaos_app::win32::*;
-    use chaos_app::{art, catalog, client, models, settings};
+    use chaos_app::{art, catalog, client, models, settings, update};
     use std::cell::RefCell;
     use std::process::{Child, Command};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,7 +100,38 @@ mod windows_app {
         /// "the model did not come up" after ten minutes of polling and the
         /// actual sentence was lost.
         serve_err: String,
+        /// What the last update check found, kept so "Install update" knows
+        /// which file to fetch without asking GitHub a second time.
+        update: Option<update::Outcome>,
+        /// Set when a check has produced something the window has not shown
+        /// yet. Separate from `update` because the outcome outlives its
+        /// announcement -- the menu item stays usable after the notice is gone.
+        update_news: bool,
+        /// Whether the announcement should be a dialog or only the status line.
+        /// The check at startup is quiet unless there is news.
+        update_asked: bool,
+        /// Set when the installer is running, so the window closes and stops
+        /// holding `chaos-app.exe` open. Windows will not let the installer
+        /// overwrite a binary that is still executing.
+        update_quit: bool,
     }
+
+    /// Whether the next `WM_CLOSE` means "quit" or "hide".
+    ///
+    /// **Closing the window is not quitting any more.** Atur: *"chaos run in
+    /// background well when app closed, that chaos must be in small bar in
+    /// every device and show there as running to the user; now chaos always
+    /// run in background and just finish work with exit button."* So the X
+    /// hides to the notification area and the model stays up; Exit is the only
+    /// thing that stops the engine and ends the process.
+    fn really_quitting() -> &'static AtomicBool {
+        static Q: AtomicBool = AtomicBool::new(false);
+        &Q
+    }
+
+    /// The id of our icon within this window. Any number; it only has to be
+    /// stable between `NIM_ADD` and `NIM_DELETE`.
+    const TRAY_ID: u32 = 1;
 
     /// Which set of models the MODELS page lists.
     #[derive(PartialEq, Clone, Copy)]
@@ -277,6 +308,25 @@ mod windows_app {
     }
 
     pub fn run() {
+        // **Before any window exists**, because awareness cannot be changed
+        // afterwards. Without it Windows renders the app at 96 DPI and stretches
+        // the result: soft text, and every coordinate in a made-up space.
+        chaos_app::win32::become_dpi_aware();
+
+        // **One Chaos at a time.** Closing the window no longer quits, so a
+        // second launch used to be an easy mistake with an expensive result:
+        // two windows, two icons, and two engines each holding a model's worth
+        // of memory, with the first one invisible. Hand the launch to whoever
+        // is already running and stop.
+        if let Some(existing) = already_running() {
+            unsafe {
+                // Its own restore path, so the two agree about what "open"
+                // means -- restore, show, foreground.
+                SendMessageW(existing, WM_COMMAND, nav::IDM_TRAY_OPEN as WPARAM, 0);
+            }
+            return;
+        }
+
         let cfg = settings::Settings::load();
 
         unsafe {
@@ -303,6 +353,7 @@ mod windows_app {
             }
 
             let title = wide("Chaos");
+            let geom = opening_geometry();
             let hwnd = CreateWindowExW(
                 0,
                 class.as_ptr(),
@@ -312,10 +363,10 @@ mod windows_app {
                 // every child control repaints too -- a visible flash across
                 // the whole window, once a second, forever.
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                120,
-                80,
-                1180,
-                780,
+                geom.0,
+                geom.1,
+                geom.2,
+                geom.3,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 hinst,
@@ -327,6 +378,9 @@ mod windows_app {
 
             set_window_icon(hwnd, hinst);
             main_window().store(hwnd as usize, Ordering::SeqCst);
+            // Before anything can close the window, so there is always
+            // somewhere for it to go.
+            tray_add(hwnd, hinst);
 
             build_controls(hwnd, hinst, cfg);
             build_menu(hwnd);
@@ -337,6 +391,15 @@ mod windows_app {
 
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
+
+            // Ask once, on a worker, after the window is up. Quiet unless
+            // there is something newer: this is how a user finds out a release
+            // exists without being told to go and look, and it costs one
+            // request against a static JSON file. `CHAOS_NO_UPDATE_CHECK`
+            // turns it off for anyone who would rather it did not.
+            if std::env::var_os("CHAOS_NO_UPDATE_CHECK").is_none() {
+                check_for_updates(false);
+            }
 
             let accel = accelerators();
             let mut msg = MSG::default();
@@ -398,6 +461,9 @@ mod windows_app {
 
         let help = CreatePopupMenu();
         add(help, nav::IDM_MANUAL, "&Manual");
+        add(help, nav::IDM_CHECK_UPDATE, "Check for &updates");
+        add(help, nav::IDM_INSTALL_UPDATE, "&Install update...");
+        sep(help);
         add(help, nav::IDM_RELEASES, "&Releases");
         add(help, nav::IDM_CRASH_LOG, "Open &crash log");
         sep(help);
@@ -541,6 +607,33 @@ mod windows_app {
         CreateFontW(px, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, name.as_ptr())
     }
 
+    /// Where the window opens: `(x, y, width, height)`.
+    ///
+    /// # Why this is not four constants
+    ///
+    /// It was. `(120, 80, 1180, 780)` puts the bottom edge at 860 on a desktop
+    /// whose work area is 816 tall -- the machine this was written on has a
+    /// scaled 1536x864 primary screen -- so the window opened with its lower
+    /// strip under the taskbar, every time, on first run. A fixed size cannot
+    /// be right on an unknown screen.
+    ///
+    /// So: the preferred size, shrunk to fit the work area with a margin, and
+    /// centred in it. Centred rather than at a corner because the work area's
+    /// origin is not always `(0, 0)` -- a taskbar on the left or top moves it,
+    /// and a second monitor to the left makes it negative.
+    fn opening_geometry() -> (i32, i32, i32, i32) {
+        const WANT_W: i32 = 1180;
+        const WANT_H: i32 = 780;
+        const MARGIN: i32 = 40;
+        let Some((l, t, r, b)) = chaos_app::win32::work_area() else {
+            return (120, 80, WANT_W, WANT_H);
+        };
+        let (aw, ah) = ((r - l).max(320), (b - t).max(240));
+        let w = WANT_W.min(aw - MARGIN);
+        let h = WANT_H.min(ah - MARGIN);
+        (l + (aw - w) / 2, t + (ah - h) / 2, w, h)
+    }
+
     unsafe fn child(
         parent: HWND,
         class: &str,
@@ -656,6 +749,7 @@ mod windows_app {
         }
         button(hwnd, "SAVE", nav::ID_SAVE, hinst);
         button(hwnd, "RESET", nav::ID_RESET, hinst);
+        button(hwnd, "BROWSE...", nav::ID_BROWSE_MODELS, hinst);
 
         // The transcript, the composer and the list carry measurements, so they
         // are monospaced; everything else is the UI face.
@@ -843,6 +937,33 @@ mod windows_app {
             unsafe {
                 layout(h);
                 InvalidateRect(h, std::ptr::null(), 1);
+            }
+        }
+        // **Invalidating the parent does not repaint its children.** The rail
+        // buttons are owner-drawn, so they only redraw when Windows sends them
+        // a `WM_DRAWITEM`, and it only does that when the *button* is
+        // invalidated. Without this the highlight followed the mouse rather
+        // than the page: clicking SETTINGS in the rail worked because the click
+        // repainted that one button, but View > Settings and Ctrl+4 left CHAT
+        // lit while the settings page was on screen.
+        //
+        // The primary action moves with the page too (`weight_of`), so those
+        // buttons are refreshed here as well rather than staying heavy on a
+        // page they no longer belong to.
+        for id in nav::SHELL_CONTROLS {
+            let c = ctl(id);
+            if !c.is_null() {
+                unsafe {
+                    InvalidateRect(c, std::ptr::null(), 1);
+                }
+            }
+        }
+        for &id in nav::controls(p) {
+            let c = ctl(id);
+            if !c.is_null() {
+                unsafe {
+                    InvalidateRect(c, std::ptr::null(), 1);
+                }
             }
         }
         sync_enabled();
@@ -1977,6 +2098,22 @@ Any value a client sends is accepted.                      The server still list
                 }
             });
         }
+        show_update_outcome();
+        // The installer is up; get out of its way. Anything running under this
+        // window goes with it, which is what the installer needs anyway.
+        if shared().lock().unwrap().update_quit {
+            let h = main_hwnd();
+            if !h.is_null() {
+                // **`quit`, not a bare `WM_CLOSE`.** Since closing began
+                // hiding to the notification area, posting `WM_CLOSE` here
+                // would have hidden the window and left the process alive --
+                // and the installer would then have stopped on "cannot write
+                // chaos-app.exe", because the binary it must replace was still
+                // executing. The update would have failed in the one place it
+                // is hardest to explain: after the download, with no window.
+                quit(h);
+            }
+        }
         if finished && busy().swap(false, Ordering::SeqCst) {
             UI.with(|u| {
                 if let Some(ui) = u.borrow_mut().as_mut() {
@@ -2046,6 +2183,7 @@ Any value a client sends is accepted.                      The server still list
                             SendMessageW(h, CB_ADDSTRING, 0, t.as_ptr() as LPARAM);
                         }
                         SendMessageW(h, CB_SETCURSEL, selected, 0);
+                        widen_dropdown(h, &list);
                     }
                     // Cached so paint and save do not rebuild the list, and so
                     // the note under the box follows the selection.
@@ -2060,6 +2198,46 @@ Any value a client sends is accepted.                      The server still list
                 },
             }
         }
+    }
+
+    /// Make the open list as wide as its longest option.
+    ///
+    /// **A drop-down is exactly as wide as its box unless it is told
+    /// otherwise**, and these boxes sit in a settings column narrower than the
+    /// sentences in them -- so "Processor (the GPU is not used here)" opened as
+    /// "Processor (the GPU is not used her...", with the ellipsis landing on
+    /// the part that says what the option does. Atur's report was that the
+    /// drop-downs did not work well, and this is the whole of it: they opened,
+    /// they selected, they could not be read.
+    ///
+    /// Measured against the same font the rows are drawn in, capped so one long
+    /// label cannot push the list off the screen.
+    unsafe fn widen_dropdown(h: HWND, list: &[Choice]) {
+        let hdc = GetDC(h);
+        if hdc.is_null() {
+            return;
+        }
+        let font = UI.with(|u| u.borrow().as_ref().map(|ui| ui.fonts.body));
+        let Some(font) = font else {
+            ReleaseDC(h, hdc);
+            return;
+        };
+        let widest = list
+            .iter()
+            .map(|c| text_width(hdc, &c.label, font))
+            .max()
+            .unwrap_or(0);
+        ReleaseDC(h, hdc);
+
+        let mut r = RECT::default();
+        GetWindowRect(h, &mut r);
+        let own = r.right - r.left;
+        // 10px of padding either side in `draw_combo`, plus room for the
+        // scrollbar the list grows when there are more than `COMBO_VISIBLE`.
+        let want = (widest + 20 + 20).max(own);
+        // Never wider than the screen it opens on.
+        let cap = work_area().map(|(l, _, r, _)| r - l).unwrap_or(1280) - 80;
+        SendMessageW(h, CB_SETDROPPEDWIDTH, want.min(cap) as WPARAM, 0);
     }
 
     /// The value a settings control currently holds, whichever kind it is.
@@ -2092,6 +2270,44 @@ Any value a client sends is accepted.                      The server still list
     }
 
     /// Read every box back and write the file.
+    /// Pick the models folder instead of typing it.
+    ///
+    /// **The chosen folder is appended, not substituted, when one is already
+    /// set.** The field takes several folders separated by `;` and people do
+    /// use that -- a fast disk and an archive drive -- so replacing the lot
+    /// because somebody wanted to add a second one would quietly lose the
+    /// first. Picking the folder that is already there changes nothing.
+    fn browse_models_dir(hwnd: HWND) {
+        let current = field_value(nav::ID_MODELS_DIR);
+        let first = current.split(';').next().unwrap_or("").trim().to_string();
+        let start = if first.is_empty() {
+            models::default_dir().to_string_lossy().to_string()
+        } else {
+            first
+        };
+        let Some(picked) =
+            chaos_app::win32::pick_folder(hwnd, "Where models are kept", Some(&start))
+        else {
+            return;
+        };
+        let already: Vec<&str> = current
+            .split(';')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let next = if already.iter().any(|p| p.eq_ignore_ascii_case(&picked)) {
+            current.clone()
+        } else if already.is_empty() {
+            picked.clone()
+        } else {
+            format!("{};{}", already.join(";"), picked)
+        };
+        unsafe {
+            SetWindowTextW(ctl(nav::ID_MODELS_DIR), wide(&next).as_ptr());
+        }
+        set_status(&format!("models folder: {next} -- press SAVE to keep it"));
+    }
+
     fn save_settings() {
         // Reads a dropdown's selected *value* or a box's text, as appropriate.
         let read = field_value;
@@ -2318,7 +2534,7 @@ Any value a client sends is accepted.                      The server still list
     /// Where the model list ends and the model's own page begins.
     fn models_split(page: RECT) -> i32 {
         let usable = page.right - page.left - metric::INSET * 2;
-        page.left + metric::INSET + (usable * 44 / 100)
+        page.left + metric::INSET + (usable * 54 / 100)
     }
 
     /// The first line of a page's content, under the title block.
@@ -2339,6 +2555,26 @@ Any value a client sends is accepted.                      The server still list
     /// **Computed in one place** because `layout` positions the controls and
     /// `paint` draws the labels and hints beside them. Two independent walks of
     /// the same list is exactly how a label ends up over the wrong box.
+    /// Extra height a settings field needs beyond label, control and note.
+    ///
+    /// Only the models folder, which has BROWSE under it.
+    ///
+    /// **Both walkers ask this, because drifting apart is exactly what went
+    /// wrong.** `settings_rows` put BROWSE six pixels under the field and
+    /// `paint_settings` painted the field's note in the same six pixels, so the
+    /// button sat on top of the sentence that explains what the field is for --
+    /// "%\.chaos\models. Several, separated by ; are all searched." read as
+    /// "...chaos\models. Several, separated by ; are all searched." with its
+    /// first half behind a button. Two walkers stepping by different amounts is
+    /// the shape of that bug, and one shared step is the fix.
+    fn field_extra(id: i32) -> i32 {
+        if id == nav::ID_MODELS_DIR {
+            metric::BUTTON + 12
+        } else {
+            0
+        }
+    }
+
     fn settings_rows(page: RECT) -> Vec<(i32, i32, i32, bool)> {
         let (left, right, _) = settings_columns(page);
         let mut out = Vec::new();
@@ -2350,7 +2586,7 @@ Any value a client sends is accepted.                      The server still list
             y[c] += 26;
             for f in nav::FIELDS.iter().filter(|f| f.group == *group) {
                 out.push((f.id, x, y[c] + 18, false));
-                y[c] += 18 + metric::CONTROL + 34;
+                y[c] += 18 + metric::CONTROL + 34 + field_extra(f.id);
             }
             for f in nav::TOGGLES.iter().filter(|f| f.group == *group) {
                 out.push((f.id, x, y[c], true));
@@ -2435,13 +2671,15 @@ Any value a client sends is accepted.                      The server still list
         // brand's *ground* -- what Hermes puts behind its wordmark -- and the
         // logo itself is black art. And not `StretchDIBits` over a 1-bit 56px
         // bitmap either, which is what made it a blob at 30 pixels.
-        // **44, not 32.** At 32 the mark reads as a smudge next to a 20px
-        // wordmark -- the sun's rays are one pixel wide there and the eye inside
-        // it is not visible at all, which is what "the logos in the app are
-        // small and low quality" was about. The art is filtered from the 256px
-        // master at whatever size is asked for, so a larger box costs nothing but
-        // rail space, and the rail is 208px wide.
-        let box_px = 44usize;
+        // **64, not 44 and certainly not 32.** This mark is a sun of two dozen
+        // fine rays around an eye, and a ray is roughly one pixel wide at 44 --
+        // so the rays alias against each other and the eye is barely there.
+        // Atur reported "low quality logo on top" at 44 as he had at 32. The
+        // art is scan-converted from outlines at whatever size is asked for
+        // (`art::logo_coverage`) and cached, so a larger box costs rail width
+        // and nothing else: the rail is 208px, the mark starts at INSET and the
+        // wordmark follows it, which still leaves room for five letters.
+        let box_px = 64usize;
         let cov = art::logo_scaled(box_px);
         let chan = |c: Rgb, shift: u32| ((c >> shift) & 0xFF) as i32;
         let mut px = vec![0u8; box_px * box_px * 4];
@@ -2478,7 +2716,7 @@ Any value a client sends is accepted.                      The server still list
         StretchDIBits(
             hdc,
             metric::INSET,
-            28,
+            24,
             box_px,
             box_px,
             0,
@@ -2493,7 +2731,7 @@ Any value a client sends is accepted.                      The server still list
         label(
             hdc,
             metric::INSET + box_px + 10,
-            38,
+            44,
             metric::RAIL,
             "CHAOS",
             ui.fonts.mark,
@@ -2503,7 +2741,7 @@ Any value a client sends is accepted.                      The server still list
         label(
             hdc,
             metric::INSET,
-            70,
+            92,
             metric::RAIL - metric::INSET,
             &format!("v{}", env!("CARGO_PKG_VERSION")),
             ui.fonts.small,
@@ -3027,9 +3265,19 @@ Any value a client sends is accepted.                      The server still list
         for (k, v) in [
             (
                 "models installed",
+                // **The word, not just a comma.** "18, 276 GB in total" reads
+                // as the single number 18,276 -- a thousands separator is
+                // exactly what a comma between two digits means to a reader,
+                // and this line is drawn in a monospace face where the two are
+                // hardest to tell apart.
                 format!(
-                    "{}, {} in total",
+                    "{} {} -- {} in total",
                     ui.entries.len(),
+                    if ui.entries.len() == 1 {
+                        "model"
+                    } else {
+                        "models"
+                    },
                     models::human_size(bytes)
                 ),
             ),
@@ -3090,20 +3338,23 @@ Any value a client sends is accepted.                      The server still list
                     })
                     .map(|c| c.note.clone())
                     .unwrap_or_else(|| f.hint.to_string());
+                // Below whatever the field puts under itself -- BROWSE, for
+                // the models folder -- not on top of it.
+                let note_top = y[c] + 18 + metric::CONTROL + 4 + field_extra(f.id);
                 text(
                     hdc,
                     RECT {
                         left: x,
-                        top: y[c] + 18 + metric::CONTROL + 4,
+                        top: note_top,
                         right: x + col,
-                        bottom: y[c] + 18 + metric::CONTROL + 34,
+                        bottom: note_top + 30,
                     },
                     &note,
                     ui.fonts.small,
                     t.fg_tertiary,
                     DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS,
                 );
-                y[c] += 18 + metric::CONTROL + 34;
+                y[c] += 18 + metric::CONTROL + 34 + field_extra(f.id);
             }
             for f in nav::TOGGLES.iter().filter(|f| f.group == *group) {
                 text(
@@ -3243,6 +3494,14 @@ Any value a client sends is accepted.                      The server still list
                             metric::CONTROL
                         };
                         m.push((id, cx, cy, bw, h));
+                    }
+                    // BROWSE sits directly under the folder it changes, not
+                    // beside SAVE: a picker two columns away from the field it
+                    // fills is a button nobody connects to anything.
+                    if let Some(&(_, fx, fy, _, fh)) =
+                        m.iter().find(|(id, ..)| *id == nav::ID_MODELS_DIR)
+                    {
+                        m.push((nav::ID_BROWSE_MODELS, fx, fy + fh + 6, 120, metric::BUTTON));
                     }
                     let by = page.bottom - 26 - metric::BUTTON - 16;
                     m.push((nav::ID_SAVE, x, by, 110, metric::BUTTON));
@@ -3636,18 +3895,55 @@ Any value a client sends is accepted.                      The server still list
             );
             x += 13;
         }
+        // **Columns, drawn right to left.** Everything after the first is a
+        // measurement -- the size, and "(unfinished)" -- and each is placed at
+        // its own right edge so the name keeps every pixel that is left. Drawn
+        // as one string it was the *name* that lost its tail to the ellipsis,
+        // and a name without its quantisation does not identify a model.
+        let mut parts = s.split(models::COLUMN_SEP);
+        let name = parts.next().unwrap_or("");
+        let extras: Vec<&str> = parts.collect();
+        let mut right = di.rcItem.right - 12;
+        for extra in extras.iter().rev() {
+            let w = text_width(di.hDC, extra, font) + 18;
+            text(
+                di.hDC,
+                RECT {
+                    left: right - w,
+                    right,
+                    ..di.rcItem
+                },
+                extra,
+                font,
+                t.fg_tertiary,
+                DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+            );
+            right -= w;
+        }
         text(
             di.hDC,
             RECT {
                 left: x,
-                right: di.rcItem.right - 8,
+                right: right.max(x + 40),
                 ..di.rcItem
             },
-            &s,
+            name,
             if running { font_bold } else { font },
             t.fg,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
         );
+    }
+
+    /// How wide a string draws in `font`, for right-aligning a column.
+    unsafe fn text_width(hdc: HDC, s: &str, font: HFONT) -> i32 {
+        let old = SelectObject(hdc, font as HGDIOBJ);
+        let w: Vec<u16> = s.encode_utf16().collect();
+        let mut sz = SIZE { cx: 0, cy: 0 };
+        if !w.is_empty() {
+            GetTextExtentPoint32W(hdc, w.as_ptr(), w.len() as i32, &mut sz);
+        }
+        SelectObject(hdc, old);
+        sz.cx
     }
 
     /// Put the embedded icon on the window itself.
@@ -3665,6 +3961,394 @@ Any value a client sends is accepted.                      The server still list
         if !small.is_null() {
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small as LPARAM);
         }
+    }
+
+    /// The window of a Chaos already running, if there is one.
+    ///
+    /// **The mutex is the test; the window is the answer.** A named mutex says
+    /// reliably whether another instance exists -- `CreateMutexW` succeeds
+    /// either way and `GetLastError` reports `ERROR_ALREADY_EXISTS` -- but it
+    /// cannot say *where* it is. `FindWindowW` on our own class does, and on
+    /// its own it is not enough: between one instance starting and registering
+    /// its class there is a window in which a second launch finds nothing and
+    /// both proceed.
+    ///
+    /// The handle is deliberately never closed. It must live as long as the
+    /// process -- releasing it early is what would let a second instance in --
+    /// and Windows reclaims it at exit.
+    fn already_running() -> Option<HWND> {
+        unsafe {
+            let name = wide("Local\\ChaosAppSingleInstance");
+            let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+            if h.is_null() {
+                // The guard could not be created. Starting is the safer
+                // failure: refusing to launch because a mutex would not open
+                // is worse than two windows.
+                return None;
+            }
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                // **The handle is never closed, on purpose.** It has to live as
+                // long as the process -- closing it is what would let a second
+                // instance in -- and Windows releases it at exit. Nothing to
+                // `forget`: a raw handle is `Copy`, so dropping the binding
+                // does not close anything.
+                return None;
+            }
+            // Someone else has it. Their window may be hidden in the tray,
+            // which `FindWindowW` still finds -- hidden is not destroyed.
+            let hwnd = FindWindowW(wide("ChaosAppWindow").as_ptr(), std::ptr::null());
+            if hwnd.is_null() {
+                None
+            } else {
+                Some(hwnd)
+            }
+        }
+    }
+
+    // ---- the notification area ---------------------------------------------
+    //
+    // Atur: *"chaos run in background well when app closed ... and just finish
+    // work with exit button"*. A model that took four minutes to load should
+    // not be thrown away because somebody closed a window, and an engine still
+    // holding 7 GiB with nothing on screen is worse -- it is the memory leak
+    // this app already fixed once. The icon is what makes background running
+    // honest: it is visible, it says what is loaded, and it has the way out.
+
+    /// Fill in the parts of `NOTIFYICONDATAW` every call needs.
+    fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+        NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_ID,
+            ..Default::default()
+        }
+    }
+
+    /// Copy a string into one of the structure's fixed arrays, truncated.
+    ///
+    /// **Truncated at a UTF-16 boundary and always terminated.** A tip that
+    /// fills its buffer with no NUL is read past the end by the shell.
+    ///
+    /// Not called `fill`: that is the painting primitive, three arguments and a
+    /// colour, and two functions of the same name in one module is how a rename
+    /// lands in the wrong place.
+    fn set_utf16(dst: &mut [u16], text: &str) {
+        let w: Vec<u16> = text.encode_utf16().take(dst.len() - 1).collect();
+        dst[..w.len()].copy_from_slice(&w);
+        dst[w.len()] = 0;
+    }
+
+    /// Put the icon in the notification area.
+    unsafe fn tray_add(hwnd: HWND, hinst: HINSTANCE) {
+        let mut d = tray_data(hwnd);
+        d.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        d.uCallbackMessage = WM_APP_TRAY;
+        // The same resource the window and Explorer use, at the size the shell
+        // asks for rather than a stretched large one.
+        d.hIcon = LoadImageW(hinst, 1u16 as *const u16, IMAGE_ICON, 16, 16, LR_SHARED) as HICON;
+        set_utf16(&mut d.szTip, "Chaos");
+        Shell_NotifyIconW(NIM_ADD, &mut d);
+    }
+
+    /// Say what is running, in the tooltip.
+    ///
+    /// **The icon has to answer "is anything loaded" without a click**, or
+    /// running in the background is indistinguishable from having been left
+    /// open by accident.
+    fn tray_tip(hwnd: HWND) {
+        let loaded = UI.with(|u| u.borrow().as_ref().and_then(|ui| ui.loaded.clone()));
+        let tip = match loaded {
+            Some(m) => format!("Chaos -- {m} is running"),
+            None => "Chaos -- no model running".to_string(),
+        };
+        let mut d = tray_data(hwnd);
+        d.uFlags = NIF_TIP;
+        set_utf16(&mut d.szTip, &tip);
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, &mut d);
+        }
+    }
+
+    /// Take the icon away. Called on the way out, and only there.
+    ///
+    /// **An icon whose window is gone stays on screen** until the user hovers
+    /// over it, which is how a tidy-looking application leaves a ghost behind.
+    unsafe fn tray_remove(hwnd: HWND) {
+        let mut d = tray_data(hwnd);
+        Shell_NotifyIconW(NIM_DELETE, &mut d);
+    }
+
+    /// Tell the user where the window went, once.
+    ///
+    /// Hiding a window with no explanation reads as a crash. Windows shows this
+    /// as a balloon or a toast depending on the version and the user's
+    /// settings; either way it is shown once per run, on the first close.
+    unsafe fn tray_explain_once(hwnd: HWND) {
+        static TOLD: AtomicBool = AtomicBool::new(false);
+        if TOLD.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut d = tray_data(hwnd);
+        d.uFlags = NIF_INFO;
+        d.dwInfoFlags = NIIF_INFO;
+        set_utf16(&mut d.szInfoTitle, "Chaos is still running");
+        set_utf16(
+            &mut d.szInfo,
+            "The model stays loaded so it is ready when you come back. \
+             Click the icon to open the window, or right-click it and choose \
+             Exit to stop.",
+        );
+        Shell_NotifyIconW(NIM_MODIFY, &mut d);
+    }
+
+    /// Bring the window back and put it in front.
+    unsafe fn tray_open(hwnd: HWND) {
+        ShowWindow(hwnd, SW_RESTORE);
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        SetForegroundWindow(hwnd);
+        InvalidateRect(hwnd, std::ptr::null(), 1);
+    }
+
+    /// The right-click menu: open, and the way out.
+    ///
+    /// **`SetForegroundWindow` before, and a stray click after.** A popup owned
+    /// by a window that is not in front never receives its dismissal, so it
+    /// hangs on screen until something else is clicked -- a documented quirk
+    /// with a documented workaround, and skipping either one is how a tray menu
+    /// becomes sticky.
+    unsafe fn tray_menu(hwnd: HWND) {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return;
+        }
+        let loaded = UI.with(|u| u.borrow().as_ref().and_then(|ui| ui.loaded.clone()));
+        let open = wide("&Open Chaos");
+        AppendMenuW(menu, MF_STRING, nav::IDM_TRAY_OPEN as usize, open.as_ptr());
+        if let Some(m) = &loaded {
+            let stop = wide(&format!("&Stop {m}"));
+            AppendMenuW(menu, MF_STRING, nav::IDM_STOP as usize, stop.as_ptr());
+        }
+        let sep = wide("");
+        AppendMenuW(menu, MF_SEPARATOR, 0, sep.as_ptr());
+        let exit = wide("E&xit Chaos");
+        AppendMenuW(menu, MF_STRING, nav::IDM_TRAY_EXIT as usize, exit.as_ptr());
+
+        let mut pt = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            pt.x,
+            pt.y,
+            0,
+            hwnd,
+            std::ptr::null(),
+        );
+        // The other half of the quirk: without this the menu can linger.
+        PostMessageW(hwnd, WM_NULL, 0, 0);
+        DestroyMenu(menu);
+        match cmd {
+            c if c == nav::IDM_TRAY_OPEN => tray_open(hwnd),
+            c if c == nav::IDM_STOP => unload_model(),
+            c if c == nav::IDM_TRAY_EXIT => quit(hwnd),
+            _ => {}
+        }
+    }
+
+    /// Stop for real: the engine, the icon, the process.
+    fn quit(hwnd: HWND) {
+        really_quitting().store(true, Ordering::SeqCst);
+        unsafe {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+    }
+
+    // ---- updating in place -------------------------------------------------
+    //
+    // Atur: *"users can get the most updated release when they connect to the
+    // internet from the app -- an updating flow, not every time go and download
+    // a new setup"*.
+    //
+    // The decisions -- is this newer, which file does this platform need -- are
+    // in `chaos_app::update`, where they are tested. What is here is the two
+    // things that need a window: a `curl` call on a worker thread, and the
+    // sequencing of the handover to the installer.
+
+    /// Ask GitHub what the newest release is, without flashing a console.
+    ///
+    /// The arguments are `update::feed_curl_args()`, the same list
+    /// `chaos-run --update` uses -- the missing `User-Agent` that the API
+    /// rejects outright is exactly the kind of thing that gets fixed in one
+    /// copy. What is here and not shared is `CREATE_NO_WINDOW`, a Windows-only
+    /// extension to `Command`: without it a console window blinks open on the
+    /// user's screen every time the app checks.
+    fn fetch_latest_json() -> Result<String, String> {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = Command::new("curl");
+        cmd.args(update::feed_curl_args());
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        match cmd.output() {
+            Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+            Ok(o) => {
+                let why = String::from_utf8_lossy(&o.stderr);
+                let first = why.lines().next().unwrap_or("").trim().to_string();
+                Err(if first.is_empty() {
+                    format!("curl exited {}", o.status)
+                } else {
+                    first
+                })
+            }
+            Err(e) => Err(format!("curl could not be run ({e})")),
+        }
+    }
+
+    /// Check in the background, and leave the answer for `drain` to show.
+    ///
+    /// `announce` is what separates the two callers. The one at startup is
+    /// quiet unless there is news -- an app that opens a dialog to say nothing
+    /// has changed is an app people stop launching. The menu item always
+    /// answers, because a check that says nothing is indistinguishable from a
+    /// broken one.
+    fn check_for_updates(announce: bool) {
+        if announce {
+            set_status("checking for a newer Chaos...");
+        }
+        std::thread::spawn(move || {
+            let outcome = match fetch_latest_json() {
+                Ok(json) => update::decide(update::parse_latest(&json), update::running()),
+                Err(why) => update::Outcome::Failed(why),
+            };
+            let news = announce || matches!(outcome, update::Outcome::Available { .. });
+            {
+                let mut sh = shared().lock().unwrap();
+                sh.update = Some(outcome);
+                sh.update_news = news;
+                sh.update_asked = announce;
+            }
+            notify();
+        });
+    }
+
+    /// Show what a finished check found, once.
+    ///
+    /// Runs on the UI thread out of `drain`, which is the only place a dialog
+    /// can be put up at all: `MessageBoxW` owned by a window belonging to
+    /// another thread does nothing here, as the connection test found out.
+    fn show_update_outcome() {
+        let (outcome, asked) = {
+            let mut sh = shared().lock().unwrap();
+            if !sh.update_news {
+                return;
+            }
+            sh.update_news = false;
+            (sh.update.clone(), sh.update_asked)
+        };
+        let Some(outcome) = outcome else { return };
+        set_status(&outcome.line());
+        match &outcome {
+            update::Outcome::Available { version, .. } => {
+                let msg = format!(
+                    "Chaos {} is available. You are running {}.\r\n\r\n\
+                     Download it and start the installer now?\r\n\r\n\
+                     Chaos will close so the installer can replace its files. \
+                     Your models are not touched.",
+                    version.text(),
+                    update::running().text()
+                );
+                let yes = unsafe {
+                    MessageBoxW(
+                        main_hwnd(),
+                        wide(&msg).as_ptr(),
+                        wide("A newer Chaos").as_ptr(),
+                        MB_YESNO | MB_ICONINFORMATION,
+                    )
+                } == IDYES;
+                if yes {
+                    install_update();
+                }
+            }
+            // Only the menu item's caller waited for these, so only it hears
+            // them as a dialog; the status line has them either way.
+            _ if asked => unsafe {
+                MessageBoxW(
+                    main_hwnd(),
+                    wide(&outcome.line()).as_ptr(),
+                    wide("Check for updates").as_ptr(),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            },
+            _ => {}
+        }
+    }
+
+    /// Fetch the installer for the release the last check found, and hand over.
+    ///
+    /// **The app has to be gone before the installer writes.** `chaos-setup`
+    /// overwrites `chaos-app.exe` in place, and Windows keeps a running
+    /// executable's file open -- so a silent install from inside the running app
+    /// would fail on exactly the binary doing the asking. The installer is
+    /// therefore started with its window and this process closes immediately; by
+    /// the time anyone presses INSTALL there is nothing holding the file.
+    fn install_update() {
+        let outcome = shared().lock().unwrap().update.clone();
+        let (version, url) = match outcome {
+            Some(update::Outcome::Available { version, url }) => (version, url),
+            Some(update::Outcome::UpToDate(v)) => {
+                set_status(&format!("Chaos {} is already the newest release", v.text()));
+                return;
+            }
+            // Nothing has been checked yet, so check rather than refuse.
+            _ => {
+                check_for_updates(true);
+                return;
+            }
+        };
+        let name = update::asset_for_platform(&version);
+        let dest = std::env::temp_dir().join(&name);
+        set_status(&format!("downloading Chaos {}...", version.text()));
+        std::thread::spawn(move || {
+            use std::os::windows::process::CommandExt;
+            let mut cmd = Command::new("curl");
+            cmd.args(["-L", "--fail", "-sS", "--retry", "3"])
+                .arg("-o")
+                .arg(&dest)
+                .arg(&url);
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            let ok = matches!(cmd.status(), Ok(st) if st.success());
+            // **Exit zero is not a file.** The same trap `chaos-pull` documents:
+            // a redirect to an error page saves perfectly and runs not at all.
+            // No installer this project has ever built is under a megabyte.
+            let bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+            if !ok || bytes < (1 << 20) {
+                let mut sh = shared().lock().unwrap();
+                sh.report = Some((
+                    format!(
+                        "The update could not be downloaded.\n\n{url}\n\n\
+                         Download it in a browser and run it -- your models and \
+                         settings are kept."
+                    ),
+                    false,
+                ));
+                drop(sh);
+                notify();
+                return;
+            }
+            let started = Command::new(&dest).spawn().is_ok();
+            let mut sh = shared().lock().unwrap();
+            sh.update_quit = started;
+            if !started {
+                sh.report = Some((
+                    format!(
+                        "The update downloaded but would not start. Run it by hand:\n\n{}",
+                        dest.display()
+                    ),
+                    false,
+                ));
+            }
+            drop(sh);
+            notify();
+        });
     }
 
     fn about() {
@@ -3724,6 +4408,12 @@ Any value a client sends is accepted.                      The server still list
                 0
             }
             WM_TIMER => {
+                // What the icon says follows what is loaded. Cheap: one
+                // `Shell_NotifyIconW` a second, and only while hidden is it the
+                // only thing telling the user anything.
+                if IsWindowVisible(hwnd) == 0 {
+                    tray_tip(hwnd);
+                }
                 // Uptime and free memory move on their own; nothing else here
                 // would ever ask for them to be redrawn.
                 let free = free_memory_bytes();
@@ -3799,6 +4489,19 @@ Any value a client sends is accepted.                      The server still list
                 drain();
                 0
             }
+            // The shell sends mouse messages for the icon here, in `lParam`.
+            WM_APP_TRAY => {
+                match lp as u32 {
+                    // One click opens it. Not a double-click: the icon has one
+                    // obvious action and making people find that out by trying
+                    // twice is the kind of thing this window is trying not to
+                    // do.
+                    WM_LBUTTONUP | WM_LBUTTONDBLCLK => tray_open(hwnd),
+                    WM_RBUTTONUP => tray_menu(hwnd),
+                    _ => {}
+                }
+                0
+            }
             WM_DRAWITEM => {
                 let di = &*(lp as *const DRAWITEMSTRUCT);
                 draw_item(di);
@@ -3821,8 +4524,15 @@ Any value a client sends is accepted.                      The server still list
                     return 0;
                 }
                 match id {
-                    nav::IDM_EXIT => {
-                        DestroyWindow(hwnd);
+                    // The one command that ends the process. Everything else
+                    // that looks like closing now hides to the notification
+                    // area instead.
+                    nav::IDM_EXIT | nav::IDM_TRAY_EXIT => {
+                        quit(hwnd);
+                        return 0;
+                    }
+                    nav::IDM_TRAY_OPEN => {
+                        tray_open(hwnd);
                         return 0;
                     }
                     nav::IDM_THEME_LIGHT => {
@@ -3887,6 +4597,14 @@ Any value a client sends is accepted.                      The server still list
                         about();
                         return 0;
                     }
+                    nav::IDM_CHECK_UPDATE => {
+                        check_for_updates(true);
+                        return 0;
+                    }
+                    nav::IDM_INSTALL_UPDATE => {
+                        install_update();
+                        return 0;
+                    }
                     _ => {}
                 }
                 match (id, code) {
@@ -3906,6 +4624,7 @@ Any value a client sends is accepted.                      The server still list
                     (nav::ID_TAB_INSTALLED, BN_CLICKED) => set_tab(Tab::Installed),
                     (nav::ID_TAB_AVAILABLE, BN_CLICKED) => set_tab(Tab::Available),
                     (nav::ID_SAVE, BN_CLICKED) => save_settings(),
+                    (nav::ID_BROWSE_MODELS, BN_CLICKED) => browse_models_dir(hwnd),
                     (nav::ID_RESET, BN_CLICKED) => reset_settings(),
                     (nav::ID_AUTO, BN_CLICKED) | (nav::ID_FORCE, BN_CLICKED) => toggle(id),
                     // Selecting a different model redraws its page beside the
@@ -3926,9 +4645,24 @@ Any value a client sends is accepted.                      The server still list
                 }
                 0
             }
+            // **The X hides; only Exit quits.** Atur: *"chaos run in background
+            // well when app closed ... and just finish work with exit button"*.
+            // A model can take four minutes to load, and throwing that away
+            // because somebody closed a window is the wrong default -- but
+            // background running has to be *visible*, so the notification-area
+            // icon says what is loaded and carries the way out. An engine
+            // holding 7 GiB with nothing on screen and no icon is the memory
+            // leak this app already fixed once.
             WM_CLOSE => {
-                stop_server();
-                DestroyWindow(hwnd);
+                if really_quitting().load(Ordering::SeqCst) {
+                    tray_remove(hwnd);
+                    stop_server();
+                    DestroyWindow(hwnd);
+                } else {
+                    ShowWindow(hwnd, SW_HIDE);
+                    tray_tip(hwnd);
+                    tray_explain_once(hwnd);
+                }
                 0
             }
             WM_DESTROY => {
@@ -3939,6 +4673,11 @@ Any value a client sends is accepted.                      The server still list
                 // taskbar close became a memory leak you had to find in Task
                 // Manager.
                 KillTimer(hwnd, TIMER_ID);
+                // Not only in `WM_CLOSE`: a destroy can arrive from elsewhere
+                // (a session ending, `DestroyWindow` from the menu), and an
+                // icon whose window is gone stays on screen until the user
+                // happens to hover over it.
+                tray_remove(hwnd);
                 stop_server();
                 PostQuitMessage(0);
                 0

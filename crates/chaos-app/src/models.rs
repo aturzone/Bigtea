@@ -100,23 +100,79 @@ pub fn list() -> Vec<Entry> {
         .collect()
 }
 
-/// One line for the list box: name on the left, size on the right.
+/// The separator between a row's columns.
+///
+/// A control character, so it cannot occur in a filename and cannot be typed by
+/// accident. The list is owner-drawn and splits on it to right-align the size.
+pub const COLUMN_SEP: char = '\u{1}';
+
+/// One line for the list box, its columns joined.
 pub fn row(e: &Entry) -> String {
-    let size = match e.bytes {
-        Some(b) => format!("{}   {}", e.label, human_size(b)),
-        None => e.label.clone(),
-    };
+    columns(e).join(&COLUMN_SEP.to_string())
+}
+
+/// A row as its parts: the name, then what is known about it.
+///
+/// **Separate columns, because one string truncates from the wrong end.** Built
+/// as `name + "   " + size` and drawn with an ellipsis, a narrow list eats the
+/// *end of the name* — and the end of the name is the quantisation, which is
+/// the part that tells two copies of a model apart. `Qwen3-VL-8B-Instruct-Q4_K_M`
+/// became `Qwen3-VL-8B-Instru…`, so the list stopped answering the one question
+/// it exists to answer. Now the name gets the width it needs and the size is
+/// right-aligned into its own column.
+pub fn columns(e: &Entry) -> Vec<String> {
+    let mut v = vec![e.label.clone()];
+    if let Some(b) = e.bytes {
+        v.push(human_size(b));
+    }
     // Said in the list, not only on the model's own page: the list is where the
     // choice is made, and "9.00 GB" beside a file holding 911 MB is a lie.
-    match &e.incomplete {
-        Some(_) => format!("{size}   (unfinished)"),
-        None => size,
+    if e.incomplete.is_some() {
+        v.push("(unfinished)".to_string());
     }
+    v
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row's columns are separate, so a narrow list eats a measurement rather
+    /// than the end of the name.
+    #[test]
+    fn the_name_is_its_own_column() {
+        let e = Entry {
+            label: "Qwen3-VL-8B-Instruct-Q4_K_M".into(),
+            path: std::path::PathBuf::from("x.gguf"),
+            bytes: Some(5_027_785_568),
+            incomplete: None,
+        };
+        let c = columns(&e);
+        assert_eq!(c[0], "Qwen3-VL-8B-Instruct-Q4_K_M", "the name, whole");
+        assert_eq!(c[1], "5.03 GB");
+        // The separator cannot appear in a filename, so splitting is safe.
+        assert!(!c[0].contains(COLUMN_SEP));
+        assert_eq!(row(&e).split(COLUMN_SEP).next().unwrap(), c[0]);
+
+        // An unfinished download says so in its own column too.
+        let e = Entry {
+            incomplete: Some("half".into()),
+            ..e
+        };
+        let c = columns(&e);
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[2], "(unfinished)");
+
+        // A model whose size could not be measured has one column and no
+        // stray separator to split on.
+        let e = Entry {
+            bytes: None,
+            incomplete: None,
+            ..e
+        };
+        assert_eq!(columns(&e).len(), 1);
+        assert!(!row(&e).contains(COLUMN_SEP));
+    }
 
     #[test]
     fn sizes_read_the_way_a_person_would_write_them() {

@@ -481,6 +481,56 @@ compiling**, and three of these were believed fixed before a pixel was measured.
 - **Do not do file I/O while painting.** Counting a model's shards in the
   detail panel meant a directory scan per repaint, and the transcript repaints
   on every token. Count it once, in the rescan.
+- **`InvalidateRect` on the parent does not repaint owner-drawn children.** They
+  redraw only when Windows sends them a `WM_DRAWITEM`, and it only does that for
+  a control that is itself invalid. The rail therefore lit each item as it was
+  clicked and never un-lit the last one: click all four pages and all four are
+  highlighted. Atur reported it as *"the menu options all of them become
+  blue"*. Worse through the menu and `Ctrl+1..4`, where no button was clicked at
+  all, so the page changed and the rail kept pointing at the old one. Invalidate
+  every control whose appearance depends on the state you just changed.
+- **A drop-down is exactly as wide as its box unless told otherwise.**
+  `CB_SETDROPPEDWIDTH`, measured against the longest label and capped to the
+  work area. Without it *"Processor (the GPU is not used here yet)"* opened as
+  *"Processor (the GPU is not used her…"* — the list opened, it selected, it
+  could not be read, and the report was that the drop-downs did not work.
+- **Two walkers over the same layout drift, and the drift is invisible in
+  code.** Already written down once for labels over boxes; it recurred with a
+  button. `settings_rows` put BROWSE six pixels under the models-folder field
+  and `paint_settings` painted that field's note in the same six pixels, so the
+  button sat on the sentence explaining the field. One shared step function is
+  the fix; there is now `field_extra(id)` and both callers add it.
+- **A logo of fine lines needs supersamples, not pixels.** The mark is a sun of
+  two dozen one-pixel rays around an eye. At 44px with 4x4 supersampling every
+  ray edge landed on one of sixteen grey levels and the whole thing read as
+  notched — reported as "low quality logo" twice, at 32px and again at 44px.
+  8x8 at 64px is smooth. The rasterisation is cached, so the cost is paid once.
+- **Making the X hide instead of quit changes what `WM_CLOSE` means
+  everywhere.** Every place that posted one in order to end the process now
+  merely hides the window. The in-app updater did exactly that: it downloaded
+  the installer, started it, posted `WM_CLOSE`, stayed alive, and the installer
+  stopped on "cannot write chaos-app.exe" -- after the download, with no window
+  on screen. Grep for `WM_CLOSE` when you make that change, and route real exits
+  through one function that sets a flag.
+- **Closing-to-tray makes single-instance mandatory, not optional.** With the
+  window hidden, double-clicking the shortcut is an easy mistake that starts a
+  second engine holding a second model's worth of memory, with the first one
+  invisible. `FindWindowW` alone is not enough -- between starting and
+  registering a class there is a gap where both instances find nothing. A named
+  mutex closes it: `CreateMutexW` succeeds either way and `GetLastError` reports
+  `ERROR_ALREADY_EXISTS`.
+- **`Shell_NotifyIcon` needs `cbSize` to match a version of the struct the shell
+  knows**, and a wrong one is rejected silently -- no icon, no error. Remove the
+  icon on `WM_DESTROY` as well as on the close path, or an icon whose window is
+  gone sits in the tray until somebody hovers over it.
+- **On Windows 11 a new tray icon goes behind the `^` and there is no API to
+  change that.** Do not spend time looking; say so in the manual.
+- **Nothing rescues a detailed mark at 16px.** Tried on the title-bar icon:
+  averaging the subsamples gives blue mush, taking the maximum gives a solid
+  white disc, and every blend between is one or the other. `make-ico.py` already
+  renders each size from the vector at its own resolution, which is the correct
+  thing to do and is not the problem. **A small icon needs a simplified glyph,
+  which is artwork, not filtering** — do not spend another hour on the filter.
 
 ## Releasing
 
@@ -513,6 +563,19 @@ compiling**, and three of these were believed fixed before a pixel was measured.
   installer test would have matched nothing and indexed `[0]` on an empty array
   — in the step that proves the installer works. Grep the workflow for the old
   name whenever an artefact is renamed.
+
+- **A `workflow_dispatch` input that nothing reads is worse than no input**, and
+  it looks like a working dry-run mechanism until the day you use it. The `tag`
+  input existed, was documented "for a dry run without publishing", and was
+  never read: `Package` used `GITHUB_REF_NAME`, which on a branch dispatch is
+  the *branch*. A dry run from `ticket/r68-app-ui` therefore built
+  `Chaos-ticket/r68-app-ui-linux-x86_64.tar.gz` -- a name with a slash -- so
+  `mkdir -p` made a directory, `tar` wrote inside it, and four of five builds
+  reported failure having compiled and smoke-tested perfectly.
+- **Rehearse the release workflow before tagging when the matrix changes.** Two
+  new runners (`ubuntu-24.04-arm`, `macos-13`) were added in v0.0.12; a dry run
+  proved both build ggml, build all twelve binaries and start them, and it cost
+  one dispatch instead of a broken release.
 
 ## The installer
 

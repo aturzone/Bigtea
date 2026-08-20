@@ -46,11 +46,17 @@ pub fn logo_size() -> (usize, usize) {
 /// dark one without a second asset.
 pub fn logo_coverage(n: usize) -> Vec<u8> {
     let n = n.max(1);
-    // 4x4 subsamples per output pixel. The scanline fill below is hard-edged,
-    // so supersampling is the only source of antialiasing -- and 16 levels is
-    // where the rays stop looking notched at 32px, checked by eye against 8
-    // and 36.
-    const SS: usize = 4;
+    // 8x8 subsamples per output pixel. The scanline fill below is hard-edged,
+    // so supersampling is the only source of antialiasing, and the number of
+    // subsamples is the number of grey levels an edge can take.
+    //
+    // **16 levels was not enough for this mark.** It is a sun of two dozen fine
+    // rays, and at 44px a ray is about one pixel wide -- so every ray edge
+    // landed on one of sixteen steps and the whole mark read as notched. Atur's
+    // report was "low quality logo on top", twice. 64 levels is smooth at that
+    // size; the cost is four times a rasterisation that happens once and is
+    // then cached by `logo_scaled`.
+    const SS: usize = 8;
     let w = n * SS;
     let mut grid = vec![0u8; w * w];
 

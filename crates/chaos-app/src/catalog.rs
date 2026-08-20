@@ -9,7 +9,7 @@
 //! tell a user it is impossible when it is the thing this project exists to do,
 //! so both figures are surfaced and the verdict is computed from the right one.
 
-use crate::models::human_size;
+use crate::models::{self, human_size};
 
 pub struct Offer {
     pub name: String,
@@ -106,12 +106,29 @@ pub fn verdict(o: &Offer, free_bytes: u64) -> Verdict {
     }
 }
 
-/// One line for the list.
+/// One line for the list, its columns joined.
 pub fn row(o: &Offer, free_bytes: u64) -> String {
+    columns(o, free_bytes).join(&models::COLUMN_SEP.to_string())
+}
+
+/// A downloadable offer as its parts: what it is, then what it costs.
+///
+/// **Separate columns, for the reason the installed list has them.** Built as
+/// one string with spaces between, the row was drawn with a single
+/// `DT_END_ELLIPSIS` and the *tail* went first -- so "needs 16.5 GB - slow,
+/// re-reads" became "needs 16.5 GB - sl..." and the verdict, which is the one
+/// thing the row exists to say, was the one thing cut. Each measurement now
+/// gets its own right edge and the name keeps what is left.
+pub fn columns(o: &Offer, free_bytes: u64) -> Vec<String> {
     // An unsupported architecture outranks the fit verdict: "streams" is true
     // and useless if the engine will refuse the container on load.
     let mark = if o.unsupported.is_some() {
-        "not supported yet"
+        // One word, not "not supported yet". It is the widest column in the
+        // list and it appears on one row, where it cost that row's name its
+        // tail: "qwen3-30b-a3b Q4_K_M" read as "qwen3-30b-a3b ...". The
+        // sentence with the actual reason is on the model's own panel, which is
+        // where somebody who cares reads it.
+        "unsupported"
     } else {
         match verdict(o, free_bytes) {
             Verdict::Resident => "fits",
@@ -127,16 +144,27 @@ pub fn row(o: &Offer, free_bytes: u64) -> String {
     } else {
         String::new()
     };
-    format!(
-        "{}{} {}   {}{}   needs {} - {}",
-        o.name,
-        flag,
-        o.quant,
-        human_size(o.bytes),
-        shards,
-        human_size(o.always_read),
-        mark
-    )
+    let size = human_size(o.bytes);
+    let needs = human_size(o.always_read);
+    let mut v = vec![
+        format!("{}{} {}", o.name, flag, o.quant),
+        format!("{size}{shards}"),
+    ];
+    // **Both numbers, but only when they are two numbers.** The download size
+    // and the resident requirement are different questions -- one is disk, the
+    // other is whether it runs -- and on a *dense* model they have the same
+    // answer, because every weight is always read. Printing "9.00 GB   needs
+    // 9.00 GB" spent a column saying nothing on twenty rows out of
+    // twenty-seven, and the width it cost came out of the name.
+    //
+    // What is left is the case the column exists for: 155 GB that needs 7.92,
+    // 18.6 GB that needs 998 MB. That is the whole idea of this engine, and
+    // now it is the only place the second number appears.
+    if needs != size {
+        v.push(format!("needs {needs}"));
+    }
+    v.push(mark.to_string());
+    v
 }
 
 #[cfg(test)]
@@ -181,7 +209,7 @@ mod tests {
         let mut o = offer(22_000_000_000, 2_600_000_000);
         o.unsupported = Some("needs a rope mode Chaos does not implement");
         let r = row(&o, 8_000_000_000);
-        assert!(r.contains("not supported"), "{r}");
+        assert!(r.contains("unsupported"), "{r}");
         assert!(!r.contains("streams"), "{r}");
     }
 
@@ -263,8 +291,12 @@ mod tests {
         assert!(matches!(verdict(&small, 10_000_000_000), Verdict::Resident));
     }
 
-    /// Both numbers appear, because the download size and the requirement are
-    /// different questions and a user needs each.
+    /// Both numbers appear when they are two numbers, and one when they are one.
+    ///
+    /// The download size and the resident requirement are different questions
+    /// and a user needs each -- but on a dense model they have the same answer,
+    /// and a column that says "9.00 GB   needs 9.00 GB" is width taken from the
+    /// name to repeat a number.
     #[test]
     fn the_row_carries_size_and_requirement() {
         let v4 = offer(155_000_000_000, 7_925_000_000);
@@ -273,6 +305,17 @@ mod tests {
         // 7.925 lands just under the halfway point as a float, so it formats
         // down. Pinned as it actually behaves rather than as it reads.
         assert!(r.contains("7.92 GB"), "{r}");
+
+        // A dense model reads every weight, so the two are the same number and
+        // it is printed once.
+        let dense = offer(9_000_000_000, 9_000_000_000);
+        let c = columns(&dense, 20_000_000_000);
+        assert_eq!(
+            c.iter().filter(|p| p.contains("9.00 GB")).count(),
+            1,
+            "{c:?}"
+        );
+        assert!(!row(&dense, 20_000_000_000).contains("needs"), "{c:?}");
     }
 
     #[test]
@@ -280,6 +323,29 @@ mod tests {
         let mut v4 = offer(155_000_000_000, 7_925_000_000);
         v4.shards = 5;
         assert!(row(&v4, 10_000_000_000).contains("[5 files]"));
+    }
+
+    /// The verdict is its own column, so it cannot be the thing that truncates.
+    ///
+    /// Drawn as one string it was: "needs 16.5 GB - slow, re-reads" came out as
+    /// "needs 16.5 GB - sl...", cutting the one word the row exists to say.
+    #[test]
+    fn the_verdict_is_a_column_of_its_own() {
+        let v4 = offer(155_000_000_000, 7_925_000_000);
+        let c = columns(&v4, 10_000_000_000);
+        assert!(c.len() >= 4, "{c:?}");
+        assert_eq!(c[c.len() - 1], "streams", "the verdict is the last column");
+        assert!(c[0].contains(&v4.name), "the name is the first column");
+        // No column carries the separator, so splitting the row recovers them.
+        for part in &c {
+            assert!(!part.contains(models::COLUMN_SEP), "{part:?}");
+        }
+        assert_eq!(
+            row(&v4, 10_000_000_000)
+                .split(models::COLUMN_SEP)
+                .collect::<Vec<_>>(),
+            c.iter().map(String::as_str).collect::<Vec<_>>()
+        );
     }
 
     #[test]

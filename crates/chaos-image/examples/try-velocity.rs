@@ -215,6 +215,48 @@ fn main() {
         );
     }
 
+    // **Decode what the denoiser thinks the clean image is.** A cosine cannot
+    // show an orientation error: a flipped prediction and a wrong one both
+    // differ elementwise. Decoding `x0` and looking at it beside the input
+    // photograph is the only thing that separates "wrong content" from "right
+    // content, upside down" -- and the first 1024x1024 generation came out
+    // inverted.
+    if let Ok(out) = std::env::var("CHAOS_X0_PNG") {
+        let sigma = 0.5f32;
+        let noise = Noise::seeded(1234).normals(packed.len());
+        let x: Vec<f32> = packed
+            .iter()
+            .zip(&noise)
+            .map(|(l, n)| l * (1.0 - sigma) + n * sigma)
+            .collect();
+        let pred = d
+            .forward(&dit::Inputs {
+                latent: &x,
+                grid_w: gw as i64,
+                grid_h: gh as i64,
+                timestep: flow::timestep_for(sigma),
+                context: &[],
+                context_len: 0,
+            })
+            .expect("forward");
+        let mut x0: Vec<f32> = x.iter().zip(&pred).map(|(xi, v)| xi - sigma * v).collect();
+        if let Some((m, v)) = vae::latent_stats(&st, &file) {
+            vae::denormalize_latent(&mut x0, &m, &v);
+        }
+        let latent0 = vae::unpack_latent(&x0, gw, gh, c.ae_channels as usize, c.patch as usize);
+        let (px, _) = vae::decode_planned(&st, &file, &latent0, lw as i64, lh as i64, threads)
+            .expect("decode");
+        let rgb8 = vae::to_rgb8(&px, w, h);
+        if let Some(bytes) = chaos_image::png::encode_rgb(w as u32, h as u32, &rgb8) {
+            let _ = std::fs::write(&out, &bytes);
+            println!(
+                "
+wrote {out} -- the denoiser's idea of the clean image."
+            );
+            println!("If it is the photograph the right way up, nothing here flips.");
+        }
+    }
+
     println!("\ncos(v) near +1 is a working denoiser, near -1 an inverted sign.");
     println!("cos(-L) is whether it can see the image, cos(N) whether it can see");
     println!("the noise. x0 err under 1.0 means its guess at the clean latent");

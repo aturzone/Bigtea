@@ -38,9 +38,23 @@ chaos-ggml = { path = "../chaos-ggml" }
 chaos-gguf = { path = "../chaos-gguf" }
 chaos-model = { path = "../chaos-model" }
 
-# Only the examples need it: the text encoder takes token ids, and something has
-# to turn a prompt into them.
+# The text encoder takes token ids, and something has to turn a prompt into
+# them.
 chaos-tokenizer = { path = "../chaos-tokenizer" }
 
-# No build script: this crate produces no binaries, and
-# `cargo:rustc-link-arg-bins` is an error in a crate that has none.
+[build-dependencies]
+# For the icon. `chaos-draw` is a shipped binary now, and a binary without one
+# gets the blank Windows default in every Explorer view.
+chaos-build = { path = "../chaos-build" }
+
+# Draw an image from a prompt.
+#
+# **An example until v0.0.12.** The comment on it said it would become a binary
+# "when there is evidence, not before", and the evidence is now in: the
+# autoencoder round-trips a photograph at 36-41 dB with the check ablated three
+# ways, the text encoder answers " Paris" at logit 22.58, the denoiser scores
+# 0.85 velocity cosine against a real latent, and at 1024x1024 the output is
+# photorealistic. Object form is still imperfect and `--help` says so.
+[[bin]]
+name = "chaos-draw"
+path = "src/bin/chaos-draw.rs"

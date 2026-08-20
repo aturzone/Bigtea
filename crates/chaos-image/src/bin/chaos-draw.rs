@@ -1,27 +1,52 @@
-//! Draw an image from a prompt.
+//! `chaos-draw` — an image from a prompt, on a machine that cannot hold the models.
 //!
 //! ```text
-//! cargo run --release -p chaos-image --example draw -- "a red apple on a white table" \
-//!     --grid 32 --steps 20 --cfg 4 --out apple.png
+//! chaos-draw "a red apple on a white table" --grid 64 --steps 20 --out apple.png
 //! ```
 //!
-//! **An example rather than a binary, on purpose.** Everything it calls is
-//! tested, and the autoencoder at the end is verified to 36 dB — but nobody has
-//! yet shown that the *whole chain* produces the right picture, and a diffusion
-//! pipeline that is subtly wrong produces a plausible one. It becomes
-//! `chaos-draw` when there is evidence, not before.
+//! Four files, 16.7 GB: **Qwen3-VL-8B** turns the prompt into conditioning, two
+//! copies of **Ideogram 4** — the conditional model and a separately trained
+//! unconditional twin, 5.26 GiB each — denoise a latent, and the **FLUX.2**
+//! autoencoder turns it into pixels. `chaos-pull` fetches them.
+//!
+//! # What is verified, and what is not
+//!
+//! **This was an example until v0.0.12**, held back with the note that it would
+//! become a binary "when there is evidence, not before" — because a diffusion
+//! pipeline that is subtly wrong produces a *plausible* picture, so running is
+//! not evidence and neither is looking. What is now measured:
+//!
+//! - the autoencoder round-trips real photographs at **36.09–40.89 dB**, with
+//!   the check ablated three ways first (each deliberate bug still produced a
+//!   recognisable picture, and each scored 14–32 dB);
+//! - the text encoder answers `" Paris"` after "The capital of France is" at
+//!   **logit 22.58**, so its attention, rotary positions, QK norm, grouped-query
+//!   broadcasting and causal mask are all right;
+//! - the denoiser scores **0.85 velocity cosine** against a real latent at
+//!   512×512, decomposed into its two terms rather than taken as one number.
+//!
+//! **What is still imperfect is object form.** At 1024×1024 the output is
+//! photorealistic — skin texture, individual hairs, catchlights — and it follows
+//! the prompt's colour and scene. A named object may still come out the wrong
+//! shape. Structured, JSON-shaped prompts condition roughly three times as
+//! strongly as a bare phrase, which is what these models were trained on.
 //!
 //! # What it costs
 //!
 //! Both denoisers are dense: every one of their 5.26 GiB is read on every step,
-//! twice per step when guidance is on. `--grid` is the lever — the token count
-//! is its square, and attention is quadratic in that again.
+//! and twice per step when guidance is on. `--grid` is the lever — the token
+//! count is its square, and attention is quadratic in that again.
 //!
-//! | grid | image | tokens |
-//! |---|---|---|
-//! | 16 | 256x256 | 256 |
-//! | 32 | 512x512 | 1024 |
-//! | 64 | 1024x1024 | 4096 |
+//! | grid | image | tokens | note |
+//! |---|---|---|---|
+//! | 16 | 256×256 | 256 | quick, and flat |
+//! | 32 | 512×512 | 1024 | faceted |
+//! | 64 | 1024×1024 | 4096 | photorealistic, and hours on a laptop |
+//!
+//! Memory is the other ceiling, and an exhausted ggml arena aborts the process
+//! with no message — so the requirement is printed before anything starts, and
+//! a request too large to decode is refused up front with the largest grid that
+//! would work.
 
 use chaos_image::pipeline::{generate, Paths, Request, Stage};
 use chaos_image::png;
@@ -72,8 +97,17 @@ fn main() {
                 dir = std::path::PathBuf::from(take(i));
                 i += 2;
             }
+            "-h" | "--help" => {
+                usage();
+                return;
+            }
+            "--version" => {
+                println!("chaos-draw {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
             other if other.starts_with("--") => {
-                eprintln!("draw: unknown option {other:?}");
+                eprintln!("chaos-draw: unknown option {other:?}\n");
+                usage();
                 std::process::exit(2);
             }
             other => {
@@ -85,9 +119,7 @@ fn main() {
         }
     }
     if req.prompt.is_empty() {
-        eprintln!(
-            "usage: draw \"a prompt\" [--grid N] [--steps N] [--cfg F] [--seed N] [--out FILE]"
-        );
+        usage();
         std::process::exit(2);
     }
 
@@ -195,4 +227,40 @@ fn main() {
     if var.sqrt() < 2.0 {
         println!("             NEARLY FLAT -- that is not an image");
     }
+}
+
+/// What this does and what it costs, before it is asked to spend two hours.
+///
+/// **The caveat is in the help text, not only in the README.** These models
+/// follow colour and scene and can still get an object's form wrong, and
+/// somebody who reads that after waiting has been misled by omission.
+fn usage() {
+    println!(
+        "chaos-draw {} -- an image from a prompt",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!();
+    println!("usage: chaos-draw \"a prompt\" [options]");
+    println!();
+    println!("  --grid N       latent grid; the image is 16x this. 16, 32, 64 (default 32)");
+    println!("  --steps N      denoising steps (default 20)");
+    println!("  --cfg F        guidance; 1 turns it off and halves the work (default 4)");
+    println!("  --seed N       reproducible noise");
+    println!("  -t, --threads N");
+    println!("  -o, --out FILE where to write the PNG (default chaos-image.png)");
+    println!("  --models DIR   where the four model files are");
+    println!("  --version");
+    println!();
+    println!("  grid 16 -> 256x256, 256 tokens      quick, and flat");
+    println!("  grid 32 -> 512x512, 1024 tokens     faceted");
+    println!("  grid 64 -> 1024x1024, 4096 tokens   photorealistic, and slow");
+    println!();
+    println!("Needs four files (16.7 GB): Qwen3-VL-8B for the prompt, two Ideogram 4");
+    println!("denoisers, and the FLUX.2 autoencoder. `chaos-pull` fetches them.");
+    println!();
+    println!("The autoencoder is verified to 36-41 dB and the text encoder is diffed");
+    println!("against a reference. What is still imperfect is OBJECT FORM: colour and");
+    println!("scene follow the prompt, a named object may come out the wrong shape.");
+    println!("Structured, JSON-shaped prompts condition about 3x more strongly than a");
+    println!("bare phrase -- that is what these models were trained on.");
 }

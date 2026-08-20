@@ -115,6 +115,8 @@ pub const ID_AUTO: i32 = 308;
 pub const ID_FORCE: i32 = 309;
 pub const ID_SAVE: i32 = 310;
 pub const ID_RESET: i32 = 311;
+/// Pick the models folder with a dialog instead of typing a path.
+pub const ID_BROWSE_MODELS: i32 = 312;
 
 // The shell: 400. Present on every page.
 pub const ID_NAV_CHAT: i32 = 401;
@@ -145,6 +147,15 @@ pub const IDM_MANUAL: i32 = 530;
 pub const IDM_RELEASES: i32 = 531;
 pub const IDM_CRASH_LOG: i32 = 532;
 pub const IDM_ABOUT: i32 = 533;
+pub const IDM_CHECK_UPDATE: i32 = 534;
+pub const IDM_INSTALL_UPDATE: i32 = 535;
+
+// The notification-area menu. Not on the menu bar, so `every_menu_command_is_handled`
+// would look for them there -- they are 6xx to keep that distinction visible.
+/// Bring the window back from the notification area.
+pub const IDM_TRAY_OPEN: i32 = 601;
+/// Quit for real, as opposed to closing the window.
+pub const IDM_TRAY_EXIT: i32 = 602;
 
 /// The navigation button for a page.
 pub fn nav_id(p: Page) -> i32 {
@@ -207,6 +218,7 @@ pub fn controls(p: Page) -> &'static [i32] {
             ID_FORCE,
             ID_SAVE,
             ID_RESET,
+            ID_BROWSE_MODELS,
         ],
     }
 }

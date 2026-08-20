@@ -240,6 +240,10 @@ impl TextEncoder {
     ) -> Result<Encoded, Error> {
         let c = self.config;
         let t = ids.len() as i64;
+        // `v` names the output of block `v - 1`. Not only read from the
+        // reference: the list ends at 36 and this container has 36 blocks, so
+        // reading `v` as the block index would ask for block 36 and there is no
+        // such thing. Tried, and it fails exactly that way.
         let wanted: Vec<u32> = OUT_LAYERS.iter().map(|v| v - 1).collect();
 
         // The embedding, in its own context: `token_embd` is 373 MB and is not

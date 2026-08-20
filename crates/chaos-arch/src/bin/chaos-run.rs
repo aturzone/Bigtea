@@ -1436,6 +1436,7 @@ fn usage_rest() -> ExitCode {
     eprintln!("  --verbosity N       0 quiet, 1 normal, 2+ verbose");
     eprintln!("  --no-perf           omit the timing summary");
     eprintln!("  --version           print the version and exit");
+    eprintln!("  --update            check for a newer Chaos and install it");
     eprintln!("  --perplexity        score a corpus instead of generating");
     eprintln!("  --ppl-chunk N       perplexity chunk size (default 512)");
     eprintln!("  --seed S            reproducible sampling");
@@ -1450,6 +1451,90 @@ fn usage_rest() -> ExitCode {
     eprintln!("  --no-repack         keep resident weights in their stored layout");
     eprintln!("                      (repacking is on by default: 1.35x prefill)");
     ExitCode::from(2)
+}
+
+/// `--update`: fetch a newer Chaos and hand over to its installer.
+///
+/// Atur asked for the update flow to cover *"all apps and exports"*, and the
+/// window is one of twelve binaries a release ships. Somebody who only ever
+/// types `chaos-run` should not have to open a GUI to find out a release
+/// exists, so the same check `chaos-app` makes on startup is a flag here.
+///
+/// **One installer updates everything.** It carries the whole payload -- this
+/// binary, `chaos-serve`, the window, all of it -- so there is nothing to do
+/// per-binary and no version skew to manage.
+fn update_in_place() -> ExitCode {
+    use chaos_model::release;
+    let running = release::running();
+    println!("chaos-run {}", running.text());
+    print!("checking for a newer release... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    let outcome = release::check();
+    println!();
+    println!("{}", outcome.line());
+
+    let release::Outcome::Available { version, url } = outcome else {
+        // Up to date, no asset for this platform, or the check failed. Each
+        // says why in its own line above; only a failure is an error exit.
+        return match outcome {
+            release::Outcome::Failed(_) => ExitCode::FAILURE,
+            _ => ExitCode::SUCCESS,
+        };
+    };
+
+    // On Windows the asset is an installer that can simply be run. Everywhere
+    // else it is a tarball, and unpacking it over a prefix this process may be
+    // executing from is a different job with different failure modes -- so say
+    // where it is and stop, rather than half-doing it.
+    if !cfg!(windows) {
+        println!("\n  {url}\n");
+        println!("Unpack it over your install prefix. On Debian and Ubuntu the .deb");
+        println!("from the same release upgrades in place instead.");
+        return ExitCode::SUCCESS;
+    }
+
+    let name = release::asset_for_platform(&version);
+    let dest = std::env::temp_dir().join(&name);
+    print!("\nDownload {name} and start the installer? [y/N] ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let mut line = String::new();
+    if std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).is_err()
+        || !matches!(line.trim(), "y" | "Y" | "yes")
+    {
+        println!("nothing downloaded -- {url}");
+        return ExitCode::SUCCESS;
+    }
+
+    println!("downloading to {}", dest.display());
+    let ok = std::process::Command::new("curl")
+        .args(release::asset_curl_args())
+        .arg("-o")
+        .arg(&dest)
+        .arg(&url)
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false);
+    let bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    if !ok || bytes < release::MIN_INSTALLER_BYTES {
+        eprintln!("the download failed ({bytes} bytes). Fetch it by hand:\n  {url}");
+        return ExitCode::FAILURE;
+    }
+
+    // The installer replaces this very binary, and Windows keeps a running
+    // executable's file open -- so it is started with its window and this
+    // process exits immediately. By the time anyone presses INSTALL there is
+    // nothing holding the file.
+    match std::process::Command::new(&dest).spawn() {
+        Ok(_) => {
+            println!("\nthe installer is open. Close this window; your models are not touched.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("could not start {} ({e})", dest.display());
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -1484,6 +1569,10 @@ fn main() -> ExitCode {
                 println!("chaos-run {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
+            // Here as well as in the main loop, for the same reason `--version`
+            // is: asking to be updated should not first require a model that
+            // loads.
+            "--update" => return update_in_place(),
             // One list rather than two that drift apart: this falls into the
             // same usage block the no-argument path uses.
             "--help" | "-h" => return usage(),
@@ -2616,6 +2705,9 @@ fn main() -> ExitCode {
             "--version" => {
                 println!("chaos-run {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
+            }
+            "--update" => {
+                return update_in_place();
             }
             // --- RoPE, for a container whose metadata is wrong or absent ---
             "--rope-freq-base" => {

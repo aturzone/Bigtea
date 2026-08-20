@@ -156,6 +156,9 @@ pub const WM_DESTROY: u32 = 0x0002;
 pub const WM_SIZE: u32 = 0x0005;
 pub const WM_PAINT: u32 = 0x000F;
 pub const WM_CLOSE: u32 = 0x0010;
+/// Does nothing, which is the point: posting it wakes a message loop.
+pub const WM_NULL: u32 = 0x0000;
+pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
@@ -164,6 +167,74 @@ pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
 pub const WM_SETFONT: u32 = 0x0030;
 /// Our own: the worker thread has produced output and the UI should read it.
 pub const WM_APP_TICK: u32 = 0x8000 + 1;
+/// Our own: something happened to the notification-area icon.
+///
+/// **The shell sends this to the window, not to the icon** -- an icon is not a
+/// window and has no procedure of its own. `wParam` is the icon's id and
+/// `lParam` is the mouse message.
+pub const WM_APP_TRAY: u32 = 0x8000 + 2;
+
+// -- the notification area ---------------------------------------------------
+
+pub const NIM_ADD: u32 = 0x0000;
+pub const NIM_MODIFY: u32 = 0x0001;
+pub const NIM_DELETE: u32 = 0x0002;
+/// Which fields of `NOTIFYICONDATAW` are filled in.
+pub const NIF_MESSAGE: u32 = 0x0001;
+pub const NIF_ICON: u32 = 0x0002;
+pub const NIF_TIP: u32 = 0x0004;
+/// The balloon fields (`szInfo`, `szInfoTitle`, `dwInfoFlags`) are meant.
+pub const NIF_INFO: u32 = 0x0010;
+pub const NIIF_INFO: u32 = 0x0001;
+
+pub const WM_LBUTTONUP: u32 = 0x0202;
+pub const WM_LBUTTONDBLCLK: u32 = 0x0203;
+pub const WM_RBUTTONUP: u32 = 0x0205;
+
+/// Return the chosen command instead of posting it, so the caller decides.
+pub const TPM_RETURNCMD: u32 = 0x0100;
+pub const TPM_RIGHTBUTTON: u32 = 0x0002;
+
+pub const SW_RESTORE: i32 = 9;
+pub const SW_SHOWNORMAL: i32 = 1;
+
+/// What the shell needs to put an icon in the notification area.
+///
+/// **`cbSize` decides which version of this structure the shell reads**, and
+/// the layout has grown four times. This is the Vista-and-later one, declared
+/// in full so `size_of` matches what the shell expects; a short one is rejected
+/// silently and the icon simply never appears.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NOTIFYICONDATAW {
+    pub cbSize: u32,
+    pub hWnd: HWND,
+    pub uID: u32,
+    pub uFlags: u32,
+    pub uCallbackMessage: u32,
+    pub hIcon: HICON,
+    /// 128 UTF-16 units. The tooltip, and it is truncated rather than wrapped.
+    pub szTip: [u16; 128],
+    pub dwState: u32,
+    pub dwStateMask: u32,
+    pub szInfo: [u16; 256],
+    /// A union of a timeout and a version in the real header; the version is
+    /// what anything modern sets.
+    pub uVersion: u32,
+    pub szInfoTitle: [u16; 64],
+    pub dwInfoFlags: u32,
+    pub guidItem: [u8; 16],
+    pub hBalloonIcon: HICON,
+}
+
+impl Default for NOTIFYICONDATAW {
+    fn default() -> Self {
+        // SAFETY: every field is a plain integer, a pointer or an array of
+        // them, so an all-zero value is valid and is what the shell expects for
+        // "not set".
+        unsafe { std::mem::zeroed() }
+    }
+}
 
 pub const WM_DRAWITEM: u32 = 0x002B;
 pub const ODS_SELECTED: u32 = 0x0001;
@@ -343,6 +414,18 @@ extern "system" {
 
 #[link(name = "kernel32")]
 extern "system" {
+    /// A named object every process on the desktop can see.
+    ///
+    /// **This is the single-instance mechanism**, and the useful part is not
+    /// the mutex but `GetLastError` returning `ERROR_ALREADY_EXISTS` while the
+    /// call still *succeeds*: the second instance learns it is second without
+    /// racing anything.
+    pub fn CreateMutexW(
+        lpMutexAttributes: *mut c_void,
+        bInitialOwner: BOOL,
+        lpName: *const u16,
+    ) -> *mut c_void;
+    pub fn GetLastError() -> u32;
     pub fn GetModuleHandleW(lpModuleName: *const u16) -> HINSTANCE;
 }
 
@@ -565,6 +648,14 @@ pub const VK_ESCAPE: u16 = 0x1B;
 pub const VK_RETURN: u16 = 0x0D;
 pub const VK_F5: u16 = 0x74;
 
+// The notification area, which lives in the shell rather than in user32.
+// `SHBrowseForFolderW` is already declared elsewhere against the same library;
+// this block is separate only because it sits beside the tray constants.
+#[link(name = "shell32")]
+extern "system" {
+    pub fn Shell_NotifyIconW(dwMessage: u32, lpData: *mut NOTIFYICONDATAW) -> BOOL;
+}
+
 #[link(name = "user32")]
 extern "system" {
     pub fn CreateMenu() -> HMENU;
@@ -582,6 +673,22 @@ extern "system" {
     pub fn CreateAcceleratorTableW(paccel: *const ACCEL, cAccel: i32) -> HACCEL;
     pub fn TranslateAcceleratorW(hWnd: HWND, hAccTable: HACCEL, lpMsg: *mut MSG) -> i32;
     pub fn SetFocus(hWnd: HWND) -> HWND;
+    pub fn TrackPopupMenu(
+        hMenu: HMENU,
+        uFlags: u32,
+        x: i32,
+        y: i32,
+        nReserved: i32,
+        hWnd: HWND,
+        prcRect: *const RECT,
+    ) -> i32;
+    pub fn GetCursorPos(lpPoint: *mut POINT) -> BOOL;
+    /// Find a window by class name. Used to hand a second launch over to the
+    /// instance already running.
+    pub fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> HWND;
+    pub fn SetForegroundWindow(hWnd: HWND) -> BOOL;
+    pub fn IsWindowVisible(hWnd: HWND) -> BOOL;
+    pub fn DestroyMenu(hMenu: HMENU) -> BOOL;
     pub fn SetTimer(hWnd: HWND, nIDEvent: usize, uElapse: u32, lpTimerFunc: usize) -> usize;
     pub fn KillTimer(hWnd: HWND, uIDEvent: usize) -> BOOL;
     pub fn TrackMouseEvent(lpEventTrack: *mut TRACKMOUSEEVENT) -> BOOL;
@@ -724,6 +831,159 @@ extern "system" {
         ppsmemCounters: *mut PROCESS_MEMORY_COUNTERS,
         cb: u32,
     ) -> BOOL;
+    pub fn LoadLibraryW(lpLibFileName: *const u16) -> HANDLE;
+    pub fn GetProcAddress(hModule: HANDLE, lpProcName: *const i8) -> *mut c_void;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    pub fn SystemParametersInfoW(
+        uiAction: u32,
+        uiParam: u32,
+        pvParam: *mut c_void,
+        fWinIni: u32,
+    ) -> BOOL;
+    pub fn SetProcessDPIAware() -> BOOL;
+}
+
+/// What `SHBrowseForFolderW` is given.
+#[repr(C)]
+pub struct BROWSEINFOW {
+    pub hwndOwner: HWND,
+    pub pidlRoot: *mut c_void,
+    pub pszDisplayName: *mut u16,
+    pub lpszTitle: *const u16,
+    pub ulFlags: u32,
+    pub lpfn: Option<unsafe extern "system" fn(HWND, u32, isize, isize) -> i32>,
+    pub lParam: isize,
+    pub iImage: i32,
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    pub fn SHBrowseForFolderW(lpbi: *mut BROWSEINFOW) -> *mut c_void;
+    pub fn SHGetPathFromIDListW(pidl: *mut c_void, pszPath: *mut u16) -> BOOL;
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    pub fn CoInitializeEx(pvReserved: *mut c_void, dwCoInit: u32) -> i32;
+    pub fn CoTaskMemFree(pv: *mut c_void);
+}
+
+/// Ask the user for a folder, returning what they picked.
+///
+/// # Why a dialog and not a text box
+///
+/// The models folder was a field you typed a path into. A typo there is silent:
+/// the list simply comes up empty, and nothing says the path does not exist.
+/// A picked folder cannot be misspelled, and it starts from where the setting
+/// already points, so "change it slightly" is a click rather than a retype.
+///
+/// `SHBrowseForFolderW` rather than the newer `IFileOpenDialog`: one call, no
+/// COM interface pointers to release by hand, present on every Windows this
+/// ships to.
+pub fn pick_folder(owner: HWND, title: &str, start: Option<&str>) -> Option<String> {
+    // BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE — a real folder, resizable.
+    const FLAGS: u32 = 0x0001 | 0x0040;
+    let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let start_w: Option<Vec<u16>> = start
+        .filter(|p| !p.is_empty())
+        .map(|p| p.encode_utf16().chain(std::iter::once(0)).collect());
+
+    // SAFETY: every pointer is to a local that outlives the call, and the
+    // callback only preselects a starting folder.
+    unsafe {
+        // COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE. Already-initialised
+        // returns a failure code that is not one, which is why it is ignored.
+        let _ = CoInitializeEx(std::ptr::null_mut(), 0x2 | 0x4);
+        let mut bi = BROWSEINFOW {
+            hwndOwner: owner,
+            pidlRoot: std::ptr::null_mut(),
+            pszDisplayName: std::ptr::null_mut(),
+            lpszTitle: title_w.as_ptr(),
+            ulFlags: FLAGS,
+            lpfn: start_w.as_ref().map(|_| browse_callback as _),
+            lParam: start_w.as_ref().map_or(0, |v| v.as_ptr() as isize),
+            iImage: 0,
+        };
+        let pidl = SHBrowseForFolderW(&mut bi);
+        if pidl.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 260];
+        let ok = SHGetPathFromIDListW(pidl, buf.as_mut_ptr());
+        CoTaskMemFree(pidl);
+        if ok == 0 {
+            return None;
+        }
+        let n = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..n]))
+    }
+}
+
+/// Preselects the folder the setting already names.
+///
+/// `BFFM_INITIALIZED` is 1 and `BFFM_SETSELECTIONW` is 0x467.
+unsafe extern "system" fn browse_callback(hwnd: HWND, msg: u32, _l: isize, data: isize) -> i32 {
+    if msg == 1 && data != 0 {
+        SendMessageW(hwnd, 0x467, 1, data);
+    }
+    0
+}
+
+/// Screen coordinates of the primary monitor's **work area** — the desktop
+/// minus the taskbar.
+pub fn work_area() -> Option<(i32, i32, i32, i32)> {
+    let mut r = RECT::default();
+    // SPI_GETWORKAREA = 0x0030. SAFETY: writes into a local RECT.
+    let ok = unsafe { SystemParametersInfoW(0x0030, 0, &mut r as *mut RECT as *mut c_void, 0) };
+    (ok != 0).then_some((r.left, r.top, r.right, r.bottom))
+}
+
+/// Tell Windows this process draws its own pixels at the monitor's real
+/// resolution.
+///
+/// # Why a window can open in the wrong place without this
+///
+/// A process that says nothing is **DPI-virtualised**: on a display at 125% it
+/// renders into a 96-DPI surface and the system stretches the result. Text goes
+/// soft, and every coordinate the app computes is in a made-up space — a screen
+/// reported as 1536x864 that is really 1920x1080. So a window asked for at
+/// (120, 80) does not land at (120, 80), and a size chosen to fit the desktop
+/// does not fit it.
+///
+/// Per-monitor v2 is the mode that also keeps this right when the window is
+/// dragged between monitors of different scaling, which is the case on the
+/// machine this was found on: 1920x1080 beside a scaled 1536x864.
+///
+/// Called before any window exists, because awareness cannot be changed
+/// afterwards. Best effort: on Windows 8.1 and older the newer entry points are
+/// absent, and `SetProcessDPIAware` is the whole of what is available.
+pub fn become_dpi_aware() {
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4.
+    const PER_MONITOR_V2: isize = -4;
+    // SAFETY: both are pure process-wide settings taking no pointers we own.
+    unsafe {
+        let user32 = LoadLibraryW(wide_z("user32.dll").as_ptr());
+        if !user32.is_null() {
+            // A C string literal, so the NUL is in the constant and cannot be
+            // forgotten -- `GetProcAddress` reads until one.
+            let name = c"SetProcessDpiAwarenessContext";
+            let f = GetProcAddress(user32, name.as_ptr());
+            if !f.is_null() {
+                let f: extern "system" fn(isize) -> BOOL = std::mem::transmute(f);
+                if f(PER_MONITOR_V2) != 0 {
+                    return;
+                }
+            }
+        }
+        SetProcessDPIAware();
+    }
+}
+
+fn wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// The working set of another process, in bytes, or `None` if it cannot be
@@ -966,6 +1226,12 @@ pub const CBS_OWNERDRAWFIXED: u32 = 0x0010;
 pub const CBS_HASSTRINGS: u32 = 0x0200;
 
 pub const CB_ADDSTRING: u32 = 0x0143;
+/// Widen the *open* list past the closed control.
+///
+/// Without it the drop-down is exactly as wide as the box, so an option whose
+/// label does not fit is unreadable in the one place it has to be read -- which
+/// is what "Processor (the GPU is not used her..." was.
+pub const CB_SETDROPPEDWIDTH: u32 = 0x0160;
 pub const CB_RESETCONTENT: u32 = 0x014B;
 pub const CB_SETCURSEL: u32 = 0x014E;
 pub const CB_GETCURSEL: u32 = 0x0147;

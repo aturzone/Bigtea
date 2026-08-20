@@ -28,7 +28,7 @@ and pressing UNINSTALL.
 ```
 +----------------+----------------------------------------------+
 | ✳ CHAOS        |  Chat                                        |
-|   v0.0.11      |  Talk to the running model, or point a       |
+|   v0.0.12      |  Talk to the running model, or point a       |
 |                |  coding agent at its endpoint.               |
 | ▎CHAT          |                                              |
 |  MODELS        |  +----------------------------------------+  |
@@ -118,6 +118,66 @@ The key is on the model's page and on MONITOR while a model runs.
 **DELETE** removes an installed model and *every shard* of it, after telling you
 how many files and how many bytes. It refuses while that model is running.
 
+### Running in the background
+
+**Closing the window does not stop Chaos.** Atur's ask, and the right default: a
+model can take four minutes to load, and throwing that away because somebody
+closed a window is expensive. The X hides the window, the model stays loaded,
+the endpoint stays up, and Chaos moves to the notification area.
+
+| | |
+|---|---|
+| **X** / `Alt+F4` | hides the window; everything keeps running |
+| click the tray icon | brings the window back |
+| right-click the tray icon | Open, Stop *model*, Exit |
+| **File ▸ Exit** | stops the engine, frees the memory, ends the process |
+
+**The icon says what is loaded.** Hover it: *"Chaos — qwen3-4b is running"*, or
+*"Chaos — no model running"*. That is the point of having it — background
+running that you cannot see is indistinguishable from an application you forgot
+to close, and an engine holding 7 GiB with nothing on screen is a bug this app
+has already had once.
+
+The first time you close the window, Chaos says so with a notification, once per
+run. On Windows 11 the icon starts **behind the `^`** in the tray; that is where
+the system puts every new one, and pinning it is a Windows setting rather than
+something an application can do for you.
+
+**Launching Chaos again brings the window back.** One Chaos runs at a time — a
+second launch finds the first, restores its window and stops. So the shortcut,
+the Start menu and the taskbar all do the obvious thing whether the window is on
+screen or in the tray.
+
+> **Exit is the only thing that stops the engine.** Not the X, not the taskbar's
+> close, not minimising. If you want the memory back, use Exit — or **STOP** on
+> the strip, which unloads the model and leaves the window open.
+
+### Point an agent at Chaos
+
+Chaos speaks the OpenAI API on `127.0.0.1`, so anything that talks to OpenAI
+talks to Chaos. **MODELS ▸ COPY ENDPOINT** (or `Ctrl+E`) puts the address on the
+clipboard, with the API key beside it if one is set.
+
+| the client asks for | give it |
+|---|---|
+| base URL | `http://127.0.0.1:8231/v1` |
+| API key | whatever **Model ▸ Require an API key** shows, or any value if none is set |
+| model name | the name in the list — or anything; one model is loaded at a time |
+
+That covers Hermes, Claude Code, Continue, Aider, Zed, and anything else with an
+"OpenAI-compatible endpoint" box. **Model ▸ Test connection** sends a real
+request through the same path a client uses and writes the answer into the
+transcript, so a misconfiguration is a sentence rather than a silent failure in
+somebody else's application.
+
+**The port is yours to choose** — SETTINGS ▸ *port*, then SAVE. Change it while
+a model is running and the change applies the next time one is loaded; the
+strip always shows the address actually in use, not the one in the file.
+
+Because the window keeps the engine alive in the background, an agent can go on
+using the endpoint with no Chaos window on screen. That is the arrangement to
+aim for: load a model once, close the window, and leave it serving.
+
 ### An unfinished download
 
 A row marked `(unfinished)` is a container that stopped part way. Chaos knows
@@ -172,9 +232,42 @@ engine setting to measured, and leaves the theme alone.
 **File** — rescan (`F5`), open the models folder, exit.
 **Model** — load (`Ctrl+L`), stop, download, delete, copy endpoint (`Ctrl+E`).
 **View** — the four pages, and light or dark.
-**Help** — manual, releases, crash log, about.
+**Help** — manual, check for updates, install update, releases, crash log, about.
 
 Commands that cannot be run right now are greyed rather than left to be tried.
+
+## Updating
+
+**Chaos tells you when there is a newer release.** It asks GitHub once, shortly
+after the window opens, and says nothing at all unless something newer exists —
+if one does, it offers to fetch the installer and hand over to it.
+
+| | |
+|---|---|
+| `Help ▸ Check for updates` | asks now, and always answers, even to say you are current |
+| `Help ▸ Install update…` | downloads this platform's installer and starts it |
+| `chaos-run --update` | the same, from a terminal |
+
+**Chaos closes when the installer starts.** Windows keeps a running
+executable's file open, so the installer cannot replace `chaos-app.exe` while
+the window is up — it would stop with *"cannot write chaos-app.exe. Close Chaos
+and run this again."* Letting it hand over cleanly is the whole reason for the
+step.
+
+**One update updates everything.** The installer carries all twelve binaries —
+the window, `chaos-run`, `chaos-serve`, `chaos-pull` and the rest — so there is
+nothing to update per binary and no version skew to manage.
+
+**Your models are never touched.** They live outside the install prefix
+(`%USERPROFILE%\.chaos\models` by default) and neither the installer nor the
+uninstaller goes near them. Your settings survive too.
+
+> **To turn the automatic check off**, set `CHAOS_NO_UPDATE_CHECK=1` in the
+> environment. The menu items still work; nothing is asked on startup.
+
+If the download fails, Chaos says so and gives you the URL — no update is ever
+applied from a file it could not verify the size of, because `curl` reports
+success after saving an error page just as happily as after saving an installer.
 
 ## Light and dark
 
@@ -232,9 +325,16 @@ Named plainly rather than left to be discovered:
 - Download progress is measured from the bytes on disk, so a paused or
   restarted fetch is still tracked; it cannot show which *shard* of a
   five-part container is in flight.
-- No tray icon — closing the window is the way to quit.
+- The notification-area icon is where Windows 11 puts a new one: **behind the
+  `^`**, not on the taskbar itself. Drag it out, or **Settings ▸ Personalisation
+  ▸ Taskbar ▸ Other system tray icons** to pin it. There is no API that puts it
+  there for you; Windows decides.
 - MONITOR cannot show streamed bytes or cache residency; the engine measures
   them but does not report them over the socket.
 - The menu bar does not follow dark mode. See above for what was tried.
+- **No image page.** `chaos-draw` ships in the same install and draws from a
+  prompt; the window does not drive it yet. A picture at 1024x1024 is hours of
+  work on a laptop, and a progress surface honest about that is its own job
+  rather than a button bolted onto MODELS.
 
 `docs/graph/backlog/app-to-production.md` tracks these.
