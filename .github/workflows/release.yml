@@ -188,8 +188,22 @@ jobs:
 
       - name: Package
         shell: bash
+        env:
+          DRY_TAG: ${{ inputs.tag }}
         run: |
-          VER="${GITHUB_REF_NAME:-dev}"
+          # **The dispatch input is what makes a dry run a dry run**, and it was
+          # declared and never read: `GITHUB_REF_NAME` on a `workflow_dispatch`
+          # from a branch is the *branch*, so a dry run from `ticket/r68-app-ui`
+          # built `Chaos-ticket/r68-app-ui-linux-x86_64.tar.gz` -- a slash, so
+          # `mkdir -p` made a nested directory, `tar` wrote the archive inside
+          # it, and `ls Chaos-*.tar.gz` in the workspace root found nothing.
+          # Three of five builds "failed" at packaging having built perfectly.
+          VER="${DRY_TAG:-${GITHUB_REF_NAME:-dev}}"
+          # A slash here is a directory, not a name. Nothing downstream expects
+          # one, so refuse rather than produce an archive in the wrong place.
+          case "$VER" in
+            */*) echo "::error::version ${VER} contains a slash; pass a tag to the dispatch input"; exit 1 ;;
+          esac
           # **One prefix, one version format, platform and architecture
           # always present.** The v0.0.8 assets were a mix of `chaos-` and
           # `Chaos-`, and a release page where the same project spells its own
@@ -232,9 +246,13 @@ jobs:
       - name: Linux packages (.deb, AppImage)
         if: matrix.name == 'linux-x86_64'
         shell: bash
+        env:
+          DRY_TAG: ${{ inputs.tag }}
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
-          VER="${GITHUB_REF_NAME:-dev}"
+          # Same as Package: the dispatch input wins, so a dry run names its
+          # packages after the tag it is rehearsing rather than after a branch.
+          VER="${DRY_TAG:-${GITHUB_REF_NAME:-dev}}"
           bash scripts/make-linux-packages.sh "$VER" "target/release"
           ls -la *.deb *.AppImage 2>/dev/null || true
 
