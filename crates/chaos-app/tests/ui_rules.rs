@@ -884,3 +884,28 @@ fn a_second_launch_hands_over_to_the_first() {
         "the guard runs after a window class is registered, which is too late"
     );
 }
+
+/// The in-app update must actually end the process, not hide the window.
+///
+/// **This broke the moment closing began hiding.** `install_update` posted a
+/// bare `WM_CLOSE`, which now hides to the notification area and leaves the
+/// process alive -- so the installer would stop on "cannot write
+/// chaos-app.exe", the binary it must replace still being executed. The failure
+/// would land after the download, with no window on screen, which is the
+/// hardest possible place to explain it.
+#[test]
+fn installing_an_update_really_exits() {
+    let src = main_rs();
+    let i = src
+        .find("if shared().lock().unwrap().update_quit")
+        .expect("no update_quit check");
+    let body = &src[i..(i + 900).min(src.len())];
+    assert!(
+        body.contains("quit(h)"),
+        "the update path closes the window instead of quitting, so the          installer will find chaos-app.exe locked"
+    );
+    assert!(
+        !body.contains("PostMessageW(h, WM_CLOSE"),
+        "a bare WM_CLOSE only hides the window now"
+    );
+}

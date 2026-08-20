@@ -709,7 +709,7 @@ mod setup {
                     // A running binary is locked, and this is the one failure a
                     // user hits twice: install, run, install again.
                     format!(
-                        "cannot write {} ({e}). Close Chaos and run this again.",
+                        "cannot write {} ({e}). Chaos is still running.                          Closing its window is not enough since v0.0.12 -- it                          keeps running in the notification area. Right-click                          the Chaos icon there (behind the ^ on Windows 11) and                          choose Exit, then run this again.",
                         f.name
                     )
                 })
@@ -949,7 +949,7 @@ mod setup {
                 return (
                     false,
                     format!(
-                        "cannot write {} ({e}). Close Chaos and run this again.",
+                        "cannot write {} ({e}). Chaos is still running.                          Closing its window is not enough since v0.0.12 -- it                          keeps running in the notification area. Right-click                          the Chaos icon there (behind the ^ on Windows 11) and                          choose Exit, then run this again.",
                         f.name
                     ),
                 );

@@ -2104,9 +2104,14 @@ Any value a client sends is accepted.                      The server still list
         if shared().lock().unwrap().update_quit {
             let h = main_hwnd();
             if !h.is_null() {
-                unsafe {
-                    PostMessageW(h, WM_CLOSE, 0, 0);
-                }
+                // **`quit`, not a bare `WM_CLOSE`.** Since closing began
+                // hiding to the notification area, posting `WM_CLOSE` here
+                // would have hidden the window and left the process alive --
+                // and the installer would then have stopped on "cannot write
+                // chaos-app.exe", because the binary it must replace was still
+                // executing. The update would have failed in the one place it
+                // is hardest to explain: after the download, with no window.
+                quit(h);
             }
         }
         if finished && busy().swap(false, Ordering::SeqCst) {
