@@ -547,6 +547,59 @@ fn push_mid(v: &mut Vec<String>, half: &str) {
     v.push(format!("{half}.mid_block.attentions.0.to_out.0.bias"));
 }
 
+/// The latent normalisation the file carries beside the autoencoder.
+///
+/// FLUX.2 keeps a BatchNorm's running statistics — `bn.running_mean` and
+/// `bn.running_var` — and they are **128-wide, the packed channel count**, not
+/// the autoencoder's 32. They are what older autoencoders did with a scalar
+/// `scaling_factor`: they put the latent in the space the diffusion model was
+/// trained on.
+///
+/// Returns `(mean, variance)`, or `None` if the file has no such tensors.
+pub fn latent_stats(st: &SafeTensors, file: &[u8]) -> Option<(Vec<f32>, Vec<f32>)> {
+    let read = |name: &str| -> Option<Vec<f32>> {
+        let e = st.get(name)?;
+        if e.dtype != Dtype::F32 {
+            return None;
+        }
+        let b = st.bytes_of(file, e)?;
+        Some(
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        )
+    };
+    Some((read("bn.running_mean")?, read("bn.running_var")?))
+}
+
+/// Epsilon in the latent normalisation. PyTorch's `BatchNorm2d` default.
+pub const BN_EPS: f32 = 1e-5;
+
+/// `(z - mean) / sqrt(var + eps)`, per packed channel, in place.
+///
+/// `packed` is `[gw, gh, 128]` in ggml order, so a channel is a contiguous
+/// plane of `gw * gh` values.
+pub fn normalize_latent(packed: &mut [f32], mean: &[f32], var: &[f32]) {
+    let plane = packed.len() / mean.len();
+    for (c, chunk) in packed.chunks_mut(plane).enumerate() {
+        let s = 1.0 / (var[c] + BN_EPS).sqrt();
+        for v in chunk {
+            *v = (*v - mean[c]) * s;
+        }
+    }
+}
+
+/// [`normalize_latent`] reversed, for the latent the sampler hands back.
+pub fn denormalize_latent(packed: &mut [f32], mean: &[f32], var: &[f32]) {
+    let plane = packed.len() / mean.len();
+    for (c, chunk) in packed.chunks_mut(plane).enumerate() {
+        let s = (var[c] + BN_EPS).sqrt();
+        for v in chunk {
+            *v = *v * s + mean[c];
+        }
+    }
+}
+
 /// Fold each 2x2 block of a 32-channel latent into one cell of 128 channels.
 ///
 /// **The denoiser never sees the autoencoder's latent directly.** FLUX.2's

@@ -93,6 +93,41 @@ are the measurement that killed one.
   input-channel assert fires and ggml **aborts**, which is the one failure in
   this area that announces itself.
 
+## Diffusion, where every failure looks like a picture
+
+- **Score a denoiser against a real latent, not against your eyes.** A rectified
+  flow model at noise level `sigma` sees `latent*(1-sigma) + noise*sigma` and
+  must predict `noise - latent`. Both terms are known if the autoencoder's
+  encoder produces the latent, so the answer can be scored by cosine similarity
+  with no image involved. **Score it against each term separately**: `cos(N)`
+  high with `cos(-latent)` near zero means the model can see the noise and not
+  the image, which is the signature of a permuted or out-of-distribution input —
+  noise is permutation-invariant and image content is not. That one decomposition
+  found two separate bugs that a picture could not have distinguished.
+- **`kv_scale` in `stable-diffusion.cpp` is not the attention scale.** Ideogram 4
+  passes `1.f / 128.f`, which reads exactly like a scale for head_dim 256. It is
+  not: the helper multiplies k and v by it, divides the softmax scale by it, and
+  divides the output back out — an F16 overflow guard that cancels. The real
+  scale is the textbook `1/sqrt(head_dim)`. Using 1/128 makes the softmax eight
+  times too flat, so every token attends to every other about equally: the model
+  still reports each token's noise and stops seeing structure.
+- **A reference implementation can be missing something the file provides.**
+  `flux2-vae.safetensors` carries `bn.running_mean` and `bn.running_var`, 128
+  wide — the packed channel count — and `stable-diffusion.cpp` never reads them.
+  Normalising the latent with them moved the velocity score from 0.17 to 0.49 at
+  sigma 0.3. **Being faithful to the reference is not the same as being right**,
+  and the only way to tell them apart is a measurement the reference does not
+  make.
+- **`rope_interleaved` is a real argument.** Ideogram 4 passes `false`, so
+  element `f` rotates with `f + head_dim/2` and not with its neighbour. Adjacent
+  pairing scored near-optimal at high noise and collapsed at low noise, for the
+  same reason as above.
+- **Resolution is part of the architecture.** The same code scored 0.79 at
+  256x256 and 0.85 at 512x512 on the identical photograph. A diffusion
+  transformer trained at 1024 and up is out of distribution at 256, so a small
+  test image is not merely a faster test — it is a different one, and a
+  disappointing picture at 256 is not evidence of a bug.
+
 ## Correctness, which fails silently here
 
 - **An autoencoder is checked by round trip, not by looking.** A decoder alone

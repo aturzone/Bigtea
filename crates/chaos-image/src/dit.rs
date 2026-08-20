@@ -29,8 +29,9 @@
 //!
 //! # Three details that produce a picture, and a wrong one
 //!
-//! **The attention scale is `1/128`, not `1/sqrt(256)`.** head_dim is 256, so
-//! the textbook scale would be 1/16. Ideogram uses 1/128 and so does this.
+//! **The reference's `1.f / 128.f` is not the attention scale.** It is a
+//! `kv_scale` overflow guard that cancels out exactly; the real scale is the
+//! textbook `1/sqrt(head_dim)`. See [`Denoiser::attention`].
 //!
 //! **The timestep runs backwards and the output is negated.** The timestep is
 //! `1000 * (1 - sigma)` and the final tensor is multiplied by -1. The two
@@ -282,15 +283,24 @@ fn modulate<'c>(ctx: &'c Context, x: &Tensor<'c>, scale: &Tensor<'c>) -> Result<
     Ok(ctx.add(x, &scaled)?)
 }
 
-/// Rotate `[head_dim, tokens, heads]` by the interleaved rotary table.
+/// Rotate `[head_dim, tokens, heads]` by the rotary table, **split-half**.
 ///
-/// Consecutive pairs `(x[2f], x[2f+1])` rotate together; `cos` and `sin` are
-/// `[1, head_dim/2, tokens, 1]` and broadcast over heads.
+/// # The pairing, which is the whole point of this function
 ///
-/// The reference builds this from `repeat` and strided views. Splitting the pair
-/// into two views, rotating, and concatenating is the same arithmetic with fewer
-/// copies — and the shapes stay readable, which matters because a transposed
-/// rotation is invisible until it is a picture.
+/// Element `f` rotates with element `f + head_dim/2` — *not* with its
+/// neighbour. Ideogram 4 calls the reference's attention with
+/// `rope_interleaved = false`, which takes the branch reshaping to
+/// `[d/2, 2, ...]` rather than `[2, d/2, ...]`.
+///
+/// Adjacent-pair rotation was written here first, and **how** it failed is worth
+/// recording. Scored against a real latent by cosine similarity it was
+/// near-optimal at high noise — 0.57 where the best possible is about 0.54 —
+/// and collapsed at low noise, 0.14 against about 0.84. Rotating the wrong pairs
+/// scrambles the position information the model reads *structure* with, and
+/// structure is all that is left once the noise is gone. What it drew was grey
+/// texture, not a wrong picture.
+///
+/// `cos` and `sin` are `[head_dim/2, tokens, 1, 1]`, broadcast over heads.
 fn apply_rope<'c>(
     ctx: &'c Context,
     x: &Tensor<'c>,
@@ -301,26 +311,25 @@ fn apply_rope<'c>(
     let (head_dim, tokens, heads) = (ne[0], ne[1], ne[2]);
     let half = head_dim / 2;
 
-    let pairs = ctx.reshape_4d(x, [2, half, tokens, heads])?;
-    let (_, nb) = pairs.dims_and_strides();
-    // ne[0] = 1 picks one element of each pair; the strides stay the pair
-    // tensor's own, so the view walks the same grid one element at a time.
-    let even = ctx.view_4d(&pairs, [1, half, tokens, heads], [nb[1], nb[2], nb[3]], 0)?;
-    let odd = ctx.view_4d(
-        &pairs,
-        [1, half, tokens, heads],
+    let (_, nb) = x.dims_and_strides();
+    // The two *halves* of each row, not the two elements of each pair: the
+    // second view starts `half` floats along and walks the same grid.
+    let lo = ctx.view_4d(x, [half, tokens, heads, 1], [nb[1], nb[2], nb[3]], 0)?;
+    let hi = ctx.view_4d(
+        x,
+        [half, tokens, heads, 1],
         [nb[1], nb[2], nb[3]],
-        nb[0],
+        half as usize * 4,
     )?;
 
     // (a, b) -> (a cos + b sin, b cos - a sin): the reference's
     // [cos, -sin; sin, cos] read down its columns. There is no `ggml_sub`
     // bound here, so the subtraction is an add of a negation.
     let neg_sin = ctx.scale(sin, -1.0)?;
-    let out0 = ctx.add(&ctx.mul(&even, cos)?, &ctx.mul(&odd, sin)?)?;
-    let out1 = ctx.add(&ctx.mul(&odd, cos)?, &ctx.mul(&even, &neg_sin)?)?;
-    let out0 = ctx.cont_4d(&out0, [1, half, tokens, heads])?;
-    let out1 = ctx.cont_4d(&out1, [1, half, tokens, heads])?;
+    let out0 = ctx.add(&ctx.mul(&lo, cos)?, &ctx.mul(&hi, sin)?)?;
+    let out1 = ctx.add(&ctx.mul(&hi, cos)?, &ctx.mul(&lo, &neg_sin)?)?;
+    let out0 = ctx.cont_4d(&out0, [half, tokens, heads, 1])?;
+    let out1 = ctx.cont_4d(&out1, [half, tokens, heads, 1])?;
 
     let joined = ctx.concat(&out0, &out1, 0)?;
     Ok(ctx.reshape_4d(&joined, [head_dim, tokens, heads, 1])?)
@@ -636,9 +645,9 @@ impl Denoiser {
         adaln.set_f32(adaln_in)?;
 
         let half = c.head_dim() / 2;
-        let cos_t = ctx.new_f32_4d(1, half, n, 1)?;
+        let cos_t = ctx.new_f32_4d(half, n, 1, 1)?;
         cos_t.set_f32(cos)?;
-        let sin_t = ctx.new_f32_4d(1, half, n, 1)?;
+        let sin_t = ctx.new_f32_4d(half, n, 1, 1)?;
         sin_t.set_f32(sin)?;
 
         // -- the four modulation signals --------------------------------------
@@ -761,9 +770,20 @@ impl Denoiser {
         let q = apply_rope(ctx, &q, cos, sin)?;
         let k = apply_rope(ctx, &k, cos, sin)?;
 
-        // scores[j, i, head] = k_j . q_i, softmaxed over j. **1/128, not 1/16.**
+        // scores[j, i, head] = k_j . q_i, softmaxed over j, at 1/sqrt(head_dim).
+        //
+        // **The reference's `1.f / 128.f` is not this number.** It is passed as
+        // `kv_scale`, which multiplies k and v, divides the softmax scale by the
+        // same factor and divides the output back out again -- an overflow guard
+        // for F16 flash attention that cancels exactly. Reading it as the
+        // attention scale makes the softmax eight times too flat: every token
+        // attends to every other about equally, so the model still sees each
+        // token's noise and stops being able to see structure. Measured against
+        // a real latent at sigma 0.1, cos(-latent) was 0.39 with 1/128 and 0.52
+        // with 1/16 -- better, and still short of the 0.99 a correct denoiser
+        // reaches there, so this was not the only thing wrong.
         let scores = ctx.mul_mat(&k, &q)?;
-        let scores = ctx.scale(&scores, 1.0 / 128.0)?;
+        let scores = ctx.scale(&scores, 1.0 / (hd as f32).sqrt())?;
         let probs = ctx.soft_max(&scores)?;
 
         // v is [head_dim, tokens, heads]; contracting over tokens needs it

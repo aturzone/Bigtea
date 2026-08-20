@@ -41,6 +41,7 @@
 
 pub mod dit;
 pub mod flow;
+pub mod pipeline;
 pub mod png;
 pub mod rope3d;
 pub mod safetensors;
