@@ -436,17 +436,22 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
 
-          # **`--notes-from-tag` published the commit message instead of the tag
-          # message on v0.0.10** -- `Co-Authored-By` trailer and all -- and the
-          # user-facing notes written into the tag were never seen. Read the tag
-          # object directly instead.
+          # **The tag object is not in the checkout, and that is the whole bug.**
+          # v0.0.10 published its commit message as release notes -- trailer and
+          # all -- and `--notes-from-tag` took the blame. It was innocent:
+          # `actions/checkout` leaves `refs/tags/$TAG` pointing straight at the
+          # commit, so there was no annotated tag here to read and `gh` fell back
+          # to the only message it could find. Asking for it explicitly is the
+          # fix; reading it with `git` rather than `gh` is belt and braces.
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}" || true
           #
           # The guard is `cat-file -t`, not an emptiness check: for a
           # *lightweight* tag `%(contents)` silently returns the commit message,
           # which is the exact failure being fixed and would sail straight
-          # through `[ -s ]`. Only an annotated tag has type `tag`.
+          # through `[ -s ]`. Only an annotated tag has type `tag`. It has
+          # already earned its keep -- it is what caught this.
           if [ "$(git cat-file -t "$TAG")" != "tag" ]; then
-            echo "::error::$TAG is a lightweight tag, so it carries no notes."
+            echo "::error::$TAG has no annotated tag object here, so it carries no notes."
             echo "::error::Release notes are written for users, not taken from a commit. Tag with:"
             echo "::error::  git tag -a --cleanup=verbatim $TAG -F notes.md"
             exit 1

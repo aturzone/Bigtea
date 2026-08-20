@@ -486,11 +486,24 @@ compiling**, and three of these were believed fixed before a pixel was measured.
 
 - **`git tag -a -F file` deletes every line beginning with `#`.** A tag message
   defaults to `--cleanup=strip`, which removes comment lines, and the release
-  workflow builds the release body from the annotation with `--notes-from-tag`.
-  So Markdown `##` headings vanish and the release page becomes one wall of
-  text. Pass `--cleanup=verbatim`, and check with
-  `git tag -l --format='%(contents)'` on a throwaway tag before pushing the real
-  one — the page is public the moment the tag lands.
+  workflow builds the release body from the annotation. So Markdown `##`
+  headings vanish and the release page becomes one wall of text. Pass
+  `--cleanup=verbatim`, and check with `git tag -l --format='%(contents)'` on a
+  throwaway tag before pushing the real one — the page is public the moment the
+  tag lands.
+- **`actions/checkout` does not give you the annotated tag object**, even on a
+  tag push with `fetch-depth: 0`: `refs/tags/$TAG` ends up pointing straight at
+  the commit. v0.0.10 published its commit message as release notes — trailer
+  and all — and `gh release create --notes-from-tag` was blamed for it. **That
+  diagnosis was wrong**: there was no annotated tag in the checkout to read, so
+  `gh` fell back to the only message it could find, and reading the tag with
+  `git` instead failed the same way for the same reason. Fetch it explicitly:
+  `git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"`.
+- **Guard it with `git cat-file -t`, not with a non-empty check.** For a
+  lightweight tag `%(contents)` silently returns the *commit* message, which is
+  the exact failure being guarded against. Only an annotated tag has type `tag`
+  — and that guard is what caught the checkout problem on v0.0.11, one release
+  after the wrong explanation was written down.
 - **Asset names are read by people scanning a release page.** One prefix, one
   version format, platform and architecture on every file. The `.deb` is the
   documented exception: Debian policy wants `name_version_arch.deb`, lower case
