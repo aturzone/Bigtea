@@ -108,6 +108,16 @@ fn main() {
         "work         {passes} denoiser passes, {:.1} GiB of reads",
         passes as f64 * 5.26
     );
+    // The arena is the real ceiling on image size, and an exhausted one kills
+    // the process with no message -- so it is printed before anything starts.
+    let (arena, _) = chaos_image::pipeline::arena_estimate(&req);
+    println!(
+        "memory       {:.1} GiB per denoiser layer, {:.1} GiB to decode",
+        arena as f64 / (1u64 << 30) as f64,
+        chaos_image::vae::decode_arena_bytes(req.image_size() as usize, req.image_size() as usize)
+            as f64
+            / (1u64 << 30) as f64
+    );
 
     let started = std::time::Instant::now();
     let mut step_started = std::time::Instant::now();
