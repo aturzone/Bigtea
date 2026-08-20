@@ -61,18 +61,37 @@ Read from `leejet/stable-diffusion.cpp`, then corrected against measurement:
 Being faithful to the reference and being right are not the same thing, and only
 a measurement the reference does not make can tell them apart.
 
+## What the prompt does, measured at three sizes
+
+At **256x256** the pipeline drew a coherent dark stone-wall scene for "a red
+apple on a white table" — a real photograph of the wrong thing. At **512x512**,
+16 steps, cfg 5, the same prompt drew a **red mass on white surfaces beside a
+wooden shelf**: colour and scene follow the prompt, the object's *form* does not.
+So the conditioning works and the geometry is the weak part.
+
+The numbers behind that: two prompts as different as "a red apple on a white
+table" and "a snowy mountain range at sunrise" move the predicted velocity by 14%
+(cosine 0.9897), where the *unconditional twin* — different weights entirely — is
+0.89 away. Fourteen per cent sounds small and is not: the velocity is dominated
+by "remove the noise", which is the same whatever the prompt, and guidance
+multiplies the difference.
+
 ## What is still open
 
-The pipeline draws a coherent photographic image that **does not follow the
-prompt closely**. Two prompts as different as "a red apple on a white table" and
-"a snowy mountain range at sunrise" move the predicted velocity by 14%
-(cos 0.9897), where the *unconditional twin* — different weights entirely — is
-0.89 away. So the text reaches the model and does too little.
+**Form.** The subject comes out as a flat saturated region rather than an object.
+Untested candidates, in the order worth trying:
 
-Candidates, none yet tested: the thirteen hidden-state layers may be the wrong
-ones; Ideogram 4 is trained on elaborate structured-JSON prompts and a seven-word
-one may genuinely condition weakly; and everything so far has been measured well
-below the 1024x1024 the model was trained for.
+1. **Resolution.** Everything here has been measured below the 1024x1024 the
+   model was trained for, and the same code scored 0.79 at 256 against 0.85 at
+   512 on one photograph. `stable-diffusion.cpp`'s own issue #1648 reports
+   Ideogram 4 collapsing at 1024 and being correct at 1536 and 2048, so this
+   model is unusually resolution-sensitive.
+2. **Guidance strength.** Flat saturated regions are what too much of it looks
+   like on a flow model.
+3. **Prompt shape.** Ideogram 4 is trained on elaborate structured-JSON prompts;
+   a seven-word one may genuinely condition weakly.
+4. The thirteen hidden-state layers, which are read from the reference and not
+   independently checked.
 
 ## The autoencoder is verified, and here is what that word is doing
 

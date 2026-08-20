@@ -49,11 +49,12 @@ The suite carries the round trip at 128x128 as two `#[ignore]`d tests that
 
 **The whole image pipeline now runs end to end** (2026-08-20): Qwen3-VL for the
 text, both Ideogram 4 denoisers for the sampling, and the autoencoder for the
-pixels. It produces a **coherent photographic image** and does **not yet follow
-the prompt closely** — two prompts as different as "a red apple on a white
-table" and "a snowy mountain range at sunrise" move the predicted velocity by
-14%, where the unconditional twin is 11% away. So the text reaches the model and
-does too little. Open, with the candidates written down.
+pixels. It produces a **coherent photographic image that follows the prompt's colour and
+scene**: at 512x512 "a red apple on a white table, studio photograph" drew a red
+mass on white surfaces beside a wooden shelf. **The object's form is wrong** — a
+flat saturated region rather than an apple — and that is the open problem, with
+resolution the first suspect: the model is trained at 1024 and up, and the same
+code scores 0.79 at 256 against 0.85 at 512.
 
 The denoiser is scored **without looking at a picture**: a rectified-flow model
 at noise level `sigma` must predict `noise - latent`, and both terms are known
