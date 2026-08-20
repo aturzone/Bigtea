@@ -3245,9 +3245,19 @@ Any value a client sends is accepted.                      The server still list
         for (k, v) in [
             (
                 "models installed",
+                // **The word, not just a comma.** "18, 276 GB in total" reads
+                // as the single number 18,276 -- a thousands separator is
+                // exactly what a comma between two digits means to a reader,
+                // and this line is drawn in a monospace face where the two are
+                // hardest to tell apart.
                 format!(
-                    "{}, {} in total",
+                    "{} {} -- {} in total",
                     ui.entries.len(),
+                    if ui.entries.len() == 1 {
+                        "model"
+                    } else {
+                        "models"
+                    },
                     models::human_size(bytes)
                 ),
             ),
