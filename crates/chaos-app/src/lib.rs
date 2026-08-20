@@ -22,6 +22,8 @@ pub mod nav;
 pub mod settings;
 /// The design tokens. Nothing outside this module names a colour.
 pub mod theme;
+/// Whether a newer Chaos exists, and which installer this platform needs.
+pub mod update;
 /// Raw Win32, shared with `chaos-setup` so there is one set of declarations
 /// rather than two that can drift apart.
 #[cfg(windows)]

@@ -147,6 +147,8 @@ pub const IDM_MANUAL: i32 = 530;
 pub const IDM_RELEASES: i32 = 531;
 pub const IDM_CRASH_LOG: i32 = 532;
 pub const IDM_ABOUT: i32 = 533;
+pub const IDM_CHECK_UPDATE: i32 = 534;
+pub const IDM_INSTALL_UPDATE: i32 = 535;
 
 /// The navigation button for a page.
 pub fn nav_id(p: Page) -> i32 {

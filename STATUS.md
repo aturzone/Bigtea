@@ -5,7 +5,7 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-20 · **Version**: **v0.0.11** · **Branch**: `main` ·
+**Last updated**: 2026-08-20 · **Version**: **v0.0.12** · **Branch**: `main` ·
 **Open PRs**: none.
 
 **Twelve of thirteen installed models generate correct text** on this 15.7 GiB
@@ -19,8 +19,29 @@ engines agree to five significant figures on every layer sum and then both
 overflow to NaN at `l_out-5`. Chaos warns before generating and points at the
 container.
 
-**The release**: v0.0.11, six assets — Windows installer and zip, Linux tarball,
+**The release**: v0.0.12, six assets — Windows installer and zip, Linux tarball,
 `.deb` and AppImage, macOS arm64 tarball.
+
+**Chaos updates itself now.** It asks GitHub once at startup whether a newer
+release exists and says nothing unless one does; `Help ▸ Check for updates` asks
+on demand, `Help ▸ Install update…` fetches the installer and hands over, and
+`chaos-run --update` does the same from a terminal. One installer carries all
+eleven binaries, so one update updates every export and leaves the models
+directory alone. `CHAOS_NO_UPDATE_CHECK=1` turns the automatic check off. The
+decision — is this newer, which asset does this platform need — is
+`chaos_model::release`, tested against a fixture of **GitHub's real response**
+rather than one this repo wrote: `0.0.9` must not look newer than `0.0.11`, and
+the assets must not come back labelled with the uploader's name.
+
+**Six defects Atur found by using the window, all fixed in v0.0.12.** The rail
+lit every page at once (invalidating a parent does not repaint owner-drawn
+children, so nothing ever un-lit the previous item); drop-downs opened exactly as
+wide as their box, so *"Processor (the GPU is not used here yet)"* was
+unreadable; BROWSE was drawn on top of the sentence explaining the models folder,
+because two layout walkers stepped by different amounts; the mark in the rail was
+44px with 16 levels of antialiasing against two dozen one-pixel rays; model names
+were truncated from the wrong end; and the window opened off the corner of a
+scaled display because the process claimed no DPI awareness at all.
 
 **There is no v0.0.9.** The version was bumped in `Cargo.toml` and the installer
 was exercised locally, but **the tag was never pushed**, so v0.0.8 stayed the

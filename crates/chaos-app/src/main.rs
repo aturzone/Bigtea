@@ -49,7 +49,7 @@ mod windows_app {
     use chaos_app::nav::{self, Page};
     use chaos_app::theme::{self, metric, size, weight, Mode, Rgb, Theme};
     use chaos_app::win32::*;
-    use chaos_app::{art, catalog, client, models, settings};
+    use chaos_app::{art, catalog, client, models, settings, update};
     use std::cell::RefCell;
     use std::process::{Child, Command};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,6 +100,20 @@ mod windows_app {
         /// "the model did not come up" after ten minutes of polling and the
         /// actual sentence was lost.
         serve_err: String,
+        /// What the last update check found, kept so "Install update" knows
+        /// which file to fetch without asking GitHub a second time.
+        update: Option<update::Outcome>,
+        /// Set when a check has produced something the window has not shown
+        /// yet. Separate from `update` because the outcome outlives its
+        /// announcement -- the menu item stays usable after the notice is gone.
+        update_news: bool,
+        /// Whether the announcement should be a dialog or only the status line.
+        /// The check at startup is quiet unless there is news.
+        update_asked: bool,
+        /// Set when the installer is running, so the window closes and stops
+        /// holding `chaos-app.exe` open. Windows will not let the installer
+        /// overwrite a binary that is still executing.
+        update_quit: bool,
     }
 
     /// Which set of models the MODELS page lists.
@@ -343,6 +357,15 @@ mod windows_app {
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
 
+            // Ask once, on a worker, after the window is up. Quiet unless
+            // there is something newer: this is how a user finds out a release
+            // exists without being told to go and look, and it costs one
+            // request against a static JSON file. `CHAOS_NO_UPDATE_CHECK`
+            // turns it off for anyone who would rather it did not.
+            if std::env::var_os("CHAOS_NO_UPDATE_CHECK").is_none() {
+                check_for_updates(false);
+            }
+
             let accel = accelerators();
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
@@ -403,6 +426,9 @@ mod windows_app {
 
         let help = CreatePopupMenu();
         add(help, nav::IDM_MANUAL, "&Manual");
+        add(help, nav::IDM_CHECK_UPDATE, "Check for &updates");
+        add(help, nav::IDM_INSTALL_UPDATE, "&Install update...");
+        sep(help);
         add(help, nav::IDM_RELEASES, "&Releases");
         add(help, nav::IDM_CRASH_LOG, "Open &crash log");
         sep(help);
@@ -876,6 +902,33 @@ mod windows_app {
             unsafe {
                 layout(h);
                 InvalidateRect(h, std::ptr::null(), 1);
+            }
+        }
+        // **Invalidating the parent does not repaint its children.** The rail
+        // buttons are owner-drawn, so they only redraw when Windows sends them
+        // a `WM_DRAWITEM`, and it only does that when the *button* is
+        // invalidated. Without this the highlight followed the mouse rather
+        // than the page: clicking SETTINGS in the rail worked because the click
+        // repainted that one button, but View > Settings and Ctrl+4 left CHAT
+        // lit while the settings page was on screen.
+        //
+        // The primary action moves with the page too (`weight_of`), so those
+        // buttons are refreshed here as well rather than staying heavy on a
+        // page they no longer belong to.
+        for id in nav::SHELL_CONTROLS {
+            let c = ctl(id);
+            if !c.is_null() {
+                unsafe {
+                    InvalidateRect(c, std::ptr::null(), 1);
+                }
+            }
+        }
+        for &id in nav::controls(p) {
+            let c = ctl(id);
+            if !c.is_null() {
+                unsafe {
+                    InvalidateRect(c, std::ptr::null(), 1);
+                }
             }
         }
         sync_enabled();
@@ -2010,6 +2063,17 @@ Any value a client sends is accepted.                      The server still list
                 }
             });
         }
+        show_update_outcome();
+        // The installer is up; get out of its way. Anything running under this
+        // window goes with it, which is what the installer needs anyway.
+        if shared().lock().unwrap().update_quit {
+            let h = main_hwnd();
+            if !h.is_null() {
+                unsafe {
+                    PostMessageW(h, WM_CLOSE, 0, 0);
+                }
+            }
+        }
         if finished && busy().swap(false, Ordering::SeqCst) {
             UI.with(|u| {
                 if let Some(ui) = u.borrow_mut().as_mut() {
@@ -2079,6 +2143,7 @@ Any value a client sends is accepted.                      The server still list
                             SendMessageW(h, CB_ADDSTRING, 0, t.as_ptr() as LPARAM);
                         }
                         SendMessageW(h, CB_SETCURSEL, selected, 0);
+                        widen_dropdown(h, &list);
                     }
                     // Cached so paint and save do not rebuild the list, and so
                     // the note under the box follows the selection.
@@ -2093,6 +2158,46 @@ Any value a client sends is accepted.                      The server still list
                 },
             }
         }
+    }
+
+    /// Make the open list as wide as its longest option.
+    ///
+    /// **A drop-down is exactly as wide as its box unless it is told
+    /// otherwise**, and these boxes sit in a settings column narrower than the
+    /// sentences in them -- so "Processor (the GPU is not used here)" opened as
+    /// "Processor (the GPU is not used her...", with the ellipsis landing on
+    /// the part that says what the option does. Atur's report was that the
+    /// drop-downs did not work well, and this is the whole of it: they opened,
+    /// they selected, they could not be read.
+    ///
+    /// Measured against the same font the rows are drawn in, capped so one long
+    /// label cannot push the list off the screen.
+    unsafe fn widen_dropdown(h: HWND, list: &[Choice]) {
+        let hdc = GetDC(h);
+        if hdc.is_null() {
+            return;
+        }
+        let font = UI.with(|u| u.borrow().as_ref().map(|ui| ui.fonts.body));
+        let Some(font) = font else {
+            ReleaseDC(h, hdc);
+            return;
+        };
+        let widest = list
+            .iter()
+            .map(|c| text_width(hdc, &c.label, font))
+            .max()
+            .unwrap_or(0);
+        ReleaseDC(h, hdc);
+
+        let mut r = RECT::default();
+        GetWindowRect(h, &mut r);
+        let own = r.right - r.left;
+        // 10px of padding either side in `draw_combo`, plus room for the
+        // scrollbar the list grows when there are more than `COMBO_VISIBLE`.
+        let want = (widest + 20 + 20).max(own);
+        // Never wider than the screen it opens on.
+        let cap = work_area().map(|(l, _, r, _)| r - l).unwrap_or(1280) - 80;
+        SendMessageW(h, CB_SETDROPPEDWIDTH, want.min(cap) as WPARAM, 0);
     }
 
     /// The value a settings control currently holds, whichever kind it is.
@@ -2410,6 +2515,26 @@ Any value a client sends is accepted.                      The server still list
     /// **Computed in one place** because `layout` positions the controls and
     /// `paint` draws the labels and hints beside them. Two independent walks of
     /// the same list is exactly how a label ends up over the wrong box.
+    /// Extra height a settings field needs beyond label, control and note.
+    ///
+    /// Only the models folder, which has BROWSE under it.
+    ///
+    /// **Both walkers ask this, because drifting apart is exactly what went
+    /// wrong.** `settings_rows` put BROWSE six pixels under the field and
+    /// `paint_settings` painted the field's note in the same six pixels, so the
+    /// button sat on top of the sentence that explains what the field is for --
+    /// "%\.chaos\models. Several, separated by ; are all searched." read as
+    /// "...chaos\models. Several, separated by ; are all searched." with its
+    /// first half behind a button. Two walkers stepping by different amounts is
+    /// the shape of that bug, and one shared step is the fix.
+    fn field_extra(id: i32) -> i32 {
+        if id == nav::ID_MODELS_DIR {
+            metric::BUTTON + 12
+        } else {
+            0
+        }
+    }
+
     fn settings_rows(page: RECT) -> Vec<(i32, i32, i32, bool)> {
         let (left, right, _) = settings_columns(page);
         let mut out = Vec::new();
@@ -2421,7 +2546,7 @@ Any value a client sends is accepted.                      The server still list
             y[c] += 26;
             for f in nav::FIELDS.iter().filter(|f| f.group == *group) {
                 out.push((f.id, x, y[c] + 18, false));
-                y[c] += 18 + metric::CONTROL + 34;
+                y[c] += 18 + metric::CONTROL + 34 + field_extra(f.id);
             }
             for f in nav::TOGGLES.iter().filter(|f| f.group == *group) {
                 out.push((f.id, x, y[c], true));
@@ -2506,13 +2631,15 @@ Any value a client sends is accepted.                      The server still list
         // brand's *ground* -- what Hermes puts behind its wordmark -- and the
         // logo itself is black art. And not `StretchDIBits` over a 1-bit 56px
         // bitmap either, which is what made it a blob at 30 pixels.
-        // **44, not 32.** At 32 the mark reads as a smudge next to a 20px
-        // wordmark -- the sun's rays are one pixel wide there and the eye inside
-        // it is not visible at all, which is what "the logos in the app are
-        // small and low quality" was about. The art is filtered from the 256px
-        // master at whatever size is asked for, so a larger box costs nothing but
-        // rail space, and the rail is 208px wide.
-        let box_px = 44usize;
+        // **64, not 44 and certainly not 32.** This mark is a sun of two dozen
+        // fine rays around an eye, and a ray is roughly one pixel wide at 44 --
+        // so the rays alias against each other and the eye is barely there.
+        // Atur reported "low quality logo on top" at 44 as he had at 32. The
+        // art is scan-converted from outlines at whatever size is asked for
+        // (`art::logo_coverage`) and cached, so a larger box costs rail width
+        // and nothing else: the rail is 208px, the mark starts at INSET and the
+        // wordmark follows it, which still leaves room for five letters.
+        let box_px = 64usize;
         let cov = art::logo_scaled(box_px);
         let chan = |c: Rgb, shift: u32| ((c >> shift) & 0xFF) as i32;
         let mut px = vec![0u8; box_px * box_px * 4];
@@ -2549,7 +2676,7 @@ Any value a client sends is accepted.                      The server still list
         StretchDIBits(
             hdc,
             metric::INSET,
-            28,
+            24,
             box_px,
             box_px,
             0,
@@ -2564,7 +2691,7 @@ Any value a client sends is accepted.                      The server still list
         label(
             hdc,
             metric::INSET + box_px + 10,
-            38,
+            44,
             metric::RAIL,
             "CHAOS",
             ui.fonts.mark,
@@ -2574,7 +2701,7 @@ Any value a client sends is accepted.                      The server still list
         label(
             hdc,
             metric::INSET,
-            70,
+            92,
             metric::RAIL - metric::INSET,
             &format!("v{}", env!("CARGO_PKG_VERSION")),
             ui.fonts.small,
@@ -3161,20 +3288,23 @@ Any value a client sends is accepted.                      The server still list
                     })
                     .map(|c| c.note.clone())
                     .unwrap_or_else(|| f.hint.to_string());
+                // Below whatever the field puts under itself -- BROWSE, for
+                // the models folder -- not on top of it.
+                let note_top = y[c] + 18 + metric::CONTROL + 4 + field_extra(f.id);
                 text(
                     hdc,
                     RECT {
                         left: x,
-                        top: y[c] + 18 + metric::CONTROL + 4,
+                        top: note_top,
                         right: x + col,
-                        bottom: y[c] + 18 + metric::CONTROL + 34,
+                        bottom: note_top + 30,
                     },
                     &note,
                     ui.fonts.small,
                     t.fg_tertiary,
                     DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS,
                 );
-                y[c] += 18 + metric::CONTROL + 34;
+                y[c] += 18 + metric::CONTROL + 34 + field_extra(f.id);
             }
             for f in nav::TOGGLES.iter().filter(|f| f.group == *group) {
                 text(
@@ -3783,6 +3913,193 @@ Any value a client sends is accepted.                      The server still list
         }
     }
 
+    // ---- updating in place -------------------------------------------------
+    //
+    // Atur: *"users can get the most updated release when they connect to the
+    // internet from the app -- an updating flow, not every time go and download
+    // a new setup"*.
+    //
+    // The decisions -- is this newer, which file does this platform need -- are
+    // in `chaos_app::update`, where they are tested. What is here is the two
+    // things that need a window: a `curl` call on a worker thread, and the
+    // sequencing of the handover to the installer.
+
+    /// Ask GitHub what the newest release is, without flashing a console.
+    ///
+    /// The arguments are `update::feed_curl_args()`, the same list
+    /// `chaos-run --update` uses -- the missing `User-Agent` that the API
+    /// rejects outright is exactly the kind of thing that gets fixed in one
+    /// copy. What is here and not shared is `CREATE_NO_WINDOW`, a Windows-only
+    /// extension to `Command`: without it a console window blinks open on the
+    /// user's screen every time the app checks.
+    fn fetch_latest_json() -> Result<String, String> {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = Command::new("curl");
+        cmd.args(update::feed_curl_args());
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        match cmd.output() {
+            Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+            Ok(o) => {
+                let why = String::from_utf8_lossy(&o.stderr);
+                let first = why.lines().next().unwrap_or("").trim().to_string();
+                Err(if first.is_empty() {
+                    format!("curl exited {}", o.status)
+                } else {
+                    first
+                })
+            }
+            Err(e) => Err(format!("curl could not be run ({e})")),
+        }
+    }
+
+    /// Check in the background, and leave the answer for `drain` to show.
+    ///
+    /// `announce` is what separates the two callers. The one at startup is
+    /// quiet unless there is news -- an app that opens a dialog to say nothing
+    /// has changed is an app people stop launching. The menu item always
+    /// answers, because a check that says nothing is indistinguishable from a
+    /// broken one.
+    fn check_for_updates(announce: bool) {
+        if announce {
+            set_status("checking for a newer Chaos...");
+        }
+        std::thread::spawn(move || {
+            let outcome = match fetch_latest_json() {
+                Ok(json) => update::decide(update::parse_latest(&json), update::running()),
+                Err(why) => update::Outcome::Failed(why),
+            };
+            let news = announce || matches!(outcome, update::Outcome::Available { .. });
+            {
+                let mut sh = shared().lock().unwrap();
+                sh.update = Some(outcome);
+                sh.update_news = news;
+                sh.update_asked = announce;
+            }
+            notify();
+        });
+    }
+
+    /// Show what a finished check found, once.
+    ///
+    /// Runs on the UI thread out of `drain`, which is the only place a dialog
+    /// can be put up at all: `MessageBoxW` owned by a window belonging to
+    /// another thread does nothing here, as the connection test found out.
+    fn show_update_outcome() {
+        let (outcome, asked) = {
+            let mut sh = shared().lock().unwrap();
+            if !sh.update_news {
+                return;
+            }
+            sh.update_news = false;
+            (sh.update.clone(), sh.update_asked)
+        };
+        let Some(outcome) = outcome else { return };
+        set_status(&outcome.line());
+        match &outcome {
+            update::Outcome::Available { version, .. } => {
+                let msg = format!(
+                    "Chaos {} is available. You are running {}.\r\n\r\n\
+                     Download it and start the installer now?\r\n\r\n\
+                     Chaos will close so the installer can replace its files. \
+                     Your models are not touched.",
+                    version.text(),
+                    update::running().text()
+                );
+                let yes = unsafe {
+                    MessageBoxW(
+                        main_hwnd(),
+                        wide(&msg).as_ptr(),
+                        wide("A newer Chaos").as_ptr(),
+                        MB_YESNO | MB_ICONINFORMATION,
+                    )
+                } == IDYES;
+                if yes {
+                    install_update();
+                }
+            }
+            // Only the menu item's caller waited for these, so only it hears
+            // them as a dialog; the status line has them either way.
+            _ if asked => unsafe {
+                MessageBoxW(
+                    main_hwnd(),
+                    wide(&outcome.line()).as_ptr(),
+                    wide("Check for updates").as_ptr(),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            },
+            _ => {}
+        }
+    }
+
+    /// Fetch the installer for the release the last check found, and hand over.
+    ///
+    /// **The app has to be gone before the installer writes.** `chaos-setup`
+    /// overwrites `chaos-app.exe` in place, and Windows keeps a running
+    /// executable's file open -- so a silent install from inside the running app
+    /// would fail on exactly the binary doing the asking. The installer is
+    /// therefore started with its window and this process closes immediately; by
+    /// the time anyone presses INSTALL there is nothing holding the file.
+    fn install_update() {
+        let outcome = shared().lock().unwrap().update.clone();
+        let (version, url) = match outcome {
+            Some(update::Outcome::Available { version, url }) => (version, url),
+            Some(update::Outcome::UpToDate(v)) => {
+                set_status(&format!("Chaos {} is already the newest release", v.text()));
+                return;
+            }
+            // Nothing has been checked yet, so check rather than refuse.
+            _ => {
+                check_for_updates(true);
+                return;
+            }
+        };
+        let name = update::asset_for_platform(&version);
+        let dest = std::env::temp_dir().join(&name);
+        set_status(&format!("downloading Chaos {}...", version.text()));
+        std::thread::spawn(move || {
+            use std::os::windows::process::CommandExt;
+            let mut cmd = Command::new("curl");
+            cmd.args(["-L", "--fail", "-sS", "--retry", "3"])
+                .arg("-o")
+                .arg(&dest)
+                .arg(&url);
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            let ok = matches!(cmd.status(), Ok(st) if st.success());
+            // **Exit zero is not a file.** The same trap `chaos-pull` documents:
+            // a redirect to an error page saves perfectly and runs not at all.
+            // No installer this project has ever built is under a megabyte.
+            let bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+            if !ok || bytes < (1 << 20) {
+                let mut sh = shared().lock().unwrap();
+                sh.report = Some((
+                    format!(
+                        "The update could not be downloaded.\n\n{url}\n\n\
+                         Download it in a browser and run it -- your models and \
+                         settings are kept."
+                    ),
+                    false,
+                ));
+                drop(sh);
+                notify();
+                return;
+            }
+            let started = Command::new(&dest).spawn().is_ok();
+            let mut sh = shared().lock().unwrap();
+            sh.update_quit = started;
+            if !started {
+                sh.report = Some((
+                    format!(
+                        "The update downloaded but would not start. Run it by hand:\n\n{}",
+                        dest.display()
+                    ),
+                    false,
+                ));
+            }
+            drop(sh);
+            notify();
+        });
+    }
+
     fn about() {
         let msg = format!(
             "Chaos v{}\n\nA runner for models larger than memory: the always-read \
@@ -4001,6 +4318,14 @@ Any value a client sends is accepted.                      The server still list
                     }
                     nav::IDM_ABOUT => {
                         about();
+                        return 0;
+                    }
+                    nav::IDM_CHECK_UPDATE => {
+                        check_for_updates(true);
+                        return 0;
+                    }
+                    nav::IDM_INSTALL_UPDATE => {
+                        install_update();
                         return 0;
                     }
                     _ => {}

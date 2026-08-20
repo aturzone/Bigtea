@@ -481,6 +481,36 @@ compiling**, and three of these were believed fixed before a pixel was measured.
 - **Do not do file I/O while painting.** Counting a model's shards in the
   detail panel meant a directory scan per repaint, and the transcript repaints
   on every token. Count it once, in the rescan.
+- **`InvalidateRect` on the parent does not repaint owner-drawn children.** They
+  redraw only when Windows sends them a `WM_DRAWITEM`, and it only does that for
+  a control that is itself invalid. The rail therefore lit each item as it was
+  clicked and never un-lit the last one: click all four pages and all four are
+  highlighted. Atur reported it as *"the menu options all of them become
+  blue"*. Worse through the menu and `Ctrl+1..4`, where no button was clicked at
+  all, so the page changed and the rail kept pointing at the old one. Invalidate
+  every control whose appearance depends on the state you just changed.
+- **A drop-down is exactly as wide as its box unless told otherwise.**
+  `CB_SETDROPPEDWIDTH`, measured against the longest label and capped to the
+  work area. Without it *"Processor (the GPU is not used here yet)"* opened as
+  *"Processor (the GPU is not used her…"* — the list opened, it selected, it
+  could not be read, and the report was that the drop-downs did not work.
+- **Two walkers over the same layout drift, and the drift is invisible in
+  code.** Already written down once for labels over boxes; it recurred with a
+  button. `settings_rows` put BROWSE six pixels under the models-folder field
+  and `paint_settings` painted that field's note in the same six pixels, so the
+  button sat on the sentence explaining the field. One shared step function is
+  the fix; there is now `field_extra(id)` and both callers add it.
+- **A logo of fine lines needs supersamples, not pixels.** The mark is a sun of
+  two dozen one-pixel rays around an eye. At 44px with 4x4 supersampling every
+  ray edge landed on one of sixteen grey levels and the whole thing read as
+  notched — reported as "low quality logo" twice, at 32px and again at 44px.
+  8x8 at 64px is smooth. The rasterisation is cached, so the cost is paid once.
+- **Nothing rescues a detailed mark at 16px.** Tried on the title-bar icon:
+  averaging the subsamples gives blue mush, taking the maximum gives a solid
+  white disc, and every blend between is one or the other. `make-ico.py` already
+  renders each size from the vector at its own resolution, which is the correct
+  thing to do and is not the problem. **A small icon needs a simplified glyph,
+  which is artwork, not filtering** — do not spend another hour on the filter.
 
 ## Releasing
 

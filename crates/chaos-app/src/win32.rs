@@ -1119,6 +1119,12 @@ pub const CBS_OWNERDRAWFIXED: u32 = 0x0010;
 pub const CBS_HASSTRINGS: u32 = 0x0200;
 
 pub const CB_ADDSTRING: u32 = 0x0143;
+/// Widen the *open* list past the closed control.
+///
+/// Without it the drop-down is exactly as wide as the box, so an option whose
+/// label does not fit is unreadable in the one place it has to be read -- which
+/// is what "Processor (the GPU is not used her..." was.
+pub const CB_SETDROPPEDWIDTH: u32 = 0x0160;
 pub const CB_RESETCONTENT: u32 = 0x014B;
 pub const CB_SETCURSEL: u32 = 0x014E;
 pub const CB_GETCURSEL: u32 = 0x0147;

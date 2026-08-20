@@ -617,3 +617,141 @@ fn changing_the_selection_re_decides_which_buttons_are_live() {
          previously selected model:\n{arm}"
     );
 }
+
+/// The app asks whether it is out of date, without being told to.
+///
+/// Atur's ask was *"users can get the most updated release when they connect to
+/// the internet from the app"* -- which a menu item alone does not satisfy,
+/// because nobody opens Help to find out that Help has something to say. The
+/// check runs once at startup and is silent unless there is news.
+#[test]
+fn the_app_checks_for_a_newer_release_on_its_own() {
+    let src = main_rs();
+    assert!(
+        src.contains("check_for_updates(false)"),
+        "nothing checks for updates unless the user goes looking"
+    );
+    assert!(
+        src.contains("CHAOS_NO_UPDATE_CHECK"),
+        "the automatic check cannot be turned off"
+    );
+    // The comparison lives in the tested module, not inline in the window.
+    assert!(
+        src.contains("update::decide("),
+        "the window decides for itself whether a release is newer"
+    );
+}
+
+/// The window has to be gone before the installer overwrites `chaos-app.exe`.
+///
+/// Windows keeps a running executable's file open, so an install launched from
+/// inside the app fails on exactly the binary that asked for it -- `chaos-setup`
+/// answers "cannot write chaos-app.exe. Close Chaos and run this again."
+#[test]
+fn installing_an_update_closes_the_app() {
+    let src = main_rs();
+    let i = src
+        .find("fn install_update()")
+        .expect("no install_update()");
+    let body = &src[i..];
+    assert!(
+        src.contains("update_quit"),
+        "nothing tells the window to stand aside for the installer"
+    );
+    assert!(
+        src.contains(".update_quit {"),
+        "update_quit is set but never read"
+    );
+    // The flag must lead to a close, not merely exist.
+    let q = src
+        .find(".update_quit {")
+        .expect("update_quit is never read");
+    assert!(
+        src[q..(q + 400).min(src.len())].contains("WM_CLOSE"),
+        "update_quit is read but the window never closes"
+    );
+    assert!(
+        body[..body.len().min(3000)].contains("Command::new(&dest)"),
+        "the downloaded installer is never started"
+    );
+}
+
+/// A downloaded installer is checked for being an installer.
+///
+/// `curl` exits zero after saving a redirect to an error page, which is how a
+/// corrupt .gguf got onto this machine once. The same trap applies here, and a
+/// zero-byte "installer" that does nothing reads as a broken updater.
+#[test]
+fn a_downloaded_update_is_not_trusted_by_its_exit_code() {
+    let src = main_rs();
+    let i = src
+        .find("fn install_update()")
+        .expect("no install_update()");
+    let body = &src[i..i + 3000.min(src.len() - i)];
+    assert!(
+        body.contains("metadata(&dest)"),
+        "the downloaded file's size is never checked"
+    );
+}
+
+/// An option that does not fit the box must still be readable when the box is
+/// open.
+///
+/// A Win32 drop-down is exactly as wide as its control unless it is told
+/// otherwise, and the settings column is narrower than the sentences in it --
+/// so "Processor (the GPU is not used here)" opened as
+/// "Processor (the GPU is not used her...". Atur reported the drop-downs as not
+/// working well, and that was the whole of it.
+#[test]
+fn a_dropdown_opens_wide_enough_to_read() {
+    let src = main_rs();
+    assert!(
+        src.contains("CB_SETDROPPEDWIDTH"),
+        "the open list is never widened past its box"
+    );
+    // Measured, not a guessed constant: the labels are sentences and their
+    // width depends on the font and the DPI.
+    let i = src
+        .find("unsafe fn widen_dropdown(")
+        .expect("no widen_dropdown");
+    let body = &src[i..(i + 1600).min(src.len())];
+    assert!(
+        body.contains("text_width("),
+        "the width is guessed rather than measured"
+    );
+    assert!(
+        body.contains("work_area()"),
+        "a long label could push the list off the screen"
+    );
+    // And it is actually called when a list is filled.
+    assert!(
+        src.contains("widen_dropdown(h, &list)"),
+        "widen_dropdown exists but no drop-down uses it"
+    );
+}
+
+/// Changing the page repaints the rail, not only the button that was clicked.
+///
+/// **Invalidating the parent does not repaint its children.** The rail items
+/// are owner-drawn, so one only redraws when Windows sends it a `WM_DRAWITEM`,
+/// and it only does that when that button is invalidated. Without this, each
+/// rail item lit itself on click and nothing ever un-lit the previous one --
+/// click all four and all four are highlighted, which is what Atur saw as
+/// "the menu options all of them become blue". The menu and the Ctrl+1..4
+/// accelerators were worse still: they changed the page and left the rail
+/// pointing at the old one.
+#[test]
+fn changing_page_repaints_the_rail() {
+    let src = main_rs();
+    let i = src.find("fn show_page(").expect("no show_page");
+    let body = &src[i..(i + 3000).min(src.len())];
+    assert!(
+        body.contains("nav::SHELL_CONTROLS"),
+        "show_page never touches the rail buttons"
+    );
+    let n = body.matches("InvalidateRect").count();
+    assert!(
+        n >= 2,
+        "show_page invalidates {n} thing(s); the parent alone does not repaint          owner-drawn children"
+    );
+}

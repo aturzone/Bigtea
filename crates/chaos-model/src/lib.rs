@@ -36,6 +36,8 @@ pub mod complete;
 mod discover;
 pub mod download;
 pub mod find;
+/// Which Chaos release is newest, and which installer this platform needs.
+pub mod release;
 mod resident;
 pub mod validate;
 

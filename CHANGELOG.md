@@ -8,6 +8,52 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
+## [0.0.12] — 2026-08-20
+
+### The app updates itself
+
+Atur: *"users can get the most updated release when they connect to the internet
+from the app — an updating flow, not every time go and download a new setup. For
+all apps and exports we need."*
+
+- **Chaos asks once at startup whether a newer release exists**, and says nothing
+  unless one does. If one does, it offers to fetch the installer and hand over.
+  `Help ▸ Check for updates` asks on demand and always answers; `Help ▸ Install
+  update…` does the download. `CHAOS_NO_UPDATE_CHECK=1` turns the automatic
+  check off.
+- **`chaos-run --update` does the same from a terminal**, because the window is
+  one of eleven binaries a release ships and a CLI user should not have to open
+  a GUI to learn that a release exists.
+- **One update updates everything.** The installer carries the whole payload —
+  the window, `chaos-run`, `chaos-serve`, all of it — so there is nothing to do
+  per binary. Your models are not touched.
+- The decision logic is in `chaos_model::release` and is tested against
+  **GitHub's actual response**, kept as a fixture: `0.0.9` must not look newer
+  than `0.0.11`, and a macOS tarball must not be downloaded onto Windows.
+
+### The window, after Atur used it
+
+Six reports, each one a real defect:
+
+- **The rail lit every page at once.** Invalidating the parent window does not
+  repaint owner-drawn children, so each rail item lit itself when clicked and
+  nothing ever un-lit the last one — click all four and all four are
+  highlighted. `View ▸` and `Ctrl+1..4` were worse: they changed the page and
+  left the rail pointing at the old one.
+- **Drop-downs opened too narrow to read.** A Win32 drop-down is exactly as wide
+  as its box unless told otherwise, so *"Processor (the GPU is not used here
+  yet)"* opened as *"Processor (the GPU is not used her…"*. The open list is now
+  measured against its longest option, capped to the screen.
+- **BROWSE sat on top of the sentence explaining the models folder.** Two
+  layout walkers stepped by different amounts; they now share one.
+- **The mark in the rail was rough.** It is a sun of two dozen fine rays around
+  an eye, drawn at 44px with 16 levels of antialiasing — about one level per ray
+  edge. Now 64px at 64 levels, scan-converted from outlines and cached.
+- The models list gives the name its own column, so a narrow window eats a
+  measurement rather than the end of `Qwen3-VL-8B-Instruct-Q4_K_M`.
+- The window is DPI-aware (per-monitor v2) and opens centred in the work area
+  rather than off the corner of a scaled display.
+
 ## [0.0.11] — 2026-08-20
 
 ### Chaos draws images
@@ -1181,7 +1227,8 @@ Qwen3-30B-A3B Q4_K_M prefill, Chaos / llama.cpp:
   requires a competitor's exact command line and output before any competitive
   claim is citable.
 
-[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.11...HEAD
+[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.12...HEAD
+[0.0.12]: https://github.com/aturzone/Chaos/releases/tag/v0.0.12
 [0.0.11]: https://github.com/aturzone/Chaos/releases/tag/v0.0.11
 [0.0.10]: https://github.com/aturzone/Chaos/releases/tag/v0.0.10
 [0.0.8]: https://github.com/aturzone/Chaos/releases/tag/v0.0.8

@@ -28,7 +28,7 @@ and pressing UNINSTALL.
 ```
 +----------------+----------------------------------------------+
 | ✳ CHAOS        |  Chat                                        |
-|   v0.0.11      |  Talk to the running model, or point a       |
+|   v0.0.12      |  Talk to the running model, or point a       |
 |                |  coding agent at its endpoint.               |
 | ▎CHAT          |                                              |
 |  MODELS        |  +----------------------------------------+  |
@@ -172,9 +172,42 @@ engine setting to measured, and leaves the theme alone.
 **File** — rescan (`F5`), open the models folder, exit.
 **Model** — load (`Ctrl+L`), stop, download, delete, copy endpoint (`Ctrl+E`).
 **View** — the four pages, and light or dark.
-**Help** — manual, releases, crash log, about.
+**Help** — manual, check for updates, install update, releases, crash log, about.
 
 Commands that cannot be run right now are greyed rather than left to be tried.
+
+## Updating
+
+**Chaos tells you when there is a newer release.** It asks GitHub once, shortly
+after the window opens, and says nothing at all unless something newer exists —
+if one does, it offers to fetch the installer and hand over to it.
+
+| | |
+|---|---|
+| `Help ▸ Check for updates` | asks now, and always answers, even to say you are current |
+| `Help ▸ Install update…` | downloads this platform's installer and starts it |
+| `chaos-run --update` | the same, from a terminal |
+
+**Chaos closes when the installer starts.** Windows keeps a running
+executable's file open, so the installer cannot replace `chaos-app.exe` while
+the window is up — it would stop with *"cannot write chaos-app.exe. Close Chaos
+and run this again."* Letting it hand over cleanly is the whole reason for the
+step.
+
+**One update updates everything.** The installer carries all eleven binaries —
+the window, `chaos-run`, `chaos-serve`, `chaos-pull` and the rest — so there is
+nothing to update per binary and no version skew to manage.
+
+**Your models are never touched.** They live outside the install prefix
+(`%USERPROFILE%\.chaos\models` by default) and neither the installer nor the
+uninstaller goes near them. Your settings survive too.
+
+> **To turn the automatic check off**, set `CHAOS_NO_UPDATE_CHECK=1` in the
+> environment. The menu items still work; nothing is asked on startup.
+
+If the download fails, Chaos says so and gives you the URL — no update is ever
+applied from a file it could not verify the size of, because `curl` reports
+success after saving an error page just as happily as after saving an installer.
 
 ## Light and dark
 
