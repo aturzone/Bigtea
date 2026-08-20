@@ -119,6 +119,28 @@ fn main() {
         println!("(raw latent, normalisation skipped)");
     }
 
+    // **Test the one convention that was derived and never measured.** The 2x2
+    // patch is folded into the channel index as `px + 2*py + 4*c`; swapping the
+    // two patch axes, or moving the latent channel to the fast end, both produce
+    // a latent of exactly the right shape. CHAOS_PACK=swap|cfast tries them.
+    if let Ok(mode) = std::env::var("CHAOS_PACK") {
+        let (ae, pp) = (c.ae_channels as usize, c.patch as usize);
+        let plane = packed.len() / (ae * pp * pp);
+        let mut out = vec![0.0f32; packed.len()];
+        for ch in 0..ae * pp * pp {
+            let (px, py, cc) = (ch % pp, (ch / pp) % pp, ch / (pp * pp));
+            let src = match mode.as_str() {
+                "swap" => py + pp * px + pp * pp * cc,
+                "cfast" => cc + ae * px + ae * pp * py,
+                _ => ch,
+            };
+            out[ch * plane..(ch + 1) * plane]
+                .copy_from_slice(&packed[src * plane..(src + 1) * plane]);
+        }
+        packed = out;
+        println!("(channel order: {mode})");
+    }
+
     // -- the denoiser --------------------------------------------------------
     let path = dir.join("ideogram4_uncond-Q4_0.gguf");
     let model = Model::open_split(&path).unwrap_or_else(|e| {
