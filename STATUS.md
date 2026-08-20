@@ -36,6 +36,14 @@ says so in the binary. All four models are in the catalogue, so `chaos-pull
 ideogram-4 ideogram-4-uncond qwen3-vl-8b flux2-vae` fetches them. A release now
 carries **twelve** binaries.
 
+**Chaos runs in the background now.** Closing the window hides it to the
+notification area and leaves the model loaded and the endpoint serving; the icon
+says what is running, its menu has Open / Stop / Exit, and **Exit is the only
+thing that stops the engine**. Verified on the built binary rather than by
+reading the diff: `WM_CLOSE` leaves the process alive with the window hidden,
+the tray Open command brings it back, and Exit ends the process. On Windows 11
+the icon starts behind the `^` — that is where the shell puts every new one.
+
 **Chaos updates itself now.** It asks GitHub once at startup whether a newer
 release exists and says nothing unless one does; `Help ▸ Check for updates` asks
 on demand, `Help ▸ Install update…` fetches the installer and hands over, and
@@ -110,7 +118,7 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **809 tests** (60 binaries, 0 failed, 33 ignored — the V4-Flash set
+**Current**: **812 tests** (60 binaries, 0 failed, 33 ignored — the V4-Flash set
 needs the container, and the autoencoder set needs the 336 MB `flux2-vae`),
 clippy `--workspace --all-targets -D warnings` 0, fmt clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by

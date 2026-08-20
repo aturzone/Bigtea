@@ -116,6 +116,23 @@ mod windows_app {
         update_quit: bool,
     }
 
+    /// Whether the next `WM_CLOSE` means "quit" or "hide".
+    ///
+    /// **Closing the window is not quitting any more.** Atur: *"chaos run in
+    /// background well when app closed, that chaos must be in small bar in
+    /// every device and show there as running to the user; now chaos always
+    /// run in background and just finish work with exit button."* So the X
+    /// hides to the notification area and the model stays up; Exit is the only
+    /// thing that stops the engine and ends the process.
+    fn really_quitting() -> &'static AtomicBool {
+        static Q: AtomicBool = AtomicBool::new(false);
+        &Q
+    }
+
+    /// The id of our icon within this window. Any number; it only has to be
+    /// stable between `NIM_ADD` and `NIM_DELETE`.
+    const TRAY_ID: u32 = 1;
+
     /// Which set of models the MODELS page lists.
     #[derive(PartialEq, Clone, Copy)]
     enum Tab {
@@ -346,6 +363,9 @@ mod windows_app {
 
             set_window_icon(hwnd, hinst);
             main_window().store(hwnd as usize, Ordering::SeqCst);
+            // Before anything can close the window, so there is always
+            // somewhere for it to go.
+            tray_add(hwnd, hinst);
 
             build_controls(hwnd, hinst, cfg);
             build_menu(hwnd);
@@ -3913,6 +3933,165 @@ Any value a client sends is accepted.                      The server still list
         }
     }
 
+    // ---- the notification area ---------------------------------------------
+    //
+    // Atur: *"chaos run in background well when app closed ... and just finish
+    // work with exit button"*. A model that took four minutes to load should
+    // not be thrown away because somebody closed a window, and an engine still
+    // holding 7 GiB with nothing on screen is worse -- it is the memory leak
+    // this app already fixed once. The icon is what makes background running
+    // honest: it is visible, it says what is loaded, and it has the way out.
+
+    /// Fill in the parts of `NOTIFYICONDATAW` every call needs.
+    fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+        NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_ID,
+            ..Default::default()
+        }
+    }
+
+    /// Copy a string into one of the structure's fixed arrays, truncated.
+    ///
+    /// **Truncated at a UTF-16 boundary and always terminated.** A tip that
+    /// fills its buffer with no NUL is read past the end by the shell.
+    ///
+    /// Not called `fill`: that is the painting primitive, three arguments and a
+    /// colour, and two functions of the same name in one module is how a rename
+    /// lands in the wrong place.
+    fn set_utf16(dst: &mut [u16], text: &str) {
+        let w: Vec<u16> = text.encode_utf16().take(dst.len() - 1).collect();
+        dst[..w.len()].copy_from_slice(&w);
+        dst[w.len()] = 0;
+    }
+
+    /// Put the icon in the notification area.
+    unsafe fn tray_add(hwnd: HWND, hinst: HINSTANCE) {
+        let mut d = tray_data(hwnd);
+        d.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        d.uCallbackMessage = WM_APP_TRAY;
+        // The same resource the window and Explorer use, at the size the shell
+        // asks for rather than a stretched large one.
+        d.hIcon = LoadImageW(hinst, 1u16 as *const u16, IMAGE_ICON, 16, 16, LR_SHARED) as HICON;
+        set_utf16(&mut d.szTip, "Chaos");
+        Shell_NotifyIconW(NIM_ADD, &mut d);
+    }
+
+    /// Say what is running, in the tooltip.
+    ///
+    /// **The icon has to answer "is anything loaded" without a click**, or
+    /// running in the background is indistinguishable from having been left
+    /// open by accident.
+    fn tray_tip(hwnd: HWND) {
+        let loaded = UI.with(|u| u.borrow().as_ref().and_then(|ui| ui.loaded.clone()));
+        let tip = match loaded {
+            Some(m) => format!("Chaos -- {m} is running"),
+            None => "Chaos -- no model running".to_string(),
+        };
+        let mut d = tray_data(hwnd);
+        d.uFlags = NIF_TIP;
+        set_utf16(&mut d.szTip, &tip);
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, &mut d);
+        }
+    }
+
+    /// Take the icon away. Called on the way out, and only there.
+    ///
+    /// **An icon whose window is gone stays on screen** until the user hovers
+    /// over it, which is how a tidy-looking application leaves a ghost behind.
+    unsafe fn tray_remove(hwnd: HWND) {
+        let mut d = tray_data(hwnd);
+        Shell_NotifyIconW(NIM_DELETE, &mut d);
+    }
+
+    /// Tell the user where the window went, once.
+    ///
+    /// Hiding a window with no explanation reads as a crash. Windows shows this
+    /// as a balloon or a toast depending on the version and the user's
+    /// settings; either way it is shown once per run, on the first close.
+    unsafe fn tray_explain_once(hwnd: HWND) {
+        static TOLD: AtomicBool = AtomicBool::new(false);
+        if TOLD.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut d = tray_data(hwnd);
+        d.uFlags = NIF_INFO;
+        d.dwInfoFlags = NIIF_INFO;
+        set_utf16(&mut d.szInfoTitle, "Chaos is still running");
+        set_utf16(
+            &mut d.szInfo,
+            "The model stays loaded so it is ready when you come back. \
+             Click the icon to open the window, or right-click it and choose \
+             Exit to stop.",
+        );
+        Shell_NotifyIconW(NIM_MODIFY, &mut d);
+    }
+
+    /// Bring the window back and put it in front.
+    unsafe fn tray_open(hwnd: HWND) {
+        ShowWindow(hwnd, SW_RESTORE);
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        SetForegroundWindow(hwnd);
+        InvalidateRect(hwnd, std::ptr::null(), 1);
+    }
+
+    /// The right-click menu: open, and the way out.
+    ///
+    /// **`SetForegroundWindow` before, and a stray click after.** A popup owned
+    /// by a window that is not in front never receives its dismissal, so it
+    /// hangs on screen until something else is clicked -- a documented quirk
+    /// with a documented workaround, and skipping either one is how a tray menu
+    /// becomes sticky.
+    unsafe fn tray_menu(hwnd: HWND) {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return;
+        }
+        let loaded = UI.with(|u| u.borrow().as_ref().and_then(|ui| ui.loaded.clone()));
+        let open = wide("&Open Chaos");
+        AppendMenuW(menu, MF_STRING, nav::IDM_TRAY_OPEN as usize, open.as_ptr());
+        if let Some(m) = &loaded {
+            let stop = wide(&format!("&Stop {m}"));
+            AppendMenuW(menu, MF_STRING, nav::IDM_STOP as usize, stop.as_ptr());
+        }
+        let sep = wide("");
+        AppendMenuW(menu, MF_SEPARATOR, 0, sep.as_ptr());
+        let exit = wide("E&xit Chaos");
+        AppendMenuW(menu, MF_STRING, nav::IDM_TRAY_EXIT as usize, exit.as_ptr());
+
+        let mut pt = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            pt.x,
+            pt.y,
+            0,
+            hwnd,
+            std::ptr::null(),
+        );
+        // The other half of the quirk: without this the menu can linger.
+        PostMessageW(hwnd, WM_NULL, 0, 0);
+        DestroyMenu(menu);
+        match cmd {
+            c if c == nav::IDM_TRAY_OPEN => tray_open(hwnd),
+            c if c == nav::IDM_STOP => unload_model(),
+            c if c == nav::IDM_TRAY_EXIT => quit(hwnd),
+            _ => {}
+        }
+    }
+
+    /// Stop for real: the engine, the icon, the process.
+    fn quit(hwnd: HWND) {
+        really_quitting().store(true, Ordering::SeqCst);
+        unsafe {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+    }
+
     // ---- updating in place -------------------------------------------------
     //
     // Atur: *"users can get the most updated release when they connect to the
@@ -4157,6 +4336,12 @@ Any value a client sends is accepted.                      The server still list
                 0
             }
             WM_TIMER => {
+                // What the icon says follows what is loaded. Cheap: one
+                // `Shell_NotifyIconW` a second, and only while hidden is it the
+                // only thing telling the user anything.
+                if IsWindowVisible(hwnd) == 0 {
+                    tray_tip(hwnd);
+                }
                 // Uptime and free memory move on their own; nothing else here
                 // would ever ask for them to be redrawn.
                 let free = free_memory_bytes();
@@ -4232,6 +4417,19 @@ Any value a client sends is accepted.                      The server still list
                 drain();
                 0
             }
+            // The shell sends mouse messages for the icon here, in `lParam`.
+            WM_APP_TRAY => {
+                match lp as u32 {
+                    // One click opens it. Not a double-click: the icon has one
+                    // obvious action and making people find that out by trying
+                    // twice is the kind of thing this window is trying not to
+                    // do.
+                    WM_LBUTTONUP | WM_LBUTTONDBLCLK => tray_open(hwnd),
+                    WM_RBUTTONUP => tray_menu(hwnd),
+                    _ => {}
+                }
+                0
+            }
             WM_DRAWITEM => {
                 let di = &*(lp as *const DRAWITEMSTRUCT);
                 draw_item(di);
@@ -4254,8 +4452,15 @@ Any value a client sends is accepted.                      The server still list
                     return 0;
                 }
                 match id {
-                    nav::IDM_EXIT => {
-                        DestroyWindow(hwnd);
+                    // The one command that ends the process. Everything else
+                    // that looks like closing now hides to the notification
+                    // area instead.
+                    nav::IDM_EXIT | nav::IDM_TRAY_EXIT => {
+                        quit(hwnd);
+                        return 0;
+                    }
+                    nav::IDM_TRAY_OPEN => {
+                        tray_open(hwnd);
                         return 0;
                     }
                     nav::IDM_THEME_LIGHT => {
@@ -4368,9 +4573,24 @@ Any value a client sends is accepted.                      The server still list
                 }
                 0
             }
+            // **The X hides; only Exit quits.** Atur: *"chaos run in background
+            // well when app closed ... and just finish work with exit button"*.
+            // A model can take four minutes to load, and throwing that away
+            // because somebody closed a window is the wrong default -- but
+            // background running has to be *visible*, so the notification-area
+            // icon says what is loaded and carries the way out. An engine
+            // holding 7 GiB with nothing on screen and no icon is the memory
+            // leak this app already fixed once.
             WM_CLOSE => {
-                stop_server();
-                DestroyWindow(hwnd);
+                if really_quitting().load(Ordering::SeqCst) {
+                    tray_remove(hwnd);
+                    stop_server();
+                    DestroyWindow(hwnd);
+                } else {
+                    ShowWindow(hwnd, SW_HIDE);
+                    tray_tip(hwnd);
+                    tray_explain_once(hwnd);
+                }
                 0
             }
             WM_DESTROY => {
@@ -4381,6 +4601,11 @@ Any value a client sends is accepted.                      The server still list
                 // taskbar close became a memory leak you had to find in Task
                 // Manager.
                 KillTimer(hwnd, TIMER_ID);
+                // Not only in `WM_CLOSE`: a destroy can arrive from elsewhere
+                // (a session ending, `DestroyWindow` from the menu), and an
+                // icon whose window is gone stays on screen until the user
+                // happens to hover over it.
+                tray_remove(hwnd);
                 stop_server();
                 PostQuitMessage(0);
                 0

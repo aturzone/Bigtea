@@ -31,6 +31,35 @@ all apps and exports we need."*
   **GitHub's actual response**, kept as a fixture: `0.0.9` must not look newer
   than `0.0.11`, and a macOS tarball must not be downloaded onto Windows.
 
+### Chaos stays running when you close the window
+
+Atur: *"chaos run in background well when app closed, that chaos must be in
+small bar in every device and show there as running to the user; now chaos
+always run in background and just finish work with exit button."*
+
+- **The X hides the window.** The model stays loaded, the endpoint stays up, and
+  Chaos moves to the notification area. A model can take four minutes to load,
+  and throwing that away because somebody closed a window is the wrong default.
+- **The icon says what is running** — hover it for *"Chaos — qwen3-4b is
+  running"*. Background running you cannot see is indistinguishable from an app
+  you forgot to close, and an engine holding 7 GiB with nothing on screen is a
+  bug this app has had once already.
+- **Right-click it** for Open, Stop *model*, and Exit. **Exit is now the only
+  thing that stops the engine** — not the X, not the taskbar's close.
+- The first close explains itself with a notification, once per run.
+
+On Windows 11 a new tray icon starts behind the `^`; that is where the system
+puts every one of them, and pinning it is a Windows setting rather than
+something an application can do for itself. `docs/APP.md` says where.
+
+### Pointing an agent at Chaos, written down
+
+The endpoint and the API key were already there; what was missing was the page
+that says how to use them. `docs/APP.md` now has the base URL, the key, and what
+to put in the "OpenAI-compatible endpoint" box of Hermes, Claude Code, Continue,
+Aider or Zed — plus the fact that, because the window keeps the engine alive in
+the background, an agent can go on using it with no Chaos window on screen.
+
 ### Five builds, eight assets
 
 Two platforms that had nothing at all:

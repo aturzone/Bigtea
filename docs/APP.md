@@ -118,6 +118,61 @@ The key is on the model's page and on MONITOR while a model runs.
 **DELETE** removes an installed model and *every shard* of it, after telling you
 how many files and how many bytes. It refuses while that model is running.
 
+### Running in the background
+
+**Closing the window does not stop Chaos.** Atur's ask, and the right default: a
+model can take four minutes to load, and throwing that away because somebody
+closed a window is expensive. The X hides the window, the model stays loaded,
+the endpoint stays up, and Chaos moves to the notification area.
+
+| | |
+|---|---|
+| **X** / `Alt+F4` | hides the window; everything keeps running |
+| click the tray icon | brings the window back |
+| right-click the tray icon | Open, Stop *model*, Exit |
+| **File ▸ Exit** | stops the engine, frees the memory, ends the process |
+
+**The icon says what is loaded.** Hover it: *"Chaos — qwen3-4b is running"*, or
+*"Chaos — no model running"*. That is the point of having it — background
+running that you cannot see is indistinguishable from an application you forgot
+to close, and an engine holding 7 GiB with nothing on screen is a bug this app
+has already had once.
+
+The first time you close the window, Chaos says so with a notification, once per
+run. On Windows 11 the icon starts **behind the `^`** in the tray; that is where
+the system puts every new one, and pinning it is a Windows setting rather than
+something an application can do for you.
+
+> **Exit is the only thing that stops the engine.** Not the X, not the taskbar's
+> close, not minimising. If you want the memory back, use Exit — or **STOP** on
+> the strip, which unloads the model and leaves the window open.
+
+### Point an agent at Chaos
+
+Chaos speaks the OpenAI API on `127.0.0.1`, so anything that talks to OpenAI
+talks to Chaos. **MODELS ▸ COPY ENDPOINT** (or `Ctrl+E`) puts the address on the
+clipboard, with the API key beside it if one is set.
+
+| the client asks for | give it |
+|---|---|
+| base URL | `http://127.0.0.1:8231/v1` |
+| API key | whatever **Model ▸ Require an API key** shows, or any value if none is set |
+| model name | the name in the list — or anything; one model is loaded at a time |
+
+That covers Hermes, Claude Code, Continue, Aider, Zed, and anything else with an
+"OpenAI-compatible endpoint" box. **Model ▸ Test connection** sends a real
+request through the same path a client uses and writes the answer into the
+transcript, so a misconfiguration is a sentence rather than a silent failure in
+somebody else's application.
+
+**The port is yours to choose** — SETTINGS ▸ *port*, then SAVE. Change it while
+a model is running and the change applies the next time one is loaded; the
+strip always shows the address actually in use, not the one in the file.
+
+Because the window keeps the engine alive in the background, an agent can go on
+using the endpoint with no Chaos window on screen. That is the arrangement to
+aim for: load a model once, close the window, and leave it serving.
+
 ### An unfinished download
 
 A row marked `(unfinished)` is a container that stopped part way. Chaos knows
@@ -265,7 +320,10 @@ Named plainly rather than left to be discovered:
 - Download progress is measured from the bytes on disk, so a paused or
   restarted fetch is still tracked; it cannot show which *shard* of a
   five-part container is in flight.
-- No tray icon — closing the window is the way to quit.
+- The notification-area icon is where Windows 11 puts a new one: **behind the
+  `^`**, not on the taskbar itself. Drag it out, or **Settings ▸ Personalisation
+  ▸ Taskbar ▸ Other system tray icons** to pin it. There is no API that puts it
+  there for you; Windows decides.
 - MONITOR cannot show streamed bytes or cache residency; the engine measures
   them but does not report them over the socket.
 - The menu bar does not follow dark mode. See above for what was tried.

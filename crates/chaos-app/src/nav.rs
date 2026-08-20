@@ -150,6 +150,13 @@ pub const IDM_ABOUT: i32 = 533;
 pub const IDM_CHECK_UPDATE: i32 = 534;
 pub const IDM_INSTALL_UPDATE: i32 = 535;
 
+// The notification-area menu. Not on the menu bar, so `every_menu_command_is_handled`
+// would look for them there -- they are 6xx to keep that distinction visible.
+/// Bring the window back from the notification area.
+pub const IDM_TRAY_OPEN: i32 = 601;
+/// Quit for real, as opposed to closing the window.
+pub const IDM_TRAY_EXIT: i32 = 602;
+
 /// The navigation button for a page.
 pub fn nav_id(p: Page) -> i32 {
     match p {

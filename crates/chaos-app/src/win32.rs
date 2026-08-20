@@ -156,6 +156,8 @@ pub const WM_DESTROY: u32 = 0x0002;
 pub const WM_SIZE: u32 = 0x0005;
 pub const WM_PAINT: u32 = 0x000F;
 pub const WM_CLOSE: u32 = 0x0010;
+/// Does nothing, which is the point: posting it wakes a message loop.
+pub const WM_NULL: u32 = 0x0000;
 pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
@@ -164,6 +166,74 @@ pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
 pub const WM_SETFONT: u32 = 0x0030;
 /// Our own: the worker thread has produced output and the UI should read it.
 pub const WM_APP_TICK: u32 = 0x8000 + 1;
+/// Our own: something happened to the notification-area icon.
+///
+/// **The shell sends this to the window, not to the icon** -- an icon is not a
+/// window and has no procedure of its own. `wParam` is the icon's id and
+/// `lParam` is the mouse message.
+pub const WM_APP_TRAY: u32 = 0x8000 + 2;
+
+// -- the notification area ---------------------------------------------------
+
+pub const NIM_ADD: u32 = 0x0000;
+pub const NIM_MODIFY: u32 = 0x0001;
+pub const NIM_DELETE: u32 = 0x0002;
+/// Which fields of `NOTIFYICONDATAW` are filled in.
+pub const NIF_MESSAGE: u32 = 0x0001;
+pub const NIF_ICON: u32 = 0x0002;
+pub const NIF_TIP: u32 = 0x0004;
+/// The balloon fields (`szInfo`, `szInfoTitle`, `dwInfoFlags`) are meant.
+pub const NIF_INFO: u32 = 0x0010;
+pub const NIIF_INFO: u32 = 0x0001;
+
+pub const WM_LBUTTONUP: u32 = 0x0202;
+pub const WM_LBUTTONDBLCLK: u32 = 0x0203;
+pub const WM_RBUTTONUP: u32 = 0x0205;
+
+/// Return the chosen command instead of posting it, so the caller decides.
+pub const TPM_RETURNCMD: u32 = 0x0100;
+pub const TPM_RIGHTBUTTON: u32 = 0x0002;
+
+pub const SW_RESTORE: i32 = 9;
+pub const SW_SHOWNORMAL: i32 = 1;
+
+/// What the shell needs to put an icon in the notification area.
+///
+/// **`cbSize` decides which version of this structure the shell reads**, and
+/// the layout has grown four times. This is the Vista-and-later one, declared
+/// in full so `size_of` matches what the shell expects; a short one is rejected
+/// silently and the icon simply never appears.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NOTIFYICONDATAW {
+    pub cbSize: u32,
+    pub hWnd: HWND,
+    pub uID: u32,
+    pub uFlags: u32,
+    pub uCallbackMessage: u32,
+    pub hIcon: HICON,
+    /// 128 UTF-16 units. The tooltip, and it is truncated rather than wrapped.
+    pub szTip: [u16; 128],
+    pub dwState: u32,
+    pub dwStateMask: u32,
+    pub szInfo: [u16; 256],
+    /// A union of a timeout and a version in the real header; the version is
+    /// what anything modern sets.
+    pub uVersion: u32,
+    pub szInfoTitle: [u16; 64],
+    pub dwInfoFlags: u32,
+    pub guidItem: [u8; 16],
+    pub hBalloonIcon: HICON,
+}
+
+impl Default for NOTIFYICONDATAW {
+    fn default() -> Self {
+        // SAFETY: every field is a plain integer, a pointer or an array of
+        // them, so an all-zero value is valid and is what the shell expects for
+        // "not set".
+        unsafe { std::mem::zeroed() }
+    }
+}
 
 pub const WM_DRAWITEM: u32 = 0x002B;
 pub const ODS_SELECTED: u32 = 0x0001;
@@ -565,6 +635,14 @@ pub const VK_ESCAPE: u16 = 0x1B;
 pub const VK_RETURN: u16 = 0x0D;
 pub const VK_F5: u16 = 0x74;
 
+// The notification area, which lives in the shell rather than in user32.
+// `SHBrowseForFolderW` is already declared elsewhere against the same library;
+// this block is separate only because it sits beside the tray constants.
+#[link(name = "shell32")]
+extern "system" {
+    pub fn Shell_NotifyIconW(dwMessage: u32, lpData: *mut NOTIFYICONDATAW) -> BOOL;
+}
+
 #[link(name = "user32")]
 extern "system" {
     pub fn CreateMenu() -> HMENU;
@@ -582,6 +660,19 @@ extern "system" {
     pub fn CreateAcceleratorTableW(paccel: *const ACCEL, cAccel: i32) -> HACCEL;
     pub fn TranslateAcceleratorW(hWnd: HWND, hAccTable: HACCEL, lpMsg: *mut MSG) -> i32;
     pub fn SetFocus(hWnd: HWND) -> HWND;
+    pub fn TrackPopupMenu(
+        hMenu: HMENU,
+        uFlags: u32,
+        x: i32,
+        y: i32,
+        nReserved: i32,
+        hWnd: HWND,
+        prcRect: *const RECT,
+    ) -> i32;
+    pub fn GetCursorPos(lpPoint: *mut POINT) -> BOOL;
+    pub fn SetForegroundWindow(hWnd: HWND) -> BOOL;
+    pub fn IsWindowVisible(hWnd: HWND) -> BOOL;
+    pub fn DestroyMenu(hMenu: HMENU) -> BOOL;
     pub fn SetTimer(hWnd: HWND, nIDEvent: usize, uElapse: u32, lpTimerFunc: usize) -> usize;
     pub fn KillTimer(hWnd: HWND, uIDEvent: usize) -> BOOL;
     pub fn TrackMouseEvent(lpEventTrack: *mut TRACKMOUSEEVENT) -> BOOL;

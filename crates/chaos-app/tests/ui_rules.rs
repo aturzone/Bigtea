@@ -318,8 +318,12 @@ fn every_menu_command_is_handled() {
             checked += 1;
             continue;
         }
+        // `IDM_X => ...` or, where two commands do the same thing,
+        // `IDM_X | IDM_Y => ...`. Matching only the first spelling made an
+        // or-pattern look like an unhandled command, which is a test failing on
+        // correct code.
         assert!(
-            src.contains(&format!("{full} =>")),
+            src.contains(&format!("{full} =>")) || src.contains(&format!("{full} |")),
             "{full} is in the menu but never handled"
         );
         checked += 1;
@@ -754,4 +758,82 @@ fn changing_page_repaints_the_rail() {
         n >= 2,
         "show_page invalidates {n} thing(s); the parent alone does not repaint          owner-drawn children"
     );
+}
+
+/// Closing the window must not stop the engine, and Exit must.
+///
+/// Atur: *"chaos run in background well when app closed, that chaos must be in
+/// small bar in every device and show there as running to the user; now chaos
+/// always run in background and just finish work with exit button."*
+///
+/// **Both halves are load-bearing.** Hiding without an icon is how an engine
+/// ends up holding 7 GiB with nothing on screen -- a bug this app has already
+/// had once, when the taskbar close left the child `chaos-serve` alive. So the
+/// icon goes up before anything can close the window, and it comes down on the
+/// way out whichever way the window dies.
+#[test]
+fn closing_hides_and_only_exit_quits() {
+    let src = main_rs();
+    let i = src.find("WM_CLOSE => {").expect("no WM_CLOSE arm");
+    let arm = &src[i..(i + 700).min(src.len())];
+    assert!(
+        arm.contains("really_quitting()"),
+        "WM_CLOSE does not distinguish hiding from quitting"
+    );
+    assert!(
+        arm.contains("SW_HIDE"),
+        "WM_CLOSE never hides the window, so closing still quits"
+    );
+    // Exit is the command that sets the flag.
+    assert!(
+        src.contains("nav::IDM_EXIT | nav::IDM_TRAY_EXIT => {"),
+        "Exit and the tray's Exit are not the same command"
+    );
+    let q = src.find("fn quit(hwnd: HWND)").expect("no quit()");
+    assert!(
+        src[q..(q + 300).min(src.len())].contains("really_quitting().store(true"),
+        "quit() does not mark the close as a real one"
+    );
+}
+
+/// The icon goes up with the window and comes down with it.
+///
+/// An icon whose window is gone stays on screen until the user happens to hover
+/// over it, which is how a tidy-looking application leaves a ghost in the tray.
+#[test]
+fn the_tray_icon_is_added_and_removed() {
+    let src = main_rs();
+    assert!(
+        src.contains("tray_add(hwnd, hinst)"),
+        "no icon is ever added"
+    );
+    // Removed on both paths out, not just the one that is usually taken.
+    assert!(
+        src.matches("tray_remove(hwnd)").count() >= 2,
+        "the icon is removed on only one exit path"
+    );
+    let d = src.find("WM_DESTROY => {").expect("no WM_DESTROY arm");
+    assert!(
+        src[d..(d + 900).min(src.len())].contains("tray_remove(hwnd)"),
+        "a destroy that did not come through WM_CLOSE leaves the icon behind"
+    );
+}
+
+/// The icon has to answer "is anything loaded" without a click.
+#[test]
+fn the_tray_icon_says_what_is_running() {
+    let src = main_rs();
+    let t = src.find("fn tray_tip(hwnd: HWND)").expect("no tray_tip");
+    let body = &src[t..(t + 900).min(src.len())];
+    assert!(
+        body.contains("ui.loaded"),
+        "the tooltip ignores what is loaded"
+    );
+    assert!(body.contains("NIM_MODIFY"), "the tooltip is never updated");
+    // And the right-click menu carries the way out.
+    let m = src.find("unsafe fn tray_menu(").expect("no tray_menu");
+    let menu = &src[m..(m + 2000).min(src.len())];
+    for want in ["IDM_TRAY_OPEN", "IDM_TRAY_EXIT"] {
+        assert!(menu.contains(want), "the tray menu has no {want}");
+    }
 }
