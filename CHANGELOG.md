@@ -8,6 +8,8 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
+## [0.0.13] — 2026-08-20
+
 ### The workspace has a shape now
 
 `core/` `cli/` `network/` `gui/`, which is what the Rust book's workspace
@@ -1346,7 +1348,8 @@ Qwen3-30B-A3B Q4_K_M prefill, Chaos / llama.cpp:
   requires a competitor's exact command line and output before any competitive
   claim is citable.
 
-[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.12...HEAD
+[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.13...HEAD
+[0.0.13]: https://github.com/aturzone/Chaos/releases/tag/v0.0.13
 [0.0.12]: https://github.com/aturzone/Chaos/releases/tag/v0.0.12
 [0.0.11]: https://github.com/aturzone/Chaos/releases/tag/v0.0.11
 [0.0.10]: https://github.com/aturzone/Chaos/releases/tag/v0.0.10
