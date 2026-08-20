@@ -46,7 +46,7 @@ sudo install -m 755 Chaos-*/chaos-* /usr/local/bin/ && mkdir -p ~/.chaos/models
 
 **The window is Windows-only.** `chaos-app` is written against Win32, so the
 Linux and macOS builds are the command-line tools -- `chaos-run`, `chaos-serve`,
-`chaos-probe`, `chaos-pull` and the rest. `chaos-serve` speaks the OpenAI API, so
+`chaos-probe`, `chaos-pull`, `chaos-draw` and the rest. `chaos-serve` speaks the OpenAI API, so
 any client works on every platform.
 
 **2. Get a model.** Ask Chaos for one:
@@ -87,6 +87,27 @@ INSTALLED  AVAILABLE      v4flash UD-Q4_K_XL  155 GB [5 files]  needs 7.92 GB - 
 **Read the second column, not the first.** A 155 GB model streams on a 16 GB
 machine; a 20 GB dense one does not, because a dense container has no routed
 experts to leave on disk.
+
+**And it draws.** `chaos-draw` runs a diffusion pipeline the same way — four
+files, 16.7 GB, none of which has to fit in memory at once.
+
+```bash
+chaos-pull ideogram-4 ideogram-4-uncond qwen3-vl-8b flux2-vae
+chaos-draw "a red apple on a white table" --grid 64 --steps 20 -o apple.png
+```
+
+Qwen3-VL-8B turns the prompt into conditioning, two copies of Ideogram 4 — the
+conditional model and a separately trained unconditional twin — denoise a latent,
+and the FLUX.2 autoencoder turns it into pixels.
+
+> **Colour and scene follow the prompt; object form is still imperfect.** Said
+> here because a diffusion pipeline that is subtly wrong produces a *plausible*
+> picture, so "it drew something" is not evidence. What is measured: the
+> autoencoder round-trips real photographs at **36.09–40.89 dB** (with the check
+> ablated three ways first — each deliberate bug still produced a recognisable
+> image), the text encoder answers `" Paris"` at logit 22.58, and the denoiser
+> scores **0.85 velocity cosine** against a real latent. Structured, JSON-shaped
+> prompts condition about three times as strongly as a bare phrase.
 
 **`chaos-serve` gives you a window as well as a socket.** Open its address in a
 browser and you get a chat interface; point a coding agent at

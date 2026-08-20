@@ -22,6 +22,16 @@ container.
 **The release**: v0.0.12, six assets — Windows installer and zip, Linux tarball,
 `.deb` and AppImage, macOS arm64 tarball.
 
+**`chaos-draw` ships in v0.0.12.** It was an example, held back by a comment
+saying it would become a binary "when there is evidence, not before". The
+evidence: the autoencoder round-trips photographs at 36.09-40.89 dB with the
+check ablated three ways, the text encoder answers `" Paris"` at logit 22.58,
+the denoiser scores 0.85 velocity cosine against a real latent, and at 1024x1024
+the output is photorealistic. **Object form is still imperfect** and `--help`
+says so in the binary. All four models are in the catalogue, so `chaos-pull
+ideogram-4 ideogram-4-uncond qwen3-vl-8b flux2-vae` fetches them. A release now
+carries **twelve** binaries.
+
 **Chaos updates itself now.** It asks GitHub once at startup whether a newer
 release exists and says nothing unless one does; `Help ▸ Check for updates` asks
 on demand, `Help ▸ Install update…` fetches the installer and hands over, and

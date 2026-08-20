@@ -269,5 +269,9 @@ Named plainly rather than left to be discovered:
 - MONITOR cannot show streamed bytes or cache residency; the engine measures
   them but does not report them over the socket.
 - The menu bar does not follow dark mode. See above for what was tried.
+- **No image page.** `chaos-draw` ships in the same install and draws from a
+  prompt; the window does not drive it yet. A picture at 1024x1024 is hours of
+  work on a laptop, and a progress surface honest about that is its own job
+  rather than a button bolted onto MODELS.
 
 `docs/graph/backlog/app-to-production.md` tracks these.
