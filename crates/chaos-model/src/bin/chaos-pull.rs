@@ -167,6 +167,23 @@ fn run(
             have += md.len();
         }
     }
+    // **`saturating_sub` is why a corrupt file once looked finished.** A resume
+    // whose range the server ignores makes curl append the *whole* file to what
+    // is already there, so the result is larger than the real one. The
+    // subtraction floors at zero, `remaining == 0` reports "already complete",
+    // and the container then passes every structural check -- because it is too
+    // big rather than too short, every tensor offset is readable and the bytes
+    // at them are wrong. Qwen3-VL-8B arrived 478,535,680 bytes over and produced
+    // NaN at block 31 of 36.
+    let oversized: Vec<(String, u64)> = files
+        .iter()
+        .filter_map(|f| {
+            let n = std::fs::metadata(dir.join(catalogue::Entry::local_name(f)))
+                .ok()?
+                .len();
+            (n > quant.bytes).then_some((f.clone(), n))
+        })
+        .collect();
     let remaining = quant.bytes.saturating_sub(have);
 
     let machine = chaos_probe::Machine::probe(dir, false);
@@ -191,6 +208,25 @@ fn run(
             dir.display()
         );
         return Ok(ExitCode::FAILURE);
+    }
+    // Before `remaining == 0`, because an oversized file is what makes that
+    // true. Single-file models only: a shard's own size is not in the
+    // catalogue, so there is nothing to compare one against.
+    if files.len() == 1 {
+        if let Some((f, n)) = oversized.first() {
+            let path = dir.join(catalogue::Entry::local_name(f));
+            println!(
+                "\n{f} is {n} bytes and should be {}: {} too many.\n\
+                 A resumed download the server did not honour appends the whole \
+                 file to\nthe part already there. The result is the right shape \
+                 and the wrong bytes,\nso it loads and produces nonsense. Delete \
+                 it and run this again:\n  {}",
+                quant.bytes,
+                n - quant.bytes,
+                path.display()
+            );
+            return Ok(ExitCode::from(4));
+        }
     }
     if remaining == 0 {
         println!("\nAlready complete. Nothing to download.");
@@ -219,7 +255,7 @@ fn run(
         return Ok(ExitCode::SUCCESS);
     }
 
-    fetch(entry, &files, dir)?;
+    fetch(entry, &files, dir, quant.bytes)?;
     println!("\nDone. Run it with:");
     println!(
         "  chaos-run {} \"your prompt\" -n 32",
@@ -342,6 +378,7 @@ fn fetch(
     entry: &catalogue::Entry,
     files: &[String],
     dir: &Path,
+    expected: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if Command::new("curl").arg("--version").output().is_err() {
         return Err(
@@ -382,6 +419,22 @@ fn fetch(
                  if this is a gated repo, set HF_TOKEN."
             )
             .into());
+        }
+        // **Exit zero is not a correct file.** curl reports success after
+        // appending a whole file to a partial one, which is what a resume
+        // becomes when the range is ignored.
+        if files.len() == 1 {
+            let got = std::fs::metadata(&out)?.len();
+            if got != expected {
+                return Err(format!(
+                    "{f} is {got} bytes after downloading, expected {expected}. \
+                     Delete {} and run this again -- a resume the server did not \
+                     honour leaves a file of the wrong size that passes every \
+                     other check.",
+                    out.display()
+                )
+                .into());
+            }
         }
     }
     Ok(())

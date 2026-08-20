@@ -39,6 +39,11 @@
 //! and a diffusion pipeline that is subtly wrong produces a plausible-looking
 //! image, which is this project's oldest hazard wearing different clothes.
 
+pub mod dit;
+pub mod flow;
+pub mod pipeline;
 pub mod png;
+pub mod rope3d;
 pub mod safetensors;
+pub mod text;
 pub mod vae;

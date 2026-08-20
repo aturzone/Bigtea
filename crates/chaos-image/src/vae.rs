@@ -547,6 +547,104 @@ fn push_mid(v: &mut Vec<String>, half: &str) {
     v.push(format!("{half}.mid_block.attentions.0.to_out.0.bias"));
 }
 
+/// The latent normalisation the file carries beside the autoencoder.
+///
+/// FLUX.2 keeps a BatchNorm's running statistics — `bn.running_mean` and
+/// `bn.running_var` — and they are **128-wide, the packed channel count**, not
+/// the autoencoder's 32. They are what older autoencoders did with a scalar
+/// `scaling_factor`: they put the latent in the space the diffusion model was
+/// trained on.
+///
+/// Returns `(mean, variance)`, or `None` if the file has no such tensors.
+pub fn latent_stats(st: &SafeTensors, file: &[u8]) -> Option<(Vec<f32>, Vec<f32>)> {
+    let read = |name: &str| -> Option<Vec<f32>> {
+        let e = st.get(name)?;
+        if e.dtype != Dtype::F32 {
+            return None;
+        }
+        let b = st.bytes_of(file, e)?;
+        Some(
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        )
+    };
+    Some((read("bn.running_mean")?, read("bn.running_var")?))
+}
+
+/// Epsilon in the latent normalisation. PyTorch's `BatchNorm2d` default.
+pub const BN_EPS: f32 = 1e-5;
+
+/// `(z - mean) / sqrt(var + eps)`, per packed channel, in place.
+///
+/// `packed` is `[gw, gh, 128]` in ggml order, so a channel is a contiguous
+/// plane of `gw * gh` values.
+pub fn normalize_latent(packed: &mut [f32], mean: &[f32], var: &[f32]) {
+    let plane = packed.len() / mean.len();
+    for (c, chunk) in packed.chunks_mut(plane).enumerate() {
+        let s = 1.0 / (var[c] + BN_EPS).sqrt();
+        for v in chunk {
+            *v = (*v - mean[c]) * s;
+        }
+    }
+}
+
+/// [`normalize_latent`] reversed, for the latent the sampler hands back.
+pub fn denormalize_latent(packed: &mut [f32], mean: &[f32], var: &[f32]) {
+    let plane = packed.len() / mean.len();
+    for (c, chunk) in packed.chunks_mut(plane).enumerate() {
+        let s = (var[c] + BN_EPS).sqrt();
+        for v in chunk {
+            *v = *v * s + mean[c];
+        }
+    }
+}
+
+/// Fold each 2x2 block of a 32-channel latent into one cell of 128 channels.
+///
+/// **The denoiser never sees the autoencoder's latent directly.** FLUX.2's
+/// autoencoder is 8x, but Ideogram 4 consumes a 16x grid: the pipeline packs
+/// every 2x2 patch of latent into the channel dimension first. That is why the
+/// denoiser's `input_proj` is 128 wide and the autoencoder's `conv_in` is 32.
+///
+/// The channel numbering is `px + 2*py + 4*ae` — the patch offsets in the fast
+/// bits and the latent channel in the slow ones. Reversing those two produces a
+/// latent of exactly the right shape whose 2x2 blocks are transposed, which
+/// decodes to a picture that looks like a printing fault.
+///
+/// `[w, h, 32]` in, `[w/2, h/2, 128]` out, both in ggml order with width
+/// fastest.
+pub fn pack_latent(latent: &[f32], w: usize, h: usize, ae: usize, p: usize) -> Vec<f32> {
+    let (gw, gh) = (w / p, h / p);
+    let mut out = vec![0.0f32; gw * gh * ae * p * p];
+    for c in 0..ae {
+        for y in 0..h {
+            for x in 0..w {
+                let ch = (x % p) + p * (y % p) + p * p * c;
+                let dst = (x / p) + gw * (y / p) + gw * gh * ch;
+                out[dst] = latent[x + w * y + w * h * c];
+            }
+        }
+    }
+    out
+}
+
+/// [`pack_latent`] reversed: `[w, h, 128]` back to `[2w, 2h, 32]`.
+pub fn unpack_latent(packed: &[f32], gw: usize, gh: usize, ae: usize, p: usize) -> Vec<f32> {
+    let (w, h) = (gw * p, gh * p);
+    let mut out = vec![0.0f32; w * h * ae];
+    for c in 0..ae {
+        for y in 0..h {
+            for x in 0..w {
+                let ch = (x % p) + p * (y % p) + p * p * c;
+                let src = (x / p) + gw * (y / p) + gw * gh * ch;
+                out[x + w * y + w * h * c] = packed[src];
+            }
+        }
+    }
+    out
+}
+
 /// Turn 8-bit RGB into the `[W, H, 3, 1]` planar float image the encoder wants.
 ///
 /// Diffusers' `VaeImageProcessor` normalises to `[-1, 1]`, so this is
@@ -705,6 +803,32 @@ mod tests {
         // And the planar layout really is planar: channel 0 of pixel (1, 0) is
         // the second element, not the fourth.
         assert!((planar[1] - ((rgb[3] as f32 / 255.0) * 2.0 - 1.0)).abs() < 1e-6);
+    }
+
+    /// Packing folds 2x2 blocks into channels and unpacking undoes it exactly.
+    #[test]
+    fn the_latent_pack_is_an_exact_permutation() {
+        let (w, h, ae, p) = (4usize, 6usize, 3usize, 2usize);
+        let latent: Vec<f32> = (0..w * h * ae).map(|i| i as f32).collect();
+        let packed = pack_latent(&latent, w, h, ae, p);
+        assert_eq!(
+            packed.len(),
+            latent.len(),
+            "a fold moves values, not counts"
+        );
+        assert_eq!(unpack_latent(&packed, w / p, h / p, ae, p), latent);
+
+        // The documented numbering: the top-left pixel of every 2x2 block keeps
+        // channel 4c, and its right neighbour lands on 4c + 1.
+        let (gw, gh) = (w / p, h / p);
+        for c in 0..ae {
+            let top_left = packed[gw * gh * (p * p * c)];
+            assert_eq!(top_left, latent[w * h * c], "c = {c}");
+            let right = packed[gw * gh * (1 + p * p * c)];
+            assert_eq!(right, latent[1 + w * h * c], "px = 1 is channel 4c + 1");
+            let below = packed[gw * gh * (p + p * p * c)];
+            assert_eq!(below, latent[w + w * h * c], "py = 1 is channel 4c + 2");
+        }
     }
 
     /// PSNR is a score, so its two ends need to mean what a report says they do.

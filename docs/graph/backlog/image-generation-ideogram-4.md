@@ -3,8 +3,8 @@
 > Atur asked for Ideogram 4 in the release. It **is** open-weight, so "we cannot
 > get it" was never the answer. This is the real answer.
 
-**Status: the autoencoder runs and is verified, 2026-08-19. The denoiser is not
-started.**
+**Status: the whole pipeline runs end to end and produces a coherent
+photographic image, 2026-08-20. It does not yet follow the prompt closely.**
 
 ## Done, and how it was checked
 
@@ -14,9 +14,84 @@ started.**
 | safetensors reading | **done** — against the real 251-tensor VAE header |
 | all four files fetchable | **done** — `chaos-pull` gets them, 16.65 GB total |
 | **VAE encode + decode** | **done — 36.09 dB round trip on a real photograph** |
-| the denoiser forward pass | not started |
-| the sampler loop | not started |
-| text conditioning | not started |
+| **the denoiser forward pass** | **done — 34-layer DiT, scored 0.85 against a real latent** |
+| **the sampler loop** | **done — logit-normal schedule, Euler, CFG** |
+| **text conditioning** | **done — Qwen3-VL, verified by " Paris"** |
+| prompt adherence | **weak, open** |
+
+## How the denoiser is checked, since a picture cannot check it
+
+A rectified-flow model at noise level `sigma` sees
+`latent*(1-sigma) + noise*sigma` and must predict `noise - latent`. **Both terms
+are known**: the autoencoder's encoder — already verified to 36 dB by round trip
+— turns a real photograph into a real latent, and the noise is ours. So the
+model's answer is scored by cosine similarity against the truth, with no image
+involved. `examples/try-velocity.rs`.
+
+Scored against each half separately, which is what made it diagnostic:
+
+| | cos(v) | cos(-latent) | cos(noise) |
+|---|---|---|---|
+| first working version | 0.57 | 0.16 | 0.80 |
+| + latent normalisation | 0.73 | 0.15 | 0.84 |
+| + correct attention scale | 0.79 | 0.20 | 0.88 |
+| + at 512x512 instead of 256 | **0.85** | 0.34 | 0.83 |
+
+**`cos(noise)` high with `cos(-latent)` near zero** was the signature that found
+both bugs: noise is permutation-invariant and image content is not, so a model
+that reports the noise and misses the image is being fed something it cannot
+read.
+
+## Three things the reference implementation gets wrong or leaves out
+
+Read from `leejet/stable-diffusion.cpp`, then corrected against measurement:
+
+1. **`kv_scale` is not the attention scale.** Ideogram 4 passes `1.f / 128.f`,
+   which reads exactly like a scale for head_dim 256. The helper multiplies k and
+   v by it, divides the softmax scale by it, and divides the output back out — an
+   F16 overflow guard that cancels exactly. The real scale is
+   `1/sqrt(head_dim)`. Using 1/128 makes the softmax eight times too flat.
+2. **The autoencoder's latent normalisation is never applied.**
+   `bn.running_mean` and `bn.running_var` are in the file, 128 wide to match the
+   packed channel count, and `stable-diffusion.cpp` reads neither. Applying them
+   is worth 0.17 to 0.49 at sigma 0.3.
+3. **`rope_interleaved = false`** means element `f` rotates with `f + head_dim/2`,
+   not with its neighbour.
+
+Being faithful to the reference and being right are not the same thing, and only
+a measurement the reference does not make can tell them apart.
+
+## What the prompt does, measured at three sizes
+
+At **256x256** the pipeline drew a coherent dark stone-wall scene for "a red
+apple on a white table" — a real photograph of the wrong thing. At **512x512**,
+16 steps, cfg 5, the same prompt drew a **red mass on white surfaces beside a
+wooden shelf**: colour and scene follow the prompt, the object's *form* does not.
+So the conditioning works and the geometry is the weak part.
+
+The numbers behind that: two prompts as different as "a red apple on a white
+table" and "a snowy mountain range at sunrise" move the predicted velocity by 14%
+(cosine 0.9897), where the *unconditional twin* — different weights entirely — is
+0.89 away. Fourteen per cent sounds small and is not: the velocity is dominated
+by "remove the noise", which is the same whatever the prompt, and guidance
+multiplies the difference.
+
+## What is still open
+
+**Form.** The subject comes out as a flat saturated region rather than an object.
+Untested candidates, in the order worth trying:
+
+1. **Resolution.** Everything here has been measured below the 1024x1024 the
+   model was trained for, and the same code scored 0.79 at 256 against 0.85 at
+   512 on one photograph. `stable-diffusion.cpp`'s own issue #1648 reports
+   Ideogram 4 collapsing at 1024 and being correct at 1536 and 2048, so this
+   model is unusually resolution-sensitive.
+2. **Guidance strength.** Flat saturated regions are what too much of it looks
+   like on a flow model.
+3. **Prompt shape.** Ideogram 4 is trained on elaborate structured-JSON prompts;
+   a seven-word one may genuinely condition weakly.
+4. The thirteen hidden-state layers, which are read from the reference and not
+   independently checked.
 
 ## The autoencoder is verified, and here is what that word is doing
 

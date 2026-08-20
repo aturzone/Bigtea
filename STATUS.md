@@ -47,9 +47,27 @@ have passed "it looks right". Unreversed convolution kernels abort ggml outright
 The suite carries the round trip at 128x128 as two `#[ignore]`d tests that
 **panic rather than skip** when the file is absent.
 
-**The denoiser is not started**, so Chaos cannot yet generate an image from a
-prompt — only decode a latent into one. `image-generation-ideogram-4.md` has the
-shapes and the order of work.
+**The whole image pipeline now runs end to end** (2026-08-20): Qwen3-VL for the
+text, both Ideogram 4 denoisers for the sampling, and the autoencoder for the
+pixels. It produces a **coherent photographic image that follows the prompt's colour and
+scene**: at 512x512 "a red apple on a white table, studio photograph" drew a red
+mass on white surfaces beside a wooden shelf. **The object's form is wrong** — a
+flat saturated region rather than an apple — and that is the open problem, with
+resolution the first suspect: the model is trained at 1024 and up, and the same
+code scores 0.79 at 256 against 0.85 at 512.
+
+The denoiser is scored **without looking at a picture**: a rectified-flow model
+at noise level `sigma` must predict `noise - latent`, and both terms are known
+because the verified encoder supplies a real latent. Cosine against the truth is
+**0.85 at 512x512**. Scoring against each half separately — "can it see the
+noise" against "can it see the image" — is what found the two bugs below, and a
+picture could not have told them apart.
+
+**Two of them are in the reference implementation.** `stable-diffusion.cpp`
+passes `1.f / 128.f` as an attention scale that is really an F16 overflow guard
+which cancels out, and it never reads the autoencoder's own latent
+normalisation (`bn.running_mean`, `bn.running_var`). Being faithful to a
+reference and being right are not the same thing.
 
 **The project is now called `chaos`.** Every crate, binary, environment variable
 and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
@@ -57,7 +75,7 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **761 tests** (58 binaries, 0 failed, 33 ignored — the V4-Flash set
+**Current**: **786 tests** (58 binaries, 0 failed, 33 ignored — the V4-Flash set
 needs the container, and the autoencoder set needs the 336 MB `flux2-vae`),
 clippy `--workspace --all-targets -D warnings` 0, fmt clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by

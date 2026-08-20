@@ -55,7 +55,10 @@ name = "chaos-image"
 version = "0.0.10"
 dependencies = [
  "chaos-ggml",
+ "chaos-gguf",
  "chaos-grammar",
+ "chaos-model",
+ "chaos-tokenizer",
 ]
 
 [[package]]
