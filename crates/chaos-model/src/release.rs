@@ -75,19 +75,33 @@ pub fn running() -> Version {
 /// it does not change shape when the site is redesigned.
 pub const LATEST_URL: &str = "https://api.github.com/repos/aturzone/Chaos/releases/latest";
 
-/// The installer for the platform this is running on.
+/// The name of the release asset built for the machine this is running on.
 ///
-/// **Named per platform, because downloading the wrong one is silent.** A macOS
-/// tarball saves perfectly well onto Windows and then does nothing, which reads
-/// as a broken updater rather than as the wrong file.
+/// **Both halves matter, and getting either wrong is silent.** A macOS tarball
+/// saves perfectly well onto Windows and then does nothing, which reads as a
+/// broken updater rather than as the wrong file — and an arm64 binary on an
+/// Intel Mac is the same failure one level down: it downloads, it unpacks, and
+/// then nothing runs.
+///
+/// So the architecture is read from the build, not assumed. A release ships
+/// five: Windows x86_64, macOS on both arm64 and x86_64, and Linux on both
+/// x86_64 and arm64.
 pub fn asset_for_platform(version: &Version) -> String {
     let v = version.text();
+    // The names the release workflow's matrix produces. `arm64` rather than
+    // Rust's `aarch64`, because the asset names are what a person reads on the
+    // releases page.
+    let arm = cfg!(target_arch = "aarch64");
     if cfg!(windows) {
+        // One Windows build. When an arm64 one exists this needs the same
+        // branch the others have.
         format!("Chaos-v{v}-windows-x86_64-Setup.exe")
     } else if cfg!(target_os = "macos") {
-        format!("Chaos-v{v}-macos-arm64.tar.gz")
+        let arch = if arm { "arm64" } else { "x86_64" };
+        format!("Chaos-v{v}-macos-{arch}.tar.gz")
     } else {
-        format!("Chaos-v{v}-linux-x86_64.tar.gz")
+        let arch = if arm { "arm64" } else { "x86_64" };
+        format!("Chaos-v{v}-linux-{arch}.tar.gz")
     }
 }
 
@@ -297,24 +311,38 @@ mod tests {
         assert_eq!(Version::parse(""), None);
     }
 
+    /// The five assets a release ships, shaped as GitHub returns them: the
+    /// download URL ends in the asset's own filename, which is what makes a
+    /// mis-pairing detectable rather than plausible.
     fn feed(tag: &str) -> String {
-        format!(
-            r#"{{"tag_name":"{tag}","name":"{tag}","assets":[
-              {{"name":"Chaos-{tag}-windows-x86_64-Setup.exe","browser_download_url":"https://example/setup.exe"}},
-              {{"name":"Chaos-{tag}-linux-x86_64.tar.gz","browser_download_url":"https://example/linux.tgz"}},
-              {{"name":"Chaos-{tag}-macos-arm64.tar.gz","browser_download_url":"https://example/mac.tgz"}}]}}"#
-        )
+        let a =
+            |n: &str| format!(r#"{{"name":"{n}","browser_download_url":"https://example/{n}"}}"#);
+        let assets = [
+            a(&format!("Chaos-{tag}-windows-x86_64-Setup.exe")),
+            a(&format!("Chaos-{tag}-linux-x86_64.tar.gz")),
+            a(&format!("Chaos-{tag}-linux-arm64.tar.gz")),
+            a(&format!("Chaos-{tag}-macos-arm64.tar.gz")),
+            a(&format!("Chaos-{tag}-macos-x86_64.tar.gz")),
+        ]
+        .join(",");
+        format!(r#"{{"tag_name":"{tag}","name":"{tag}","assets":[{assets}]}}"#)
     }
 
     #[test]
     fn the_feed_gives_up_its_tag_and_assets() {
         let r = parse_latest(&feed("v0.0.12")).expect("parsed");
         assert_eq!(r.version, Version(0, 0, 12));
-        assert_eq!(r.assets.len(), 3);
-        // The name and the URL of one asset stay together.
-        let (n, u) = &r.assets[0];
-        assert!(n.contains("Setup.exe"));
-        assert_eq!(u, "https://example/setup.exe");
+        assert_eq!(r.assets.len(), 5, "an asset was lost or invented");
+        // The name and the URL of an asset stay together -- for every one of
+        // them, not only the first. Pairing by scanning back from each URL is
+        // the part that can go wrong.
+        assert!(r.assets[0].0.contains("Setup.exe"));
+        for (name, url) in &r.assets {
+            assert!(
+                url.ends_with(name.as_str()),
+                "{name} was paired with {url}, which is a different build"
+            );
+        }
         // Nonsense in gives nothing out rather than a wrong version.
         assert!(parse_latest("not json at all").is_none());
         assert!(parse_latest("{}").is_none());
@@ -325,13 +353,48 @@ mod tests {
     fn the_asset_matches_the_platform() {
         let r = parse_latest(&feed("v0.0.12")).expect("parsed");
         let url = r.asset_url().expect("an asset for this platform");
-        if cfg!(windows) {
-            assert_eq!(url, "https://example/setup.exe");
+        // **The architecture as well as the operating system.** An arm64
+        // tarball on an Intel Mac downloads, unpacks and then runs nothing --
+        // the same silent failure as the wrong OS, one level down.
+        let want = format!("https://example/{}", asset_for_platform(&r.version));
+        assert_eq!(url, want, "picked the wrong build for this machine");
+        // And that name really is this machine's: OS and architecture both.
+        let os = if cfg!(windows) {
+            "windows"
         } else if cfg!(target_os = "macos") {
-            assert_eq!(url, "https://example/mac.tgz");
+            "macos"
         } else {
-            assert_eq!(url, "https://example/linux.tgz");
-        }
+            "linux"
+        };
+        let arch = if cfg!(target_arch = "aarch64") && !cfg!(windows) {
+            "arm64"
+        } else {
+            "x86_64"
+        };
+        assert!(url.contains(os) && url.contains(arch), "{url}");
+    }
+
+    /// The five names are exactly the five the release workflow produces.
+    ///
+    /// **A name is the whole contract here.** The updater finds its download by
+    /// string equality against the feed, so a matrix entry renamed in
+    /// `release.yml` and not here is an updater that reports "no installer for
+    /// this platform" forever, on that platform only, with nothing in a log.
+    #[test]
+    fn the_asset_names_are_the_ones_the_release_builds() {
+        let v = Version(0, 0, 12);
+        let mine = asset_for_platform(&v);
+        let shipped = [
+            "Chaos-v0.0.12-windows-x86_64-Setup.exe",
+            "Chaos-v0.0.12-linux-x86_64.tar.gz",
+            "Chaos-v0.0.12-linux-arm64.tar.gz",
+            "Chaos-v0.0.12-macos-arm64.tar.gz",
+            "Chaos-v0.0.12-macos-x86_64.tar.gz",
+        ];
+        assert!(
+            shipped.contains(&mine.as_str()),
+            "{mine} is not one of the assets a release builds"
+        );
     }
 
     #[test]

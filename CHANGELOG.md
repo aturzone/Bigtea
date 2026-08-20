@@ -31,6 +31,22 @@ all apps and exports we need."*
   **GitHub's actual response**, kept as a fixture: `0.0.9` must not look newer
   than `0.0.11`, and a macOS tarball must not be downloaded onto Windows.
 
+### Five builds, eight assets
+
+Two platforms that had nothing at all:
+
+- **Intel Macs.** `macos-latest` is Apple Silicon, so every macOS release so far
+  was arm64 only.
+- **arm64 Linux** — a Raspberry Pi, an Ampere box, an arm64 VM.
+
+The updater picks by **architecture as well as operating system** now. An arm64
+tarball on an Intel Mac is the same silent failure as the wrong OS one level
+down: it downloads, it unpacks, and then nothing runs. A test pins the five
+names against the five the release workflow builds, because the updater matches
+by string equality — a matrix entry renamed in one place and not the other is an
+updater that says "no installer for this platform" forever, on that platform
+only, with nothing in a log.
+
 ### Images ship
 
 `chaos-draw` is a **binary** now, not an example held back behind a comment that

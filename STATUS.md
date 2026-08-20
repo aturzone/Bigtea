@@ -19,8 +19,12 @@ engines agree to five significant figures on every layer sum and then both
 overflow to NaN at `l_out-5`. Chaos warns before generating and points at the
 container.
 
-**The release**: v0.0.12, six assets — Windows installer and zip, Linux tarball,
-`.deb` and AppImage, macOS arm64 tarball.
+**The release**: v0.0.12, **eight** assets across **five** builds — Windows
+installer and zip; Linux x86_64 tarball, `.deb` and AppImage; Linux **arm64**
+tarball; macOS **arm64** and **x86_64** tarballs. The last two are new in
+v0.0.12: `macos-latest` is Apple Silicon only, so an Intel Mac had nothing that
+ran, and `ubuntu-latest` is x86_64 only, so a Pi or an Ampere box had nothing
+either.
 
 **`chaos-draw` ships in v0.0.12.** It was an example, held back by a comment
 saying it would become a binary "when there is evidence, not before". The
@@ -106,7 +110,7 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **808 tests** (60 binaries, 0 failed, 33 ignored — the V4-Flash set
+**Current**: **809 tests** (60 binaries, 0 failed, 33 ignored — the V4-Flash set
 needs the container, and the autoencoder set needs the 336 MB `flux2-vae`),
 clippy `--workspace --all-targets -D warnings` 0, fmt clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by
