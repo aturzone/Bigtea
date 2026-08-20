@@ -277,6 +277,10 @@ mod windows_app {
     }
 
     pub fn run() {
+        // **Before any window exists**, because awareness cannot be changed
+        // afterwards. Without it Windows renders the app at 96 DPI and stretches
+        // the result: soft text, and every coordinate in a made-up space.
+        chaos_app::win32::become_dpi_aware();
         let cfg = settings::Settings::load();
 
         unsafe {
@@ -303,6 +307,7 @@ mod windows_app {
             }
 
             let title = wide("Chaos");
+            let geom = opening_geometry();
             let hwnd = CreateWindowExW(
                 0,
                 class.as_ptr(),
@@ -312,10 +317,10 @@ mod windows_app {
                 // every child control repaints too -- a visible flash across
                 // the whole window, once a second, forever.
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                120,
-                80,
-                1180,
-                780,
+                geom.0,
+                geom.1,
+                geom.2,
+                geom.3,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 hinst,
@@ -541,6 +546,33 @@ mod windows_app {
         CreateFontW(px, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, name.as_ptr())
     }
 
+    /// Where the window opens: `(x, y, width, height)`.
+    ///
+    /// # Why this is not four constants
+    ///
+    /// It was. `(120, 80, 1180, 780)` puts the bottom edge at 860 on a desktop
+    /// whose work area is 816 tall -- the machine this was written on has a
+    /// scaled 1536x864 primary screen -- so the window opened with its lower
+    /// strip under the taskbar, every time, on first run. A fixed size cannot
+    /// be right on an unknown screen.
+    ///
+    /// So: the preferred size, shrunk to fit the work area with a margin, and
+    /// centred in it. Centred rather than at a corner because the work area's
+    /// origin is not always `(0, 0)` -- a taskbar on the left or top moves it,
+    /// and a second monitor to the left makes it negative.
+    fn opening_geometry() -> (i32, i32, i32, i32) {
+        const WANT_W: i32 = 1180;
+        const WANT_H: i32 = 780;
+        const MARGIN: i32 = 40;
+        let Some((l, t, r, b)) = chaos_app::win32::work_area() else {
+            return (120, 80, WANT_W, WANT_H);
+        };
+        let (aw, ah) = ((r - l).max(320), (b - t).max(240));
+        let w = WANT_W.min(aw - MARGIN);
+        let h = WANT_H.min(ah - MARGIN);
+        (l + (aw - w) / 2, t + (ah - h) / 2, w, h)
+    }
+
     unsafe fn child(
         parent: HWND,
         class: &str,
@@ -656,6 +688,7 @@ mod windows_app {
         }
         button(hwnd, "SAVE", nav::ID_SAVE, hinst);
         button(hwnd, "RESET", nav::ID_RESET, hinst);
+        button(hwnd, "BROWSE...", nav::ID_BROWSE_MODELS, hinst);
 
         // The transcript, the composer and the list carry measurements, so they
         // are monospaced; everything else is the UI face.
@@ -2092,6 +2125,44 @@ Any value a client sends is accepted.                      The server still list
     }
 
     /// Read every box back and write the file.
+    /// Pick the models folder instead of typing it.
+    ///
+    /// **The chosen folder is appended, not substituted, when one is already
+    /// set.** The field takes several folders separated by `;` and people do
+    /// use that -- a fast disk and an archive drive -- so replacing the lot
+    /// because somebody wanted to add a second one would quietly lose the
+    /// first. Picking the folder that is already there changes nothing.
+    fn browse_models_dir(hwnd: HWND) {
+        let current = field_value(nav::ID_MODELS_DIR);
+        let first = current.split(';').next().unwrap_or("").trim().to_string();
+        let start = if first.is_empty() {
+            models::default_dir().to_string_lossy().to_string()
+        } else {
+            first
+        };
+        let Some(picked) =
+            chaos_app::win32::pick_folder(hwnd, "Where models are kept", Some(&start))
+        else {
+            return;
+        };
+        let already: Vec<&str> = current
+            .split(';')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let next = if already.iter().any(|p| p.eq_ignore_ascii_case(&picked)) {
+            current.clone()
+        } else if already.is_empty() {
+            picked.clone()
+        } else {
+            format!("{};{}", already.join(";"), picked)
+        };
+        unsafe {
+            SetWindowTextW(ctl(nav::ID_MODELS_DIR), wide(&next).as_ptr());
+        }
+        set_status(&format!("models folder: {next} -- press SAVE to keep it"));
+    }
+
     fn save_settings() {
         // Reads a dropdown's selected *value* or a box's text, as appropriate.
         let read = field_value;
@@ -3244,6 +3315,14 @@ Any value a client sends is accepted.                      The server still list
                         };
                         m.push((id, cx, cy, bw, h));
                     }
+                    // BROWSE sits directly under the folder it changes, not
+                    // beside SAVE: a picker two columns away from the field it
+                    // fills is a button nobody connects to anything.
+                    if let Some(&(_, fx, fy, _, fh)) =
+                        m.iter().find(|(id, ..)| *id == nav::ID_MODELS_DIR)
+                    {
+                        m.push((nav::ID_BROWSE_MODELS, fx, fy + fh + 6, 120, metric::BUTTON));
+                    }
                     let by = page.bottom - 26 - metric::BUTTON - 16;
                     m.push((nav::ID_SAVE, x, by, 110, metric::BUTTON));
                     m.push((nav::ID_RESET, x + 120, by, 110, metric::BUTTON));
@@ -3636,18 +3715,55 @@ Any value a client sends is accepted.                      The server still list
             );
             x += 13;
         }
+        // **Columns, drawn right to left.** Everything after the first is a
+        // measurement -- the size, and "(unfinished)" -- and each is placed at
+        // its own right edge so the name keeps every pixel that is left. Drawn
+        // as one string it was the *name* that lost its tail to the ellipsis,
+        // and a name without its quantisation does not identify a model.
+        let mut parts = s.split(models::COLUMN_SEP);
+        let name = parts.next().unwrap_or("");
+        let extras: Vec<&str> = parts.collect();
+        let mut right = di.rcItem.right - 12;
+        for extra in extras.iter().rev() {
+            let w = text_width(di.hDC, extra, font) + 18;
+            text(
+                di.hDC,
+                RECT {
+                    left: right - w,
+                    right,
+                    ..di.rcItem
+                },
+                extra,
+                font,
+                t.fg_tertiary,
+                DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+            );
+            right -= w;
+        }
         text(
             di.hDC,
             RECT {
                 left: x,
-                right: di.rcItem.right - 8,
+                right: right.max(x + 40),
                 ..di.rcItem
             },
-            &s,
+            name,
             if running { font_bold } else { font },
             t.fg,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
         );
+    }
+
+    /// How wide a string draws in `font`, for right-aligning a column.
+    unsafe fn text_width(hdc: HDC, s: &str, font: HFONT) -> i32 {
+        let old = SelectObject(hdc, font as HGDIOBJ);
+        let w: Vec<u16> = s.encode_utf16().collect();
+        let mut sz = SIZE { cx: 0, cy: 0 };
+        if !w.is_empty() {
+            GetTextExtentPoint32W(hdc, w.as_ptr(), w.len() as i32, &mut sz);
+        }
+        SelectObject(hdc, old);
+        sz.cx
     }
 
     /// Put the embedded icon on the window itself.
@@ -3906,6 +4022,7 @@ Any value a client sends is accepted.                      The server still list
                     (nav::ID_TAB_INSTALLED, BN_CLICKED) => set_tab(Tab::Installed),
                     (nav::ID_TAB_AVAILABLE, BN_CLICKED) => set_tab(Tab::Available),
                     (nav::ID_SAVE, BN_CLICKED) => save_settings(),
+                    (nav::ID_BROWSE_MODELS, BN_CLICKED) => browse_models_dir(hwnd),
                     (nav::ID_RESET, BN_CLICKED) => reset_settings(),
                     (nav::ID_AUTO, BN_CLICKED) | (nav::ID_FORCE, BN_CLICKED) => toggle(id),
                     // Selecting a different model redraws its page beside the

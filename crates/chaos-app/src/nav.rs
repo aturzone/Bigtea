@@ -115,6 +115,8 @@ pub const ID_AUTO: i32 = 308;
 pub const ID_FORCE: i32 = 309;
 pub const ID_SAVE: i32 = 310;
 pub const ID_RESET: i32 = 311;
+/// Pick the models folder with a dialog instead of typing a path.
+pub const ID_BROWSE_MODELS: i32 = 312;
 
 // The shell: 400. Present on every page.
 pub const ID_NAV_CHAT: i32 = 401;
@@ -207,6 +209,7 @@ pub fn controls(p: Page) -> &'static [i32] {
             ID_FORCE,
             ID_SAVE,
             ID_RESET,
+            ID_BROWSE_MODELS,
         ],
     }
 }

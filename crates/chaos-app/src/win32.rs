@@ -724,6 +724,159 @@ extern "system" {
         ppsmemCounters: *mut PROCESS_MEMORY_COUNTERS,
         cb: u32,
     ) -> BOOL;
+    pub fn LoadLibraryW(lpLibFileName: *const u16) -> HANDLE;
+    pub fn GetProcAddress(hModule: HANDLE, lpProcName: *const i8) -> *mut c_void;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    pub fn SystemParametersInfoW(
+        uiAction: u32,
+        uiParam: u32,
+        pvParam: *mut c_void,
+        fWinIni: u32,
+    ) -> BOOL;
+    pub fn SetProcessDPIAware() -> BOOL;
+}
+
+/// What `SHBrowseForFolderW` is given.
+#[repr(C)]
+pub struct BROWSEINFOW {
+    pub hwndOwner: HWND,
+    pub pidlRoot: *mut c_void,
+    pub pszDisplayName: *mut u16,
+    pub lpszTitle: *const u16,
+    pub ulFlags: u32,
+    pub lpfn: Option<unsafe extern "system" fn(HWND, u32, isize, isize) -> i32>,
+    pub lParam: isize,
+    pub iImage: i32,
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    pub fn SHBrowseForFolderW(lpbi: *mut BROWSEINFOW) -> *mut c_void;
+    pub fn SHGetPathFromIDListW(pidl: *mut c_void, pszPath: *mut u16) -> BOOL;
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    pub fn CoInitializeEx(pvReserved: *mut c_void, dwCoInit: u32) -> i32;
+    pub fn CoTaskMemFree(pv: *mut c_void);
+}
+
+/// Ask the user for a folder, returning what they picked.
+///
+/// # Why a dialog and not a text box
+///
+/// The models folder was a field you typed a path into. A typo there is silent:
+/// the list simply comes up empty, and nothing says the path does not exist.
+/// A picked folder cannot be misspelled, and it starts from where the setting
+/// already points, so "change it slightly" is a click rather than a retype.
+///
+/// `SHBrowseForFolderW` rather than the newer `IFileOpenDialog`: one call, no
+/// COM interface pointers to release by hand, present on every Windows this
+/// ships to.
+pub fn pick_folder(owner: HWND, title: &str, start: Option<&str>) -> Option<String> {
+    // BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE — a real folder, resizable.
+    const FLAGS: u32 = 0x0001 | 0x0040;
+    let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let start_w: Option<Vec<u16>> = start
+        .filter(|p| !p.is_empty())
+        .map(|p| p.encode_utf16().chain(std::iter::once(0)).collect());
+
+    // SAFETY: every pointer is to a local that outlives the call, and the
+    // callback only preselects a starting folder.
+    unsafe {
+        // COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE. Already-initialised
+        // returns a failure code that is not one, which is why it is ignored.
+        let _ = CoInitializeEx(std::ptr::null_mut(), 0x2 | 0x4);
+        let mut bi = BROWSEINFOW {
+            hwndOwner: owner,
+            pidlRoot: std::ptr::null_mut(),
+            pszDisplayName: std::ptr::null_mut(),
+            lpszTitle: title_w.as_ptr(),
+            ulFlags: FLAGS,
+            lpfn: start_w.as_ref().map(|_| browse_callback as _),
+            lParam: start_w.as_ref().map_or(0, |v| v.as_ptr() as isize),
+            iImage: 0,
+        };
+        let pidl = SHBrowseForFolderW(&mut bi);
+        if pidl.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 260];
+        let ok = SHGetPathFromIDListW(pidl, buf.as_mut_ptr());
+        CoTaskMemFree(pidl);
+        if ok == 0 {
+            return None;
+        }
+        let n = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..n]))
+    }
+}
+
+/// Preselects the folder the setting already names.
+///
+/// `BFFM_INITIALIZED` is 1 and `BFFM_SETSELECTIONW` is 0x467.
+unsafe extern "system" fn browse_callback(hwnd: HWND, msg: u32, _l: isize, data: isize) -> i32 {
+    if msg == 1 && data != 0 {
+        SendMessageW(hwnd, 0x467, 1, data);
+    }
+    0
+}
+
+/// Screen coordinates of the primary monitor's **work area** — the desktop
+/// minus the taskbar.
+pub fn work_area() -> Option<(i32, i32, i32, i32)> {
+    let mut r = RECT::default();
+    // SPI_GETWORKAREA = 0x0030. SAFETY: writes into a local RECT.
+    let ok = unsafe { SystemParametersInfoW(0x0030, 0, &mut r as *mut RECT as *mut c_void, 0) };
+    (ok != 0).then_some((r.left, r.top, r.right, r.bottom))
+}
+
+/// Tell Windows this process draws its own pixels at the monitor's real
+/// resolution.
+///
+/// # Why a window can open in the wrong place without this
+///
+/// A process that says nothing is **DPI-virtualised**: on a display at 125% it
+/// renders into a 96-DPI surface and the system stretches the result. Text goes
+/// soft, and every coordinate the app computes is in a made-up space — a screen
+/// reported as 1536x864 that is really 1920x1080. So a window asked for at
+/// (120, 80) does not land at (120, 80), and a size chosen to fit the desktop
+/// does not fit it.
+///
+/// Per-monitor v2 is the mode that also keeps this right when the window is
+/// dragged between monitors of different scaling, which is the case on the
+/// machine this was found on: 1920x1080 beside a scaled 1536x864.
+///
+/// Called before any window exists, because awareness cannot be changed
+/// afterwards. Best effort: on Windows 8.1 and older the newer entry points are
+/// absent, and `SetProcessDPIAware` is the whole of what is available.
+pub fn become_dpi_aware() {
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4.
+    const PER_MONITOR_V2: isize = -4;
+    // SAFETY: both are pure process-wide settings taking no pointers we own.
+    unsafe {
+        let user32 = LoadLibraryW(wide_z("user32.dll").as_ptr());
+        if !user32.is_null() {
+            // A C string literal, so the NUL is in the constant and cannot be
+            // forgotten -- `GetProcAddress` reads until one.
+            let name = c"SetProcessDpiAwarenessContext";
+            let f = GetProcAddress(user32, name.as_ptr());
+            if !f.is_null() {
+                let f: extern "system" fn(isize) -> BOOL = std::mem::transmute(f);
+                if f(PER_MONITOR_V2) != 0 {
+                    return;
+                }
+            }
+        }
+        SetProcessDPIAware();
+    }
+}
+
+fn wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// The working set of another process, in bytes, or `None` if it cannot be
