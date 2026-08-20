@@ -21,7 +21,7 @@ export GGML_LIB_DIR=C:/Projects/llamacpp-unsloth/build/ggml/src   # PowerShell: 
 # GPU work needs build-vulkan/ggml/src instead. That build has NO Vulkan archive,
 # and the GPU tests SKIP rather than fail without a card -- so a green "6 passed"
 # was once reported for a file whose two GPU tests never ran once.
-cargo test --release          # 814 tests
+cargo test --release          # 815 tests
 cargo test --release --test deepseek4_forward -- --ignored   # 19 V4-Flash, needs the container
 cargo build --release
 ./target/release/chaos-run <name-or-path> "prompt" -n 16   # bare `chaos-run` lists models
@@ -32,13 +32,21 @@ cargo build --release
 Windows needs the **GNU** Rust toolchain plus MSYS2 mingw64 on PATH, and
 `.cargo/config.toml`'s `link-self-contained=no` must stay.
 
-## Crates
+## Layout — `core/` `cli/` `network/` `gui/`, per the Rust book
 
-`gguf` container parsing · `probe` hardware + RAM reclaim · `plan` prediction +
-residency policy · `io` cache-bypassing aligned reads · `model` sharded
-resolution, partial reads, name lookup · `ggml` FFI (graph, zero-copy weight
-binding) · `tokenizer` byte-level BPE · `jinja` chat templates · `arch`
-architectures + streaming forward pass · `image` PNG, safetensors, FLUX.2 VAE
+**Directories moved, crate names did not.** `core/gguf` is the `chaos-gguf`
+package, so `-p chaos-gguf` and `use chaos_gguf::` are unchanged.
+
+`core/`: `build` build-script helpers · `gguf` container parsing · `ggml` FFI
+(graph, zero-copy weight binding) · `io` cache-bypassing aligned reads · `probe`
+hardware + RAM reclaim · `plan` prediction + residency policy · `model` sharded
+resolution, partial reads, catalogue, release checks · `tokenizer` byte-level
+BPE · `grammar` constrained decoding + the workspace's JSON parser · `jinja` chat
+templates · `arch` architectures + streaming forward pass · `image` PNG,
+safetensors, FLUX.2 VAE, the sampler.
+
+`cli/run` chaos-run · `network/serve` chaos-serve · `gui/app` the window ·
+`gui/setup` the installer. Benchmarks stay beside the crate they measure.
 
 ## Traps — one line each, full text in `docs/graph/reference/hard-won-facts.md`
 

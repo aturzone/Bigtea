@@ -99,6 +99,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "chaos-run"
+version = "0.0.12"
+dependencies = [
+ "chaos-arch",
+ "chaos-build",
+ "chaos-ggml",
+ "chaos-gguf",
+ "chaos-grammar",
+ "chaos-io",
+ "chaos-jinja",
+ "chaos-model",
+ "chaos-probe",
+ "chaos-tokenizer",
+]
+
+[[package]]
+name = "chaos-serve"
+version = "0.0.12"
+dependencies = [
+ "chaos-arch",
+ "chaos-build",
+ "chaos-ggml",
+ "chaos-gguf",
+ "chaos-grammar",
+ "chaos-io",
+ "chaos-jinja",
+ "chaos-model",
+ "chaos-probe",
+ "chaos-tokenizer",
+]
+
+[[package]]
 name = "chaos-setup"
 version = "0.0.12"
 dependencies = [

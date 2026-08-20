@@ -93,7 +93,7 @@ if it just fails — that is a genuinely useful bug report.
 - `chaos-probe` on unusual hardware: report what it gets wrong.
 - Documentation: if something in the README did not work, that is a bug.
 - Architectures: adding one is well-bounded work with a clear oracle to check
-  against. `crates/chaos-arch/src/qwen3.rs` is the smaller example to copy.
+  against. `core/arch/src/qwen3.rs` is the smaller example to copy.
 
 ## Reporting a bug
 

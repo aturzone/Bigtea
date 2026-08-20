@@ -1,0 +1,60 @@
+# Image generation: the parts of a diffusion pipeline that are not a token loop.
+#
+# **No dependencies, like every other crate here.** That includes the PNG
+# encoder: `png` and `flate2` would be the first external crates in the
+# workspace, and a PNG is a signature, three chunks and a CRC. See `png.rs` for
+# why storing rather than compressing is the right first answer.
+[package]
+name = "chaos-image"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Diffusion-model support for Chaos: PNG output, safetensors, and the sampler."
+
+[dependencies]
+# **For its JSON parser, not for grammars.** A safetensors header is JSON, and
+# `chaos-grammar` holds the workspace's only JSON parser -- with ordered objects,
+# which keeps the tensor table in the file's own order. Writing a second parser
+# here would be a second place for every fix to be missing from.
+chaos-grammar = { path = "../../core/grammar" }
+
+# The autoencoder is a graph of convolutions, so it needs the same ggml the
+# token loop uses. It borrows the arithmetic and owns the architecture -- which
+# is the arrangement everywhere else here too.
+#
+# **This makes chaos-image the second crate that needs `GGML_LIB_DIR`**, after
+# chaos-arch. `png` and `safetensors` do not, and splitting them out would keep
+# image *output* available on a machine that has never compiled C -- worth doing
+# if anyone wants it, and not worth a build script guessing at ggml's presence
+# before anyone does.
+chaos-ggml = { path = "../../core/ggml" }
+
+# The denoiser is a 5.26 GiB GGUF whose weights are streamed one layer at a
+# time, which is exactly what these two already do for language models.
+chaos-gguf = { path = "../../core/gguf" }
+chaos-model = { path = "../../core/model" }
+
+# The text encoder takes token ids, and something has to turn a prompt into
+# them.
+chaos-tokenizer = { path = "../../core/tokenizer" }
+
+[build-dependencies]
+# For the icon. `chaos-draw` is a shipped binary now, and a binary without one
+# gets the blank Windows default in every Explorer view.
+chaos-build = { path = "../../core/build" }
+
+# Draw an image from a prompt.
+#
+# **An example until v0.0.12.** The comment on it said it would become a binary
+# "when there is evidence, not before", and the evidence is now in: the
+# autoencoder round-trips a photograph at 36-41 dB with the check ablated three
+# ways, the text encoder answers " Paris" at logit 22.58, the denoiser scores
+# 0.85 velocity cosine against a real latent, and at 1024x1024 the output is
+# photorealistic. Object form is still imperfect and `--help` says so.
+[[bin]]
+name = "chaos-draw"
+path = "src/bin/chaos-draw.rs"
