@@ -572,6 +572,13 @@ compiling**, and three of these were believed fixed before a pixel was measured.
   `Chaos-ticket/r68-app-ui-linux-x86_64.tar.gz` -- a name with a slash -- so
   `mkdir -p` made a directory, `tar` wrote inside it, and four of five builds
   reported failure having compiled and smoke-tested perfectly.
+- **A retired GitHub runner label does not fail, it queues forever.** The Intel
+  Mac build was written against `macos-13`, which GitHub retired on 2025-12-08;
+  the job sat at "queued" against a pool with no runners while the other four
+  went green, and nothing anywhere said why. Fourteen minutes of that with a tag
+  waiting is the symptom. `macos-15-intel` is the current Intel image, and
+  **Intel macOS ends when it retires in autumn 2027**. Check the label against
+  `actions/runner-images` before assuming a queued job is merely slow.
 - **Rehearse the release workflow before tagging when the matrix changes.** Two
   new runners (`ubuntu-24.04-arm`, `macos-13`) were added in v0.0.12; a dry run
   proved both build ggml, build all twelve binaries and start them, and it cost
