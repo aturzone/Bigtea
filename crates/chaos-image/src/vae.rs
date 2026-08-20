@@ -608,9 +608,19 @@ pub fn denormalize_latent(packed: &mut [f32], mean: &[f32], var: &[f32]) {
 /// denoiser's `input_proj` is 128 wide and the autoencoder's `conv_in` is 32.
 ///
 /// The channel numbering is `px + 2*py + 4*ae` — the patch offsets in the fast
-/// bits and the latent channel in the slow ones. Reversing those two produces a
-/// latent of exactly the right shape whose 2x2 blocks are transposed, which
-/// decodes to a picture that looks like a printing fault.
+/// bits and the latent channel in the slow ones. Every other arrangement gives a
+/// latent of exactly the right shape, so this was derived from the reference and
+/// then **checked against the denoiser**, scoring its velocity on a real
+/// photograph at sigma 0.6 and 0.2:
+///
+/// | channel order | cos(v) at 0.6 | at 0.2 |
+/// |---|---|---|
+/// | `px + 2*py + 4*ae` (this one) | **0.748** | **0.529** |
+/// | patch axes swapped | 0.744 | 0.495 |
+/// | latent channel fastest | 0.530 | 0.267 |
+///
+/// The swapped variant is only slightly worse, which is the point: a derivation
+/// that lands on it would look right and cost a little of every image.
 ///
 /// `[w, h, 32]` in, `[w/2, h/2, 128]` out, both in ggml order with width
 /// fastest.
