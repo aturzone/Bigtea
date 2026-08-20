@@ -1456,7 +1456,7 @@ fn usage_rest() -> ExitCode {
 /// `--update`: fetch a newer Chaos and hand over to its installer.
 ///
 /// Atur asked for the update flow to cover *"all apps and exports"*, and the
-/// window is one of eleven binaries a release ships. Somebody who only ever
+/// window is one of twelve binaries a release ships. Somebody who only ever
 /// types `chaos-run` should not have to open a GUI to find out a release
 /// exists, so the same check `chaos-app` makes on startup is a flag here.
 ///

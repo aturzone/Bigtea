@@ -113,7 +113,7 @@ jobs:
         run: |
           cd target/release
           fail=0
-          for b in chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench chaos-iobench chaos-gpubench; do
+          for b in chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench chaos-iobench chaos-gpubench chaos-draw; do
             exe="./$b${{ matrix.ext }}"
             test -f "$exe" || { echo "::error::$b was not built"; fail=1; continue; }
             # No arguments: every one of these prints usage and exits non-zero,
@@ -158,7 +158,7 @@ jobs:
           GGML_LIB_DIR: ${{ github.workspace }}/ggml-libs
         run: |
           mkdir -p stage
-          for b in chaos-app chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench chaos-iobench chaos-gpubench; do
+          for b in chaos-app chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench chaos-iobench chaos-gpubench chaos-draw; do
             test -f "target/release/$b.exe" || { echo "::error::$b.exe missing"; exit 1; }
             cp "target/release/$b.exe" stage/
           done
@@ -192,7 +192,7 @@ jobs:
           # chaos-app ships but is deliberately absent from the smoke test
           # above: with no arguments it opens a window, and CI would wait
           # for someone to close it.
-          for b in chaos-app chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench chaos-iobench chaos-gpubench; do
+          for b in chaos-app chaos-run chaos-serve chaos-probe chaos-model-info chaos-pull chaos-meta gguf-info chaos-loadbench chaos-iobench chaos-gpubench chaos-draw; do
             cp "target/release/$b${{ matrix.ext }}" "$DIR/"
           done
           cp README.md LICENSE NOTICE CHANGELOG.md STATUS.md "$DIR/"

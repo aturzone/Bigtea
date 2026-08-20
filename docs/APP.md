@@ -194,7 +194,7 @@ the window is up — it would stop with *"cannot write chaos-app.exe. Close Chao
 and run this again."* Letting it hand over cleanly is the whole reason for the
 step.
 
-**One update updates everything.** The installer carries all eleven binaries —
+**One update updates everything.** The installer carries all twelve binaries —
 the window, `chaos-run`, `chaos-serve`, `chaos-pull` and the rest — so there is
 nothing to update per binary and no version skew to manage.
 

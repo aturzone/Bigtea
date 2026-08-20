@@ -5,7 +5,7 @@
 //! new setup. For all apps and exports we need."*
 //!
 //! Here rather than in `chaos-app` because of that last sentence. The window is
-//! one of eleven binaries a release ships, and a CLI user who never opens it
+//! one of twelve binaries a release ships, and a CLI user who never opens it
 //! needs the same answer -- `chaos-run --update`. `chaos-model` is the crate
 //! both already depend on, and the crate that already owns the other thing that
 //! talks to the network and downloads a file (`chaos-pull`).

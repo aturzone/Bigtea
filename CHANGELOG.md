@@ -22,7 +22,7 @@ all apps and exports we need."*
   update…` does the download. `CHAOS_NO_UPDATE_CHECK=1` turns the automatic
   check off.
 - **`chaos-run --update` does the same from a terminal**, because the window is
-  one of eleven binaries a release ships and a CLI user should not have to open
+  one of twelve binaries a release ships and a CLI user should not have to open
   a GUI to learn that a release exists.
 - **One update updates everything.** The installer carries the whole payload —
   the window, `chaos-run`, `chaos-serve`, all of it — so there is nothing to do
@@ -30,6 +30,38 @@ all apps and exports we need."*
 - The decision logic is in `chaos_model::release` and is tested against
   **GitHub's actual response**, kept as a fixture: `0.0.9` must not look newer
   than `0.0.11`, and a macOS tarball must not be downloaded onto Windows.
+
+### Images ship
+
+`chaos-draw` is a **binary** now, not an example held back behind a comment that
+said it would become one "when there is evidence, not before". The evidence:
+the autoencoder round-trips real photographs at **36.09–40.89 dB** with the check
+ablated three ways first, the text encoder answers `" Paris"` at **logit 22.58**,
+the denoiser scores **0.85 velocity cosine** against a real latent, and at
+1024×1024 the output is photorealistic — skin texture, individual hairs,
+catchlights.
+
+```
+chaos-pull ideogram-4 ideogram-4-uncond qwen3-vl-8b flux2-vae
+chaos-draw "a red apple on a white table" --grid 64 --steps 20 -o apple.png
+```
+
+**What is still imperfect is object form**, and `--help` says so rather than
+leaving it to be discovered after two hours: colour and scene follow the prompt,
+a named object may come out the wrong shape. Structured, JSON-shaped prompts
+condition about three times as strongly as a bare phrase, which is what these
+models were trained on.
+
+It ships in every artifact, so a release now carries twelve binaries.
+
+### The icon, drawn from the vector at every size
+
+`make-ico.py` renders `assets/logo.svg` at each of the nine sizes Windows asks
+for. It now does so with **8 subsamples instead of 3** — that is the number of
+grey levels an antialiased edge can take, and this mark is two dozen rays about
+one pixel wide, so nine steps was what "blocky" looked like — and with a **4%
+inset rather than 8%**, which at 16px is the difference between 13 and 15 pixels
+of drawing.
 
 ### The window, after Atur used it
 

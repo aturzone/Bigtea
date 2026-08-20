@@ -54,6 +54,7 @@ version = "0.0.12"
 name = "chaos-image"
 version = "0.0.12"
 dependencies = [
+ "chaos-build",
  "chaos-ggml",
  "chaos-gguf",
  "chaos-grammar",

@@ -26,7 +26,7 @@ container.
 release exists and says nothing unless one does; `Help ▸ Check for updates` asks
 on demand, `Help ▸ Install update…` fetches the installer and hands over, and
 `chaos-run --update` does the same from a terminal. One installer carries all
-eleven binaries, so one update updates every export and leaves the models
+twelve binaries, so one update updates every export and leaves the models
 directory alone. `CHAOS_NO_UPDATE_CHECK=1` turns the automatic check off. The
 decision — is this newer, which asset does this platform need — is
 `chaos_model::release`, tested against a fixture of **GitHub's real response**
