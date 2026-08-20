@@ -683,12 +683,72 @@ pub type HANDLE = *mut c_void;
 pub const SYNCHRONIZE: u32 = 0x0010_0000;
 pub const WAIT_OBJECT_0: u32 = 0;
 
+/// Enough to ask another process how much memory it is using, and no more.
+///
+/// `PROCESS_QUERY_LIMITED_INFORMATION` rather than `PROCESS_QUERY_INFORMATION`:
+/// it is the narrower right, it is what a working-set query needs, and it is
+/// granted in cases the wider one is not.
+pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+pub const PROCESS_VM_READ: u32 = 0x0010;
+
+/// What `GetProcessMemoryInfo` fills in.
+///
+/// Declared in full because the call validates `cb` against its own idea of the
+/// size, and a short struct is a silent failure rather than an error.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct PROCESS_MEMORY_COUNTERS {
+    pub cb: u32,
+    pub PageFaultCount: u32,
+    pub PeakWorkingSetSize: usize,
+    pub WorkingSetSize: usize,
+    pub QuotaPeakPagedPoolUsage: usize,
+    pub QuotaPagedPoolUsage: usize,
+    pub QuotaPeakNonPagedPoolUsage: usize,
+    pub QuotaNonPagedPoolUsage: usize,
+    pub PagefileUsage: usize,
+    pub PeakPagefileUsage: usize,
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     pub fn GetCurrentProcessId() -> u32;
     pub fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: BOOL, dwProcessId: u32) -> HANDLE;
     pub fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) -> u32;
     pub fn CloseHandle(hObject: HANDLE) -> BOOL;
+    /// **In kernel32, not psapi.** Since Windows 7 the psapi entry points are
+    /// forwarders; linking `psapi` as well works and is one more dependency for
+    /// the installer to be wrong about.
+    pub fn K32GetProcessMemoryInfo(
+        Process: HANDLE,
+        ppsmemCounters: *mut PROCESS_MEMORY_COUNTERS,
+        cb: u32,
+    ) -> BOOL;
+}
+
+/// The working set of another process, in bytes, or `None` if it cannot be
+/// asked.
+///
+/// **This is how a model's loading progress is measured.** `chaos-serve` reads
+/// its always-read weights into memory before it answers anything, so its
+/// working set against the catalogue's resident figure is a percentage that
+/// needs no cooperation from the process being watched — the same reasoning
+/// that made bytes-on-disk the download's progress.
+pub fn working_set(pid: u32) -> Option<u64> {
+    // SAFETY: a null handle is checked; every pointer is to a local.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut c = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        let ok = K32GetProcessMemoryInfo(h, &mut c, c.cb);
+        CloseHandle(h);
+        (ok != 0).then_some(c.WorkingSetSize as u64)
+    }
 }
 
 /// `SHCNE_ASSOCCHANGED`: "what a file looks like has changed."

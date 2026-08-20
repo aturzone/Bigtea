@@ -13,6 +13,9 @@ pub mod client;
 /// Watching a download by the bytes it puts on disk, since the downloader is
 /// another process with no console.
 pub mod download;
+/// Watching a model load by the memory it takes, since "loading" with no
+/// number is a window that looks broken.
+pub mod loading;
 pub mod models;
 /// Where every control lives: four pages, and the id of each thing on them.
 pub mod nav;

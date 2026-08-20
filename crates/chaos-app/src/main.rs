@@ -45,6 +45,7 @@ fn main() {
 mod windows_app {
     use chaos_app::choices::{self, Choice};
     use chaos_app::download::Download;
+    use chaos_app::loading;
     use chaos_app::nav::{self, Page};
     use chaos_app::theme::{self, metric, size, weight, Mode, Rgb, Theme};
     use chaos_app::win32::*;
@@ -1273,8 +1274,17 @@ mod windows_app {
                     SetWindowTextW(ctl(nav::ID_OUT), wide("").as_ptr());
                 }
                 sync_enabled();
-                set_status("loading -- a large model takes a while");
+                // **A number, not a promise.** "loading -- a large model takes a
+                // while" and then nothing is a window that looks broken for as
+                // long as the load takes. The server's working set against the
+                // catalogue's resident figure is the progress, measured the same
+                // way a download's is: from the outside, with no cooperation
+                // from the process being watched.
+                let resident = catalog::resident_for(&label).unwrap_or(0);
+                let mut watch = loading::Loading::new(label.clone(), resident);
+                set_status(&watch.line());
                 std::thread::spawn(move || {
+                    let began = Instant::now();
                     // Poll rather than parse stdout: readiness is exactly "does
                     // it answer", and that is the check a client makes too.
                     //
@@ -1305,6 +1315,16 @@ mod windows_app {
                             notify();
                             return;
                         }
+                        // Sampled every turn of the same loop that checks
+                        // readiness, so the line moves whenever anything else
+                        // would have.
+                        watch.rss = chaos_app::win32::working_set(pid).unwrap_or(watch.rss);
+                        watch.elapsed = began.elapsed().as_secs_f64();
+                        {
+                            let mut s = shared().lock().unwrap();
+                            s.status = watch.line();
+                        }
+                        notify();
                         std::thread::sleep(std::time::Duration::from_millis(500));
                     }
                     let mut s = shared().lock().unwrap();

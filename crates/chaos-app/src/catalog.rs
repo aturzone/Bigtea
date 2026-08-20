@@ -31,6 +31,34 @@ pub struct Offer {
     pub adult: bool,
 }
 
+/// What must stay resident for an installed model, if the catalogue knows it.
+///
+/// Matched on the container's file stem, because that is all an installed model
+/// carries: `Qwen3-VL-8B-Instruct-Q4_K_M.gguf` against the catalogue's stem and
+/// quant. **`None` rather than a guess** — the caller shows bytes without a
+/// percentage instead, and a denominator taken from the file size would report
+/// a 144 GB mixture-of-experts as 5% loaded for its whole load.
+pub fn resident_for(stem: &str) -> Option<u64> {
+    // The catalogue already stores the filename template each entry downloads
+    // to, so this is that comparison and not a guess at how names are spelled.
+    let want = stem.trim_end_matches(".gguf").to_ascii_lowercase();
+    for e in chaos_model::catalogue::CATALOGUE {
+        for q in e.quants {
+            for f in e.files(q) {
+                let name = chaos_model::catalogue::Entry::local_name(&f)
+                    .trim_end_matches(".gguf")
+                    .to_ascii_lowercase();
+                // Shards end `-00001-of-00005`; the stem on screen may be any
+                // one of them, so a prefix match is what identifies the model.
+                if !name.is_empty() && (want == name || want.starts_with(&name)) {
+                    return Some(q.always_read_bytes);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Everything fetchable, flattened to one row per quantisation.
 pub fn offers() -> Vec<Offer> {
     let mut out = Vec::new();
@@ -196,6 +224,31 @@ mod tests {
         let v4 = offer(155_000_000_000, 7_925_000_000);
         assert!(matches!(verdict(&v4, 10_000_000_000), Verdict::Streams));
         assert!(row(&v4, 10_000_000_000).contains("streams"));
+    }
+
+    /// The resident lookup matches the names actually on disk.
+    ///
+    /// An installed model carries only its file stem, so this is string
+    /// matching, and string matching that silently misses shows a loading line
+    /// with no percentage — which looks like the feature is broken rather than
+    /// like the catalogue does not know the model.
+    #[test]
+    fn the_resident_lookup_matches_real_filenames() {
+        // Names as `chaos-pull` writes them.
+        for stem in [
+            "Qwen3-VL-8B-Instruct-Q4_K_M",
+            "Llama-3.2-1B-Instruct-Q4_K_M",
+            "gemma-3-4b-it-Q4_K_M",
+        ] {
+            assert!(
+                resident_for(stem).is_some_and(|b| b > 0),
+                "no resident size for {stem}"
+            );
+        }
+        // And it does not invent one for something that is not in the
+        // catalogue, because a wrong denominator is worse than none.
+        assert_eq!(resident_for("something-nobody-ships-Q4_K_M"), None);
+        assert_eq!(resident_for(""), None);
     }
 
     #[test]
