@@ -26,8 +26,14 @@ use chaos_image::{dit, flow, text, text::TextEncoder};
 use chaos_model::Model;
 use chaos_tokenizer::Tokenizer;
 
-const A: &str = "a red apple on a white table";
-const B: &str = "a snowy mountain range at sunrise, wide landscape photograph";
+/// Ideogram 4 is trained on **structured JSON**, not on a phrase. The reference
+/// implementation's own example prompt is hundreds of tokens of nested
+/// description, so a seven-word one may simply be far outside what the model
+/// was ever conditioned on. These two are in that shape, and as different from
+/// each other as the short pair was.
+const A: &str = r##"{"high_level_description":"A single red apple resting on a white table, photographed straight on in a bright studio.","style_description":{"aesthetics":"clean product photography, minimal, bright, commercial","lighting":"soft even studio lighting from above, gentle shadow beneath the apple","photo":"high resolution, sharp focus on the apple skin, shallow depth of field","medium":"digital photograph","color_palette":["#C81E1E","#FFFFFF","#F2F2F2","#8A8A8A"]},"compositional_deconstruction":{"canvas":"Square canvas, upright orientation, centred subject.","background":"A plain white studio backdrop meeting a white tabletop, no visible seam.","layout":"The apple sits alone in the centre of the frame with generous empty space around it.","elements":[{"type":"obj","desc":"Exactly one ripe red apple with a short brown stem, glossy skin, a soft highlight on its upper left."},{"type":"obj","desc":"A soft contact shadow directly under the apple on the white surface."}]}}"##;
+
+const B: &str = r##"{"high_level_description":"A snowy mountain range at sunrise, a wide landscape photograph taken from a high ridge.","style_description":{"aesthetics":"epic landscape photography, cold alpine light, vast scale","lighting":"low golden sunrise raking across the peaks, deep blue shadow in the valleys","photo":"wide angle, deep focus from foreground snow to distant peaks","medium":"digital photograph","color_palette":["#F5C77E","#9FC0E8","#20395B","#FFFFFF"]},"compositional_deconstruction":{"canvas":"Square canvas, upright orientation, horizon in the upper third.","background":"A pale sunrise sky graduating from gold at the horizon to cold blue above.","layout":"Layered ridgelines receding into haze, the tallest peak left of centre.","elements":[{"type":"obj","desc":"Snow-covered jagged peaks catching the first orange light on their east faces."},{"type":"obj","desc":"A wind-scoured snowfield in the foreground with rippled texture."}]}}"##;
 
 fn main() {
     let grid: i64 = std::env::args()
