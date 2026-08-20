@@ -19,12 +19,27 @@ pub fn probe() -> Vec<Gpu> {
 }
 
 fn nvidia_smi() -> Vec<Gpu> {
-    let out = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        .output();
+    let mut cmd = Command::new("nvidia-smi");
+    cmd.args([
+        "--query-gpu=name,memory.total",
+        "--format=csv,noheader,nounits",
+    ]);
+    // **A console window flashes on screen without this.** `nvidia-smi` is a
+    // console program, so Windows gives it a console -- and a windowed app that
+    // has none of its own gets a new one, on top of whatever the user is doing,
+    // for as long as the query takes. Atur saw two of them before the window
+    // appeared, because the app probed twice.
+    //
+    // Nothing here reads a terminal, so there is nothing to lose by suppressing
+    // it. `.output()` still captures stdout exactly as before.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW. Declared here rather than depended on, because
+        // chaos-probe has no Windows module and one constant is not worth one.
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.output();
 
     let Ok(out) = out else { return Vec::new() };
     if !out.status.success() {

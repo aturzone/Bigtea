@@ -727,19 +727,20 @@ pub fn why_not_runnable(arch: &str) -> Option<&'static str> {
         // four modulation signals from a 512-wide conditioning vector, 128 patch
         // channels in and out. What is missing is not the denoiser.
         "ideogram4" => {
-            "it is an image model. Chaos has the denoiser's shape but not the three \
-             things around it -- the unconditional twin for guidance, a text encoder \
-             (Qwen3-VL), and the FLUX.2 autoencoder to turn latents into pixels. \
-             Image generation is being built; see backlog/image-generation-ideogram-4.md"
+            "it is an image model, so it does not load here -- a token loop has nothing \
+             to do with it. Chaos DOES run it: `chaos-draw \"your prompt\" --grid 64` \
+             uses this file together with the unconditional twin, Qwen3-VL and the \
+             FLUX.2 autoencoder"
         }
         "ideogram4uncond" => {
             "it is the unconditional half of Ideogram 4's denoiser -- one of the two \
-             graphs classifier-free guidance needs, not a model on its own"
+             graphs classifier-free guidance needs, not a model on its own. \
+             `chaos-draw` uses it with the other half; there is nothing to load"
         }
         "qwen3vl" => {
-            "it is the text encoder for image generation. It is a language model and this \
-             engine runs the family, but what a denoiser needs is hidden states rather \
-             than sampled tokens, and that path is not built"
+            "it is the text encoder for image generation -- a denoiser needs its hidden \
+             states, not sampled tokens, so there is no chat to have with it here. \
+             `chaos-draw` uses it to turn a prompt into conditioning"
         }
         "loraflux" => {
             "it is a LoRA adapter, not a model -- a few hundred megabytes of deltas that \
@@ -751,8 +752,9 @@ pub fn why_not_runnable(arch: &str) -> Option<&'static str> {
              safetensors files"
         }
         "flux2vae" => {
-            "it is the FLUX.2 autoencoder -- 32-channel latents to RGB pixels. All \
-             convolutions and group norms, none of which a token loop has ever needed"
+            "it is the FLUX.2 autoencoder -- 32-channel latents to RGB pixels, all \
+             convolutions and group norms, none of which a token loop has ever needed. \
+             `chaos-draw` uses it as the last step of drawing an image"
         }
         "qwen3moe" => "its forward pass does not yet match llama.cpp exactly",
         _ => "this architecture has never been diffed against llama.cpp",

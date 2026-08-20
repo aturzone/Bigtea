@@ -847,6 +847,18 @@ mod windows_app {
     /// because nothing on this page needs it and the window must not stall on
     /// startup.
     fn probe_machine() -> choices::Machine {
+        // **Measured once per run, not once per caller.** Two call sites --
+        // building the controls and filling the state -- each ran a full probe
+        // during startup, and on Windows each spawned `nvidia-smi`. That is
+        // what "two CLI before app show" was: two console windows, one per
+        // probe. The console is suppressed in `chaos-probe` now as well, and
+        // this is the other half: the answer cannot change between two calls a
+        // few milliseconds apart, so it is worth caching regardless.
+        static CACHE: std::sync::OnceLock<choices::Machine> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(measure_machine)
+    }
+
+    fn measure_machine() -> choices::Machine {
         let m = chaos_probe::Machine::probe(models::default_dir(), false);
         choices::Machine {
             cores: m.cpu_threads.max(1) as u32,
