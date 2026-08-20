@@ -509,11 +509,26 @@ impl Denoiser {
     ///
     /// Generous on purpose: ggml **aborts** on an exhausted arena and takes the
     /// process with it, and the attention scores alone are `heads * tokens^2`.
-    fn arena(&self, tokens: usize) -> usize {
+    /// Bytes one layer's ggml arena needs at this token count.
+    ///
+    /// **Public because the alternative to knowing is a crash with no message.**
+    /// ggml aborts on an exhausted arena, killing the process, so a caller
+    /// asking for an image too large for the machine gets no explanation at all
+    /// unless it can compare this against free memory first.
+    ///
+    /// The quadratic term is the attention scores, and it is what actually
+    /// decides the ceiling: at 4096 tokens they are 1.22 GiB each and this asks
+    /// for about 14.6 GiB, which is why 1024x1024 does not fit on a 15.7 GiB
+    /// machine while 768x768 does at about 7 GiB.
+    pub fn arena_bytes(&self, tokens: usize) -> usize {
         let c = self.config;
         let per_token = (5 * c.emb_dim + 2 * c.intermediate) as usize * 4;
         let scores = c.num_heads as usize * tokens * tokens * 4;
         (1 << 30) + tokens * per_token * 8 + scores * 6
+    }
+
+    fn arena(&self, tokens: usize) -> usize {
+        self.arena_bytes(tokens)
     }
 
     /// Project the latent and the text, add the indicator, and build the

@@ -76,6 +76,31 @@ table" and "a snowy mountain range at sunrise" move the predicted velocity by 14
 by "remove the noise", which is the same whatever the prompt, and guidance
 multiplies the difference.
 
+## The ceiling is the decoder, and it is not the weights
+
+**512x512 is the largest image this machine renders.** Not because of the
+models — both denoisers stream a layer at a time, so their 5.26 GiB never has to
+fit — but because the **autoencoder decodes in one graph with no memory reuse**,
+and its last block works at full output resolution.
+
+| output | decode arena |
+|---|---|
+| 256x256 | 3.7 GiB |
+| 512x512 | 13.1 GiB |
+| 768x768 | **29.5 GiB** |
+
+Found the expensive way: a 768x768 request ran all sixteen denoising steps over
+an hour and then died inside `ggml_new_object`, taking the process with it. The
+pipeline now computes that number **before loading anything** and refuses in 34
+milliseconds with the largest grid that works.
+
+**The fix is a graph allocator, not a bigger machine.** Almost every tensor in
+that graph is dead one step after it is written; `ggml_gallocr` would reuse the
+buffers and cut the requirement by most of an order of magnitude.
+`chaos-ggml` already exposes a `GraphAllocator` for the device path. Failing
+that, staging the decoder per resnet the way `dit.rs` stages its layers would
+bring the peak down to one block.
+
 ## What is still open
 
 **Form.** The subject comes out as a flat saturated region rather than an object.

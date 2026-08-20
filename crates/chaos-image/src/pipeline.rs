@@ -72,6 +72,44 @@ impl Request {
     }
 }
 
+/// The largest decode arena this will attempt.
+///
+/// Not a hardware probe: it is a line past which the request is refused with an
+/// explanation instead of aborting the process inside ggml. 14 GiB is what a
+/// 512x512 image needs plus a little, which is the largest size measured to
+/// complete here.
+pub const DECODE_ARENA_LIMIT: usize = 14 << 30;
+
+/// The largest `--grid` whose decode fits under [`DECODE_ARENA_LIMIT`].
+pub fn largest_grid() -> i64 {
+    let mut g = 1;
+    while vae::decode_arena_bytes(((g + 1) * 16) as usize, ((g + 1) * 16) as usize)
+        <= DECODE_ARENA_LIMIT
+    {
+        g += 1;
+    }
+    g
+}
+
+/// Bytes of ggml arena one denoiser layer needs for this request, and the image
+/// tokens it is quadratic in.
+///
+/// **The ceiling on image size is this, not the weights.** Both denoisers stream
+/// a layer at a time, so their 5.26 GiB never has to fit; the attention scores
+/// do. At 4096 tokens (1024x1024) they are 1.22 GiB apiece and the arena wants
+/// about 14.6 GiB, against about 7 GiB at 2304 tokens (768x768).
+///
+/// Worth asking *before* starting, because ggml aborts on an exhausted arena --
+/// the process dies with no message, after however many minutes it had already
+/// spent.
+pub fn arena_estimate(req: &Request) -> (usize, usize) {
+    let c = dit::Config::default();
+    let tokens = req.tokens();
+    let per_token = (5 * c.emb_dim + 2 * c.intermediate) as usize * 4;
+    let scores = c.num_heads as usize * tokens * tokens * 4;
+    ((1 << 30) + tokens * per_token * 8 + scores * 6, tokens)
+}
+
 /// Where the four files live.
 pub struct Paths {
     pub text_encoder: std::path::PathBuf,
@@ -164,6 +202,8 @@ pub enum Error {
     Vae(vae::Error),
     Model(String),
     Missing(String),
+    /// The image asked for cannot be decoded in the memory available.
+    TooLarge(String),
 }
 
 impl std::fmt::Display for Error {
@@ -174,6 +214,7 @@ impl std::fmt::Display for Error {
             Error::Vae(e) => write!(f, "autoencoder: {e}"),
             Error::Model(m) => write!(f, "{m}"),
             Error::Missing(m) => write!(f, "{m}"),
+            Error::TooLarge(m) => write!(f, "{m}"),
         }
     }
 }
@@ -208,6 +249,30 @@ pub struct Image {
 /// `on` is called as each stage begins, because a run takes minutes and silence
 /// is indistinguishable from a hang.
 pub fn generate(paths: &Paths, req: &Request, on: &mut dyn FnMut(Stage)) -> Result<Image, Error> {
+    // **Refused first, before anything is loaded.** The decoder runs last and is
+    // the memory ceiling (see `vae::decode_arena_bytes`). A 768x768 request once
+    // spent sixteen denoising steps and then died inside ggml, taking the
+    // process with it -- an hour to learn the answer would not fit.
+    let side = req.image_size() as usize;
+    let need = vae::decode_arena_bytes(side, side);
+    if need > DECODE_ARENA_LIMIT {
+        let g = largest_grid();
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        let mut m = format!(
+            "decoding {side}x{side} needs about {:.1} GiB in one graph, over the {:.1} GiB cap.\n",
+            gib(need),
+            gib(DECODE_ARENA_LIMIT)
+        );
+        m.push_str("The denoisers are not the limit -- they stream a layer at a time.\n");
+        m.push_str("The autoencoder is: it decodes in one pass, with no memory reuse.\n");
+        m.push_str(&format!(
+            "Ask for --grid {g} or less ({}x{}).",
+            g * 16,
+            g * 16
+        ));
+        return Err(Error::TooLarge(m));
+    }
+
     let missing = paths.missing();
     if !missing.is_empty() {
         let mut m = String::from("these files are not here yet:\n");
@@ -354,7 +419,8 @@ pub fn decode_latent(
         .map_err(|e| Error::Model(format!("{}: {e}", path.display())))?;
     // 48 KiB per output pixel, measured in the round-trip example.
     let out_px = (w as usize * vae::SCALE) * (h as usize * vae::SCALE);
-    let arena = (512 << 20) + out_px * 48 * 1024;
+    let arena = vae::decode_arena_bytes(w as usize * vae::SCALE, h as usize * vae::SCALE);
+    let _ = out_px;
     let ctx = chaos_ggml::Context::new(arena).map_err(vae::Error::Ggml)?;
     let v = vae::Vae::new(&st, &file, &ctx);
     let z = ctx
@@ -402,6 +468,37 @@ mod tests {
         // Same seed, same picture.
         assert_eq!(Noise::seeded(9).normals(64), Noise::seeded(9).normals(64));
         assert_ne!(Noise::seeded(9).normals(64), Noise::seeded(10).normals(64));
+    }
+
+    /// The decode ceiling is real, refuses the sizes that abort, and points at
+    /// one that works.
+    ///
+    /// This is the guard on an hour of wasted compute: a 768x768 request ran all
+    /// sixteen denoising steps and then died inside ggml, because the decoder is
+    /// one graph with no memory reuse and its last block works at full output
+    /// resolution.
+    #[test]
+    fn the_decode_ceiling_refuses_what_it_cannot_finish() {
+        // Measured: 256 completes inside 3.6 GiB, 768 exhausted 29.5 GiB.
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        assert!(gib(vae::decode_arena_bytes(256, 256)) < 4.0);
+        assert!(gib(vae::decode_arena_bytes(768, 768)) > 29.0);
+        // It grows with pixels, so doubling the side is four times the memory.
+        let a = vae::decode_arena_bytes(256, 256) - (512 << 20);
+        let b = vae::decode_arena_bytes(512, 512) - (512 << 20);
+        assert_eq!(b, a * 4);
+
+        // The largest grid it will accept decodes under the cap, and one grid
+        // step larger does not -- so the number it tells the user is the real
+        // boundary, not a guess.
+        let g = largest_grid();
+        let side = (g * 16) as usize;
+        assert!(vae::decode_arena_bytes(side, side) <= DECODE_ARENA_LIMIT);
+        let over = ((g + 1) * 16) as usize;
+        assert!(vae::decode_arena_bytes(over, over) > DECODE_ARENA_LIMIT);
+        // 512x512 is what has actually been rendered here, so it must stay
+        // inside the cap -- a tightening that excluded it would be a regression.
+        assert!(g >= 32, "grid {g} would refuse 512x512, which works");
     }
 
     /// Every missing file is reported with the command that fetches it.

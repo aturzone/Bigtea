@@ -547,6 +547,35 @@ fn push_mid(v: &mut Vec<String>, half: &str) {
     v.push(format!("{half}.mid_block.attentions.0.to_out.0.bias"));
 }
 
+/// Bytes of ggml arena a whole-graph decode needs for a `w * h` **output**.
+///
+/// # Why this is the ceiling on image size, and the weights are not
+///
+/// The denoisers stream a layer at a time, so their 5.26 GiB never has to fit.
+/// The decoder is the opposite: it is one graph, ggml's context has no
+/// liveness-based reuse, and its last two blocks work at **full output
+/// resolution**. `up_blocks.3` alone holds three resnets of roughly eighteen
+/// 128-channel planes each.
+///
+/// Measured rather than derived: 256x256 completes inside 3.6 GiB, and 768x768
+/// exhausted a 29.5 GiB pool — 50 KiB per output pixel, and it scales with the
+/// pixel count, not with the model.
+///
+/// | output | arena |
+/// |---|---|
+/// | 256x256 | 3.7 GiB |
+/// | 512x512 | 13.1 GiB |
+/// | 768x768 | 29.5 GiB — **too large for a 15.7 GiB machine** |
+///
+/// **The fix is a graph allocator, not a bigger machine.** Almost every tensor
+/// here is dead a step after it is written, so allocating with reuse would cut
+/// this by most of an order of magnitude. Until then this function exists so a
+/// caller can refuse *before* spending an hour denoising a latent it will not be
+/// able to decode — which is exactly how it was found.
+pub fn decode_arena_bytes(w: usize, h: usize) -> usize {
+    (512 << 20) + w * h * 51 * 1024
+}
+
 /// The latent normalisation the file carries beside the autoencoder.
 ///
 /// FLUX.2 keeps a BatchNorm's running statistics — `bn.running_mean` and
