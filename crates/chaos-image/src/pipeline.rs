@@ -72,18 +72,21 @@ impl Request {
     }
 }
 
-/// The largest decode arena this will attempt.
+/// The largest decode plan this will attempt.
 ///
 /// Not a hardware probe: it is a line past which the request is refused with an
-/// explanation instead of aborting the process inside ggml. 14 GiB is what a
-/// 512x512 image needs plus a little, which is the largest size measured to
-/// complete here.
-pub const DECODE_ARENA_LIMIT: usize = 14 << 30;
+/// explanation instead of aborting the process inside ggml.
+///
+/// **This used to be the binding constraint and is not any more.** Decoding was
+/// one unplanned graph costing 51 KiB per output pixel — 29.5 GiB at 768x768,
+/// which aborted after an hour of denoising. With the graph planned it is about
+/// 3.3 KiB per pixel, so 1024x1024 asks for roughly 3.5 GiB instead of 52.
+pub const DECODE_ARENA_LIMIT: usize = 10 << 30;
 
 /// The largest `--grid` whose decode fits under [`DECODE_ARENA_LIMIT`].
 pub fn largest_grid() -> i64 {
     let mut g = 1;
-    while vae::decode_arena_bytes(((g + 1) * 16) as usize, ((g + 1) * 16) as usize)
+    while vae::decode_planned_bytes(((g + 1) * 16) as usize, ((g + 1) * 16) as usize)
         <= DECODE_ARENA_LIMIT
     {
         g += 1;
@@ -91,23 +94,20 @@ pub fn largest_grid() -> i64 {
     g
 }
 
-/// Bytes of ggml arena one denoiser layer needs for this request, and the image
-/// tokens it is quadratic in.
+/// Bytes one denoiser layer needs for this request, and the image tokens it is
+/// quadratic in.
 ///
-/// **The ceiling on image size is this, not the weights.** Both denoisers stream
-/// a layer at a time, so their 5.26 GiB never has to fit; the attention scores
-/// do. At 4096 tokens (1024x1024) they are 1.22 GiB apiece and the arena wants
-/// about 14.6 GiB, against about 7 GiB at 2304 tokens (768x768).
-///
-/// Worth asking *before* starting, because ggml aborts on an exhausted arena --
-/// the process dies with no message, after however many minutes it had already
-/// spent.
+/// **Both halves of the pipeline plan their graphs now**, so these are the sizes
+/// of the *live set* rather than of every tensor ever written. The denoiser fell
+/// from 14.6 GiB to a measured 2.0 GiB at 1024x1024, and the decoder from
+/// 52 GiB to about 3.5 — which is the difference between 512x512 being the
+/// ceiling and 1024x1024 being ordinary.
 pub fn arena_estimate(req: &Request) -> (usize, usize) {
     let c = dit::Config::default();
     let tokens = req.tokens();
-    let per_token = (5 * c.emb_dim + 2 * c.intermediate) as usize * 4;
     let scores = c.num_heads as usize * tokens * tokens * 4;
-    ((1 << 30) + tokens * per_token * 8 + scores * 6, tokens)
+    let planes = tokens * (3 * c.emb_dim + c.intermediate) as usize * 4;
+    ((256 << 20) + scores * 3 / 2 + planes, tokens)
 }
 
 /// Where the four files live.
@@ -254,7 +254,7 @@ pub fn generate(paths: &Paths, req: &Request, on: &mut dyn FnMut(Stage)) -> Resu
     // spent sixteen denoising steps and then died inside ggml, taking the
     // process with it -- an hour to learn the answer would not fit.
     let side = req.image_size() as usize;
-    let need = vae::decode_arena_bytes(side, side);
+    let need = vae::decode_planned_bytes(side, side);
     if need > DECODE_ARENA_LIMIT {
         let g = largest_grid();
         let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
@@ -417,19 +417,8 @@ pub fn decode_latent(
     let file = std::fs::read(path).map_err(|e| Error::Model(format!("{}: {e}", path.display())))?;
     let st = crate::safetensors::SafeTensors::parse(&file)
         .map_err(|e| Error::Model(format!("{}: {e}", path.display())))?;
-    // 48 KiB per output pixel, measured in the round-trip example.
-    let out_px = (w as usize * vae::SCALE) * (h as usize * vae::SCALE);
-    let arena = vae::decode_arena_bytes(w as usize * vae::SCALE, h as usize * vae::SCALE);
-    let _ = out_px;
-    let ctx = chaos_ggml::Context::new(arena).map_err(vae::Error::Ggml)?;
-    let v = vae::Vae::new(&st, &file, &ctx);
-    let z = ctx
-        .new_f32_4d(w, h, vae::LATENT_CHANNELS, 1)
-        .map_err(vae::Error::Ggml)?;
-    z.set_f32(latent).map_err(vae::Error::Ggml)?;
-    let out = v.decode(&z)?;
-    ctx.compute(&out, threads).map_err(vae::Error::Ggml)?;
-    Ok(out.to_vec_f32())
+    let (pixels, _bytes) = vae::decode_planned(&st, &file, latent, w, h, threads)?;
+    Ok(pixels)
 }
 
 #[cfg(test)]
@@ -470,35 +459,36 @@ mod tests {
         assert_ne!(Noise::seeded(9).normals(64), Noise::seeded(10).normals(64));
     }
 
-    /// The decode ceiling is real, refuses the sizes that abort, and points at
-    /// one that works.
+    /// The decode ceiling is real, refuses what will not fit, and points at a
+    /// size that does.
     ///
-    /// This is the guard on an hour of wasted compute: a 768x768 request ran all
-    /// sixteen denoising steps and then died inside ggml, because the decoder is
-    /// one graph with no memory reuse and its last block works at full output
-    /// resolution.
+    /// This guards an hour of wasted compute: a 768x768 request once ran all
+    /// sixteen denoising steps and then died inside ggml, because the decoder
+    /// was one graph with no memory reuse. **Planning the graph moved the
+    /// ceiling rather than removing it** — the numbers below are the planned
+    /// ones, and the cap still has to be enforced somewhere.
     #[test]
     fn the_decode_ceiling_refuses_what_it_cannot_finish() {
-        // Measured: 256 completes inside 3.6 GiB, 768 exhausted 29.5 GiB.
         let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
-        assert!(gib(vae::decode_arena_bytes(256, 256)) < 4.0);
-        assert!(gib(vae::decode_arena_bytes(768, 768)) > 29.0);
+        // Planning is worth about 15x: measured 0.20 GiB at 256x256 where the
+        // unplanned graph wanted 3.69.
+        assert!(gib(vae::decode_planned_bytes(256, 256)) < 0.5);
+        assert!(gib(vae::decode_arena_bytes(256, 256)) > 3.0);
+        assert!(vae::decode_planned_bytes(256, 256) * 10 < vae::decode_arena_bytes(256, 256));
         // It grows with pixels, so doubling the side is four times the memory.
-        let a = vae::decode_arena_bytes(256, 256) - (512 << 20);
-        let b = vae::decode_arena_bytes(512, 512) - (512 << 20);
+        let a = vae::decode_planned_bytes(256, 256) - (64 << 20);
+        let b = vae::decode_planned_bytes(512, 512) - (64 << 20);
         assert_eq!(b, a * 4);
 
-        // The largest grid it will accept decodes under the cap, and one grid
-        // step larger does not -- so the number it tells the user is the real
-        // boundary, not a guess.
+        // The largest grid accepted decodes under the cap, and one step larger
+        // does not -- so the number the user is told is the real boundary.
         let g = largest_grid();
         let side = (g * 16) as usize;
-        assert!(vae::decode_arena_bytes(side, side) <= DECODE_ARENA_LIMIT);
+        assert!(vae::decode_planned_bytes(side, side) <= DECODE_ARENA_LIMIT);
         let over = ((g + 1) * 16) as usize;
-        assert!(vae::decode_arena_bytes(over, over) > DECODE_ARENA_LIMIT);
-        // 512x512 is what has actually been rendered here, so it must stay
-        // inside the cap -- a tightening that excluded it would be a regression.
-        assert!(g >= 32, "grid {g} would refuse 512x512, which works");
+        assert!(vae::decode_planned_bytes(over, over) > DECODE_ARENA_LIMIT);
+        // 1024x1024 is what planning bought, and it must stay bought.
+        assert!(g >= 64, "grid {g} would refuse 1024x1024, which now fits");
     }
 
     /// Every missing file is reported with the command that fetches it.

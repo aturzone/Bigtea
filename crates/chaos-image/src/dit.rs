@@ -407,6 +407,47 @@ pub fn latent_from_tokens(tokens: &[f32], gw: usize, gh: usize, ae: usize, p: us
     out
 }
 
+/// Room for tensor structs, the graph and ggml's compute work buffer.
+///
+/// **Not for tensor data** — that comes from the plan. A `no_alloc` context
+/// still hands out objects, and `ggml_graph_compute_with_ctx` takes its scratch
+/// from the same pool, so this cannot be zero.
+const META_ARENA: usize = 512 << 20;
+
+/// Plan the graph, give it storage, fill the inputs, run it.
+///
+/// # The ordering is the whole point
+///
+/// A `Context`'s own arena allocates every tensor in a graph and frees none, so
+/// a 34-layer denoiser at 1024x1024 asked for 14.6 GiB per layer while the live
+/// set is a handful of tensors. `ggml_gallocr` plans the graph and reuses
+/// buffers between tensors whose lifetimes do not overlap.
+///
+/// **Inputs are written after `alloc`, never before.** Before it they have no
+/// storage, and writing into them is a segmentation fault rather than an error —
+/// which is exactly how this was learned. Weights are untouched, because the
+/// planner skips any tensor that already has a data pointer, and binding
+/// zero-copy leaves one.
+fn plan_and_run<'c>(
+    ctx: &'c Context,
+    out: &Tensor<'c>,
+    inputs: &[(&Tensor<'c>, &[f32])],
+    threads: usize,
+) -> Result<Vec<f32>, Error> {
+    let galloc = chaos_ggml::GraphAllocator::for_cpu()?;
+    galloc.reserve(ctx, &[out])?;
+    galloc.alloc(ctx, &[out])?;
+    for (t, data) in inputs {
+        t.set_f32(data)?;
+    }
+    ctx.compute(out, threads)?;
+    // **Read before returning, not after.** The plan owns the buffer every
+    // tensor's data points into, so dropping it frees the answer. Returning the
+    // tensor and reading it in the caller is a use-after-free that segfaults
+    // only sometimes -- which is how it was found.
+    Ok(out.to_vec_f32())
+}
+
 /// The denoiser, reading its weights from a container one layer at a time.
 pub struct Denoiser {
     model: Model,
@@ -509,26 +550,18 @@ impl Denoiser {
     ///
     /// Generous on purpose: ggml **aborts** on an exhausted arena and takes the
     /// process with it, and the attention scores alone are `heads * tokens^2`.
-    /// Bytes one layer's ggml arena needs at this token count.
+    /// Bytes one denoiser layer needs at this token count, **with the graph
+    /// planned**.
     ///
-    /// **Public because the alternative to knowing is a crash with no message.**
-    /// ggml aborts on an exhausted arena, killing the process, so a caller
-    /// asking for an image too large for the machine gets no explanation at all
-    /// unless it can compare this against free memory first.
-    ///
-    /// The quadratic term is the attention scores, and it is what actually
-    /// decides the ceiling: at 4096 tokens they are 1.22 GiB each and this asks
-    /// for about 14.6 GiB, which is why 1024x1024 does not fit on a 15.7 GiB
-    /// machine while 768x768 does at about 7 GiB.
+    /// The attention scores dominate and are quadratic in tokens: at 4096 tokens
+    /// they are 1.22 GiB and only a couple are live at once. Measured 2.0 GiB
+    /// resident for a 1024x1024 pass, against the 14.6 GiB the same graph wanted
+    /// when every tensor got its own storage.
     pub fn arena_bytes(&self, tokens: usize) -> usize {
         let c = self.config;
-        let per_token = (5 * c.emb_dim + 2 * c.intermediate) as usize * 4;
         let scores = c.num_heads as usize * tokens * tokens * 4;
-        (1 << 30) + tokens * per_token * 8 + scores * 6
-    }
-
-    fn arena(&self, tokens: usize) -> usize {
-        self.arena_bytes(tokens)
+        let planes = tokens * (3 * c.emb_dim + c.intermediate) as usize * 4;
+        (256 << 20) + scores * 3 / 2 + planes
     }
 
     /// Project the latent and the text, add the indicator, and build the
@@ -540,7 +573,7 @@ impl Denoiser {
     ) -> Result<(Vec<f32>, Vec<f32>), Error> {
         let c = self.config;
         let total = (inp.context_len + image_tokens) as i64;
-        let ctx = Context::new(self.arena(total as usize))?;
+        let ctx = Context::new_no_alloc(META_ARENA)?;
         let mut set = WeightSet::new();
 
         for (n, widen) in [
@@ -566,7 +599,7 @@ impl Denoiser {
             c.patch as usize,
         );
         let img = ctx.new_f32_2d(c.in_channels, image_tokens as i64)?;
-        img.set_f32(&toks)?;
+        let img_input = img;
         let img = linear(
             &ctx,
             &get(&set, "input_proj.weight")?,
@@ -575,6 +608,7 @@ impl Denoiser {
         )?;
 
         // -- the text half, if there is one -----------------------------------
+        let mut txt_input: Option<Tensor<'_>> = None;
         let h = if inp.context_len > 0 {
             for (n, widen) in [
                 ("llm_cond_norm.weight", true),
@@ -584,7 +618,7 @@ impl Denoiser {
                 bind(&self.model, &ctx, &mut set, n, widen)?;
             }
             let txt = ctx.new_f32_2d(c.llm_features, inp.context_len as i64)?;
-            txt.set_f32(inp.context)?;
+            txt_input = Some(txt);
             // eps 1e-6 here, not the 1e-5 the blocks use.
             let txt = rms_norm(&ctx, &txt, &get(&set, "llm_cond_norm.weight")?, 1e-6)?;
             let txt = linear(
@@ -602,14 +636,13 @@ impl Denoiser {
         // -- which half is which ----------------------------------------------
         let ind = rope3d::image_indicator(inp.context_len, image_tokens);
         let ids = ctx.new_i32_1d(total)?;
-        ids.set_i32(&ind)?;
         let ind_emb = ctx.get_rows(&get(&set, "embed_image_indicator.weight")?, &ids)?;
         let h = ctx.add(&h, &ind_emb)?;
 
         // -- the timestep, and the vector every layer modulates on -------------
         let emb = timestep_embedding(inp.timestep, c.emb_dim as usize, 10000.0);
         let t = ctx.new_f32_2d(c.emb_dim, 1)?;
-        t.set_f32(&emb)?;
+        let t_input = t;
         let t = linear(
             &ctx,
             &get(&set, "t_embedding.mlp_in.weight")?,
@@ -631,6 +664,16 @@ impl Denoiser {
         )?;
         let adaln = ctx.silu(&adaln)?;
 
+        // Both outputs in one plan, then the inputs, then the run.
+        let galloc = chaos_ggml::GraphAllocator::for_cpu()?;
+        galloc.reserve(&ctx, &[&h, &adaln])?;
+        galloc.alloc(&ctx, &[&h, &adaln])?;
+        img_input.set_f32(&toks)?;
+        if let Some(txt) = txt_input {
+            txt.set_f32(inp.context)?;
+        }
+        ids.set_i32(&ind)?;
+        t_input.set_f32(&emb)?;
         ctx.compute_many(&[&h, &adaln], self.threads)?;
         Ok((h.to_vec_f32(), adaln.to_vec_f32()))
     }
@@ -646,7 +689,7 @@ impl Denoiser {
         tokens: usize,
     ) -> Result<Vec<f32>, Error> {
         let c = self.config;
-        let ctx = Context::new(self.arena(tokens))?;
+        let ctx = Context::new_no_alloc(META_ARENA)?;
         let mut set = WeightSet::new();
         for (name, widen) in block_tensors(layer) {
             bind(&self.model, &ctx, &mut set, &name, widen)?;
@@ -654,16 +697,14 @@ impl Denoiser {
         let p = format!("layers.{layer}");
         let n = tokens as i64;
 
+        // Created now, **written after the plan is allocated**: until then these
+        // have no storage at all.
         let h = ctx.new_f32_2d(c.emb_dim, n)?;
-        h.set_f32(h_in)?;
+        let h_input = h;
         let adaln = ctx.new_f32_2d(c.adaln_dim, 1)?;
-        adaln.set_f32(adaln_in)?;
-
         let half = c.head_dim() / 2;
         let cos_t = ctx.new_f32_4d(half, n, 1, 1)?;
-        cos_t.set_f32(cos)?;
         let sin_t = ctx.new_f32_4d(half, n, 1, 1)?;
-        sin_t.set_f32(sin)?;
 
         // -- the four modulation signals --------------------------------------
         let m = linear(
@@ -733,8 +774,17 @@ impl Denoiser {
         )?;
         let out = ctx.add(&h, &ctx.mul(&f, &gate_mlp)?)?;
 
-        ctx.compute(&out, self.threads)?;
-        Ok(out.to_vec_f32())
+        plan_and_run(
+            &ctx,
+            &out,
+            &[
+                (&h_input, h_in),
+                (&adaln, adaln_in),
+                (&cos_t, cos),
+                (&sin_t, sin),
+            ],
+            self.threads,
+        )
     }
 
     /// Fused QKV, per-head RMS norm on q and k, rotary, then plain attention.
@@ -828,7 +878,7 @@ impl Denoiser {
         let c = self.config;
         let image_tokens = (grid_w * grid_h) as usize;
         let tokens = context_len + image_tokens;
-        let ctx = Context::new(self.arena(tokens))?;
+        let ctx = Context::new_no_alloc(META_ARENA)?;
         let mut set = WeightSet::new();
         for (n, widen) in [
             ("final_layer.linear.weight", false),
@@ -841,9 +891,7 @@ impl Denoiser {
 
         let n = tokens as i64;
         let h = ctx.new_f32_2d(c.emb_dim, n)?;
-        h.set_f32(h_in)?;
         let adaln = ctx.new_f32_2d(c.adaln_dim, 1)?;
-        adaln.set_f32(adaln_in)?;
 
         // A second silu on a vector that already had one -- see the module docs.
         let scale = linear(
@@ -876,10 +924,10 @@ impl Denoiser {
         // The sampler wants a velocity toward the image; the model emits the
         // opposite. See the module docs.
         let x = ctx.scale(&x, -1.0)?;
-        ctx.compute(&x, self.threads)?;
+        let pixels = plan_and_run(&ctx, &x, &[(&h, h_in), (&adaln, adaln_in)], self.threads)?;
 
         Ok(latent_from_tokens(
-            &x.to_vec_f32(),
+            &pixels,
             grid_w as usize,
             grid_h as usize,
             c.ae_channels as usize,

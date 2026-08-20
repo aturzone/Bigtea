@@ -76,30 +76,36 @@ table" and "a snowy mountain range at sunrise" move the predicted velocity by 14
 by "remove the noise", which is the same whatever the prompt, and guidance
 multiplies the difference.
 
-## The ceiling is the decoder, and it is not the weights
+## The ceiling was memory, and planning the graph removed it
 
-**512x512 is the largest image this machine renders.** Not because of the
-models — both denoisers stream a layer at a time, so their 5.26 GiB never has to
-fit — but because the **autoencoder decodes in one graph with no memory reuse**,
-and its last block works at full output resolution.
+**1024x1024 works now.** It did not before, and the reason was not the weights.
 
-| output | decode arena |
-|---|---|
-| 256x256 | 3.7 GiB |
-| 512x512 | 13.1 GiB |
-| 768x768 | **29.5 GiB** |
+A `Context`'s arena allocates every tensor in a graph and frees none of them, so
+a graph pays for every intermediate it ever writes even though the live set is a
+handful. `ggml_gallocr` plans the graph and gives the same buffer to tensors
+whose lifetimes do not overlap — which is what the *device* path here has always
+done, and what the host path never did.
 
-Found the expensive way: a 768x768 request ran all sixteen denoising steps over
-an hour and then died inside `ggml_new_object`, taking the process with it. The
-pipeline now computes that number **before loading anything** and refuses in 34
-milliseconds with the largest grid that works.
+| | before | after | measured |
+|---|---|---|---|
+| decode 256x256 | 3.69 GiB | **0.20 GiB** | 18.2x, bit-identical |
+| decode 1024x1024 | 52 GiB | **3.4 GiB** | |
+| denoise 1024x1024, per layer | 14.6 GiB | **2.0 GiB** | 2.0 GiB resident |
 
-**The fix is a graph allocator, not a bigger machine.** Almost every tensor in
-that graph is dead one step after it is written; `ggml_gallocr` would reuse the
-buffers and cut the requirement by most of an order of magnitude.
-`chaos-ggml` already exposes a `GraphAllocator` for the device path. Failing
-that, staging the decoder per resnet the way `dit.rs` stages its layers would
-bring the peak down to one block.
+**Bit-identical, not merely close**: 0 of 196,608 pixels differ on a real
+photograph, and the denoiser's velocity score is unchanged to four decimals
+(0.7920 / 0.7483 / 0.6067 / 0.4723). Reuse that changed an answer would be
+aliasing, and an image is exactly where nobody would notice.
+
+Two things bit on the way, both worth keeping:
+
+- **A `no_alloc` context cannot hold a weight.** Copying bytes into a tensor with
+  no storage is a segmentation fault. The autoencoder now puts weights in an
+  ordinary context and the graph in a planned one; the denoiser already bound its
+  weights zero-copy, so it needed no such split.
+- **The plan owns the buffer the answer lives in.** Returning the output tensor
+  and reading it after the `GraphAllocator` drops is a use-after-free. The helper
+  reads before returning.
 
 ## What is still open
 
