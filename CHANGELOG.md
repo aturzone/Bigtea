@@ -8,6 +8,92 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
+## [0.0.11] — 2026-08-20
+
+### Chaos draws images
+
+The whole path now runs: **Qwen3-VL-8B** turns the prompt into conditioning,
+two copies of **Ideogram 4** — the conditional model and a separately trained
+unconditional twin, 5.26 GiB each — denoise a latent, and the **FLUX.2**
+autoencoder turns it into pixels. Four files, 16.7 GB.
+
+**It follows the prompt's colour and scene and gets an object's form wrong.**
+Said plainly, because a diffusion pipeline that is subtly wrong produces a
+plausible picture: at 512×512 *"a red apple on a white table"* drew red on white
+surfaces beside a wooden shelf, and not an apple. The foundation is verified;
+the pictures are not good yet.
+
+What *is* verified, and how:
+
+- **The text encoder** answers *" Paris"* after "The capital of France is" at
+  logit 22.58 — so its attention, rotary positions, per-head QK norm,
+  grouped-query broadcasting and causal mask are all right.
+- **The denoiser** is scored without looking at a picture. A rectified-flow
+  model at noise level `sigma` must predict `noise - latent`, and **both terms
+  are known** because the autoencoder's encoder — verified to 36 dB by round trip
+  in v0.0.10 — turns a real photograph into a real latent. Cosine against the
+  truth is **0.85 at 512×512**.
+
+Scoring against each half separately — "can it see the noise" against "can it
+see the image" — is what found three bugs a picture could not have told apart.
+**Two of them are in the reference implementation**: `stable-diffusion.cpp`
+reads `1.f / 128.f` as an attention scale when it is an F16 overflow guard that
+cancels exactly, and it never applies the autoencoder's own latent
+normalisation. Being faithful to a reference and being right are not the same
+thing.
+
+### 1024×1024 stops being impossible
+
+Chaos runs models larger than memory by streaming them; the image path did not.
+Both halves built each graph in a context whose arena allocates every tensor and
+frees none, so they paid for every intermediate ever written while the live set
+is a handful. Decoding 768×768 wanted **29.5 GiB** and aborted the process after
+an hour of denoising.
+
+`ggml_gallocr` plans a graph and gives the same buffer to tensors whose
+lifetimes do not overlap. The *device* path here always did this; the host path
+never did.
+
+| | before | after |
+|---|---|---|
+| decode 256×256 | 3.69 GiB | **0.20 GiB** |
+| decode 1024×1024 | 52 GiB | **3.4 GiB** |
+| denoise 1024×1024, per layer | 14.6 GiB | **2.0 GiB** |
+
+**Bit-identical, not merely close**: 0 of 196,608 pixels differ, and the
+denoiser's velocity score is unchanged to four decimals.
+
+### The app says how far a model has loaded
+
+It said "loading — a large model takes a while" and then nothing, which on a
+144 GB container is minutes of a window that looks broken. Now:
+
+```
+loading qwen3-4b  62%  ·  1.7 GB of 2.8 GB resident  ·  340 MB/s  ·  3s left
+```
+
+Measured from the server's working set against the catalogue's resident figure,
+the same way the download bar is measured from bytes on disk — no protocol, no
+parsing, and it survives a server started with no console. **The bar stops at 99
+until the server answers**, because the tail of a load is not weights and a full
+bar over a busy app is a lie. A model the catalogue does not know gets bytes and
+**no percentage**: a denominator taken from the file size would report V4-Flash
+as 5% loaded for its whole load.
+
+### Fixed
+
+- **`chaos-pull` accepted a corrupt download.** A resume the CDN did not honour
+  made curl append the whole file to the partial one; the result was 478,535,680
+  bytes **too large**, `saturating_sub` floored the remainder to zero, and it
+  reported "already complete". The container passed every structural check —
+  being too *big* means every tensor offset is readable — and produced NaN at
+  block 31 of 36. Now refused by name, and the size is verified after
+  downloading.
+- An image too large to decode is refused **in 34 milliseconds, before anything
+  is loaded**, naming the largest size that works — rather than aborting inside
+  ggml after an hour of denoising.
+
+
 ## [0.0.10] — 2026-08-20
 
 ### Chaos decodes images, and the autoencoder is verified rather than eyeballed
@@ -1095,7 +1181,8 @@ Qwen3-30B-A3B Q4_K_M prefill, Chaos / llama.cpp:
   requires a competitor's exact command line and output before any competitive
   claim is citable.
 
-[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.10...HEAD
+[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.11...HEAD
+[0.0.11]: https://github.com/aturzone/Chaos/releases/tag/v0.0.11
 [0.0.10]: https://github.com/aturzone/Chaos/releases/tag/v0.0.10
 [0.0.8]: https://github.com/aturzone/Chaos/releases/tag/v0.0.8
 [0.0.7]: https://github.com/aturzone/Chaos/releases/tag/v0.0.7
