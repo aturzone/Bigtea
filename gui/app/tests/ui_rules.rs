@@ -909,3 +909,32 @@ fn installing_an_update_really_exits() {
         "a bare WM_CLOSE only hides the window now"
     );
 }
+
+/// The window's icons are loaded at the size this display asks for.
+///
+/// **The small icon was hard-coded to 16.** On a 125% display Windows wants 20,
+/// so it stretched a 16px image -- and a stretched 16px rendering of a mark made
+/// of one-pixel rays is what "the icon quality is bad in the taskbar" looks
+/// like. Measured with `WM_GETICON` before and after: the window was carrying a
+/// 16x16 bitmap where the metric said 20.
+///
+/// `assets/chaos.ico` carries 16, 20, 24, 32, 40, 48, 64, 128 and 256, so
+/// asking for the metric gets an exact entry instead of a resample.
+#[test]
+fn icons_are_loaded_at_the_size_windows_asks_for() {
+    let src = main_rs();
+    let i = src
+        .find("unsafe fn set_window_icon(")
+        .expect("no set_window_icon");
+    let body = &src[i..(i + 1800).min(src.len())];
+    for m in ["SM_CXICON", "SM_CXSMICON"] {
+        assert!(
+            body.contains(m),
+            "set_window_icon does not ask the system for {m}"
+        );
+    }
+    assert!(
+        !body.contains("IMAGE_ICON, 16, 16"),
+        "the small icon is still hard-coded to 16, which this display stretches"
+    );
+}

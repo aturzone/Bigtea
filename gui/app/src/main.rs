@@ -3965,11 +3965,23 @@ Any value a client sends is accepted.                      The server still list
     /// *window's* icon, which is unset until something sends `WM_SETICON`.
     unsafe fn set_window_icon(hwnd: HWND, hinst: HINSTANCE) {
         let id = 1u16 as *const u16;
-        let big = LoadImageW(hinst, id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+        // **Ask for the size this display wants, not 32 and 16.** On a 125%
+        // machine Windows wants 40 and 20; handed a 16px icon it stretches it,
+        // and a stretched 16px icon of a mark made of one-pixel rays is exactly
+        // what "the icon quality is bad in the taskbar" looks like. The .ico
+        // carries 16, 20, 24, 32, 40, 48, 64, 128 and 256, so asking for the
+        // metric gets an exact entry rather than a resample.
+        //
+        // `LR_DEFAULTSIZE` would have done this for the big icon; the small one
+        // had no such excuse, and being explicit about both keeps the pair
+        // reading as one decision.
+        let (bw, bh) = (GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+        let big = LoadImageW(hinst, id, IMAGE_ICON, bw, bh, LR_SHARED);
         if !big.is_null() {
             SendMessageW(hwnd, WM_SETICON, ICON_BIG, big as LPARAM);
         }
-        let small = LoadImageW(hinst, id, IMAGE_ICON, 16, 16, LR_SHARED);
+        let (sw, sh) = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        let small = LoadImageW(hinst, id, IMAGE_ICON, sw, sh, LR_SHARED);
         if !small.is_null() {
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small as LPARAM);
         }

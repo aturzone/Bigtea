@@ -289,6 +289,13 @@ pub const ICON_SMALL: WPARAM = 0;
 pub const ICON_BIG: WPARAM = 1;
 pub const IMAGE_ICON: u32 = 1;
 pub const LR_DEFAULTSIZE: u32 = 0x0000_0040;
+
+/// The sizes Windows actually wants, which are **not** 32 and 16 on a scaled
+/// display. On this 125% machine they are 40 and 20.
+pub const SM_CXICON: i32 = 11;
+pub const SM_CYICON: i32 = 12;
+pub const SM_CXSMICON: i32 = 49;
+pub const SM_CYSMICON: i32 = 50;
 pub const LR_SHARED: u32 = 0x0000_8000;
 
 pub const MB_YESNO: u32 = 0x0000_0004;
@@ -686,6 +693,10 @@ extern "system" {
     /// Find a window by class name. Used to hand a second launch over to the
     /// instance already running.
     pub fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> HWND;
+    /// Whether a handle still names a live window. The way to wait for another
+    /// process's window to be gone without polling its process handle.
+    pub fn IsWindow(hWnd: HWND) -> BOOL;
+    pub fn GetSystemMetrics(nIndex: i32) -> i32;
     pub fn SetForegroundWindow(hWnd: HWND) -> BOOL;
     pub fn IsWindowVisible(hWnd: HWND) -> BOOL;
     pub fn DestroyMenu(hMenu: HMENU) -> BOOL;

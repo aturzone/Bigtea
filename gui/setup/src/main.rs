@@ -158,7 +158,7 @@ fn main() {
         setup::run_uninstall(&prefix);
         return;
     }
-    setup::run();
+    setup::run(&prefix);
 }
 
 #[cfg(windows)]
@@ -265,7 +265,15 @@ mod setup {
         }
     }
 
-    pub fn run() {
+    /// Open the installer window.
+    ///
+    /// **Takes the prefix rather than assuming it.** `run()` used to fill the
+    /// box with `default_prefix()` unconditionally, so `chaos-setup --prefix
+    /// D:\\Chaos` opened a window that would install to -- and uninstall from --
+    /// `%LOCALAPPDATA%\\Chaos` instead. The flag was parsed, honoured in silent
+    /// mode, and silently dropped here. It is the kind of bug that removes the
+    /// wrong directory, which is exactly what it did while being found.
+    pub fn run(prefix: &std::path::Path) {
         unsafe {
             let hinst = GetModuleHandleW(std::ptr::null());
             let class = wide("ChaosSetupWindow");
@@ -356,7 +364,7 @@ mod setup {
             let small = mkfont(theme::size::SMALL, theme::weight::REGULAR, theme::FACE_UI);
             let mono = mkfont(theme::size::MONO, theme::weight::REGULAR, theme::FACE_MONO);
 
-            let prefix_text = wide(&default_prefix().to_string_lossy());
+            let prefix_text = wide(&prefix.to_string_lossy());
             let prefix = CreateWindowExW(
                 0,
                 wide("EDIT").as_ptr(),
@@ -521,6 +529,10 @@ mod setup {
     }
 
     fn do_install() {
+        // The installer replaces `chaos-app.exe`, which cannot be written while
+        // it is executing -- and since v0.0.12 it may well be executing with no
+        // window on screen.
+        stop_running_chaos();
         let prefix = prefix_value();
         S.with(|s| {
             if let Some(s) = s.borrow_mut().as_mut() {
@@ -768,7 +780,46 @@ mod setup {
         ];
     }
 
+    /// Ask a running Chaos to quit, and wait for it to.
+    ///
+    /// **Closing the window stopped quitting in v0.0.12.** Chaos now hides to
+    /// the notification area, so "I closed it" no longer means the process is
+    /// gone -- and a running executable keeps its own file open, so uninstall
+    /// leaves `chaos-app.exe` behind and install cannot replace it. From the
+    /// outside that is "the uninstall button does not work".
+    ///
+    /// `IDM_EXIT` is the app's own quit: it stops the engine, removes the tray
+    /// icon and ends the process. Sending that rather than terminating means a
+    /// loaded model is unloaded properly instead of being killed with 7 GiB
+    /// resident.
+    ///
+    /// Returns whether anything was asked to stop.
+    fn stop_running_chaos() -> bool {
+        unsafe {
+            let class = wide("ChaosAppWindow");
+            let hwnd = FindWindowW(class.as_ptr(), std::ptr::null());
+            if hwnd.is_null() {
+                return false;
+            }
+            SendMessageW(hwnd, WM_COMMAND, chaos_app::nav::IDM_EXIT as WPARAM, 0);
+            // Give it a moment to unload a model and go. Polling the window
+            // rather than a fixed sleep: unloading 7 GiB is not instant, and a
+            // fixed wait is either too short or wasted.
+            for _ in 0..60 {
+                if IsWindow(hwnd) == 0 {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            true
+        }
+    }
+
     fn do_uninstall() {
+        // Before anything is deleted, not after it fails.
+        if stop_running_chaos() {
+            set_status("closing Chaos first...");
+        }
         let prefix = prefix_value();
         let inside = running_inside(&prefix);
         let (ok, msg) = uninstall_to(&prefix, true);
