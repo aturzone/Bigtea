@@ -19,7 +19,7 @@ engines agree to five significant figures on every layer sum and then both
 overflow to NaN at `l_out-5`. Chaos warns before generating and points at the
 container.
 
-**The release**: v0.0.12, **published 2026-08-20**, **eight** assets across
+**The release**: v0.0.14, **published 2026-08-21**, **eight** assets across
 **five** builds — Windows
 installer and zip; Linux x86_64 tarball, `.deb` and AppImage; Linux **arm64**
 tarball; macOS **arm64** and **x86_64** tarballs. The last two are new in
