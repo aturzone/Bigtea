@@ -82,6 +82,12 @@ mod windows_app {
         status: String,
         /// Set when `chaos-pull` exits, so the UI stops watching the files.
         download_done: bool,
+        /// Lines `chaos-draw` has printed that the window has not shown yet.
+        drawing: String,
+        /// Where the finished picture went, once there is one.
+        drawn: Option<String>,
+        /// Set when `chaos-draw` exits, whether it worked or not.
+        draw_done: bool,
         /// A message box the UI thread must put up: its text, and whether it is
         /// good news.
         ///
@@ -386,6 +392,7 @@ mod windows_app {
             build_menu(hwnd);
             sync_titlebar();
             fill_settings_page();
+            fill_image_page();
             show_page(Page::Chat);
             SetTimer(hwnd, TIMER_ID, TICK_MS, 0);
 
@@ -478,6 +485,7 @@ mod windows_app {
         match p {
             Page::Chat => nav::IDM_PAGE_CHAT,
             Page::Models => nav::IDM_PAGE_MODELS,
+            Page::Image => nav::IDM_PAGE_IMAGE,
             Page::Monitor => nav::IDM_PAGE_MONITOR,
             Page::Settings => nav::IDM_PAGE_SETTINGS,
         }
@@ -751,9 +759,45 @@ mod windows_app {
         button(hwnd, "RESET", nav::ID_RESET, hinst);
         button(hwnd, "BROWSE...", nav::ID_BROWSE_MODELS, hinst);
 
+        // ---- the IMAGE page ------------------------------------------------
+        //
+        // A prompt, two choices and a button. Everything else about drawing is
+        // `chaos-draw`'s business, and it is spawned rather than linked: the
+        // denoiser is 5.26 GiB read per pass and an exhausted ggml arena aborts
+        // the process it is in, which would take the window with it.
+        child(
+            hwnd,
+            "EDIT",
+            "",
+            ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_BORDER | WS_TABSTOP,
+            nav::ID_IMG_PROMPT,
+            hinst,
+        );
+        for id in [nav::ID_IMG_SIZE, nav::ID_IMG_STEPS] {
+            child(
+                hwnd,
+                "COMBOBOX",
+                "",
+                CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
+                id,
+                hinst,
+            );
+        }
+        button(hwnd, "DRAW", nav::ID_IMG_DRAW, hinst);
+        button(hwnd, "STOP", nav::ID_IMG_STOP, hinst);
+        button(hwnd, "OPEN THE PICTURE", nav::ID_IMG_OPEN, hinst);
+        child(
+            hwnd,
+            "EDIT",
+            "",
+            ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER,
+            nav::ID_IMG_LOG,
+            hinst,
+        );
+
         // The transcript, the composer and the list carry measurements, so they
         // are monospaced; everything else is the UI face.
-        let mono_controls = [nav::ID_OUT, nav::ID_IN, nav::ID_LIST];
+        let mono_controls = [nav::ID_OUT, nav::ID_IN, nav::ID_LIST, nav::ID_IMG_LOG];
         for p in nav::PAGES {
             for &id in nav::controls(p) {
                 let f = if mono_controls.contains(&id) {
@@ -984,6 +1028,8 @@ mod windows_app {
         let focus = match p {
             Page::Chat => Some(nav::ID_IN),
             Page::Models => Some(nav::ID_LIST),
+            // The prompt box: the page exists to be typed into.
+            Page::Image => Some(nav::ID_IMG_PROMPT),
             Page::Settings => Some(nav::FIELDS[0].id),
             Page::Monitor => None,
         };
@@ -2639,6 +2685,7 @@ Any value a client sends is accepted.                      The server still list
             match ui.page {
                 Page::Chat => paint_chat(mem, ui, page),
                 Page::Models => paint_models(mem, ui, page, sel),
+                Page::Image => paint_image(mem, ui, page),
                 Page::Monitor => paint_monitor(mem, ui, page),
                 Page::Settings => paint_settings(mem, ui, page),
             }
@@ -3160,6 +3207,49 @@ Any value a client sends is accepted.                      The server still list
         }
     }
 
+    /// The IMAGE page: labels, and the sentence that sets expectations.
+    unsafe fn paint_image(hdc: HDC, ui: &Ui, page: RECT) {
+        paint_header(hdc, ui, page, Page::Image);
+        let t = &ui.theme;
+        let x = page.left + metric::INSET;
+        let w = page.right - x - metric::INSET;
+        let top = content_top(page);
+
+        label(hdc, x, top, w, "PROMPT", ui.fonts.small, t.fg_tertiary);
+        let y = top + 22 + 64 + 6;
+        label(hdc, x, y, 150, "SIZE", ui.fonts.small, t.fg_tertiary);
+        label(hdc, x + 170, y, 150, "STEPS", ui.fonts.small, t.fg_tertiary);
+
+        // **The honest sentence, on the page, before the button is pressed.**
+        // A 1024x1024 picture is minutes of work on this machine and the models
+        // are 16.7 GB; finding that out after clicking is the version of this
+        // that wastes an evening.
+        let note = if models::default_dir().join("ideogram4-Q4_0.gguf").exists() {
+            "Colour and scene follow the prompt; an object's form may not. \
+             Structured, JSON-shaped prompts condition about three times as \
+             strongly as a bare phrase."
+        } else {
+            "The four image models are not downloaded yet -- find ideogram-4, \
+             ideogram-4-uncond, qwen3-vl-8b and flux2-vae on the MODELS page. \
+             They are 16.7 GB together."
+        };
+        // Above the buttons, not under the strip: `page.bottom` is where the
+        // page ends, and anything drawn at it is behind the running-model bar.
+        text(
+            hdc,
+            RECT {
+                left: x + 200,
+                top: page.bottom - metric::BUTTON - 6,
+                right: x + w,
+                bottom: page.bottom,
+            },
+            note,
+            ui.fonts.small,
+            t.fg_tertiary,
+            DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS,
+        );
+    }
+
     unsafe fn paint_monitor(hdc: HDC, ui: &Ui, page: RECT) {
         paint_header(hdc, ui, page, Page::Monitor);
         let t = &ui.theme;
@@ -3443,6 +3533,37 @@ Any value a client sends is accepted.                      The server still list
             let top = content_top(page);
 
             match ui.page {
+                Page::Image => {
+                    // Prompt across the top, the three settings under it, then
+                    // the log takes whatever is left. The picture is not shown
+                    // here: decoding a PNG would mean an inflate implementation
+                    // in a crate that has no dependencies, and the system's own
+                    // viewer is one button away.
+                    let mut y = top + 22;
+                    m.push((nav::ID_IMG_PROMPT, x, y, w, 64));
+                    y += 64 + 26;
+                    let cw = 150;
+                    m.push((
+                        nav::ID_IMG_SIZE,
+                        x,
+                        y,
+                        cw,
+                        metric::CONTROL + metric::COMBO_ROW * 4,
+                    ));
+                    m.push((
+                        nav::ID_IMG_STEPS,
+                        x + cw + 20,
+                        y,
+                        cw,
+                        metric::CONTROL + metric::COMBO_ROW * 5,
+                    ));
+                    m.push((nav::ID_IMG_DRAW, x + w - 250, y, 120, metric::BUTTON));
+                    m.push((nav::ID_IMG_STOP, x + w - 120, y, 120, metric::BUTTON));
+                    y += metric::CONTROL + 30;
+                    let log_h = (page.bottom - y - metric::BUTTON - 30).max(100);
+                    m.push((nav::ID_IMG_LOG, x, y, w, log_h));
+                    m.push((nav::ID_IMG_OPEN, x, y + log_h + 12, 180, metric::BUTTON));
+                }
                 Page::Chat => {
                     let composer_h = 88;
                     let out_h = (page.bottom - top - composer_h - 44).max(120);
@@ -3560,9 +3681,15 @@ Any value a client sends is accepted.                      The server still list
     /// what you have, or fetching what you do not.
     fn weight_of(id: i32, page: Page, tab: Tab) -> Weight {
         match id {
-            nav::ID_NAV_CHAT | nav::ID_NAV_MODELS | nav::ID_NAV_MONITOR | nav::ID_NAV_SETTINGS => {
-                Weight::Nav
-            }
+            // **Every rail button, or the new one is drawn as a push button.**
+            // A page added without being listed here falls through to
+            // `Secondary` and appears in the rail as a bordered box among four
+            // washes -- which is exactly how IMAGE first looked.
+            nav::ID_NAV_CHAT
+            | nav::ID_NAV_MODELS
+            | nav::ID_NAV_IMAGE
+            | nav::ID_NAV_MONITOR
+            | nav::ID_NAV_SETTINGS => Weight::Nav,
             nav::ID_TAB_INSTALLED | nav::ID_TAB_AVAILABLE => Weight::Tab,
             nav::ID_AUTO | nav::ID_FORCE => Weight::Toggle,
             nav::ID_DELETE => Weight::Destructive,
@@ -4026,6 +4153,292 @@ Any value a client sends is accepted.                      The server still list
             } else {
                 Some(hwnd)
             }
+        }
+    }
+
+    // ---- drawing -----------------------------------------------------------
+    //
+    // Atur asked three times for the window to make images. `chaos-draw` has
+    // shipped since v0.0.12 and only a terminal could reach it.
+    //
+    // **Spawned, not linked.** `chaos-app` has no ggml dependency and must not
+    // grow one: a denoiser pass reads 5.26 GiB, an exhausted ggml arena aborts
+    // the process it is in, and a window that dies mid-draw with no message is
+    // the worst version of this. A child process can be watched, reported on,
+    // and killed.
+
+    /// The child currently drawing, if one is.
+    fn drawer() -> &'static Mutex<Option<Child>> {
+        static D: std::sync::OnceLock<Mutex<Option<Child>>> = std::sync::OnceLock::new();
+        D.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Grid values, and what they cost. The number is `--grid`; the image is
+    /// sixteen times it.
+    const SIZES: [(&str, u32); 3] = [
+        ("256 x 256 -- quick, and flat", 16),
+        ("512 x 512 -- faceted", 32),
+        ("1024 x 1024 -- photorealistic, and slow", 64),
+    ];
+    const STEPS: [u32; 5] = [4, 8, 20, 30, 50];
+
+    /// Put the two drop-downs' options in, and cache them where the painter
+    /// looks.
+    ///
+    /// **`draw_combo` reads its text from `ui.lists`, not from the control.**
+    /// That is deliberate -- asking a control for its own text during its own
+    /// paint is a message round trip for something already in hand -- but it
+    /// means a combo filled only with `CB_ADDSTRING` has items that select and
+    /// draw as blank rows. Which is exactly how these two first appeared.
+    fn fill_image_page() {
+        let sizes: Vec<Choice> = SIZES
+            .iter()
+            .map(|(label, grid)| Choice {
+                value: grid.to_string(),
+                label: (*label).to_string(),
+                note: String::new(),
+            })
+            .collect();
+        let steps: Vec<Choice> = STEPS
+            .iter()
+            .map(|n| Choice {
+                value: n.to_string(),
+                label: format!("{n} steps"),
+                note: String::new(),
+            })
+            .collect();
+
+        for (id, list, selected) in [
+            // 512: large enough not to be a smear, small enough to finish.
+            (nav::ID_IMG_SIZE, sizes, 1usize),
+            (nav::ID_IMG_STEPS, steps, 2usize),
+        ] {
+            let h = ctl(id);
+            if h.is_null() {
+                continue;
+            }
+            unsafe {
+                SendMessageW(h, CB_RESETCONTENT, 0, 0);
+                for c in &list {
+                    SendMessageW(h, CB_ADDSTRING, 0, wide(&c.label).as_ptr() as LPARAM);
+                }
+                SendMessageW(h, CB_SETCURSEL, selected, 0);
+                widen_dropdown(h, &list);
+            }
+            UI.with(|u| {
+                if let Some(ui) = u.borrow_mut().as_mut() {
+                    ui.lists.insert(id, list);
+                }
+            });
+        }
+    }
+
+    fn image_log(text: &str) {
+        let h = ctl(nav::ID_IMG_LOG);
+        if h.is_null() {
+            return;
+        }
+        let body = text.replace("\r\n", "\n").replace('\n', "\r\n");
+        unsafe {
+            // **A read-only EDIT ignores `EM_REPLACESEL`** -- no error, no
+            // text, nothing. `append_out` documents this at length after every
+            // generated token was dropped by it; the log is the second box to
+            // walk into the same trap. Drop the flag, append, put it back.
+            SendMessageW(h, EM_SETREADONLY, 0, 0);
+            let n = GetWindowTextLengthW(h);
+            SendMessageW(h, EM_SETSEL, n as WPARAM, n as LPARAM);
+            SendMessageW(h, EM_REPLACESEL, 0, wide(&body).as_ptr() as LPARAM);
+            SendMessageW(h, EM_SCROLLCARET, 0, 0);
+            SendMessageW(h, EM_SETREADONLY, 1, 0);
+        }
+    }
+
+    /// Start a draw.
+    fn draw_image() {
+        if drawer().lock().unwrap().is_some() {
+            set_status("already drawing -- press STOP first");
+            return;
+        }
+        let prompt = control_text(ctl(nav::ID_IMG_PROMPT)).trim().to_string();
+        if prompt.is_empty() {
+            set_status("type what to draw first");
+            unsafe {
+                SetFocus(ctl(nav::ID_IMG_PROMPT));
+            }
+            return;
+        }
+        let grid = unsafe { SendMessageW(ctl(nav::ID_IMG_SIZE), CB_GETCURSEL, 0, 0) }
+            .try_into()
+            .ok()
+            .and_then(|i: usize| SIZES.get(i))
+            .map(|(_, g)| *g)
+            .unwrap_or(32);
+        let steps = unsafe { SendMessageW(ctl(nav::ID_IMG_STEPS), CB_GETCURSEL, 0, 0) }
+            .try_into()
+            .ok()
+            .and_then(|i: usize| STEPS.get(i))
+            .copied()
+            .unwrap_or(20);
+
+        // Beside this executable, the way `chaos-serve` and `chaos-pull` are
+        // found: an install puts all twelve binaries in one directory.
+        let Some(exe) = std::env::current_exe()
+            .ok()
+            .map(|p| p.with_file_name("chaos-draw.exe"))
+            .filter(|p| p.exists())
+        else {
+            set_status("chaos-draw.exe is missing from this folder");
+            return;
+        };
+        // Beside the models, which is where a person will look for it.
+        let models_dir = models::default_dir();
+        let out = models_dir
+            .parent()
+            .map(|p| p.join("images"))
+            .unwrap_or_else(|| models_dir.join("images"));
+        let _ = std::fs::create_dir_all(&out);
+        let file = out.join(format!(
+            "chaos-{}.png",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ));
+
+        let mut cmd = Command::new(&exe);
+        cmd.arg(&prompt)
+            .arg("--grid")
+            .arg(grid.to_string())
+            .arg("--steps")
+            .arg(steps.to_string())
+            .arg("-o")
+            .arg(&file)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                set_status(&format!("cannot start chaos-draw: {e}"));
+                return;
+            }
+        };
+
+        {
+            let mut sh = shared().lock().unwrap();
+            sh.drawing.clear();
+            sh.draw_done = false;
+            sh.drawn = Some(file.to_string_lossy().into_owned());
+        }
+        unsafe {
+            SetWindowTextW(ctl(nav::ID_IMG_LOG), wide("").as_ptr());
+        }
+        image_log(&format!(
+            "chaos-draw {:?}\r\n  {}x{} from a {}x{} grid, {steps} steps\r\n  writing {}\r\n\r\n",
+            prompt,
+            grid * 16,
+            grid * 16,
+            grid,
+            grid,
+            file.display()
+        ));
+
+        // **Both pipes, on their own threads.** `chaos-draw` prints its stages
+        // to stdout and its per-step progress to stderr, and reading one to the
+        // end before the other deadlocks when the unread pipe fills.
+        for pipe in [
+            child.stdout.take().map(Pipe::Out),
+            child.stderr.take().map(Pipe::Err),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = [0u8; 256];
+                let mut src: Box<dyn Read + Send> = match pipe {
+                    Pipe::Out(o) => Box::new(o),
+                    Pipe::Err(e) => Box::new(e),
+                };
+                while let Ok(n) = src.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    shared().lock().unwrap().drawing.push_str(&text);
+                    notify();
+                }
+            });
+        }
+        *drawer().lock().unwrap() = Some(child);
+        set_status("drawing -- this takes minutes, and the log says how many");
+        sync_enabled();
+    }
+
+    /// Which pipe a reader thread is draining. A tiny enum rather than two
+    /// near-identical closures.
+    enum Pipe {
+        Out(std::process::ChildStdout),
+        Err(std::process::ChildStderr),
+    }
+
+    fn stop_drawing() {
+        if let Some(mut c) = drawer().lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+            image_log("\r\n-- stopped --\r\n");
+            set_status("drawing stopped");
+        }
+        shared().lock().unwrap().drawn = None;
+        sync_enabled();
+    }
+
+    fn open_drawn() {
+        let path = shared().lock().unwrap().drawn.clone();
+        match path.filter(|p| std::path::Path::new(p).exists()) {
+            Some(p) => shell_open(&p),
+            None => set_status("there is no finished picture yet"),
+        }
+    }
+
+    /// Move whatever the child printed into the log, and notice when it ends.
+    fn drain_drawing() {
+        let text = {
+            let mut sh = shared().lock().unwrap();
+            std::mem::take(&mut sh.drawing)
+        };
+        if !text.is_empty() {
+            // `chaos-draw` redraws its progress line with a carriage return;
+            // an EDIT has no cursor to move, so each update becomes its own
+            // line rather than a wall of them overwriting nothing.
+            image_log(&text.replace('\r', "\n"));
+        }
+        let finished = {
+            let mut d = drawer().lock().unwrap();
+            match d.as_mut() {
+                Some(c) => match c.try_wait() {
+                    Ok(Some(st)) => {
+                        *d = None;
+                        Some(st.success())
+                    }
+                    _ => None,
+                },
+                None => None,
+            }
+        };
+        if let Some(ok) = finished {
+            shared().lock().unwrap().draw_done = true;
+            if ok {
+                image_log("\r\n-- finished. Press OPEN THE PICTURE. --\r\n");
+                set_status("the picture is ready");
+            } else {
+                image_log("\r\n-- chaos-draw stopped without finishing --\r\n");
+                set_status("drawing failed -- the log says why");
+            }
+            sync_enabled();
         }
     }
 
@@ -4511,6 +4924,7 @@ Any value a client sends is accepted.                      The server still list
             }
             WM_APP_TICK => {
                 drain();
+                drain_drawing();
                 0
             }
             // The shell sends mouse messages for the icon here, in `lParam`.
@@ -4649,6 +5063,9 @@ Any value a client sends is accepted.                      The server still list
                     (nav::ID_TAB_AVAILABLE, BN_CLICKED) => set_tab(Tab::Available),
                     (nav::ID_SAVE, BN_CLICKED) => save_settings(),
                     (nav::ID_BROWSE_MODELS, BN_CLICKED) => browse_models_dir(hwnd),
+                    (nav::ID_IMG_DRAW, BN_CLICKED) => draw_image(),
+                    (nav::ID_IMG_STOP, BN_CLICKED) => stop_drawing(),
+                    (nav::ID_IMG_OPEN, BN_CLICKED) => open_drawn(),
                     (nav::ID_RESET, BN_CLICKED) => reset_settings(),
                     (nav::ID_AUTO, BN_CLICKED) | (nav::ID_FORCE, BN_CLICKED) => toggle(id),
                     // Selecting a different model redraws its page beside the
@@ -4703,6 +5120,9 @@ Any value a client sends is accepted.                      The server still list
                 // happens to hover over it.
                 tray_remove(hwnd);
                 stop_server();
+                // A draw is a child process too, and one left running holds
+                // 5 GiB and writes into a folder nobody is watching.
+                stop_drawing();
                 PostQuitMessage(0);
                 0
             }

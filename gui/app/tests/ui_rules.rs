@@ -938,3 +938,40 @@ fn icons_are_loaded_at_the_size_windows_asks_for() {
         "the small icon is still hard-coded to 16, which this display stretches"
     );
 }
+
+/// No two controls or commands share an id.
+///
+/// **A collision does not fail to compile and does not say a word.** The image
+/// page was numbered 601-607 while the notification-area menu already owned 601
+/// and 602. `WM_COMMAND` matches the menu ids first, so `ID_IMG_PROMPT` was
+/// answered by "open the window" and `ID_IMG_SIZE` -- the size drop-down -- by
+/// **quit the application**. What was visible was only that the DRAW button did
+/// nothing.
+#[test]
+fn every_id_is_unique() {
+    let src = source("nav.rs");
+    let mut seen: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
+    let mut clashes = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("pub const ID") else {
+            continue;
+        };
+        let Some((name, value)) = rest.split_once(": i32 = ") else {
+            continue;
+        };
+        let Ok(n) = value.trim_end_matches(';').trim().parse::<i32>() else {
+            continue;
+        };
+        let name = format!("ID{name}");
+        if let Some(first) = seen.insert(n, name.clone()) {
+            clashes.push(format!("{n}: {first} and {name}"));
+        }
+    }
+    assert!(
+        seen.len() > 30,
+        "only {} ids found -- did nav.rs move?",
+        seen.len()
+    );
+    assert!(clashes.is_empty(), "ids used twice: {clashes:?}");
+}
