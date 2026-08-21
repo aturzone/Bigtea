@@ -5,7 +5,7 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-20 · **Version**: **v0.0.13** · **Branch**: `main` ·
+**Last updated**: 2026-08-20 · **Version**: **v0.0.14** · **Branch**: `main` ·
 **Open PRs**: none.
 
 **Twelve of thirteen installed models generate correct text** on this 15.7 GiB
@@ -128,7 +128,7 @@ and document was renamed on 2026-08-16 — `bigtea-run` is `chaos-run`,
 remote is deliberately unchanged; Atur renames the repository himself, at which
 point the `repository`/`homepage` URLs and the CI badge start resolving.
 
-**Current**: **815 tests** (60 binaries, 0 failed, 33 ignored — the V4-Flash set
+**Current**: **819 tests** (60 binaries, 0 failed, 33 ignored — the V4-Flash set
 needs the container, and the autoencoder set needs the 336 MB `flux2-vae`),
 clippy `--workspace --all-targets -D warnings` 0, fmt clean. **165 of llama.cpp's 182 long flags implemented, 17 declined with a
 written reason, 0 unrecognised** — counted from both binaries rather than by

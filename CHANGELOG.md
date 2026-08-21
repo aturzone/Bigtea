@@ -8,6 +8,37 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
+## [0.0.14] — 2026-08-21
+
+### The window draws
+
+`chaos-draw` has shipped since v0.0.12 and only a terminal could reach it. The
+rail has an **IMAGE** page: a prompt, a size, a number of steps, and DRAW. The
+picture lands in `%USERPROFILE%\.chaos\images`; the log carries the real
+progress, because this is minutes of work and a spinner would be a lie.
+
+**Spawned, not linked.** A denoiser pass reads 5.26 GiB and an exhausted ggml
+arena aborts the process it is in — which, linked, would be the window.
+
+### Fixed
+
+- **The uninstall button, twice over.** The setup window ignored `--prefix` and
+  filled its box with the default, so `chaos-setup --prefix D:\Chaos` would
+  uninstall `%LOCALAPPDATA%\Chaos` instead — a bug that removes the wrong
+  directory, and it did while being found. And neither install nor uninstall
+  closed a **running** Chaos: since v0.0.12 closing the window only hides it, so
+  `chaos-app.exe` was still locked. Both now ask the app to quit through its own
+  Exit, so a loaded model unloads rather than being killed with 7 GiB resident.
+- **The taskbar icon was stretched.** The small window icon was hard-coded to
+  16×16 while a 125% display asks for 20. Measured with `WM_GETICON`: 16 before,
+  20 after. The icon file already carried a 20px entry.
+- **An id collision that fired the wrong handler.** The IMAGE page was numbered
+  from 601, where `IDM_TRAY_OPEN` and `IDM_TRAY_EXIT` already lived; menu ids
+  match first, so the size drop-down meant *quit the application*. Nothing
+  failed to compile. The test that exists for this read a hand-written list of
+  menu ids nobody had extended — it derives them from the source now.
+
+
 ## [0.0.13] — 2026-08-20
 
 ### The workspace has a shape now
@@ -1348,7 +1379,8 @@ Qwen3-30B-A3B Q4_K_M prefill, Chaos / llama.cpp:
   requires a competitor's exact command line and output before any competitive
   claim is citable.
 
-[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.13...HEAD
+[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.14...HEAD
+[0.0.14]: https://github.com/aturzone/Chaos/releases/tag/v0.0.14
 [0.0.13]: https://github.com/aturzone/Chaos/releases/tag/v0.0.13
 [0.0.12]: https://github.com/aturzone/Chaos/releases/tag/v0.0.12
 [0.0.11]: https://github.com/aturzone/Chaos/releases/tag/v0.0.11

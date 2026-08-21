@@ -505,6 +505,21 @@ compiling**, and three of these were believed fixed before a pixel was measured.
   ray edge landed on one of sixteen grey levels and the whole thing read as
   notched — reported as "low quality logo" twice, at 32px and again at 44px.
   8x8 at 64px is smooth. The rasterisation is cached, so the cost is paid once.
+- **A control id that collides with a menu id fails silently and looks like a
+  dead button.** `WM_COMMAND` carries both through the same parameter and the
+  menu ids are matched first, so numbering a new page from 601 -- where
+  `IDM_TRAY_OPEN` and `IDM_TRAY_EXIT` already lived -- made the prompt box mean
+  "open the window" and the size drop-down mean **quit the application**.
+  Nothing failed to compile. The visible symptom was that DRAW did nothing.
+  There was a test for exactly this and it read a **hand-written list of menu
+  ids** that nobody had extended; it derives them from the source now.
+- **An owner-drawn combo draws from the state, not from the control.**
+  `draw_combo` takes its labels from `ui.lists`, so a combo filled only with
+  `CB_ADDSTRING` has items that select correctly and paint as blank rows.
+- **A new page needs three registrations, and the compiler asks for none of
+  them**: its rail button in `SHELL_CONTROLS` or it is never shown, its id in
+  `weight_of` or it paints as a push button among washes, and its controls in
+  `nav::controls` or they never appear.
 - **Making the X hide instead of quit changes what `WM_CLOSE` means
   everywhere.** Every place that posted one in order to end the process now
   merely hides the window. The in-app updater did exactly that: it downloaded

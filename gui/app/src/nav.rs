@@ -26,12 +26,20 @@ pub enum Page {
     Models,
     /// What the machine is doing while a model runs.
     Monitor,
+    /// A prompt, and a picture. Drives `chaos-draw` as a child process.
+    Image,
     /// Everything the settings file holds -- which is nine fields, of which the
     /// old window showed three.
     Settings,
 }
 
-pub const PAGES: [Page; 4] = [Page::Chat, Page::Models, Page::Monitor, Page::Settings];
+pub const PAGES: [Page; 5] = [
+    Page::Chat,
+    Page::Models,
+    Page::Image,
+    Page::Monitor,
+    Page::Settings,
+];
 
 impl Page {
     /// The label in the navigation rail.
@@ -39,6 +47,7 @@ impl Page {
         match self {
             Page::Chat => "CHAT",
             Page::Models => "MODELS",
+            Page::Image => "IMAGE",
             Page::Monitor => "MONITOR",
             Page::Settings => "SETTINGS",
         }
@@ -49,6 +58,7 @@ impl Page {
         match self {
             Page::Chat => "Chat",
             Page::Models => "Models",
+            Page::Image => "Image",
             Page::Monitor => "Monitor",
             Page::Settings => "Settings",
         }
@@ -62,6 +72,7 @@ impl Page {
         match self {
             Page::Chat => "Talk to the running model, or point a coding agent at its endpoint.",
             Page::Models => "What is on this machine, and what Chaos can fetch.",
+            Page::Image => "A prompt, and a picture. This is slow and says how slow.",
             Page::Monitor => "What the machine is doing while a model runs.",
             Page::Settings => "Every setting Chaos keeps. Empty means measured.",
         }
@@ -72,8 +83,9 @@ impl Page {
         match self {
             Page::Chat => b'1',
             Page::Models => b'2',
-            Page::Monitor => b'3',
-            Page::Settings => b'4',
+            Page::Image => b'3',
+            Page::Monitor => b'4',
+            Page::Settings => b'5',
         }
     }
 
@@ -118,11 +130,34 @@ pub const ID_RESET: i32 = 311;
 /// Pick the models folder with a dialog instead of typing a path.
 pub const ID_BROWSE_MODELS: i32 = 312;
 
+// Image: 700.
+//
+// **Not 600: the notification-area menu is there.** `ID_IMG_PROMPT` was 601 and
+// `IDM_TRAY_OPEN` is 601; `ID_IMG_SIZE` was 602 and `IDM_TRAY_EXIT` is 602. The
+// menu ids are matched first in `WM_COMMAND`, so the size drop-down would have
+// quit the application. Nothing failed to compile and nothing said a word --
+// the DRAW button simply did nothing, because its neighbours were being
+// answered by another handler entirely.
+/// What to draw.
+pub const ID_IMG_PROMPT: i32 = 701;
+/// 256, 512 or 1024. The token count is the square of the grid, and attention
+/// is quadratic in that again, so this is the only lever that matters.
+pub const ID_IMG_SIZE: i32 = 702;
+pub const ID_IMG_STEPS: i32 = 703;
+pub const ID_IMG_DRAW: i32 = 704;
+/// Stop a draw that is going to take longer than the user wants.
+pub const ID_IMG_STOP: i32 = 705;
+/// Open the finished picture in whatever shows PNGs.
+pub const ID_IMG_OPEN: i32 = 706;
+/// Where the progress lines go.
+pub const ID_IMG_LOG: i32 = 707;
+
 // The shell: 400. Present on every page.
 pub const ID_NAV_CHAT: i32 = 401;
 pub const ID_NAV_MODELS: i32 = 402;
 pub const ID_NAV_MONITOR: i32 = 403;
 pub const ID_NAV_SETTINGS: i32 = 404;
+pub const ID_NAV_IMAGE: i32 = 406;
 pub const ID_STRIP_STOP: i32 = 405;
 
 // Menu commands: 500. A separate range so `WM_COMMAND` can tell a menu pick
@@ -139,6 +174,7 @@ pub const IDM_API_KEY: i32 = 515;
 pub const IDM_TEST_CONNECTION: i32 = 516;
 pub const IDM_PAGE_CHAT: i32 = 520;
 pub const IDM_PAGE_MODELS: i32 = 521;
+pub const IDM_PAGE_IMAGE: i32 = 526;
 pub const IDM_PAGE_MONITOR: i32 = 522;
 pub const IDM_PAGE_SETTINGS: i32 = 523;
 pub const IDM_THEME_LIGHT: i32 = 524;
@@ -161,6 +197,7 @@ pub const IDM_TRAY_EXIT: i32 = 602;
 pub fn nav_id(p: Page) -> i32 {
     match p {
         Page::Chat => ID_NAV_CHAT,
+        Page::Image => ID_NAV_IMAGE,
         Page::Models => ID_NAV_MODELS,
         Page::Monitor => ID_NAV_MONITOR,
         Page::Settings => ID_NAV_SETTINGS,
@@ -172,6 +209,7 @@ pub fn page_of_menu(id: i32) -> Option<Page> {
     match id {
         IDM_PAGE_CHAT => Some(Page::Chat),
         IDM_PAGE_MODELS => Some(Page::Models),
+        IDM_PAGE_IMAGE => Some(Page::Image),
         IDM_PAGE_MONITOR => Some(Page::Monitor),
         IDM_PAGE_SETTINGS => Some(Page::Settings),
         _ => None,
@@ -203,6 +241,15 @@ pub fn controls(p: Page) -> &'static [i32] {
             ID_REFRESH,
             ID_COPY_ENDPOINT,
         ],
+        Page::Image => &[
+            ID_IMG_PROMPT,
+            ID_IMG_SIZE,
+            ID_IMG_STEPS,
+            ID_IMG_DRAW,
+            ID_IMG_STOP,
+            ID_IMG_OPEN,
+            ID_IMG_LOG,
+        ],
         // Painted entirely. Every number on it is read from the machine each
         // tick, so a static control would be a second place to keep in step.
         Page::Monitor => &[],
@@ -224,9 +271,14 @@ pub fn controls(p: Page) -> &'static [i32] {
 }
 
 /// The shell's own controls, visible whichever page is showing.
-pub const SHELL_CONTROLS: [i32; 5] = [
+pub const SHELL_CONTROLS: [i32; 6] = [
     ID_NAV_CHAT,
     ID_NAV_MODELS,
+    // **A page is not reachable until its rail button is shell chrome.**
+    // `show_page` walks this list to reveal the rail; a nav button missing from
+    // it is created, positioned, and never shown -- which looked like a gap in
+    // the rail where IMAGE should be.
+    ID_NAV_IMAGE,
     ID_NAV_MONITOR,
     ID_NAV_SETTINGS,
     ID_STRIP_STOP,
@@ -360,6 +412,7 @@ mod tests {
             let menu = match p {
                 Page::Chat => IDM_PAGE_CHAT,
                 Page::Models => IDM_PAGE_MODELS,
+                Page::Image => IDM_PAGE_IMAGE,
                 Page::Monitor => IDM_PAGE_MONITOR,
                 Page::Settings => IDM_PAGE_SETTINGS,
             };
@@ -368,43 +421,50 @@ mod tests {
         }
     }
 
-    /// Menu ids must not collide with control ids: `WM_COMMAND` delivers both
-    /// through the same parameter, and an overlap would fire a button from a
-    /// menu pick.
+    /// No id means two things.
+    ///
+    /// `WM_COMMAND` delivers menu picks and control notifications through the
+    /// same parameter, so an overlap fires the wrong handler -- and the handler
+    /// that runs is whichever is matched first, which is the menu.
+    ///
+    /// **This test used to read a hand-written list of menu ids and it drifted.**
+    /// `IDM_TRAY_OPEN` (601) and `IDM_TRAY_EXIT` (602) were added and not listed,
+    /// so when the IMAGE page was numbered from 601 the collision went unseen:
+    /// `ID_IMG_PROMPT` was answered by "open the window" and `ID_IMG_SIZE` -- a
+    /// drop-down -- by **quit the application**. Nothing failed to compile and
+    /// nothing said a word; the DRAW button simply did nothing.
+    ///
+    /// So the ids are read out of this file rather than remembered. A constant
+    /// added tomorrow is covered without anybody editing a list.
     #[test]
-    fn menu_commands_cannot_be_mistaken_for_controls() {
-        let controls: HashSet<i32> = PAGES
-            .iter()
-            .flat_map(|&p| super::controls(p).iter().copied())
-            .chain(SHELL_CONTROLS)
-            .collect();
-        let menus = [
-            IDM_API_KEY,
-            IDM_TEST_CONNECTION,
-            IDM_RESCAN,
-            IDM_OPEN_MODELS_DIR,
-            IDM_EXIT,
-            IDM_LOAD,
-            IDM_STOP,
-            IDM_DOWNLOAD,
-            IDM_DELETE,
-            IDM_COPY_ENDPOINT,
-            IDM_PAGE_CHAT,
-            IDM_PAGE_MODELS,
-            IDM_PAGE_MONITOR,
-            IDM_PAGE_SETTINGS,
-            IDM_THEME_LIGHT,
-            IDM_THEME_DARK,
-            IDM_MANUAL,
-            IDM_RELEASES,
-            IDM_CRASH_LOG,
-            IDM_ABOUT,
-        ];
-        let mut seen = HashSet::new();
-        for m in menus {
-            assert!(!controls.contains(&m), "menu id {m} is also a control id");
-            assert!(seen.insert(m), "menu id {m} is used twice");
+    fn no_id_is_used_for_two_things() {
+        let src = include_str!("nav.rs");
+        let mut seen: std::collections::HashMap<i32, &str> = std::collections::HashMap::new();
+        let mut clashes = Vec::new();
+        for line in src.lines() {
+            let t = line.trim();
+            let Some(rest) = t
+                .strip_prefix("pub const ID")
+                .or_else(|| t.strip_prefix("pub const IDM"))
+            else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(": i32 = ") else {
+                continue;
+            };
+            let Ok(n) = value.trim_end_matches(';').trim().parse::<i32>() else {
+                continue;
+            };
+            if let Some(first) = seen.insert(n, name) {
+                clashes.push(format!("{n} is both {first} and {name}"));
+            }
         }
+        assert!(
+            seen.len() > 35,
+            "only {} ids were found -- has the shape of nav.rs changed?",
+            seen.len()
+        );
+        assert!(clashes.is_empty(), "{clashes:?}");
     }
 
     /// **Every setting in the file is on the page.** The old window exposed

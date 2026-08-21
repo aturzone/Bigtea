@@ -909,3 +909,69 @@ fn installing_an_update_really_exits() {
         "a bare WM_CLOSE only hides the window now"
     );
 }
+
+/// The window's icons are loaded at the size this display asks for.
+///
+/// **The small icon was hard-coded to 16.** On a 125% display Windows wants 20,
+/// so it stretched a 16px image -- and a stretched 16px rendering of a mark made
+/// of one-pixel rays is what "the icon quality is bad in the taskbar" looks
+/// like. Measured with `WM_GETICON` before and after: the window was carrying a
+/// 16x16 bitmap where the metric said 20.
+///
+/// `assets/chaos.ico` carries 16, 20, 24, 32, 40, 48, 64, 128 and 256, so
+/// asking for the metric gets an exact entry instead of a resample.
+#[test]
+fn icons_are_loaded_at_the_size_windows_asks_for() {
+    let src = main_rs();
+    let i = src
+        .find("unsafe fn set_window_icon(")
+        .expect("no set_window_icon");
+    let body = &src[i..(i + 1800).min(src.len())];
+    for m in ["SM_CXICON", "SM_CXSMICON"] {
+        assert!(
+            body.contains(m),
+            "set_window_icon does not ask the system for {m}"
+        );
+    }
+    assert!(
+        !body.contains("IMAGE_ICON, 16, 16"),
+        "the small icon is still hard-coded to 16, which this display stretches"
+    );
+}
+
+/// No two controls or commands share an id.
+///
+/// **A collision does not fail to compile and does not say a word.** The image
+/// page was numbered 601-607 while the notification-area menu already owned 601
+/// and 602. `WM_COMMAND` matches the menu ids first, so `ID_IMG_PROMPT` was
+/// answered by "open the window" and `ID_IMG_SIZE` -- the size drop-down -- by
+/// **quit the application**. What was visible was only that the DRAW button did
+/// nothing.
+#[test]
+fn every_id_is_unique() {
+    let src = source("nav.rs");
+    let mut seen: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
+    let mut clashes = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("pub const ID") else {
+            continue;
+        };
+        let Some((name, value)) = rest.split_once(": i32 = ") else {
+            continue;
+        };
+        let Ok(n) = value.trim_end_matches(';').trim().parse::<i32>() else {
+            continue;
+        };
+        let name = format!("ID{name}");
+        if let Some(first) = seen.insert(n, name.clone()) {
+            clashes.push(format!("{n}: {first} and {name}"));
+        }
+    }
+    assert!(
+        seen.len() > 30,
+        "only {} ids found -- did nav.rs move?",
+        seen.len()
+    );
+    assert!(clashes.is_empty(), "ids used twice: {clashes:?}");
+}

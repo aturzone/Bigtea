@@ -28,7 +28,7 @@ and pressing UNINSTALL.
 ```
 +----------------+----------------------------------------------+
 | ✳ CHAOS        |  Chat                                        |
-|   v0.0.13      |  Talk to the running model, or point a       |
+|   v0.0.14      |  Talk to the running model, or point a       |
 |                |  coding agent at its endpoint.               |
 | ▎CHAT          |                                              |
 |  MODELS        |  +----------------------------------------+  |
@@ -41,8 +41,8 @@ and pressing UNINSTALL.
 +----------------------------------------------------------------+
 ```
 
-**Four pages, and one owns the screen at a time.** Reach them from the rail, from
-**View** in the menu, or with `Ctrl+1` … `Ctrl+4`.
+**Five pages, and one owns the screen at a time.** Reach them from the rail, from
+**View** in the menu, or with `Ctrl+1` … `Ctrl+5`.
 
 **The strip along the bottom is on every page.** Whatever you are looking at, it
 says whether a model is up, where to reach it, and how fast it is going.
@@ -190,6 +190,36 @@ This matters because the failure is otherwise invisible. A half-written `.gguf`
 has a perfectly valid header — the header is written first — so it sits in the
 list looking exactly like a model that works.
 
+### IMAGE
+
+A prompt, a size, a number of steps, and **DRAW**. The picture is written to
+`%USERPROFILE%\.chaos\images` and **OPEN THE PICTURE** shows it in whatever
+displays PNGs.
+
+| size | tokens | what it looks like |
+|---|---|---|
+| 256 x 256 | 256 | quick, and flat |
+| 512 x 512 | 1024 | faceted |
+| 1024 x 1024 | 4096 | photorealistic, and slow |
+
+**This is minutes of work, and the log says how many.** Every step reads the
+denoiser's 5.26 GiB, twice when guidance is on, so the box under the controls
+carries the same progress `chaos-draw` prints in a terminal — the step, the
+seconds per step, and the time left. **STOP** ends it.
+
+> **Colour and scene follow the prompt; an object's form may not.** Structured,
+> JSON-shaped prompts condition about three times as strongly as a bare phrase,
+> which is what these models were trained on.
+
+It needs four files, 16.7 GB together: `ideogram-4`, `ideogram-4-uncond`,
+`qwen3-vl-8b` and `flux2-vae`, all on the AVAILABLE tab. Until they are there
+the page says so rather than failing when DRAW is pressed.
+
+**`chaos-draw` does the work, as a separate process.** The window never loads a
+denoiser itself: a pass reads gigabytes, an exhausted arena aborts the process
+it is in, and a window that vanished mid-draw would be the worst version of
+this. A child can be watched, reported on, and stopped.
+
 ### MONITOR
 
 What the machine is doing: memory free and in use with a bar, the running
@@ -332,9 +362,8 @@ Named plainly rather than left to be discovered:
 - MONITOR cannot show streamed bytes or cache residency; the engine measures
   them but does not report them over the socket.
 - The menu bar does not follow dark mode. See above for what was tried.
-- **No image page.** `chaos-draw` ships in the same install and draws from a
-  prompt; the window does not drive it yet. A picture at 1024x1024 is hours of
-  work on a laptop, and a progress surface honest about that is its own job
-  rather than a button bolted onto MODELS.
+- The IMAGE page shows no preview of the finished picture — decoding a PNG
+  would mean an inflate implementation in a crate that has none, and the
+  system's own viewer is one button away.
 
 `docs/graph/backlog/app-to-production.md` tracks these.
