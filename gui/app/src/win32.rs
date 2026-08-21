@@ -294,6 +294,9 @@ pub const LR_DEFAULTSIZE: u32 = 0x0000_0040;
 /// display. On this 125% machine they are 40 and 20.
 pub const SM_CXICON: i32 = 11;
 pub const SM_CYICON: i32 = 12;
+/// Give up rather than wait for a hung window, and do not let this thread be
+/// blocked by one either.
+pub const SMTO_ABORTIFHUNG: u32 = 0x0002;
 pub const SM_CXSMICON: i32 = 49;
 pub const SM_CYSMICON: i32 = 50;
 pub const LR_SHARED: u32 = 0x0000_8000;
@@ -480,7 +483,6 @@ pub const KEY_WRITE: u32 = 0x0002_0006;
 pub const REG_SZ: u32 = 1;
 pub const HWND_BROADCAST: HWND = 0xFFFF_usize as HWND;
 pub const WM_SETTINGCHANGE: u32 = 0x001A;
-pub const SMTO_ABORTIFHUNG: u32 = 0x0002;
 
 #[link(name = "advapi32")]
 extern "system" {
