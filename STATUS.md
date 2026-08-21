@@ -5,7 +5,7 @@ true today. Update it in the same commit as any change that moves a number or
 closes a task; if it disagrees with a doc, this file is wrong and the doc is
 right, so fix this file.
 
-**Last updated**: 2026-08-20 · **Version**: **v0.0.13** · **Branch**: `main` ·
+**Last updated**: 2026-08-20 · **Version**: **v0.0.14** · **Branch**: `main` ·
 **Open PRs**: none.
 
 **Twelve of thirteen installed models generate correct text** on this 15.7 GiB
