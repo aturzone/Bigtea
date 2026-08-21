@@ -129,7 +129,7 @@ are the measurement that killed an appealing idea.
 
 ## Next
 
-**v0.0.14 released 2026-08-21**: eight assets, five builds (Intel Mac and arm64
+**v0.0.15 released 2026-08-21**: eight assets, five builds (Intel Mac and arm64
 Linux are new). The window runs in the background — closing hides it to the
 notification area, **Exit** is the only thing that stops the engine — updates
 itself from inside the app, and **draws**: the IMAGE page runs `chaos-draw` as

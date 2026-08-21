@@ -547,6 +547,17 @@ compiling**, and three of these were believed fixed before a pixel was measured.
   thing to do and is not the problem. **A small icon needs a simplified glyph,
   which is artwork, not filtering** — do not spend another hour on the filter.
 
+- **Ask what a button does when pressed by accident.** The setup's UNINSTALL
+  removed a whole install on one click with no confirmation, sitting beside
+  UPDATE on the same screen. It shipped through five releases and was found only
+  when it destroyed a user's installation. The question costs nothing; not
+  asking it cost a user their setup and an evening.
+- **A public repository authenticates nothing on read.** `git ls-remote` against
+  `aturzone/Chaos` succeeds with a token of forty zeroes, so "git works but the
+  API says Bad credentials" is not evidence of a network problem -- it is what a
+  **revoked token** looks like. Test with a deliberately wrong credential before
+  concluding anything about the network.
+
 ## Releasing
 
 - **`git tag -a -F file` deletes every line beginning with `#`.** A tag message

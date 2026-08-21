@@ -19,7 +19,7 @@ engines agree to five significant figures on every layer sum and then both
 overflow to NaN at `l_out-5`. Chaos warns before generating and points at the
 container.
 
-**The release**: v0.0.14, **published 2026-08-21**, **eight** assets across
+**The release**: v0.0.15, **published 2026-08-21**, **eight** assets across
 **five** builds — Windows
 installer and zip; Linux x86_64 tarball, `.deb` and AppImage; Linux **arm64**
 tarball; macOS **arm64** and **x86_64** tarballs. The last two are new in
@@ -45,6 +45,14 @@ the output is photorealistic. **Object form is still imperfect** and `--help`
 says so in the binary. All four models are in the catalogue, so `chaos-pull
 ideogram-4 ideogram-4-uncond qwen3-vl-8b flux2-vae` fetches them. A release now
 carries **twelve** binaries.
+
+**The setup's UNINSTALL button removed an install on one click, with no
+confirmation, and it took Atur's.** Fixed in v0.0.15: it names what goes, says
+the models are kept and where, and offers "Press No if you meant to update
+instead". It is also hidden when nothing is installed, and the installer can no
+longer block forever waiting on a Chaos that is busy loading a model. **The
+question that would have caught this -- what does this button do if pressed by
+accident -- is cheap and was never asked.**
 
 **Chaos runs in the background now.** Closing the window hides it to the
 notification area and leaves the model loaded and the endpoint serving; the icon
