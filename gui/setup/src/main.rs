@@ -471,10 +471,28 @@ mod setup {
         // asks the parent for colours, which borrows.
         let welcome = screen == Screen::Welcome;
         unsafe {
-            for h in [install, uninstall, prefix] {
+            for h in [install, prefix] {
                 if !h.is_null() {
                     ShowWindow(h, if welcome { SW_SHOW } else { SW_HIDE });
                 }
+            }
+            // **UNINSTALL only when there is something to uninstall.** Atur's
+            // question was exactly right: "if chaos already in system why
+            // uninstall, if not why update and not install". The primary
+            // button already names what it will do -- INSTALL when the prefix
+            // is empty, UPDATE when something older is there -- and offering
+            // "uninstall" beside it when nothing is installed is a button that
+            // can only do nothing.
+            let anything_there = existing_install(&prefix_value()).is_some();
+            if !uninstall.is_null() {
+                ShowWindow(
+                    uninstall,
+                    if welcome && anything_there {
+                        SW_SHOW
+                    } else {
+                        SW_HIDE
+                    },
+                );
             }
         }
     }
@@ -801,7 +819,23 @@ mod setup {
             if hwnd.is_null() {
                 return false;
             }
-            SendMessageW(hwnd, WM_COMMAND, chaos_app::nav::IDM_EXIT as WPARAM, 0);
+            // **With a deadline.** A plain cross-process `SendMessageW` blocks
+            // until the other window handles it, and a Chaos busy loading a
+            // 7 GiB model is not pumping messages -- so the installer would sit
+            // there painting nothing for as long as that took, which is a
+            // window that appears to do nothing. Five seconds, then carry on:
+            // the worst case is that a file stays locked and `uninstall_to`
+            // says which one.
+            let mut ignored: usize = 0;
+            SendMessageTimeoutW(
+                hwnd,
+                WM_COMMAND,
+                chaos_app::nav::IDM_EXIT as WPARAM,
+                0,
+                SMTO_ABORTIFHUNG,
+                5_000,
+                &mut ignored,
+            );
             // Give it a moment to unload a model and go. Polling the window
             // rather than a fixed sleep: unloading 7 GiB is not instant, and a
             // fixed wait is either too short or wasted.
@@ -816,11 +850,43 @@ mod setup {
     }
 
     fn do_uninstall() {
-        // Before anything is deleted, not after it fails.
+        let prefix = prefix_value();
+
+        // **A destructive action asks first.** This button had no confirmation
+        // at all: one click and every binary was gone -- no dialog, no undo,
+        // and nothing on screen beforehand saying what was about to happen. It
+        // sits on the same screen as the primary button, which is where
+        // somebody who came to update presses it by mistake and is then left
+        // with no Chaos and no idea why. That is exactly what happened to Atur,
+        // twice: once to him and once to a script of mine.
+        let version = existing_install(&prefix)
+            .and_then(|e| e.version)
+            .map(|v| format!("Chaos {v}"))
+            .unwrap_or_else(|| "Chaos".to_string());
+        let answer = unsafe {
+            MessageBoxW(
+                main_window().load(std::sync::atomic::Ordering::SeqCst) as HWND,
+                wide(&format!(
+                    "Remove {version} from{LF}{LF}  {}{LF}{LF}\
+                     Your downloaded models are KEPT. They are in{LF}  {}{LF}{LF}\
+                     Press No if you meant to update instead.",
+                    prefix.display(),
+                    default_models_dir().display(),
+                ))
+                .as_ptr(),
+                wide("Uninstall Chaos?").as_ptr(),
+                MB_YESNO | MB_ICONQUESTION,
+            )
+        };
+        if answer != IDYES {
+            set_status("nothing was removed");
+            return;
+        }
+
+        // Only once it is going to happen.
         if stop_running_chaos() {
             set_status("closing Chaos first...");
         }
-        let prefix = prefix_value();
         let inside = running_inside(&prefix);
         let (ok, msg) = uninstall_to(&prefix, true);
         set_status(&msg);

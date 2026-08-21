@@ -8,6 +8,35 @@ While the major version is `0`, anything may change in a minor release.
 
 ## [Unreleased]
 
+## [0.0.15] — 2026-08-21
+
+### The uninstall button asks first
+
+**It had no confirmation at all.** One click and every binary was gone — no
+dialog, no undo, and nothing on screen beforehand saying what was about to
+happen. It sits on the same screen as UPDATE, which is where somebody who came
+to update presses it by mistake and is then left with no Chaos and no idea why.
+
+That is not hypothetical. It happened to Atur.
+
+Now it names what will be removed, says the models are **kept** and where they
+are, and offers *"Press No if you meant to update instead."*
+
+### Fixed
+
+- **UNINSTALL is not offered when nothing is installed.** Atur's question was
+  exactly right — *"if chaos already in system why uninstall, if not why update
+  and not install"*. The primary button already names what it will do (INSTALL
+  on an empty prefix, UPDATE over something older); a second button beside it
+  that could only do nothing was noise.
+- **The installer could hang on a running Chaos.** Closing its window and
+  waiting used a plain cross-process `SendMessageW`, which blocks until the
+  other window handles it — and a Chaos busy loading a 7 GiB model is not
+  pumping messages. The installer would sit there painting nothing for as long
+  as the load took, which from the outside is a setup where nothing works. Five
+  seconds and it carries on.
+
+
 ## [0.0.14] — 2026-08-21
 
 ### The window draws
@@ -1379,7 +1408,8 @@ Qwen3-30B-A3B Q4_K_M prefill, Chaos / llama.cpp:
   requires a competitor's exact command line and output before any competitive
   claim is citable.
 
-[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.14...HEAD
+[Unreleased]: https://github.com/aturzone/Chaos/compare/v0.0.15...HEAD
+[0.0.15]: https://github.com/aturzone/Chaos/releases/tag/v0.0.15
 [0.0.14]: https://github.com/aturzone/Chaos/releases/tag/v0.0.14
 [0.0.13]: https://github.com/aturzone/Chaos/releases/tag/v0.0.13
 [0.0.12]: https://github.com/aturzone/Chaos/releases/tag/v0.0.12
